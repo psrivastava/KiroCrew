@@ -1,8 +1,11 @@
+import { useCallback } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { useNavigate } from 'react-router-dom'
+import { useInRouterContext, useNavigate } from 'react-router-dom'
 import { Cpu } from 'lucide-react'
 import { api } from '../api/client'
 import { i18nT } from '../i18n/t'
+import { AGENT_HARNESS_SETTINGS_TAB } from '../pages/developer/kiroSignInLink'
+import { settingsPath } from './settingsPath'
 
 /**
  * Composer-shelf chip showing which ACP backend (Claude / Codex / Kiro CLI) is
@@ -14,12 +17,12 @@ import { i18nT } from '../i18n/t'
  * that gap is exactly what confused the operator. This chip reads the real
  * `agent.acp_backend` config value and names it, right next to that agent label.
  *
- * Clicking deep-links to Developer > Agent Backend (`?tab=agent-backend`), the
- * existing switcher, rather than duplicating its install-probe/switch logic
- * here. Styled to match the sibling shelf buttons (borderless, transparent),
+ * Clicking deep-links to Settings > Agent Harness (the coding-agent switcher,
+ * which upstream moved out of Developer > Agent Backend), rather than
+ * duplicating its install-probe/switch logic here. Styled to match the sibling shelf buttons (borderless, transparent),
  * with the accent reserved for an active CLI backend so it reads as "on".
  *
- * i18n: reuses the existing `agentBackendTab.agent_backend` label for the
+ * i18n: reuses the Settings tab's own `settings.tabs.agent.label` for the
  * tooltip/aria and shows the backend id (a proper noun — Claude/Codex/Kiro,
  * not translated) as the visible text, so no new catalog keys are needed.
  */
@@ -35,8 +38,26 @@ function backendLabel(id: string): string {
   return LABELS[id] ?? id
 }
 
-export default function BackendChip({ compact = false }: { compact?: boolean }) {
+const AGENT_HARNESS_PATH = settingsPath({ tab: AGENT_HARNESS_SETTINGS_TAB })
+
+const assignLocation = (to: string) => { window.location.assign(to) }
+
+/** ChatInput renders without a Router in its own tests and in the app-sdk
+ *  embed, so the router is optional here: resolve navigation once and hand it
+ *  down, the same way `BrowserLiveCard` does. */
+function BackendChipWithRouter({ compact }: { compact: boolean }) {
   const navigate = useNavigate()
+  const goTo = useCallback((to: string) => navigate(to), [navigate])
+  return <BackendChipView compact={compact} goTo={goTo} />
+}
+
+export default function BackendChip({ compact = false }: { compact?: boolean }) {
+  return useInRouterContext()
+    ? <BackendChipWithRouter compact={compact} />
+    : <BackendChipView compact={compact} goTo={assignLocation} />
+}
+
+function BackendChipView({ compact, goTo }: { compact: boolean; goTo: (to: string) => void }) {
   const { data } = useQuery<{ agent?: { acp_backend?: string } }>({
     queryKey: ['kirocrewConfig'],
     queryFn: () => api.kirocrewConfig(),
@@ -50,12 +71,12 @@ export default function BackendChip({ compact = false }: { compact?: boolean }) 
   // The non-default backends are the ones CCrew exists to drive; give them the
   // accent so the active CLI reads as "on". Kiro (the empty default) stays muted.
   const isCli = backend === 'claude' || backend === 'codex'
-  const tip = i18nT('pages.developer.agentBackendTab.agent_backend')
+  const tip = i18nT('settings.tabs.agent.label')
 
   return (
     <button
       type="button"
-      onClick={() => navigate('/developer?tab=agent-backend')}
+      onClick={() => goTo(AGENT_HARNESS_PATH)}
       title={`${tip}: ${label}`}
       aria-label={`${tip}: ${label}`}
       className={`inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] px-2.5 rounded-md bg-transparent border-none cursor-pointer transition-colors hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] ${

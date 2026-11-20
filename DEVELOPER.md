@@ -143,16 +143,23 @@ CCrew registered it too, CCrew.app could take KiroCrew's deep links.
 The sidebar ghost glyph is a raster `logo.png` (purple), so it can't be recolored
 by a token. A `.ccrew-logo-tint` CSS class hue-rotates it to lime on both glyph
 `<img>` sites. Reversible, no new asset.
-- `website/src/index.css` (`.ccrew-logo-tint`), applied in `website/src/App.tsx`
-  (`MobileNavGlyph`) and `website/src/shell/nav/railChrome.tsx` (`RailHeaderGlyph`).
+- `website/src/index.css` (`.ccrew-logo-tint`), applied in
+  `website/src/shell/topbar/shellHeader.tsx` (`MobileNavGlyph`) and
+  `website/src/shell/nav/railChrome.tsx` (`RailHeaderGlyph`).
+- Keep the class AFTER the box classes (`w-6 h-6 rounded-md … object-contain
+  ccrew-logo-tint`): upstream's `narrowFirstBaseline` test reads the logo box from a
+  className that starts with `w-N h-N`.
 
 ### 3.2 Active-backend chip
 The chat only ever showed the **agent-spec name** ("default") — never the ACP
-**backend** (claude / codex / kiro), which lived only in Developer → Agent
-Backend. These are two independent axes, which is why switching the backend never
+**backend** (claude / codex / kiro), which lived only in the agent switcher
+(now Settings → Agent Harness). These are two independent axes, which is why switching the backend never
 changed the "default" label. The `BackendChip` sits beside the agent label in the
 composer shelf, names the live backend, turns green (`--ok`) when a CLI backend is
-driving, and click-navigates to `/developer?tab=agent-backend`.
+driving, and click-navigates to Settings → Agent Harness
+(`settingsPath({ tab: AGENT_HARNESS_SETTINGS_TAB })`). Its tooltip reuses
+`settings.tabs.agent.label`. The router is optional (`useInRouterContext`, as in
+`BrowserLiveCard`), because `ChatInput` renders without a Router in its tests.
 - `website/src/components/BackendChip.tsx`; wired in `ChatInput` (in `App.tsx`).
 
 ---
