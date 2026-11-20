@@ -72,6 +72,7 @@ from kiro_crew.dashboard.chat_utils import (
     effective_session_key,
     slot_history_key,
 )
+from kiro_crew.dashboard.slack_session_list import auto_folder_id as slack_auto_folder_id
 from kiro_crew.dashboard.slot_persistence.message_entries import remember_unknown_row_fields
 from kiro_crew.dashboard.state import (
     _normalize_slot_key,
@@ -83,6 +84,7 @@ from kiro_crew.dashboard.transcript_binding import (
     bind_transcript,
     seed_autocompact_from_disk,
     seed_project_from_disk,
+    seed_turn_timeout_from_disk,
 )
 from kiro_crew.history import HUMAN_TURN_META_KEY, carry_provenance, is_incognito_transcript
 from kiro_crew.history_projection import METADATA_LINE_CORRUPT
@@ -605,10 +607,13 @@ def surface_channel_session(
         if slot.autocompact_pct is not None and state.sessions:
             state.sessions.set_autocompact_pct(effective_session_key(slot), slot.autocompact_pct)
     # The session's own turn time limit, for the same reason: without it a
-    # surfaced slot follows the global limit and its next save drops the key.
+    # surfaced slot follows the global limit and its next save drops the key. A
+    # live alias's limit stays, as its threshold does.
     from kiro_crew.dashboard.chat_persistence import _validate_turn_timeout_secs
 
-    slot.turn_timeout_secs = _validate_turn_timeout_secs(meta.get("turn_timeout_secs"))
+    seed_turn_timeout_from_disk(
+        state, slot, _validate_turn_timeout_secs(meta.get("turn_timeout_secs"))
+    )
     # Restore the dismissed source-link tombstones, mirroring the persistence
     # loaders: this surfacing path applies metadata by hand rather than going
     # through _rehydrate_slot_from_history, so without it an unlinked chip
@@ -622,7 +627,7 @@ def surface_channel_session(
         slot.workspace = meta["workspace"]
     if meta.get("memory_store"):
         slot.memory_store = str(meta["memory_store"])
-    seed_project_from_disk(state, slot, meta.get("project") or "")
+    seed_project_from_disk(state, slot, meta.get("project") or "", meta.get("project_picked"))
     if meta.get("channel_folder_filed"):
         slot._channel_folder_filed = True
     # Persisted tags are applied on EVERY surface, not just first filing: the
@@ -760,7 +765,7 @@ def _window_matches_disk(slot: "_ChatSlot", messages: list[dict[str, Any]]) -> b
 
     Matched on ``(role, ts, content)``: the window's ``cls`` and ``meta`` are
     presentation state that a persisted line need not carry, and content is
-    comparable because the write boundary already redacted non-user text before
+    comparable because the write boundary already redacted the text before
     it reached disk.
     """
     older = slot._disk_older_count
@@ -1125,6 +1130,7 @@ def _linked_running_flipped(state: "DashboardState") -> bool:
         try:
             now[name] = bool(slot.linked_turn_running)
         except Exception:
+            # One slot that cannot report must not stop the scan; the next reconcile reads it again.
             continue
     flipped = any(seen.get(name, False) != running for name, running in now.items())
     # A tab that closed while its turn ran needs no push of its own.
@@ -1359,6 +1365,11 @@ async def _reconcile_channel_slots_locked(
         ns = channel_namespace_of(key)
         if ns and ns not in folder_ids:
             folder_ids[ns] = await lookup_channel_folder(state, ns)
+            if ns == "slack" and not folder_ids[ns]:
+                # Listed Slack conversations with no ``slack.session_folder``
+                # file into a "Slack" folder made on first use, in one locked
+                # store transaction (see ``slack_session_list.auto_folder_id``).
+                folder_ids[ns] = await slack_auto_folder_id(state)
 
     # Folder tags are deliberately NOT read here: the raw ids are read fresh
     # under ``tags_write_lock`` immediately before validation and the filing
@@ -1683,9 +1694,9 @@ async def backfill_channel_folder(state: "DashboardState", namespace: str) -> di
 
     loop = asyncio.get_running_loop()
     try:
-        sessions = await loop.run_in_executor(None, log.list_sessions)
+        sessions = await loop.run_in_executor(None, log.list_sessions_indexed)
     except Exception:
-        logger.warning("channel backfill: list_sessions failed for %s", namespace, exc_info=True)
+        logger.warning("channel backfill: session listing failed for %s", namespace, exc_info=True)
         report["reason"] = "unavailable"
         return report
 

@@ -211,6 +211,10 @@ export function TeamsPanel() {
   const [appPassword, setAppPassword] = useState('')
   const [pwClear, setPwClear] = useState(false)
   const [formKey, setFormKey] = useState(0)
+  // The save's onSuccess reads the secret field as it is when it lands, not
+  // as it was when the request started.
+  const secretRef = useRef({ appPassword, pwClear })
+  useEffect(() => { secretRef.current = { appPassword, pwClear } }, [appPassword, pwClear])
   const [saved, setSaved] = useState(false)
   const [restartHint, setRestartHint] = useState(false)
   const [error, setError] = useState('')
@@ -249,11 +253,32 @@ export function TeamsPanel() {
       // leaves a quiet form that reads as saved.
       setError(msg)
     },
-    onSuccess: res => {
+    onSuccess: (res, vars) => {
       setSaved(true)
       setRestartHint(!!res.restart_required)
-      syncArmed.current = true
-      setFormKey(k => k + 1)
+      // Not re-arming the draft sync: the server took the values we sent, and
+      // a reseed would overwrite any field edited while the save was in
+      // flight. Only the password just sent is cleared, and only while the
+      // field still holds what was sent.
+      const s = secretRef.current
+      const nextPassword = vars.app_password && s.appPassword.trim() === vars.app_password ? '' : s.appPassword
+      setAppPassword(nextPassword)
+      if (vars.app_password_clear) setPwClear(false)
+      // Collapse the secret field back to its stored preview only when no
+      // newer edit is pending in it; a remount would hide it.
+      if (!nextPassword && !(s.pwClear && !vars.app_password_clear)) setFormKey(k => k + 1)
+      setDraft(d => {
+        if (!d) return d
+        // The stored App ID is masked once set; blank the sent value as the
+        // reseed did, unless it was edited during the save.
+        const appId = vars.app_id && d.app_id.trim() === vars.app_id ? '' : d.app_id
+        // A blank folder name was saved as the channel's own name: show that,
+        // unless the field was cleared after a named folder was sent.
+        const folder = d.session_folder_on && !d.session_folder.trim() && vars.session_folder === CHANNEL_NAME
+          ? vars.session_folder
+          : d.session_folder
+        return appId === d.app_id && folder === d.session_folder ? d : { ...d, app_id: appId, session_folder: folder }
+      })
       setTimeout(() => setSaved(false), 6000)
       qc.invalidateQueries({ queryKey: ['teams-config'] })
     },
@@ -400,6 +425,7 @@ export function TeamsPanel() {
       {/* ── Bot setup steps ── */}
       <SettingsSection title={i18nT('pages.settings.teamsPanel.connect_the_azure_bot')}>
         <SettingsCard index={1}>
+          <div>
           <ol className="text-[13px] text-text m-0 pl-5 space-y-1.5 list-decimal">
             <li>
               {i18nT('pages.settings.teamsPanel.expose_this_gateway_over')} <strong>{i18nT('pages.settings.teamsPanel.public_https')}</strong> {i18nT('pages.settings.teamsPanel.tunnel_or_reverse_proxy_see_the_note_above_note')}
@@ -429,6 +455,7 @@ export function TeamsPanel() {
               <Trans i18nKey="pages.settings.teamsPanel.side_load_app_with_bot_id" components={{ field: <code>{i18nT('pages.settings.teamsPanel.botid')}</code> }} />
             </li>
           </ol>
+          </div>
         </SettingsCard>
       </SettingsSection>
 
@@ -451,6 +478,9 @@ export function TeamsPanel() {
             isSet={data.app_password_set}
             preview={SECRET_MASK}
             readOnly={ro}
+            // A value still pending (typed during a save) stays in the editor,
+            // even once the refetch reports a stored credential.
+            editing={appPassword ? true : undefined}
             value={appPassword}
             onChange={setAppPassword}
             cleared={pwClear}
@@ -490,7 +520,7 @@ export function TeamsPanel() {
           />
           {/* Optional per-channel session filing. Off by default: Teams
               conversations stay unfiled in the sidebar, as before. */}
-          <div className="border-t border-border mt-4 pt-4">
+          <div className="border-t border-border mt-3 pt-3">
             <SettingsToggle
               label={i18nT('pages.settings.botChannelPanel.file_sessions_in_folder')}
               hint={i18nT('pages.settings.botChannelPanel.file_sessions_in_folder_desc', { channel: CHANNEL_NAME })}
@@ -561,7 +591,7 @@ export function TeamsPanel() {
       </SettingsSection>
 
       {/* ── Save (hidden on read-only remote sessions) ── */}
-      {!ro && <div className="flex items-center gap-3 mt-1 mb-4">
+      {!ro && <div className="flex flex-row-reverse flex-wrap items-center gap-3 mt-3 mb-4 max-w-[720px]">
         <Btn primary onClick={handleSave} disabled={saveMut.isPending || !!pctErr}>
           {saveMut.isPending ? i18nT('pages.settings.teamsPanel.saving') : i18nT('pages.settings.teamsPanel.save_teams_settings')}
         </Btn>

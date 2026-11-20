@@ -1068,7 +1068,13 @@ def test_new_launch_is_refused_at_the_per_server_cap_and_expected_launch_survive
     refusal = document["refused"]["SRV"]
     assert refusal["reason"] == mod.REFUSED_TOO_MANY
     assert len(refusal["expected_launch"].split(",")) == cap
-    assert mod.refused_servers(store) == {}
+    # The dashboard shows it as over the cap, with nothing it could approve.
+    shown = mod.refused_servers(store)["srv"]
+    assert shown["reason"] == mod.REFUSED_TOO_MANY
+    assert shown["launch_cap"] == cap
+    assert len(shown["commands"]) == len(shown["envs"]) == cap
+    assert shown["complete"] is False
+    assert "expected_launch" not in shown
 
     record = document["servers"]["SRV"]
     record["fingerprints"] = [f"{index:0129d}" for index in range(cap * 2)]
@@ -1077,6 +1083,29 @@ def test_new_launch_is_refused_at_the_per_server_cap_and_expected_launch_survive
     loaded = mod.load_approvals(store)
     assert len(loaded.approved["SRV"]) == cap
     assert len(loaded.approved_pairs["SRV"]) == cap
+
+
+def test_a_launch_repeated_after_the_cap_keeps_the_cap_as_the_reason():
+    mod = _approval_module()
+    assert mod is not None
+    cap = mod._MAX_SERVER_LAUNCHES
+    env_hash = mod.env_fingerprint({})
+    approvals = mod.LaunchApprovals()
+
+    def admit(arg: str) -> bool:
+        return approvals.admit(
+            "srv",
+            mod.launch_fingerprint(_APPROVED_CMD, [arg], {}),
+            launch=(_APPROVED_CMD, [arg]),
+            env={},
+            derived_env_hash=env_hash,
+        )
+
+    assert not any(admit(str(index)) for index in range(cap + 1))
+    assert approvals.refused["SRV"] == mod.REFUSED_TOO_MANY
+    # A later agent declaring a launch the pass already retained, in file order.
+    assert not admit("0")
+    assert approvals.refused["SRV"] == mod.REFUSED_TOO_MANY
 
 
 def test_operator_approval_refuses_a_launch_set_over_the_per_server_cap(tmp_path):
@@ -1149,12 +1178,12 @@ def test_the_approved_launch_is_wrapped_after_other_specs_fill_the_launch_cap(tm
     for index in range(cap + 1):
         name = f"aim-{index:02d}"
         entry = {"command": _APPROVED_CMD, "args": ["--skill-paths", f"/skills/{index}"]}
-        spec = {"name": name, "mcpServers": {"srv": entry}}
+        spec = {"name": name, "tools": ["*"], "mcpServers": {"srv": entry}}
         (source / f"{name}.json").write_text(json.dumps(spec))
     # Named to sort after every other spec, so it is read once the cap is full.
     crew_entry = {"command": _APPROVED_CMD, "args": []}
     (source / "kiro-crew.json").write_text(
-        json.dumps({"name": "kiro-crew", "mcpServers": {"srv": crew_entry}})
+        json.dumps({"name": "kiro-crew", "tools": ["*"], "mcpServers": {"srv": crew_entry}})
     )
 
     with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_gateway.rewriter"):
@@ -1375,6 +1404,7 @@ async def test_the_stored_approved_display_is_redacted(tmp_path, toggle_home):
         json.dumps(
             {
                 "name": "a",
+                "tools": ["*"],
                 "mcpServers": {
                     "srv": {"command": _APPROVED_CMD, "args": [], "env": {"API_TOKEN": secret}}
                 },

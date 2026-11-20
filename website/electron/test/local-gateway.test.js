@@ -127,7 +127,7 @@ test("classifyStartFailure: client-only outranks an incomplete bundle", () => {
 });
 
 test("classifyStartFailure: a launch refused its own port is client-only too", () => {
-  // The setting is ON in these states and nothing was launched anyway, because
+  // The setting is ON in these states and no gateway runs anyway, because
   // the port this launch targets is not one a new gateway may bind. The dialog
   // reads this same answer to decide whether to offer "Start Local Gateway", and
   // both messages name that button -- so a kind of "failed" here would print a
@@ -188,7 +188,7 @@ test("client-only: the failure dialog derives its log pane from that one bit", (
   // foreign-holder refusal: that launch did probe the port and logged the
   // holder's pid and command, so its log is evidence, not an earlier run's.
   const source = SUPERVISOR_FILES
-    .map((file) => fs.readFileSync(path.join(__dirname, "..", file), "utf8"))
+    .map((file) => fs.readFileSync(path.join(__dirname, "..", file), "utf8").replace(/\r\n/g, "\n"))
     .join("\n");
   assert.match(source, /const showLog = configuredShowLog \?\? !localGatewayOff;/);
   assert.deepStrictEqual(
@@ -207,7 +207,7 @@ test("client-only: the local-start offer routes through a re-exec on a crew's po
   // in place; client-only on a crew's port -> offer while a re-exec is
   // possible; noRetry -> no offer.
   const source = SUPERVISOR_FILES
-    .map((file) => fs.readFileSync(path.join(__dirname, "..", file), "utf8"))
+    .map((file) => fs.readFileSync(path.join(__dirname, "..", file), "utf8").replace(/\r\n/g, "\n"))
     .join("\n");
   assert.match(source, /const enableButton = offerLocalStart && !noRetry/);
   assert.match(source, /offerLocalStart: canOfferLocalStart\(localGatewayOff, remoteTarget\)/);

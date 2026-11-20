@@ -33,7 +33,9 @@ from kiro_crew.cron_service.model import (
     _AUTO_PAUSE_THRESHOLD,
     CronJob,
     CronSchedule,
+    parked_by_its_run,
 )
+from kiro_crew.cron_service.schedule import pin_random_cron_fields
 from kiro_crew.cron_service.zone_default_migration import (
     _LEGACY_DEFAULT_ZONE,
     LOCAL_DEFAULT_STORE_VERSION,
@@ -169,6 +171,15 @@ def _record_user_paused(j: dict[str, Any]) -> bool:
     existed. Every reader routes through here so the derivation has one owner.
     """
     return bool(j.get("user_paused", not j.get("enabled", True)))
+
+
+def _record_parked_by_run(j: dict[str, Any]) -> bool:
+    """:func:`parked_by_its_run` for a serialized job: a fired one-shot's park, not a user pause."""
+    schedule = j.get("schedule")
+    kind = schedule.get("kind") if isinstance(schedule, dict) else None
+    return parked_by_its_run(
+        kind, _record_user_paused(j), j.get("user_pause_requested"), j.get("last_run_ts")
+    )
 
 
 def _record_is_enabled(j: dict[str, Any]) -> bool:
@@ -317,7 +328,13 @@ def _job_from_record(j: dict[str, Any], *, warn_on_coercion: bool = True) -> Cro
             kind=sched_kind,
             every_secs=sched.get("every_secs"),
             at_ts=sched.get("at_ts"),
-            cron_expr=_cron_expr,
+            # A stored random (``R``) field reads as the same pick for this job on
+            # every load, so every reader agrees on when it runs.
+            cron_expr=(
+                pin_random_cron_fields(_cron_expr, _required_str(j, "id"))
+                if _cron_expr
+                else _cron_expr
+            ),
         ),
         channel=_guard_opt_str("channel"),
         thread_ts=_guard_opt_str("thread_ts"),
@@ -372,6 +389,7 @@ def _job_from_record(j: dict[str, Any], *, warn_on_coercion: bool = True) -> Cro
         minimal_context=j.get("minimal_context", False),
         hide_in_chat=j.get("hide_in_chat", False),
         new_chat_per_run=j.get("new_chat_per_run") is True,
+        on_tab_close="fresh" if j.get("on_tab_close") == "fresh" else "resume",
         folder_id=_guard_str("folder_id"),
         chat_folder_id=_guard_str("chat_folder_id"),
         project_path=_guard_str("project_path"),
@@ -380,6 +398,7 @@ def _job_from_record(j: dict[str, Any], *, warn_on_coercion: bool = True) -> Cro
         last_retry_run_ts=_guard_num("last_retry_run_ts", 0.0),
         run_generation=_guard_num("run_generation", 0),
         user_pause_generation=_guard_num("user_pause_generation", 0),
+        user_pause_requested=j.get("user_pause_requested") is True,
         agent_sequence=_str_list("agent_sequence"),
         env=j.get("env", {}),
         timeout_secs=_guard_num("timeout_secs", seams._JOB_TIMEOUT_SECS),
@@ -397,6 +416,7 @@ def _job_from_record(j: dict[str, Any], *, warn_on_coercion: bool = True) -> Cro
         secret_env_pending=j.get("secret_env_pending", {}),
         secret_env_pending_pin=_guard_str("secret_env_pending_pin"),
         secret_env_pending_ts=_guard_num("secret_env_pending_ts", 0.0),
+        secret_env_resurfaced_pin=_guard_str("secret_env_resurfaced_pin"),
     )
     # Measured on what the save writes back, so a coerced field does not count.
     # Skipping the record rather than clearing the field keeps a too-deep
@@ -580,6 +600,8 @@ def job_record(j: CronJob) -> dict[str, Any]:
     # an older build writes.
     if j.user_pause_generation:
         record["user_pause_generation"] = j.user_pause_generation
+    if j.user_pause_requested:
+        record["user_pause_requested"] = True
     # The optional ownership keys follow the same compatibility rule. An older
     # build reads a newer store's extra key and writes it back.
     if j.managed_by:
@@ -599,14 +621,19 @@ def job_record(j: CronJob) -> dict[str, Any]:
     # Written only when set, by the same rule.
     if j.new_chat_per_run:
         record["new_chat_per_run"] = True
+    if j.secret_env_resurfaced_pin:
+        record["secret_env_resurfaced_pin"] = j.secret_env_resurfaced_pin
+    if j.on_tab_close == "fresh":
+        record["on_tab_close"] = "fresh"
     return record
 
 
 #: Every key :func:`job_record` can write, read off the encoder itself so the two
 #: cannot drift: a job that sets each conditionally written key
-#: (``user_pause_generation``, ``managed_by``, ``app_manifest_digest``,
+#: (``user_pause_generation``, ``user_pause_requested``, ``managed_by``, ``app_manifest_digest``,
 #: ``person_owner_key``, ``acked_item_ids`` with ``acked_item_ids_digest``,
-#: ``project_path``, ``new_chat_per_run``, and a non-default ``auto_pause_after_failures`` and
+#: ``project_path``, ``new_chat_per_run``, ``secret_env_resurfaced_pin``,
+#: ``on_tab_close``, and a non-default ``auto_pause_after_failures`` and
 #: ``alert_after_failures``, which are omitted at the default). A record key
 #: outside this set came from a newer build. A key inside it is this build's to
 #: write or to omit, so a value this build cleared stays cleared.
@@ -618,11 +645,14 @@ _KNOWN_JOB_KEYS = frozenset(
             message="",
             schedule=CronSchedule(kind="cron"),
             user_pause_generation=1,
+            user_pause_requested=True,
             managed_by="-",
             app_manifest_digest="-",
             person_owner_key="-",
             project_path="-",
             new_chat_per_run=True,
+            secret_env_resurfaced_pin="-",
+            on_tab_close="fresh",
             auto_pause_after_failures=0,
             alert_after_failures=2,
             acked_item_ids=["-"],

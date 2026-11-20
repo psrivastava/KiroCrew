@@ -22,10 +22,12 @@ from enum import Enum
 from typing import Any
 
 from kiro_crew import name_grant, permission_floor
+from kiro_crew.agent_sdk.drivers.acp_vocab import continue_timed_out_calls
 from kiro_crew.approval_mode_policy import session_mode_permitted
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.channel_account_check import session_after_account_check
 from kiro_crew.channel_shell_base import _offerable_base_binary
+from kiro_crew.channel_spec_hooks import pre_tool_refusal, turn_spec
 from kiro_crew.config import KiroCrewConfig, live
 from kiro_crew.config.fields import _safe_int
 from kiro_crew.config.loader import config_local_path, config_path, read_endorsed_config_text
@@ -164,8 +166,8 @@ CHANNEL_AGENT_BLOCKED_TOOLS: tuple[str, ...] = (
     # Recoloring a session acts on a session the channel agent would name from
     # thread text other people wrote; same containment reason as stop.
     "session_set_color",
-    # Reload relaunches another session's agent process; same containment
-    # reason as stop.
+    "session_set_note",  # writes into another session's next turn; same reason as stop
+    # Reload relaunches another session's agent process; same reason as stop.
     "session_reload",
     # Renaming relabels a session in the person's sidebar, named from thread text
     # other people wrote; same containment reason as the tree verbs below.
@@ -181,6 +183,11 @@ CHANNEL_AGENT_BLOCKED_TOOLS: tuple[str, ...] = (
     # Reads another tracked channel's messages, which a channel agent would relay
     # into a thread other people read; same exfiltration reason.
     "read_slack_history",
+    # Reads and reorders a worker's queued instructions; same exfiltration reason.
+    "session_queue",
+    # Stops a running turn and chooses what the target runs next, so it carries
+    # `session_stop`'s containment reason and `session_send`'s together.
+    "session_run_queued",
     # The fan-out verb, blocked for the reason `session_send` is and then some: one
     # call with `all: true` reaches every session the caller created, so a channel agent acting on
     # words from a thread other people are in would relay them into the user's
@@ -191,6 +198,9 @@ CHANNEL_AGENT_BLOCKED_TOOLS: tuple[str, ...] = (
     # whoever is in that thread -- the same exfiltration `session_read_message` is
     # blocked for, one step shallower.
     "session_status",
+    # The remote-crew roster: crew names and their agents, the same
+    # exfiltration reason as session_status.
+    "crew_list",
     "session_create",
     # Creates, opens, binds and seeds a worker in one call: session_create's and
     # session_send's containment reasons together.
@@ -240,6 +250,7 @@ CHANNEL_AGENT_BLOCKED_TOOLS: tuple[str, ...] = (
     "work_report",
     "work_ledger_read",
     "work_ledger_record",
+    "work_ask_record",
     "work_ledger_rebuild",
     "accept_eval",
 ) + CHANNEL_AGENT_BLOCKED_DISPATCH_TOOLS
@@ -400,6 +411,10 @@ class ChannelAgent:
     # titles and request-body patterns are LLM-influenced and never scope a
     # grant. Set while ``_approval_future`` is pending, cleared with it.
     _pending_approval_command: str = field(default="", repr=False)
+    # The approval awaiting a decision is an organisation's ``ask`` on a KAS web
+    # call (``web_ask_rule``): a trust or YOLO sweep of pending approvals leaves it
+    # for a person. Set and cleared with ``_approval_future``.
+    _pending_approval_person_only: bool = field(default=False, repr=False)
     # The provider's text when the last lost-session verdict was a credential
     # failure ("" otherwise), so the recovery notices can name the real cause.
     _credential_error: str = field(default="", repr=False)
@@ -497,6 +512,13 @@ class Channel:
         if not agent:
             return False
         agent.state = "done"
+        # Stop its loop as ``ChannelManager.close`` does. Left running, a working
+        # member wrote "listening" back over "done", kept consuming, and held its
+        # session until the gateway exited; close cannot reach it either, since it
+        # cancels only members still in the room. The loop's ``finally`` releases
+        # the session and keeps "done".
+        if agent._task and not agent._task.done():
+            agent._task.cancel()
         self._broadcast(
             "channel_agent_left",
             {
@@ -673,7 +695,7 @@ class Channel:
                     from_role="System",
                     mention=None,
                     msg_type="system",
-                    content=f"⚠️ @{target.role} is no longer active.",
+                    content=f"Warning: @{target.role} is no longer active.",
                 )
                 self.messages.append(bounce)
                 self._msg_index[bounce.id] = bounce
@@ -983,7 +1005,7 @@ async def run_channel_agent(
         elif agent.is_orchestrator:
             await channel.post(
                 "system",
-                f"✅ @{agent.role} is ready. Send a message to get started.",
+                f"@{agent.role} is ready. Send a message to get started.",
                 from_role="System",
                 msg_type="system",
             )
@@ -1025,6 +1047,8 @@ async def run_channel_agent(
             )
             if client is None:
                 break
+            # One claim for life: a stricter sandbox recycles it here; the check below re-acquires.
+            await sessions.recycle_if_sandbox_tightened(agent.session_key)
             if sessions.get_provider(agent.session_key) is not client:
                 # IDENTITY, not presence: a clear-context discard pops this key and shuts the
                 # cached provider down, and a later claim can re-register a DIFFERENT one under it.
@@ -1032,7 +1056,7 @@ async def run_channel_agent(
                 if replacement is None:
                     await channel.post(
                         agent.id,
-                        "❌ This agent's session could not be re-acquired after its context "
+                        "Error: This agent's session could not be re-acquired after its context "
                         "was cleared. Wake it to try again.",
                         from_role=agent.role,
                         msg_type="system",
@@ -1082,9 +1106,9 @@ async def run_channel_agent(
                     await channel.post(
                         agent.id,
                         (
-                            "❌ This agent's session is stuck and could not be recovered. "
+                            "Error: This agent's session is stuck and could not be recovered. "
                             if fault == _STREAM_BUSY
-                            else f"❌ {_lost_give_up_text(agent)} "
+                            else f"Error: {_lost_give_up_text(agent)} "
                         )
                         + "Clear its context or wake it to try again.",
                         from_role=agent.role,
@@ -1388,7 +1412,11 @@ async def _stream_task(
     tool_seen = False
 
     try:
-        async for event in client.stream(message):
+        # Read before anything streams, as a channel bot's turn reads it.
+        spec = await turn_spec(client, agent.agent_name)
+        # A call whose own silence timer ends the prompt is handed back to the
+        # model inside this turn, on the same session (``acp.timed_out_continuation``).
+        async for event in continue_timed_out_calls(client.stream, message):
             if event.kind == EVENT_TEXT_CHUNK:
                 chunks.append(event.text)
 
@@ -1455,6 +1483,11 @@ async def _stream_task(
                     agent=agent.agent_name,
                     security_only=False,
                 )
+                _gate_outcome = "rejected_hook_deny"
+                if _gate_reason is None:
+                    # Then the agent spec's own PreToolUse hooks, where Crew runs them.
+                    _gate_reason = await pre_tool_refusal(spec, client, event, agent.session_key)
+                    _gate_outcome = "rejected_spec_hook"
                 if _gate_reason is not None:
                     sel().log_tool_invocation(
                         session_key=agent.session_key,
@@ -1462,7 +1495,7 @@ async def _stream_task(
                         source="channel",
                         # Permission events populate ``title``; ``text`` is empty.
                         tool_name=event.text or event.title,
-                        outcome="rejected_hook_deny",
+                        outcome=_gate_outcome,
                         metadata={"reason": _gate_reason},
                     )
                     # The gate judged the call itself: a policy verdict, with
@@ -1480,7 +1513,25 @@ async def _stream_task(
                 # YOLO mode (global) or channel trust — auto-approve. A
                 # ``gateway --approval yolo`` grant is for dashboard chats only.
                 _yolo = bool(is_yolo and is_yolo()) and safety_override().is_cli_launch is not True
-                if _yolo or (channel.trusted and session_mode_permitted("trust")):
+                from kiro_crew import mate_held_rules, web_ask_rule
+
+                # A moved Bot's limit its worker could not carry exactly
+                # (``mate_held_rules``), or an organisation's ``ask`` on a KAS web
+                # call (``web_ask_rule``): neither YOLO, channel trust nor a trusted
+                # command answers a call it covers; it reaches the card.
+                _web_held = bool(web_ask_rule.held_phrases(event))
+                _held = (
+                    bool(
+                        await asyncio.to_thread(
+                            mate_held_rules.held_for,
+                            event,
+                            session_key=agent.session_key,
+                            agent=agent.agent_name,
+                        )
+                    )
+                    or _web_held
+                )
+                if not _held and (_yolo or (channel.trusted and session_mode_permitted("trust"))):
                     approval_outcome = (
                         "auto_approved_yolo" if _yolo else "auto_approved_channel_trust"
                     )
@@ -1527,7 +1578,7 @@ async def _stream_task(
                 )
                 # Non-None past this block only for a matched grant that was declined.
                 _ng_refusal: name_grant.Refusal | None = None
-                if (agent._trusted_commands or agent._trusted_bases) and _cmd:
+                if (agent._trusted_commands or agent._trusted_bases) and _cmd and not _held:
                     matched = _match_trusted_channel_command(_cmd, agent)
                     if matched:
                         # The grant names a PROGRAM; the shell resolves that
@@ -1608,14 +1659,13 @@ async def _stream_task(
                 # authority. ``tool_input_redacted`` is transport provenance:
                 # re-running the scanners cannot reveal bytes an ACP transport
                 # already removed. Either signal makes the command display-only.
-                from kiro_crew.security import redact_with_findings
+                from kiro_crew.security import redact, redact_with_findings, refuses
 
                 _safe_cmd, _cmd_credential_redacted, _cmd_url_redacted = redact_with_findings(_cmd)
                 _command_grantable = bool(_cmd) and not (
                     bool(getattr(event, "tool_input_redacted", False))
                     or _cmd_credential_redacted
-                    or _cmd_url_redacted
-                    or _safe_cmd != _cmd
+                    or refuses(_cmd, redact)
                     or "[REDACTED" in _cmd
                 )
                 if _cmd:
@@ -1707,7 +1757,7 @@ async def _stream_task(
                 except Exception:
                     logger.exception("name-grant environment check failed")
                     _grants_refused = True
-                _prose = f"⚠️ Approval needed: **{sanitized_name}**\n```\n{sanitized_input}\n```"
+                _prose = f"Approval needed: **{sanitized_name}**\n```\n{sanitized_input}\n```"
                 if _ng_refusal is not None:
                     # ``log_text`` is a constant; ``detail`` is built from the unredacted command.
                     _prose += f"\nAsking again even though this is trusted: {_ng_refusal.log_text}."
@@ -1722,6 +1772,7 @@ async def _stream_task(
                 approval_future = loop.create_future()
                 agent._pending_approval_command = _cmd if _command_grantable else ""
                 agent._approval_future = approval_future
+                agent._pending_approval_person_only = _web_held
                 # The card's structured facts, beside the prose. The
                 # server is the only side that can refuse a per-command tier
                 # (``handlers_channel.approve``), so it states here which
@@ -1772,6 +1823,7 @@ async def _stream_task(
                     if agent._approval_future is approval_future:
                         agent._approval_future = None
                         agent._pending_approval_command = ""
+                        agent._pending_approval_person_only = False
 
                 if decision not in ("approved", "rejected", "trust"):
                     decision = "rejected"
@@ -1874,7 +1926,7 @@ async def _stream_task(
         logger.exception("LLM stream error for agent %s (%s)", agent.id, agent.role)
         await channel.post(
             agent.id,
-            "❌ An error occurred while processing. Check logs for details.",
+            "Error: An error occurred while processing. Check logs for details.",
             from_role=agent.role,
             msg_type="system",
             thread_id=thread_id,

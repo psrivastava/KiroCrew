@@ -10,8 +10,14 @@ re-exports every name here.
 from __future__ import annotations
 
 import string
+from collections.abc import Iterable
 from dataclasses import dataclass
 
+from kiro_crew.acp.harness_tool_names import (
+    claude_fused_mcp_tool,
+    opencode_fused_mcp_tool,
+    pi_fused_mcp_tool,
+)
 from kiro_crew.acp.liveness_command import (
     MAX_RETAINED_NAME_CHARS,
     MAX_RETAINED_TITLE_CHARS,
@@ -27,6 +33,7 @@ from kiro_crew.acp.liveness_evidence import (
     WAIT_TOOL_SLACK_SECS,
 )
 from kiro_crew.acp.liveness_interactive import INTERACTIVE_NONE
+from kiro_crew.acp_backends import ACP_BACKEND_CLAUDE, ACP_BACKEND_OPENCODE, ACP_BACKEND_PI
 from kiro_crew.constants import WAIT_TOOL_MAX_SECS
 from kiro_crew.session_directive import CORE_MCP_SERVER
 
@@ -65,6 +72,8 @@ class ToolCallState:
             self.tool_name = self.tool_name[:MAX_RETAINED_NAME_CHARS]
         if len(self.mcp_server_name) > MAX_RETAINED_NAME_CHARS:
             self.mcp_server_name = self.mcp_server_name[:MAX_RETAINED_NAME_CHARS]
+        if len(self.silence_server) > MAX_RETAINED_NAME_CHARS:
+            self.silence_server = self.silence_server[:MAX_RETAINED_NAME_CHARS]
 
     dispatch_ts: float = 0.0  # time.monotonic() at EVENT_TOOL_CALL
     is_shell: bool = False
@@ -105,8 +114,9 @@ class ToolCallState:
     tool_name: str = ""
     # Trusted MCP server from the adapter identity channel, set only when the
     # tool_call frame's identity is provenance-verified
-    # (``AcpEvent.mcp_identity_trusted``) or is KAS's half-identity for a
-    # ``kirocrew-core`` call (:meth:`identity_of`); empty otherwise
+    # (``AcpEvent.mcp_identity_trusted``), is KAS's half-identity for a
+    # ``kirocrew-core`` call, or is opencode's, pi's or claude's fused name for
+    # one (:meth:`identity_of`); empty otherwise
     # (fail-closed). Read by
     # :meth:`is_trusted_wait`, and by the ``remote_flat`` scan, which reads only
     # the subtree of the server this names.
@@ -118,21 +128,47 @@ class ToolCallState:
     # classification see the same value the dispatch computed, and so a
     # detached consult never re-derives it from a different command string.
     interactive_risk: str = INTERACTIVE_NONE
+    # The per-call silence timer (``acp.tool_silence``). ``silence_class`` is the
+    # bound this call gets, "" for none (a shell call keeps the oracle's rules).
+    # ``silence_server`` is the MCP server the harness's frame named, kept only so
+    # Kiro Crew's own keepalive can be matched to a call it served; it is never an
+    # identity anything trusts. ``last_activity_ts`` is when a frame attributable
+    # to this call last arrived (monotonic; the dispatch instant until one does),
+    # and ``activity_parked`` is the turn's consumer park banked at that moment,
+    # so the timer subtracts only parks that came after it.
+    silence_class: str = ""
+    silence_server: str = ""
+    last_activity_ts: float = 0.0
+    activity_parked: float = 0.0
 
     @staticmethod
-    def identity_of(event: object) -> tuple[str, str]:
+    def identity_of(
+        event: object, *, backend: str | None = None, servers: Iterable[str] = ()
+    ) -> tuple[str, str]:
         """``(mcp_server_name, tool_name)`` a state retains for a dispatch *event*.
 
         A provenance-verified pair (``mcp_identity_trusted``) is kept as it is.
-        Otherwise the server is dropped, except for one shape: KAS names the
+        Otherwise the server is dropped, except for these shapes, all for the
+        ``kirocrew-core`` server alone. KAS names the
         server on a ``tool_call`` frame (``_meta.kiro.serverName``) but stamps
         no tool name there, so a Trust-mode call, which gets no permission
-        request, never carries the tool half. For the ``kirocrew-core`` server
-        alone, and only when the frame's server half names it, the tool half is
+        request, never carries the tool half. When the frame's server half
+        names ``kirocrew-core``, the tool half is
         then read from what KAS itself wrote about the call it runs: the Tool
         Search envelope's ``tool_id`` (``kirocrew-core::<tool>``, the id the
         engine dispatches on) or the wire title KAS stamps as
-        ``@kirocrew-core/<tool>``. The display ``title`` is never read.
+        ``@kirocrew-core/<tool>``. opencode names neither half apart: on a
+        *backend* of opencode the pair is read from the fused ``kirocrew-core_<tool>``
+        wire title opencode writes as the tool's id
+        (:func:`~kiro_crew.acp.harness_tool_names.opencode_fused_mcp_tool`).
+        pi and claude name the call only by a fused ``mcp__<server>__<tool>``:
+        pi in its wire title, claude in its adapter stamp
+        (``claude_mcp_tool_name``). On those backends the pair is read from it
+        only when ``kirocrew-core`` is one of *servers*, the servers this
+        session handed the harness, and on pi only when no other of them spells
+        the same (:func:`~kiro_crew.acp.harness_tool_names.pi_fused_mcp_tool`,
+        :func:`~kiro_crew.acp.harness_tool_names.claude_fused_mcp_tool`).
+        The display ``title`` is never read.
         """
         server = getattr(event, "mcp_server_name", "") or ""
         tool = getattr(event, "tool_name", "") or ""
@@ -142,6 +178,32 @@ class ToolCallState:
             return server, tool
         if tool or getattr(event, "is_shell", False) or server not in ("", CORE_MCP_SERVER):
             return "", tool
+        if backend == ACP_BACKEND_OPENCODE and not server:
+            title = getattr(event, "wire_title", "")
+            kind = getattr(event, "tool_kind", "")
+            named = (
+                opencode_fused_mcp_tool(title, kind, CORE_MCP_SERVER)
+                if isinstance(title, str) and isinstance(kind, str)
+                else ""
+            )
+            return (CORE_MCP_SERVER, named) if ToolCallState._is_core_tool_name(named) else ("", "")
+        if backend == ACP_BACKEND_PI and not server:
+            title = getattr(event, "wire_title", "")
+            kind = getattr(event, "tool_kind", "")
+            named = (
+                pi_fused_mcp_tool(title, kind, CORE_MCP_SERVER, servers)
+                if isinstance(title, str) and isinstance(kind, str)
+                else ""
+            )
+            return (CORE_MCP_SERVER, named) if ToolCallState._is_core_tool_name(named) else ("", "")
+        if backend == ACP_BACKEND_CLAUDE and not server:
+            stamp = getattr(event, "claude_mcp_tool_name", "")
+            named = (
+                claude_fused_mcp_tool(stamp, CORE_MCP_SERVER, servers)
+                if isinstance(stamp, str)
+                else ""
+            )
+            return (CORE_MCP_SERVER, named) if ToolCallState._is_core_tool_name(named) else ("", "")
         named = ToolCallState._kas_core_tool_name(event, server_named=server == CORE_MCP_SERVER)
         return (CORE_MCP_SERVER, named) if named else ("", "")
 
@@ -213,6 +275,31 @@ class ToolCallState:
         if self.is_shell or self.mcp_server_name != CORE_MCP_SERVER:
             return False
         return _MCP_SEPARATOR_RE.split(self.tool_name)[-1] == _WAIT_TOOL_NAME
+
+    def refine_wait_input(self, tool_input: object, now: float | None = None) -> bool:
+        """Take a later frame's *tool_input* as a trusted ``wait``'s command, once.
+
+        opencode's ``tool_call`` carries ``rawInput: {}`` and the arguments only on
+        the ``in_progress`` update, so the declared seconds are unknown at dispatch.
+        Only a trusted wait whose command names no seconds yet takes an input that
+        names them, so a later frame cannot stretch a duration already read. With
+        *now* (``time.monotonic()``), the duration is counted from that frame: it is
+        the one that says the call runs, after any approval it waited on. Returns
+        whether the command was taken.
+        """
+        if not (
+            isinstance(tool_input, str)
+            and self.is_trusted_wait()
+            and parse_wait_seconds(self.command) is None
+        ):
+            return False
+        command = bounded_command_text(tool_input)
+        if parse_wait_seconds(command) is None:
+            return False
+        self.command = command
+        if now is not None:
+            self.dispatch_ts = now
+        return True
 
     def is_trusted_keepalive_tool(self) -> bool:
         """True when the adapter-authored identity names a kirocrew-core tool
@@ -353,6 +440,17 @@ class InFlightToolTracker:
         map that dropped rows never reads like one that was never that full.
         """
         return self._evicted_count
+
+    def states(self) -> list[tuple[str, ToolCallState]]:
+        """Every call still open as ``(toolCallId, state)``, in dispatch order.
+
+        The id-less judged call is included under ``""``: a per-call timer has to
+        see it too, and it is the one call ``active_calls`` leaves out.
+        """
+        out = [(call_id, state) for call_id, (state, _aux) in self._calls.items()]
+        if self._idless is not None:
+            out.append(("", self._idless[0]))
+        return out
 
     @property
     def active_calls(self) -> dict[str, tuple[ToolCallState, object]]:

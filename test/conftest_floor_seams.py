@@ -39,8 +39,9 @@ def _isolate_xdg_config_home(_xdg_config_root, _floor_monkeypatch):
     """Point ``$XDG_CONFIG_HOME`` at a tmp dir so no test writes a real unit file.
 
     ``dev_fleet._dropin_path()`` resolves the make-live systemd drop-in as
-    ``$XDG_CONFIG_HOME/systemd/user/kirocrew-gateway.service.d/make-live.conf``,
-    falling back to ``~/.config`` when the variable is unset — which is the
+    ``$XDG_CONFIG_HOME/systemd/user/<live unit>.d/make-live.conf``, where the live
+    unit is ``kirocrew.service`` or ``kirocrew-gateway.service``, and falls back to
+    ``~/.config`` when the variable is unset — which is the
     default on most developer machines and in CI. So a test that reaches the
     cutover path without stubbing ``_dropin_path`` writes the operator's real
     drop-in. That is how a test once took the gateway down.
@@ -385,7 +386,10 @@ def _no_model_download(_floor_monkeypatch, _isolation_dirs):
     monkeypatch.setenv("KIROCREW_TELEMETRY", "0")
     # A developer's ambient DO_NOT_TRACK would outrank every per-test opt-in
     # (off wins), so tests that turn recording on would fail only on their machine.
+    # An ambient KIROCREW_TELEMETRY_DISABLED holds the unwritten default off the
+    # same way. Tests that exercise either variable set it themselves.
     monkeypatch.delenv("DO_NOT_TRACK", raising=False)
+    monkeypatch.delenv("KIROCREW_TELEMETRY_DISABLED", raising=False)
 
 
 @pytest.fixture(autouse=True)

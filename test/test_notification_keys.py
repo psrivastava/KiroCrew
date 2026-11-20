@@ -24,6 +24,7 @@ from kiro_crew.dashboard.handlers.messaging import (
 from kiro_crew.dashboard.notification_coordinator import native_notification_tag, unread_count
 from kiro_crew.dashboard.state import DashboardState, _load_notifications
 from kiro_crew.notifications.bus import NotificationPayload, NotificationValidationError
+from kiro_crew.testing.synthetic_credentials import github_classic
 from kiro_crew.testing.wait import await_until
 
 
@@ -527,7 +528,9 @@ class TestReplacement:
 
         assert await await_until(dismissing, what="the keyed dismissal") == (True, True)
         assert await await_until(deleting, what="the concurrent deletion") is True
-        assert frames == [("notification_dismiss", {"ts": keyed["ts"]})]
+        # The dismissal still withdraws the note it was writing out, and the deletion
+        # withdraws it too: both name the same note, and a view drops it once.
+        assert frames == [("notification_dismiss", {"ts": keyed["ts"]})] * 2
         assert _titles(state) == _stored_titles() == ["unkeyed"]
 
     @pytest.mark.asyncio
@@ -1213,7 +1216,7 @@ class TestAgentRoutes:
     )
     async def test_a_key_that_redaction_would_rewrite_is_a_400(self, monkeypatch, tmp_path, route):
         state = _make_state(monkeypatch, tmp_path)
-        secret_like = "ghp_" + "a" * 36
+        secret_like = github_classic(seed=101)
         async with TestClient(TestServer(self._app(state))) as client:
             resp = await client.post(route, json={"title": "t", "key": secret_like})
             assert resp.status == 400

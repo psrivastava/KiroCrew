@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import re
 import shlex
 import urllib.parse
@@ -162,6 +163,10 @@ def _setting_risk(path: str, before: Any, after: Any) -> str:
     if path in _CODE_EXEC_SETTINGS:
         return RISK_CODE_EXEC
     order = _SETTING_ORDER.get(path)
+    if path == "session.max_per_creator" and isinstance(after, float) and math.isfinite(after):
+        # The route saves ``int(value)``, so a card for 449.5 writes 449: rank the
+        # number the gateway will save, as for the pin scope below.
+        after = int(after)
     if path == "dashboard.tailscale.pin_scope":
         # The route takes any short string and the loader applies its
         # normalised form, so rank the values the gateway will apply.
@@ -454,7 +459,15 @@ def build_preview(
         if not snapshot.get("exists"):
             raise _fail("not_found", "that schedule does not exist")
         before = snapshot.get("fields") or {}
-        changed = {k: v for k, v in p["fields"].items() if before.get(k) != v}
+        from kiro_crew.cron_service.schedule import pin_random_cron_fields
+
+        # The stored expression is already pinned (an ``R`` field saved as the
+        # job's own pick), so an incoming one is pinned the same way first.
+        changed = {
+            k: v
+            for k, v in p["fields"].items()
+            if before.get(k) != (pin_random_cron_fields(v, p["id"]) if k == "cron_expr" else v)
+        }
         if not changed:
             raise _fail("no_change", "the schedule already has those values")
         out["title"] = f"Update schedule “{snapshot.get('name') or p['id']}”"
@@ -774,7 +787,12 @@ def build_preview(
         if not impact:
             raise _fail("no_change", "these operations change nothing")
         label = str(context.get("label") or p["member"])
-        out["title"] = f"Change tools for “{label}”"
+        # A crewmate's own file extends its worker, not the chat the card is
+        # raised in, so the title says whose tools change.
+        if context.get("worker_kit"):
+            out["title"] = f"Change what “{label}”’s worker can use"
+        else:
+            out["title"] = f"Change tools for “{label}”"
         out["changes"] = _impact_rows(impact)
         launched = _launched_servers(p["draft"])
         for server, spec in launched:
@@ -1308,12 +1326,20 @@ IMPORT_STEP_CREATE = "create"
 IMPORT_STEP_GOAL = "goal"
 IMPORT_STEP_RULES = "rules"
 IMPORT_STEP_FILES = "files"
+IMPORT_STEP_DASHBOARD = "dashboard"
 IMPORT_STEP_CRON = "cron"
 
 
 def _import_message_crons(p: dict[str, Any]) -> list[dict[str, Any]]:
     """The crons a plain cron step creates; a ``script`` cron is made with its script."""
     return [job for job in p.get("crons") or () if "script" not in job]
+
+
+def _import_applies_dashboard(p: dict[str, Any]) -> bool:
+    """A built-in page the receiver ships; any other stays in ``not_imported``."""
+    return bool(p.get("dashboard_template")) and "dashboardTemplate" not in (
+        p.get("not_imported") or ()
+    )
 
 
 def import_step_roles(p: dict[str, Any]) -> list[str]:
@@ -1325,6 +1351,8 @@ def import_step_roles(p: dict[str, Any]) -> list[str]:
         roles.append(IMPORT_STEP_RULES)
     if p.get("carried"):
         roles.append(IMPORT_STEP_FILES)
+    if _import_applies_dashboard(p):
+        roles.append(IMPORT_STEP_DASHBOARD)
     roles += [IMPORT_STEP_CRON] * len(_import_message_crons(p))
     return roles
 
@@ -1349,6 +1377,14 @@ def _import_files_step(sha: str) -> dict[str, Any]:
     fills = _import_member_fills()
     body = _with_fills({"sha256": sha}, fills[1:])
     return step("POST", import_files_path(placeholder(fills[0])), body, fill=fills)
+
+
+def _import_dashboard_step(template: str) -> dict[str, Any]:
+    """Adopt the shipped dashboard ``builtin:<id>`` on the new crewmate."""
+    fills = _import_member_fills()
+    path = f"/api/members/{placeholder(fills[0])}/dashboard/template"
+    body = _with_fills({"template_id": template.removeprefix("builtin:")}, fills[1:])
+    return step("POST", path, body, fill=fills)
 
 
 def _import_cron_step(job: dict[str, Any]) -> dict[str, Any]:
@@ -1450,6 +1486,8 @@ def _import_preview(p: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, An
         apply.append(_import_rules_step(p["rules"]))
     if carried:
         apply.append(_import_files_step(p["bundle_sha256"]))
+    if _import_applies_dashboard(p):
+        apply.append(_import_dashboard_step(p["dashboard_template"]))
     apply += [_import_cron_step(job) for job in _import_message_crons(p)]
     out["apply"] = apply
     return out
@@ -1463,6 +1501,7 @@ def import_undo(
     Its plain crons are deleted by the ids their creates answered, its carried
     files (and the script crons made with them) by the file step's own record,
     its rules are cleared (a rules file outlives the crewmate it belongs to),
+    the dashboard the card adopted is removed only at the version it adopted,
     and the crewmate is deleted last, so every earlier step still finds it.
     """
     roles = import_step_roles(p)[:applied_steps]
@@ -1473,6 +1512,13 @@ def import_undo(
             plan.append(step("DELETE", f"/api/crons/{_q(str(job_id))}"))
     name = (evidence[0].get("name") if evidence else None) or p["name"]
     slug = str((evidence[0].get("member_id") if evidence else "") or "")
+    if IMPORT_STEP_DASHBOARD in roles:
+        at = roles.index(IMPORT_STEP_DASHBOARD)
+        adopted = evidence[at].get("instance_version") if at < len(evidence) else None
+        if isinstance(adopted, int):  # no recorded version: the page cannot be proven ours
+            tid = str(p["dashboard_template"]).removeprefix("builtin:")
+            body = {"member": name, "template_id": tid, "instance_version": adopted}
+            plan.append(step("DELETE", f"/api/members/{_q(slug)}/dashboard/template", body))
     if IMPORT_STEP_FILES in roles:
         plan.append(step("DELETE", import_files_path(_q(slug)), {"member": name}))
     if IMPORT_STEP_RULES in roles:

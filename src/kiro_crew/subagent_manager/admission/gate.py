@@ -35,6 +35,7 @@ if TYPE_CHECKING:
         _parent_runs_remotely,
         _shared_start_price_gb,
         _spawn_memory_floor_and_cost,
+        _spawning_agents,
         _startup_memory_reserve_gb,
         _validate_agent,
         _validate_app_agent_ownership,
@@ -253,9 +254,41 @@ class _GateMixin(ManagerComponent):
         # second half of a memory read (``_memory_reading``) is a re-entry too.
         _memory_reentry = _memory_reading is not None
         if batch_id and not _from_queue and not _store_accepted and not _memory_reentry:
+            _owner = (app, parent_session_key)
+            _recorded_owner = self._manager._batch_owner.get(batch_id, _owner)
+            # Check and claim without yielding: the route's early check can
+            # precede another caller's first submission. Owner-only waves may
+            # still span parents; an app's wave never crosses this boundary.
+            if _recorded_owner != _owner and (
+                app or (_recorded_owner is not None and _recorded_owner[0])
+            ):
+                try:
+                    sel().log_tool_invocation(
+                        session_key=parent_session_key,
+                        source="subagent",
+                        tool_name="spawn_run",
+                        outcome="rejected_batch_owner",
+                        metadata={"agent": agent},
+                    )
+                except Exception:
+                    logger.debug("SEL audit failed for batch-owner rejection", exc_info=True)
+                # Not this wave's member: no count, expected-total change or
+                # completion announcement into the existing wave's parent.
+                return self._manager._announce_rejection(
+                    SubagentInfo(
+                        id=agent_id,
+                        task=redact_credentials(redact_exfiltration_urls(task or "")[0])[0],
+                        agent=agent,
+                        parent_session_key=parent_session_key,
+                        done=True,
+                        error="spawn refused: batch belongs to another app or session",
+                    )
+                )
             _bs = self._manager._batch_submitted.setdefault(batch_id, [0, max(0, int(batch_total))])
             _bs[0] += 1
             self._manager._batch_progress_ts[batch_id] = time.monotonic()
+            if self._manager._batch_owner.setdefault(batch_id, _owner) != _owner:
+                self._manager._batch_owner[batch_id] = None
         # --- Task guard: refuse empty/whitespace-only tasks (defense in depth).
         # The HTTP handler (api_spawn) and MCP tool schemas validate too, but
         # direct Python callers reach this choke point unvalidated. An empty
@@ -450,6 +483,7 @@ class _GateMixin(ManagerComponent):
                     task=_redacted_task,
                     agent=agent,
                     parent_session_key=parent_session_key,
+                    app=app,
                     done=True,
                     error=(
                         f"spawn refused: a sub-agent at depth {_depth} would exceed the "
@@ -484,6 +518,7 @@ class _GateMixin(ManagerComponent):
                     id=agent_id,
                     task=_redacted_task,
                     parent_session_key=parent_session_key,
+                    app=app,
                     done=True,
                     error="memory_unavailable: the parent's memory mode could not be established",
                     batch_id=batch_id,
@@ -515,6 +550,7 @@ class _GateMixin(ManagerComponent):
                     memory_mode=_memory_mode,
                     agent=agent,
                     parent_session_key=parent_session_key,
+                    app=app,
                     done=True,
                     error=f"memory_unavailable: {exc}",
                     batch_id=batch_id,
@@ -561,6 +597,7 @@ class _GateMixin(ManagerComponent):
                     memory_mode=_memory_mode,
                     agent=agent,
                     parent_session_key=parent_session_key,
+                    app=app,
                     done=True,
                     error=f"spawn refused: {cwd_err}",
                     batch_id=batch_id,
@@ -573,7 +610,22 @@ class _GateMixin(ManagerComponent):
         # to named agents (capabilities.spawn.scopes.agents).  Resolved against
         # the PARENT surface so a per-app/per-surface profile contains what it
         # can spawn — even if the kiro side would allow it.
-        gov_spawn_err = _vet_spawn_governance(parent_session_key, agent, app=app) if _gate else None
+        # A sub-agent parent started as a named agent is judged by that agent's
+        # own profile, the one its tool calls are judged by. Each spawning run
+        # must be permitted; with none named, the parent's surface decides.
+        gov_spawn_err = None
+        if _gate:
+            for _parent_agent in _spawning_agents(
+                self._manager._agents.values(), parent_session_key or ""
+            ) or ("",):
+                gov_spawn_err = _vet_spawn_governance(
+                    parent_session_key,
+                    agent,
+                    app=app,
+                    **({"parent_agent": _parent_agent} if _parent_agent else {}),
+                )
+                if gov_spawn_err:
+                    break
         if gov_spawn_err:
             if _persistent_diagnostics:
                 logger.warning("Subagent spawn refused by governance: %s", gov_spawn_err)
@@ -596,6 +648,7 @@ class _GateMixin(ManagerComponent):
                     memory_mode=_memory_mode,
                     agent=agent,
                     parent_session_key=parent_session_key,
+                    app=app,
                     done=True,
                     error=f"spawn refused by governance: {gov_spawn_err}",
                     batch_id=batch_id,
@@ -655,6 +708,7 @@ class _GateMixin(ManagerComponent):
                     memory_mode=_memory_mode,
                     agent=agent,
                     parent_session_key=parent_session_key,
+                    app=app,
                     done=True,
                     error=f"spawn refused: {allowlist_err}",
                     error_code=AGENT_NOT_AVAILABLE_CODE,
@@ -679,6 +733,12 @@ class _GateMixin(ManagerComponent):
             )
 
             _crew_log_asked = crew_log_asking_origin(self._manager._sessions, parent_session_key)
+        if not _from_queue:
+            # Where this child's turns go in the parent's trace, read while the
+            # spawn tool call is still open (tracing/subagents.py).
+            from kiro_crew.tracing import subagents as trace_subagents
+
+            trace_subagents.pin_origin(agent_id, self._manager._sessions, parent_session_key)
         queue_params: dict = {
             "task": task,
             "parent_session_key": parent_session_key,
@@ -1265,6 +1325,7 @@ class _GateMixin(ManagerComponent):
                     memory_mode=_memory_mode,
                     agent=agent,
                     parent_session_key=parent_session_key,
+                    app=app,
                     done=True,
                     error=QUEUED_WAIT_EXPIRED_TEXT,
                     batch_id=batch_id,
@@ -1381,6 +1442,7 @@ class _GateMixin(ManagerComponent):
                 memory_mode=_memory_mode,
                 agent=agent,
                 parent_session_key=parent_session_key,
+                app=app,
                 done=True,
                 error=MEMORY_PRESSURE_NEVER_STARTED,
                 batch_id=batch_id,

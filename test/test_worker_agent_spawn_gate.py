@@ -563,8 +563,17 @@ def test_the_harness_spawn_seam_is_reached_only_through_the_gated_owner():
             invocations.append(f"{path.name}:{lineno}")
     assert sorted(name.split(":")[0] for name in invocations) == [
         "client_start.py",
+        "deepseek.py",
         "runtime_spawn_launch.py",
     ], f"the spawn seam is invoked from an unexpected place: {invocations}"
+    # The deepseek call is the harness handing its spawn to the per-process launch
+    # it wraps, so it sits inside ``DeepseekHarness.resolve_spawn`` and is reached
+    # only through the runtime's gated call above.
+    import inspect
+
+    from kiro_crew.acp.harness.deepseek import DeepseekHarness
+
+    assert "launch.resolve_spawn(" in inspect.getsource(DeepseekHarness.resolve_spawn)
     assert not any(issubclass(cls, HarnessAdapter) for cls in _PROCESS_ADAPTERS.values())
     for backend in ACP_BACKENDS_ACP_RUNTIME:
         assert process_adapter_for(backend) is None
@@ -605,6 +614,7 @@ def test_a_re_derive_during_the_hosts_own_pre_spawn_work_does_not_kill_the_sessi
     rt._model = None
     rt._sandbox_mode = "auto"
     rt._member_context = False
+    rt._extra_env = {}
     # ``_harness`` is a cached property over the backend, so the stub is installed
     # through the cache slot the runtime itself fills.
     rt._harness_resolved = _EditingHarness()
@@ -878,11 +888,11 @@ def test_a_default_spec_refused_at_the_read_gate_refuses_the_spawn(tmp_path, mon
 
 
 def test_the_gate_has_no_early_return_at_all(tmp_path):
-    """By construction rather than by audit. Every earlier version of this check grew an
-    early ``return`` for a case it could not evaluate — a missing default, an unreadable
-    one — and each was a fail-OPEN pass on the one path where the mirror is
-    unverifiable. The freshness body now has NO return statement, so falling off the end
-    is reachable only after a verified match or a successful re-derive."""
+    """By construction rather than by audit. An early ``return`` for a case the check
+    cannot evaluate — a missing default, an unreadable one — is a fail-OPEN pass on the
+    one path where the mirror is unverifiable, so the freshness body has NO return
+    statement and falling off the end is reachable only after a verified match or a
+    successful re-derive."""
     import ast
     import inspect
     import textwrap

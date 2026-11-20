@@ -73,6 +73,56 @@ def _redact_all(value: str) -> str:
     return value
 
 
+def _reserved_action_refusal(blocks: Any) -> "web.Response | None":
+    """400 when agent-supplied blocks wear a gateway-reserved action id.
+
+    The code-channel buttons (Archive, Turn on hand-off) act on the owner's click;
+    a button an agent posted -- or edited onto a gateway message -- with one of
+    those ids would turn that click into consent to text the agent wrote. Both
+    agent block paths (send and update) refuse it, as they refuse remote media,
+    on the raw blocks and again on the sanitized tree they publish.
+    """
+    from kiro_crew.slack.client import BLOCKS_RESERVED_ACTION_ERROR, blocks_use_reserved_action
+
+    if not isinstance(blocks, list) or not blocks_use_reserved_action(blocks):
+        return None
+    return web.json_response(
+        {
+            "error": (
+                "agent-supplied Block Kit cannot use an action_id or block_id "
+                "starting with kc_code_channel_: those belong to the gateway's own "
+                "code-channel buttons"
+            ),
+            "code": BLOCKS_RESERVED_ACTION_ERROR,
+        },
+        status=400,
+    )
+
+
+def _published_blocks_refusal(blocks: Any) -> "web.Response | None":
+    """400 when the SANITIZED tree an agent path is about to publish breaks a
+    Block Kit guard (remote media, reserved action ids).
+
+    Both agent block paths check the raw blocks first and then sanitize, and
+    sanitizing rewrites keys and values (ANSI stripped): a key the raw check read
+    as ``image_url\\x1b[0m`` or ``action_id\\x1b[0m`` is published as the real one.
+    So every guard also runs here, on what Slack would receive.
+    """
+    if isinstance(blocks, list) and _blocks_request_remote_media(blocks):
+        return web.json_response(
+            {
+                "error": (
+                    "agent-supplied Block Kit cannot contain image/video blocks "
+                    "or image_url/thumbnail_url/video_url fields because Slack "
+                    "fetches that media without a recipient click"
+                ),
+                "code": BLOCKS_REMOTE_MEDIA_ERROR,
+            },
+            status=400,
+        )
+    return _reserved_action_refusal(blocks)
+
+
 def _sanitize_blocks(
     blocks: list[dict],
     *redactors: Any,
@@ -300,7 +350,7 @@ async def api_delete_message(request: web.Request) -> web.Response:
     try:
         body = await request.json()
     except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
     not_object = body_not_object_error(body)
     if not_object is not None:
         return not_object
@@ -327,8 +377,12 @@ async def api_delete_message(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
-async def api_update_message(request: web.Request) -> web.Response:
+async def _update_message(request: web.Request) -> web.Response:
     """POST /api/update-message — edit a bot-authored Slack message in place.
+
+    The route is ``handlers.messaging.api_update_message``, which runs this inside the
+    channel egress seam: the seam opens on the facade, whose namespace this composed
+    owner's functions run on.
 
     The egress twin of ``api_delete_message``: same "the bot's own message"
     addressing, but it PUBLISHES replacement content, so the outbound floor is
@@ -407,6 +461,8 @@ async def api_update_message(request: web.Request) -> web.Response:
             },
             status=400,
         )
+    if (refused := _reserved_action_refusal(blocks)) is not None:
+        return refused
     if not text and not blocks:
         return web.json_response(
             {"error": "text or blocks required", "code": "content_required"}, status=400
@@ -489,6 +545,8 @@ async def api_update_message(request: web.Request) -> web.Response:
         blocks = _sanitize_blocks(
             blocks, redact_exfiltration_urls, redact_credentials, display_form=True
         )
+        if (refused := _published_blocks_refusal(blocks)) is not None:
+            return refused
     slack = state.slack_client
     if not slack:
         return web.json_response(
@@ -556,7 +614,7 @@ async def _read_send_message(
     try:
         body = await request.json()
     except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
     not_object = body_not_object_error(body)
     if not_object is not None:
         return not_object
@@ -591,6 +649,8 @@ async def _read_send_message(
             {"error": 'format must be "plain" or "markdown"', "code": "format_unknown"},
             status=400,
         )
+    if (refused := _reserved_action_refusal(blocks)) is not None:
+        return refused
 
     # ── Channel-addressed leg ──
     # Handled before the Slack-shaped validation below, because a Webex room id is
@@ -921,7 +981,7 @@ async def _deliver_send_message_fallback(
     channel_text = text
     if target_session and job_name:
         safe_name = redact(job_name)
-        title = f"⏰ {safe_name}"
+        title = f"{safe_name}"
         text += "\n\n_(session closed — delivered as notification)_"
     # Only an attested, non-app caller's key names the publishing crewmate
     # (``attributable_session_key``); a bare TCP or app-token header does not.

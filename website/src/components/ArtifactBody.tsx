@@ -7,6 +7,7 @@ import { useSilentLoadWatch } from '../hooks/useSilentLoadWatch'
 import { useScrollMemory } from '../hooks/useScrollMemory'
 import { useCommentBridge, type IframeSelection } from '../hooks/useCommentBridge'
 import { useFrameLinkBridge } from '../hooks/useFrameLinkBridge'
+import { useFrameFragmentScroll } from '../hooks/useFrameFragmentScroll'
 import { InlineCommentOverlay } from './InlineCommentOverlay'
 import { Btn } from './ui'
 import ErrorNotice from './ErrorNotice'
@@ -87,6 +88,9 @@ export function fileTypeForKind(kind: Artifact['kind']): FileType {
     // the package was flowed through the prose renderer, which collapsed its
     // newlines and interpreted markup inside a label instead of showing it.
     case 'dashboard': return 'json'
+    // A canvas is a JSON document too. Its renderer is the canvas view; this
+    // keeps any caller without one off the prose path, which collapses JSON.
+    case 'canvas': return 'json'
     // widget / html shouldn't reach here, but fall back to markdown rather
     // than throwing — keeps the page survivable for unexpected enum values.
     default:         return 'markdown'
@@ -388,6 +392,9 @@ export const ArtifactBodyIframe = memo(function ArtifactBodyIframe({
   // Links in the page open through the host after a real click in this frame
   // (the frame itself grants no popups), or through the button it returns.
   const linkChip = useFrameLinkBridge([iframeRef])
+  // A frame sized to its document cannot scroll to its own `#section` links, so
+  // the page around it does. A side panel's fixed-height frame scrolls itself.
+  useFrameFragmentScroll(iframeRef, !heightStyle)
   return (
     // The side panel's heightStyle still wins outright — that surface fits a
     // fixed pane and scrolls inside it. On the full page the wrapper takes no

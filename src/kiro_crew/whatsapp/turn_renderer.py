@@ -45,6 +45,7 @@ from kiro_crew.constants import (
     OPTIONS_RE_TRAILER,
     relocate_glued_tail_marker,
     split_trailing_protocol_suffix,
+    strip_control_comments,
 )
 from kiro_crew.messaging.approval import (
     TIMEOUT_NOTICE,
@@ -256,7 +257,7 @@ class WhatsAppRenderer(Renderer):
         """
         if self._finalized:
             return
-        chunks = await self._rendered_chunks()
+        chunks = await self._rendered_chunks(live=True)
         if not chunks or self._sealed_count >= len(chunks):
             return
         # Every chunk before the last is final: the splitter is prefix-stable, so
@@ -315,7 +316,7 @@ class WhatsAppRenderer(Renderer):
         )
         await self._show(repaired if repaired is not None else tail)
 
-    async def _rendered_chunks(self) -> list[str]:
+    async def _rendered_chunks(self, *, live: bool = False) -> list[str]:
         """The turn's text as the chunks that would actually be delivered.
 
         The WHOLE body is converted and split, never just the unsealed remainder:
@@ -338,9 +339,13 @@ class WhatsAppRenderer(Renderer):
         Every later flush then returns at ``_render_live``'s guard and ``on_done``
         computes an empty pending slice: the fragment stays on screen and the rest
         of the reply is dropped. Discord and Telegram detach the same suffix at the
-        same point, for the first half of that reason.
+        same point, for the first half of that reason. A *live* frame also holds a
+        control-tag line still arriving (``<!-- keep-vis``), as Discord does.
         """
-        visible, _protocol_suffix = split_trailing_protocol_suffix(self.text())
+        text = self.text()
+        if live:
+            text = strip_control_comments(text, hide_partial=True)
+        visible, _protocol_suffix = split_trailing_protocol_suffix(text)
         body = await asyncio.to_thread(hide_local_refs, visible)
         if not body:
             return []
@@ -353,7 +358,9 @@ class WhatsAppRenderer(Renderer):
         return elapsed >= wa_client.EDIT_WINDOW_S
 
     async def _open_live(self, text: str) -> None:
-        message_id = await self._transport.send_message(self._chat, text)
+        # *text* is a chunk ``_rendered_chunks`` already converted, so it goes out
+        # as it is (``edit_text`` does the same).
+        message_id = await self._transport.send_rendered(self._chat, text)
         now = asyncio.get_running_loop().time()
         self._live_id = message_id
         self._live_sent_at = now
@@ -364,7 +371,7 @@ class WhatsAppRenderer(Renderer):
     async def _edit_live(self, text: str) -> None:
         if text == self._live_text:
             return
-        ok = await self._client.edit_text(self._chat, self._live_id, text)
+        ok = await self._transport.edit_text(self._chat, self._live_id, text)
         self._last_edit_at = asyncio.get_running_loop().time()
         if ok:
             self._live_text = text
@@ -529,7 +536,7 @@ class WhatsAppRenderer(Renderer):
         matters more than where it appears.
         """
         notice = display_safe_text(TIMEOUT_NOTICE)
-        if self._prompt_id and await self._client.edit_text(self._chat, self._prompt_id, notice):
+        if self._prompt_id and await self._transport.edit_text(self._chat, self._prompt_id, notice):
             self._prompt_id = ""
             return
         self._prompt_id = ""
@@ -569,8 +576,12 @@ class WhatsAppRenderer(Renderer):
         # The fallback is screened rather than raw: a body that yields no chunks
         # never passed through ``to_whatsapp_text``, so it never met the display
         # screen either, and this branch would put the one form of the reply that
-        # was scanned only as literal bytes into the chat.
-        chunks = await self._rendered_chunks() or [display_safe_text(body)]
+        # was scanned only as literal bytes into the chat. It is CONVERTED here as
+        # well, because ``_show`` sends a chunk as it is: a thinking-only body
+        # renders to nothing, so nothing of its scratchpad is posted.
+        chunks = await self._rendered_chunks() or await render_chunks_off_loop(
+            display_safe_text(body), self.capabilities.max_message_chars, stable=True
+        )
         # Not the count: a streaming send that raised advanced it without landing,
         # and this is the last pass, so starting at the count would drop that
         # chunk for good. Re-sending from the earliest unlanded one can repeat a
@@ -611,12 +622,10 @@ class WhatsAppRenderer(Renderer):
             # Nothing reached the chat at all: the whole reply still has to.
             await self._send(body)
         await self._deliver_uploads()
-        # Post-answer redaction notice, counted over the converted chunks that
-        # shipped (streamed prefix included — those are chunks[:start], already
-        # delivered by earlier flushes). Best-effort by the shared contract:
+        # Redaction notice, counted over the converted chunks that shipped
+        # (including chunks[:start], streamed by earlier flushes). Best-effort:
         # ``_send`` raises so the dispatcher can fail an undelivered TURN, but
-        # the answer is out by now, so the raise is contained here rather than
-        # allowed to convert a delivered turn into a failed one.
+        # the answer is out, so the raise is caught here.
         cred_count, url_count = count_redaction_tags("\n".join(chunks))
         if cred_count or url_count:
             try:

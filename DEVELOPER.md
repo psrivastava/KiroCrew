@@ -6,7 +6,7 @@
 > approach — so a reviewer can understand the delta at a glance, and so the fork
 > can be re-based on future upstream pulls without re-deriving intent.
 >
-> **Branch:** `main` · **Fork base:** upstream commit `73e3275d9` (synced 2026-11-09;
+> **Branch:** `main` · **Fork base:** upstream commit `bdc652697` (synced 2026-11-20;
 > originally forked at `64f3b5811`). Every upstream sync is recorded in §9.
 
 ---
@@ -142,7 +142,8 @@ CCrew registered it too, CCrew.app could take KiroCrew's deep links.
 ### 3.1 Lime glyph tint
 The sidebar ghost glyph is a raster `logo.png` (purple), so it can't be recolored
 by a token. A `.ccrew-logo-tint` CSS class hue-rotates it to lime on both glyph
-`<img>` sites. Reversible, no new asset.
+sites (upstream's `PackLoaderImage`, which forwards `className` to its `<img>` or
+reduced-motion `<canvas>`). Reversible, no new asset.
 - `website/src/index.css` (`.ccrew-logo-tint`), applied in
   `website/src/shell/topbar/shellHeader.tsx` (`MobileNavGlyph`) and
   `website/src/shell/nav/railChrome.tsx` (`RailHeaderGlyph`).
@@ -322,6 +323,32 @@ parity and logo-glyph tests, and record the entry below.
 - **Other fallout:** <behavior changes, renamed APIs, new specs to read>.
 - **Verified:** <tests/builds run and results>. **Not run:** <what and why>.
 ```
+
+### 2026-11-20 — `bdc652697` (branch `sync/upstream-2026-11-20`)
+- **Range:** `73e3275d9..bdc652697`, 2932 upstream commits. Stacked on the
+  never-merged `sync/upstream-2026-11-09` branch, so this PR carries both
+  syncs. CCrew side had 3 commits since that sync: `fed74f462` local ignore
+  files and skills, `78d2d19cc` removal of the Claude CLI sessions sidebar,
+  and `af11af5fc` (BackendChip router-optional and pointed at Settings →
+  Agent Harness; logo tint moved after the box classes).
+- **Conflicts:** 2 files, no relocations. `website/src/shell/nav/railChrome.tsx`
+  (`RailHeaderGlyph`) and `website/src/shell/topbar/shellHeader.tsx`
+  (`MobileNavGlyph`): upstream swapped the logo `<img>` for `PackLoaderImage`
+  (animated pack logos hold a first frame under reduced motion). Took
+  upstream's component and re-added `ccrew-logo-tint` after the box classes.
+- **Other fallout:** none in CCrew code. Every CCrew-added line since
+  `73e3275d9` was checked against the merged tree (50 files); only the two
+  glyph lines above differ. `isCCrewBuild()` guard, no `build.protocols`,
+  `ccrewAppName()` / `com.ccrew.app`, the seatbelt re-export and its
+  `HARNESS_EXEMPT_SETS` entry, and `KIROCREW_HOME` in `ccrew.sh` all intact.
+  `packaging/build-desktop.sh` is 1916 lines. `scripts/ccrew-tint-icons.py`
+  got black's blank line after the docstring; that was a pre-existing failure.
+- **Verified:** black/isort/flake8 on the 13 CCrew-delta `.py` files; harness parity
+  (script + `test/test_harness_parity.py`); `npm ci`, `tsc -b`, `npm run build`,
+  `i18n:check`; Electron `npm test` 4067/4084 (3 known: 2 `packaging.test.js`
+  CCrew-identity cases, 1 `gateway-shim-tree-kill` `ps` sandbox).
+- **Not run:** backend pytest, vitest, `mypy --platform linux` (full suites exhaust
+  local memory; left to CI), desktop .app build, a live Claude turn.
 
 ### 2026-11-09 — `73e3275d9` (branch `sync/upstream-2026-11-09`)
 - **Range:** `bde5de12e..73e3275d9`, 4309 upstream commits; CCrew side had 2

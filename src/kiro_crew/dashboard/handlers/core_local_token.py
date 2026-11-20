@@ -24,6 +24,7 @@ from kiro_crew.dashboard.token_auth import (
     parse_duration,
 )
 from kiro_crew.dashboard.token_auth_tokens import owner_mint_extra
+from kiro_crew.executors import local_auth_executor
 from kiro_crew.mcp_gateway.socketsec import PeerCredResult, check_peer_is_self
 
 # ── Local token bootstrap (Electron / local apps) ─────────────────────
@@ -100,7 +101,9 @@ async def api_token_local(request: web.Request) -> web.Response:
         return web.json_response({"error": "invalid secret", "code": "invalid_secret"}, status=403)
     from kiro_crew.member_memory_auth import local_owner_bootstrap_provenance
 
-    provenance = await asyncio.to_thread(local_owner_bootstrap_provenance, request)
+    provenance = await asyncio.get_running_loop().run_in_executor(
+        local_auth_executor(), local_owner_bootstrap_provenance, request
+    )
     if provenance is None:
         _sel().log_api_access(
             caller="local-process",
@@ -114,6 +117,26 @@ async def api_token_local(request: web.Request) -> web.Response:
                 "error": "The gateway could not verify this process as the local owner. "
                 "Make this request inside the gateway's own host or container, not "
                 "from an agent's shell or a sandbox.",
+                "code": "member_owner_token_refused",
+            },
+            status=403,
+        )
+    if provenance.app is not None:
+        # An app backend (or a descendant of one) is code the owner enabled, not the
+        # owner: no token of any kind is minted for it, because an owner-subject token
+        # without an ``app`` claim passes ``is_owner_dashboard_request``. The registry
+        # key is kebab-case (``apps.manifest.app_name_error``), so it cannot carry a
+        # space or ``=`` and cannot forge a second field in the row.
+        _sel().log_api_access(
+            caller="local-process",
+            operation="token.local",
+            outcome="denied",
+            source="local-bootstrap",
+            resources=f"app-backend-refused app={provenance.app}",
+        )
+        return web.json_response(
+            {
+                "error": "An app backend cannot request an owner token.",
                 "code": "member_owner_token_refused",
             },
             status=403,
@@ -134,21 +157,18 @@ async def api_token_local(request: web.Request) -> web.Response:
     epp = request.query.get("embed_parent_port", "")
     if epp.isdigit() and 1 <= int(epp) <= 65535:
         extra["embed_parent_port"] = str(int(epp))
+        # The pane's own forward port on this machine, which binds the app web
+        # origin record to the port the hub minted for (apps/pane_ports.py).
+        # Meaningful only with a parent port, so only minted beside one.
+        efp = request.query.get("embed_forward_port", "")
+        if efp.isdigit() and 1 <= int(efp) <= 65535:
+            extra["embed_forward_port"] = str(int(efp))
     token = generate_token(owner_id or "local-app", ttl_seconds=ttl, extra=owner_mint_extra(extra))
-    # The provenance gate knows WHICH app's backend owns the calling process, so
-    # the audit row names it: a token minted by an app is attributed to that app,
-    # and any later per-app scoping of this grant is a data change here rather
-    # than a protocol change. The name goes into the record only, not into the
-    # token: an ``app``-scoped token is refused by ``is_owner_dashboard_request``,
-    # so a claim would withdraw the capability. The registry key is kebab-case
-    # (``apps.manifest.app_name_error``), so it cannot carry a space or ``=`` and
-    # cannot forge a second field in the row.
-    app_name = provenance.app
     _sel().log_api_access(
         caller=request.remote or "unknown",
         operation="token.local",
         outcome="success",
         source="local-bootstrap",
-        resources=f"token-issued app={app_name}" if app_name else "token-issued",
+        resources="token-issued",
     )
     return web.json_response({"token": token, "expires_in": ttl})

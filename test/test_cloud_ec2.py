@@ -43,19 +43,19 @@ class TestSubTemplateSyntax:
         # The frontend build (vite 8 + rolldown) needs Node >=22.12.0; AL2023's default
         # AppStream nodejs is 18, which fails with a node:util/styleText SyntaxError.
         # The template must (a) declare the full-version floor, (b) upgrade via a PINNED
-        # official nodejs.org tarball when the installed node is too old (dnf/NodeSource
-        # is a dead end on AL2023 — its modular filtering keeps reinstalling node 18),
-        # verifying the tarball's SHA-256 before extracting as root, and (c) fail the
-        # bootstrap if it still cannot reach the floor.
+        # official nodejs.org tarball when the installed node is too old, verifying the
+        # tarball's SHA-256 before extracting as root, and (c) fail the bootstrap if it
+        # still cannot reach the floor.
         text = ec2.load_template()
         assert "NODE_MIN=22.12.0" in text
         assert "sort -V -C" in text
         assert "nodejs.org/dist/" in text
         assert 'fail "Node.js too old' in text
-        # The tarball MUST be integrity-checked before it is extracted as root.
         assert "sha256sum -c" in text
-        assert "9e7905fdee722f9650a03ae644b51c4c6effd3b98ac93c588700072ab35c9ddb" in text
-        assert "e05a4d65232ae2b27b3d77da2e368522fb46b923335b8e0d5f77624c32484044" in text
+        # A patched 22.x release: scanners flag v22.12.0 as an outdated Node.js.
+        assert "NODE_V=v22.23.5" in text
+        assert "8bd3dc69eee8f3f226315a80d7d1d4faccf217a4c8fae500168ac2e38f3bdba3" in text
+        assert "c54118104acc524633b5abe106bbf44a53126ec8b4e5fa105cb92b5d7de8a1a1" in text
 
     @pytest.mark.skipif(os.name == "nt" or shutil.which("bash") is None, reason="POSIX bash + GNU sort")
     @pytest.mark.parametrize(
@@ -1392,8 +1392,11 @@ class TestResolveExplicitSubnet:
             return {}
 
         monkeypatch.setattr(aws, "checked_json", fake_json)
-        with pytest.raises(aws.AWSError, match="egress"):
+        with pytest.raises(aws.AWSError, match="egress") as ei:
             ec2.resolve_explicit_subnet("subnet-iso", "dev", "us-east-1")
+        # It offers the in-place recoveries, not only a network change outside Kiro Crew.
+        assert "leave the subnet unset to let Kiro Crew pick one automatically" in str(ei.value)
+        assert "choose a subnet with a NAT or internet-gateway route" in str(ei.value)
 
     def test_az_not_offering_type_raises(self, monkeypatch):
         def fake_json(args, profile="", region="", *, action, timeout=aws.DEFAULT_TIMEOUT):
@@ -1526,8 +1529,12 @@ class TestStatusAndList:
                 "AccessDenied: not authorized to perform: " "cloudformation:DescribeStacks",
             ),
         )
-        with pytest.raises(aws.AWSError):
+        with pytest.raises(aws.AWSError) as ei:
             ec2.find_stack("t1", "dev", "us-east-1")
+        assert str(ei.value).startswith(
+            "could not query stack kirocrew-t1: grant `cloudformation:DescribeStacks` "
+            "(see `kirocrew cloud iam-policy`) and retry — AccessDenied"
+        )
 
     def test_find_stack_raises_on_throttle(self, monkeypatch):
         monkeypatch.setattr(aws, "run_aws", lambda *a, **k: (255, "", "Throttling: Rate exceeded"))
@@ -1855,6 +1862,56 @@ class TestStackEventsAndFailures:
         )
         with pytest.raises(aws.AWSError, match="root cause"):
             ec2.deploy(tag="t1", tier=sizes.default_tier(), profile="dev", region="us-east-1")
+
+    # The CLI's real generic error: 201 characters once stripped, so a 200-char cut
+    # splits the stack name in the events command it prints.
+    _GENERIC_DEPLOY_ERR = (
+        "\naws: [ERROR]: Failed to create/update the stack. Run the following command\n"
+        "to fetch the list of events leading up to the failure\n"
+        "aws cloudformation describe-stack-events --stack-name kirocrew-kc-22d3b9\n"
+    )
+
+    @pytest.mark.parametrize(
+        ("resource", "expected_missing", "expected_start"),
+        [
+            (
+                "Instance",
+                "iam:PassRole",
+                "cloudformation deploy failed: grant `iam:PassRole` "
+                "(see `kirocrew cloud iam-policy`) and retry — aws: [ERROR]:",
+            ),
+            ("WaitCondition", None, "cloudformation deploy failed: aws: [ERROR]:"),
+        ],
+    )
+    def test_deploy_maps_a_denial_only_the_stack_events_carry(
+        self, monkeypatch, resource, expected_missing, expected_start
+    ):
+        # A resource's denial is the launcher's to grant; the WaitCondition's reason is
+        # the instance's own setup log, whose denial no launcher grant fixes.
+        import kiro_crew.cloud.source as source_mod
+
+        monkeypatch.setattr(ec2, "find_stack", lambda *a, **k: None)
+        monkeypatch.setattr(source_mod, "ensure_instance_boundary", lambda *a, **k: _BOUNDARY_ARN)
+        monkeypatch.setattr(source_mod, "upload_source", lambda *a, **k: ("b", "k"))
+        monkeypatch.setattr(ec2, "discover_network", lambda *a, **k: ("vpc-1", "subnet-1", "igw"))
+        monkeypatch.setattr(aws, "run_aws", lambda *a, **k: (1, "", self._GENERIC_DEPLOY_ERR))
+        reason = (
+            "User: arn:aws:sts::123456789012:assumed-role/launcher/s is not authorized to "
+            "perform: iam:PassRole on resource: arn:aws:iam::123456789012:role/kirocrew-ec2"
+        )
+        monkeypatch.setattr(
+            ec2,
+            "get_stack_failures",
+            lambda *a, **k: [{"resource": resource, "status": "CREATE_FAILED", "reason": reason}],
+        )
+        with pytest.raises(aws.AWSError) as caught:
+            ec2.deploy(
+                tag="kc-22d3b9", tier=sizes.default_tier(), profile="dev", region="us-east-1"
+            )
+        message = str(caught.value)
+        assert caught.value.missing_action == expected_missing
+        assert message.startswith(expected_start)
+        assert "--stack-name kirocrew-kc-22d3b9 — root cause:" in message
 
 
 class TestHumanActionGuard:

@@ -395,6 +395,16 @@ unit gets an `Environment=` line, the launchd plist an `EnvironmentVariables`
 entry, from the one `environment_vars` selection. Unset, nothing is emitted and a
 pod resolves the host's real `kiro-cli` exactly as before.
 
+`KIROCREW_POD_KIRO_BIN` covers every pod on the plane and is fixed at
+`pod install`. For ONE pod, use `kirocrew pod up <wt> --env
+KIROCREW_KIRO_BIN=/abs/path/fake-kiro-cli` (or the `pod_up` tool's `env` field).
+Only the keys in `env_overrides.ALLOWED_KEYS` are accepted, and each names a test
+seam, never a secret. The value lands in the pod's env file and is applied after
+the env scrub at boot. Each `pod up` replaces the overrides, so an `up` without
+`--env` clears them; `pod restart` keeps them. A pod booted this way skips the
+child-viability refusal: a fake that fails to start is the state under test, so
+the boot prints its error and serves anyway.
+
 ## Safety
 
 - A pod runs its own `KIROCREW_HOME` and binds `127.0.0.1` only; it never touches
@@ -405,7 +415,12 @@ pod resolves the host's real `kiro-cli` exactly as before.
   and the booted env scrubs `SLACK_*`, `WECOM_*`, `MICROSOFT_APP_*`, `FEISHU_*` and non-AWS
   `*_TOKEN`, so a pod can never grab a live messaging identity — not even a
   seeded one, which is the point: `--seed ~/.kiro/crew` clones the real config.
-  Pod HOME is `0700`; `config.json` is `0600`.
+  Pod HOME is `0700`; `config.json` is `0600`. Where the config content check
+  applies, the seed and restart step endorses the floored config in the pod's own
+  data home, so a restart is not shown as an outside edit; a raw edit made in the
+  pod home stays pending, and both the file and the copy the pod loads carry the floor.
+- A seeded config loses `dashboard.instance_label`, so a pod's tab and its
+  session transfers never name it as the gateway it was cloned from.
 
 ## Platform
 
@@ -762,3 +777,9 @@ stale case share one remedy naming `loginctl enable-linger <user>`, the
 privileged `sudo loginctl enable-linger <uid>` form, and `./dev-backend.sh`,
 because `loginctl` needs the system bus and so is not self-service on a host that
 cannot reach one. Refusals name the path actually judged.
+
+A unit query that times out (`systemctl()` gives each call its own timeout) raises
+`PodError`, never `PodBackendAbsent`: a manager that did not answer is no proof that
+no pod runs. The failure tail `pod up` prints comes from `recent_journal()`, which
+reports an unreadable journal in its text instead of raising, so `up` still stops
+the unit it started.

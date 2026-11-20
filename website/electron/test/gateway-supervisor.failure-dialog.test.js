@@ -27,6 +27,9 @@ const {
   fakeDialogWindows,
 } = require("./gateway-supervisor-test-helpers");
 
+// gateway-supervisor.js's TUNNEL_READY_POLL_MS.
+const TUNNEL_READY_POLL_MS = 500;
+
 // Driving the failure dialog itself: the fake window records the document the
 // dialog loads and answers it the way the page does, by setting a title the
 // supervisor reads back. That makes the enable-retry click reachable without an
@@ -99,6 +102,29 @@ function clientOnlyClickHarness({
     webContents: { isDestroyed: () => false, loadFile() {}, send() {} },
   };
 
+  // A stored crew nothing answers gets the app's own forward first, and each
+  // launch and Retry polls the port for it (ensureManagedTunnel). Those polls run
+  // at once. They share their delay with the successor's readiness poll, which
+  // only starts once a successor is spawned and stays the test's own to fire.
+  let gatewaySpawns = [];
+  const realTimers = {
+    setTimeoutFn: setTimeout,
+    clearTimeoutFn: clearTimeout,
+    setIntervalFn: setInterval,
+    clearIntervalFn: clearInterval,
+  };
+  const base = timers || realTimers;
+  const launchTimers = {
+    ...base,
+    setTimeoutFn(fn, ms) {
+      if (gatewaySpawns.length === 0 && ms === TUNNEL_READY_POLL_MS) {
+        setImmediate(fn);
+        return 0;
+      }
+      return base.setTimeoutFn(fn, ms);
+    },
+  };
+
   const built = harness({
     store: store || fakeStore({
       runLocalGateway: false,
@@ -110,7 +136,7 @@ function clientOnlyClickHarness({
     httpMod: httpOverride || httpMod,
     mainWindow,
     ...(execFileFn ? { execFileFn } : {}),
-    ...(timers ? { timers } : {}),
+    timers: launchTimers,
     app: {
       exit: (code) => state.exits.push(code),
       releaseSingleInstanceLock: () => { state.lockReleases += 1; },
@@ -144,6 +170,8 @@ function clientOnlyClickHarness({
       readFileSync() { throw new Error("no log"); },
     },
   });
+
+  gatewaySpawns = built.spawnCalls;
 
   return { ...built, documents, mainWindow, state };
 }
@@ -318,6 +346,59 @@ test("a port holder whose command could not be read is named by pid, not called 
   assert.match(shown, /onclick="act\('reveal'\)"/, "the launch log is offered");
 });
 
+test("a gateway that exits past a silent holder names that holder, not the exit code (#36213)", async () => {
+  // Nothing answers HTTP on the port, so the launch still spawns, and the
+  // gateway refuses the other program's port and exits 1. The owner probe had
+  // already found that program, so the dialog names it the way it does for one
+  // that answers.
+  const { supervisor, documents, mainWindow, spawnCalls } = clientOnlyClickHarness({
+    actions: ["quit"],
+    store: fakeStore({ runLocalGateway: true, remoteHosts: {} }),
+    port: 5476,
+    execFileFn: ownerProbe("some-other-server --port 5476"),
+  });
+
+  assert.strictEqual(await supervisor.start(), true, "the silent port is still started into");
+  assert.strictEqual(spawnCalls.length, 1);
+  spawnCalls[0].child.exitCode = 1;
+  spawnCalls[0].child.emit("exit", 1, null);
+
+  await supervisor.connect(mainWindow);
+  for (let i = 0; i < 80 && documents.length < 1; i += 1) await flush();
+  assert.strictEqual(documents.length, 1, "the failure dialog opens");
+  const shown = documents[0];
+  assert.match(shown, /served by a program this app did not start/);
+  assert.match(shown, /It is held by process 4242 \(some-other-server --port 5476\)\./);
+  assert.match(shown, /kill -TERM 4242/);
+  assert.match(shown, /<div class="title">[^<]*port 5476 is in use by another program/);
+  assert.doesNotMatch(shown, /exited on launch/, "the bare exit code is not the message");
+  assert.match(shown, /<pre class="log">/, "the launch log is still shown");
+});
+
+test("a gateway killed by a signal past a silent holder keeps the signal diagnosis", async () => {
+  // The port refusal exits 1; a signal (macOS Gatekeeper's SIGKILL) never came
+  // from it, so the dialog keeps the signal's cause and fix, not the holder's.
+  const { supervisor, documents, mainWindow, spawnCalls } = clientOnlyClickHarness({
+    actions: ["quit"],
+    store: fakeStore({ runLocalGateway: true, remoteHosts: {} }),
+    port: 5476,
+    execFileFn: ownerProbe("some-other-server --port 5476"),
+  });
+
+  assert.strictEqual(await supervisor.start(), true);
+  assert.strictEqual(spawnCalls.length, 1);
+  spawnCalls[0].child.emit("exit", null, "SIGKILL");
+
+  await supervisor.connect(mainWindow);
+  for (let i = 0; i < 80 && documents.length < 1; i += 1) await flush();
+  assert.strictEqual(documents.length, 1, "the failure dialog opens");
+  const shown = documents[0];
+  assert.match(shown, /killed on launch \(SIGKILL\)/);
+  assert.match(shown, /xattr -cr/);
+  assert.doesNotMatch(shown, /is in use by another program/);
+  assert.doesNotMatch(shown, /kill -TERM 4242/);
+});
+
 test("the same unidentified payload IS adopted when our own gateway holds the port", async () => {
   // The control for the refusal above: identical payload, identical probe
   // mechanism, and the one fact that differs is who holds the port. A legacy
@@ -335,15 +416,14 @@ test("the same unidentified payload IS adopted when our own gateway holds the po
   assert.strictEqual(spawnCalls.length, 0, "nothing is spawned over it");
 });
 
-test("the handoff waits for the successor's own platform budget, not one flat number", async () => {
-  // A primary local gateway on Windows gets 120s to bind, because importing a
-  // freshly installed bundled Python tree exceeds the ordinary deadline there.
-  // The successor IS that, so a flat 60s here expired while the successor was
+test("the handoff waits for the successor's own gateway budget, not one flat number", async () => {
+  // A primary local gateway gets 120s to bind, because importing a freshly
+  // installed bundled Python tree can exceed the ordinary deadline. The
+  // successor IS that, so a flat 60s here expired while the successor was
   // still inside its own budget, and the deadline's fail() killed a gateway that
   // was starting normally. The deadline is derived from the same function the
-  // successor applies to itself, plus one Electron-boot margin -- which is why
-  // the non-Windows value is unchanged.
-  for (const [platform, expected] of [["darwin", 60_000], ["win32", 150_000]]) {
+  // successor applies to itself, plus one Electron-boot margin, on every platform.
+  for (const [platform, expected] of [["darwin", 150_000], ["win32", 150_000]]) {
     const timers = fakeTimers();
     const built = clientOnlyClickHarness({
       readyAnswers: false,
@@ -938,7 +1018,7 @@ test("installing dialog retries exactly once when the probe reports complete", a
   // mouse, and the keyboard has to honour the same guard.
   const html = decodeURIComponent(dialog.loaded[0]);
   assert.match(html, /var primaryAct = "act\('retry'\)";/, "Enter's primary is Retry here");
-  assert.match(html, /if \(e\.key === 'Enter'\) \{\s*for \(const b of document\.querySelectorAll\('button'\)\) \{\s*if \(b\.getAttribute\('onclick'\) !== primaryAct\) continue;\s*if \(!b\.disabled\) b\.click\(\);/,
+  assert.match(html, /if \(e\.key === 'Enter' && e\.target\.tagName !== 'SUMMARY'\) \{\s*for \(const b of document\.querySelectorAll\('button'\)\) \{\s*if \(b\.getAttribute\('onclick'\) !== primaryAct\) continue;\s*if \(!b\.disabled\) b\.click\(\);/,
     "Enter presses the primary button and respects its disabled state");
   assert.ok(!/if \(e\.key === 'Enter'\) act\(/.test(html), "Enter never calls act() directly");
   assert.strictEqual(dialog.destroyed, false, "the dialog lingers on the completion line");
@@ -1166,4 +1246,77 @@ test("the failure dialog leaves the splash's Close window usable on Windows and 
     windows[0].click("quit");
     await connected;
   }
+});
+
+// The launch log carries internal identifiers and boot diagnostics (#34693): a
+// first-time user's error view shows the title, the message and the actions,
+// and the log opens only on a deliberate click, or through Reveal Log.
+test("the launch log opens folded, and unfolding it grows the window", async () => {
+  const { createFailureDialog } = require("../runtime/gateway/failure-dialog");
+  const { windows, FakeBrowserWindow } = fakeDialogWindows();
+  const { showGatewayErrorDialog } = createFailureDialog({
+    app: {},
+    BrowserWindow: FakeBrowserWindow,
+    nativeTheme: { shouldUseDarkColors: false },
+    shell: {},
+    fs: {},
+    isMac: false,
+    log: () => {},
+    gatewayLogPath: () => "/virtual/logs/gateway-launch.log",
+    mainWindow: () => null,
+    quitting: () => false,
+    quitApp: () => {},
+    cancelTrayHide: () => {},
+    getInstallingUpdate: () => false,
+  });
+  const action = showGatewayErrorDialog(null, {
+    title: "Kiro Crew — gateway failed to start",
+    message: "The gateway exited before it was ready.",
+    logTail: "Generated new staging user ID: 00000000-0000-0000-0000-000000000000\n"
+      + "crash collector armed",
+    logPath: "/virtual/logs/gateway-launch.log",
+  });
+  const [dialog] = windows;
+  const shown = decodeURIComponent(dialog.loaded[0]);
+  const folded = shown.slice(shown.indexOf("<details"), shown.indexOf("</details>"));
+  assert.ok(shown.includes("<details"), "the log sits in a disclosure");
+  assert.ok(folded.includes("<summary>Show launch log</summary>"), "named for what it opens");
+  assert.ok(folded.includes("Generated new staging user ID"), "the log is still one click away");
+  assert.ok(!folded.startsWith("<details open"), "and starts folded");
+  assert.ok(shown.includes("onclick=\"act('reveal')\""), "Reveal Log stays in the row");
+  const foldedHeight = dialog.options.height;
+  assert.ok(foldedHeight < 460, "a folded log does not open a mostly empty window");
+  const resized = [];
+  dialog.getContentSize = () => [dialog.options.width, foldedHeight];
+  dialog.setContentSize = (width, height) => resized.push([width, height]);
+  let titleKept = 0;
+  dialog.emit("page-title-updated", { preventDefault: () => { titleKept += 1; } }, "mc-log:open");
+  assert.deepStrictEqual(resized, [[dialog.options.width, 460]], "unfolding makes room for the log");
+  dialog.emit("page-title-updated", { preventDefault: () => { titleKept += 1; } }, "mc-log:closed");
+  assert.strictEqual(titleKept, 2, "the fold signal never becomes the window's title");
+  assert.strictEqual(resized.length, 1, "folding again leaves the size alone");
+
+  // Enter on the focused toggle unfolds the log; it must not also press the
+  // primary button (Retry here, Force-stop & Retry on a port conflict).
+  // The page's inline code runs from act() to the closing tag before </body>.
+  const inline = shown.slice(shown.indexOf("function act("), shown.indexOf("</body>"));
+  const script = inline.slice(0, inline.lastIndexOf("</"));
+  const clicked = [];
+  const listeners = {};
+  const buttons = [{ getAttribute: () => "act('retry')", disabled: false, click: () => clicked.push("retry") }];
+  const page = {
+    document: {
+      title: "",
+      querySelectorAll: () => buttons,
+      addEventListener: (type, fn) => { listeners[type] = fn; },
+    },
+    window: { close() {} },
+  };
+  require("node:vm").runInNewContext(script, page);
+  listeners.keydown({ key: "Enter", target: { tagName: "SUMMARY" } });
+  assert.deepStrictEqual(clicked, [], "Enter on Show launch log presses nothing else");
+  listeners.keydown({ key: "Enter", target: { tagName: "BODY" } });
+  assert.deepStrictEqual(clicked, ["retry"], "Enter elsewhere still presses the primary");
+  dialog.click("quit");
+  assert.strictEqual(await action, "quit");
 });

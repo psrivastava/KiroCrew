@@ -248,6 +248,7 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
             "(self, origin_key: 'str', text: 'str', *, actor_key: 'str') -> 'bool'",
         ),
         ("_cron_job_is_silent", "method", "(self, parent_key: 'str') -> 'bool'"),
+        ("_cron_dm_user", "method", "(self, job: 'CronJob') -> 'str'"),
     ),
     "mcp_broker": (
         ("_init_mcp_discovery", "method", "(self) -> 'None'"),
@@ -256,6 +257,8 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
             "method",
             "(self, approvals: 'LaunchApprovals') -> 'None'",
         ),
+        ("_publish_paused_share_note", "async method", "(self) -> 'None'"),
+        ("_schedule_paused_share_note", "method", "(self) -> 'None'"),
         (
             "_init_mcp_gateway",
             "async method",
@@ -297,10 +300,14 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         ("_wire_mcp_gateway_dashboard", "method", "(self) -> 'None'"),
     ),
     "memory_lifecycle": (
-        ("_initialize_memory_worker", "method", "(self) -> 'bool'"),
+        ("_initialize_memory_worker", "method", "(self, dashboard_state: 'Any' = None) -> 'bool'"),
         ("_stop_memory_startup", "method", "(self) -> 'None'"),
         ("_start_memory_after_ready", "method", "(self) -> 'None'"),
-        ("_schedule_memory_preparation", "method", "(self) -> \"'asyncio.Task[None] | None'\""),
+        (
+            "_schedule_memory_preparation",
+            "method",
+            "(self, dashboard_state: 'Any' = None) -> \"'asyncio.Task[None] | None'\"",
+        ),
         ("_wait_for_memory_preparation", "async method", "(self) -> 'bool'"),
         ("_repair_member_memory_once", "method", "(self) -> 'None'"),
         ("_repair_member_memory", "async method", "(self) -> 'None'"),
@@ -344,26 +351,16 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         (
             "_drain_update_callback_work",
             "async method",
-            "(self, *, timeout: 'float | None') -> 'bool'",
-        ),
-        (
-            "_prepare_auto_update_apply",
-            "async method",
-            "(self, *, mandatory: 'bool', mandatory_key: 'str' = '') -> 'bool'",
+            "(self, *, timeout: 'float | None', include_turns: 'bool' = True) -> 'bool'",
         ),
         ("_finish_auto_update_apply", "async method", "(self) -> 'None'"),
-        ("_restart_gate_when_idle", "async method", "(self) -> 'tuple[bool, int, int]'"),
-        ("_restart_gate_held", "method", "(self) -> 'bool'"),
-        ("_release_restart_gate_hold", "async method", "(self) -> 'None'"),
         ("_wheel_apply_module", "staticmethod", "() -> 'Any'"),
-        ("_dashboard_policy_applies", "staticmethod", "() -> \"list['asyncio.Task[Any]']\""),
         (
             "_settle_update_work",
             "async method",
             "(self, update_task: \"'asyncio.Task[None] | None'\") -> 'None'",
         ),
         ("_run_update_checks", "async method", "(self) -> 'None'"),
-        ("_retry_pending_update_restart", "async method", "(self) -> 'bool'"),
         ("_check_for_updates", "async method", "(self) -> 'None'"),
         (
             "_auto_update_effect",
@@ -372,24 +369,13 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         ),
         ("_publish_provider_update_state", "method", "(self, result: 'object') -> 'None'"),
         ("_check_for_updates_via_provider", "async method", "(self, provider: 'object') -> 'None'"),
-        (
-            "_restart_after_update_claimed",
-            "async method",
-            "(self, launcher: 'str | None', exe: 'str | None') -> 'None'",
-        ),
         ("_check_for_updates_legacy", "async method", "(self) -> 'None'"),
-        (
-            "_restart_after_update_body",
-            "async method",
-            "(self, respawn: 'Callable[[], str]') -> 'None'",
-        ),
     ),
     "update_apply": (
-        ("_auto_apply_update", "async method", "(self, *, mandatory: 'bool' = False) -> 'None'"),
         (
             "_auto_apply_wheel_update",
             "async method",
-            "(self, channel: 'str', version: 'str', *, mandatory: 'bool' = False, mandatory_key: 'str' = '') -> 'None'",
+            "(self, channel: 'str', version: 'str', *, mandatory: 'bool' = False) -> 'None'",
         ),
         (
             "_notice_wheel_update_once",
@@ -486,7 +472,7 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         (
             "_interactive_approval",
             "method",
-            "(self, source: 'str', slot_resolver: 'Callable[[str], str] | None' = None, nudge_key: 'str' = '', *, raise_when_unreachable: 'bool' = False, requester: 'str' = '', on_host_decision: 'Callable[[str, str], None] | None' = None) -> 'ToolApprovalCallback'",
+            "(self, source: 'str', slot_resolver: 'Callable[[str], str] | None' = None, nudge_key: 'str' = '', *, raise_when_unreachable: 'bool' = False, requester: 'str' = '', on_host_decision: 'Callable[[str, str], None] | None' = None, follows_approval_mode: 'bool' = False) -> 'ToolApprovalCallback'",
         ),
         (
             "_heartbeat_approval",
@@ -604,12 +590,18 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         (
             "_acquire_with_model_fallback",
             "async method",
-            "(self, job: 'CronJob', cron_execution: 'ExecutionContext', key: 'str', agent_id: 'str | None', cwd: 'str | None' = None, crew_agent: 'str | None' = None, *, execution: 'ExecutionContext | None' = None, replace_execution: 'bool' = False) -> \"'tuple[LLMProvider, bool, bool, bool]'\"",
+            "(self, job: 'CronJob', cron_execution: 'ExecutionContext', key: 'str', agent_id: 'str | None', cwd: 'str | None' = None, crew_agent: 'str | None' = None, *, execution: 'ExecutionContext | None' = None, replace_execution: 'bool' = False) -> \"'tuple[LLMProvider, bool, bool, bool, Any]'\"",
         ),
         (
             "_retained_session_agent_mismatch",
             "method",
             "(self, job: 'CronJob', key: 'str', agent: 'str | None') -> 'str | None'",
+        ),
+        ("_cron_key_work_pending", "async method", "(self, key: 'str') -> 'bool'"),
+        (
+            "_cron_batch_kind_defers",
+            "async method",
+            "(self, job: 'CronJob', key: 'str', provider: 'Any', *, reprojected: 'bool') -> 'bool'",
         ),
         ("_announce_cron_quarantine", "method", "(self) -> 'None'"),
         ("_start_cron_after_memory_ready", "async method", "(self) -> 'None'"),
@@ -669,9 +661,20 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
             "(self, job: 'CronJob', failure_hash: 'str', *, channel_delivered: 'bool', slack_failed: 'bool') -> 'None'",
         ),
         (
+            "_alert_cron_auto_paused",
+            "async method",
+            "(self, job: 'CronJob', streak: 'int', reason: 'str') -> 'None'",
+        ),
+        (
             "_alert_cron_failure",
             "async method",
-            "(self, job: 'CronJob', detail: 'str', *, denied: 'bool' = False) -> 'None'",
+            "(self, job: 'CronJob', detail: 'str', *, denied: 'bool' = False, "
+            "exit_code: 'int | None' = None) -> 'None'",
+        ),
+        (
+            "_alert_cron_interrupted",
+            "async method",
+            "(self, job: 'CronJob', detail: 'str') -> 'None'",
         ),
         (
             "_cron_single_failure",
@@ -1218,26 +1221,6 @@ def test_an_owner_imports_the_facade_and_its_siblings_only_for_type_checking() -
     assert offenders == []
 
 
-def test_every_owner_with_a_coroutine_is_in_the_config_dir_guard() -> None:
-    """``test_no_config_dir_in_async`` scans the files it lists, so an owner that
-    gains an ``async def`` must be listed there, or its coroutines escape the guard."""
-    guard = _SRC.parent / "test" / "test_no_config_dir_in_async.py"
-    listed: set[str] = set()
-    for node in ast.parse(guard.read_text(encoding="utf-8")).body:
-        if isinstance(node, ast.Assign) and any(
-            isinstance(t, ast.Name) and t.id == "_ASYNC_CHECKED_FILES" for t in node.targets
-        ):
-            listed = {elt.value for elt in node.value.elts if isinstance(elt, ast.Constant)}
-    assert listed, "_ASYNC_CHECKED_FILES not found; this check went stale"
-    with_coroutines = {
-        f"slack/gateway_runtime/{name}"
-        for name, tree in _owner_trees()
-        if any(isinstance(n, ast.AsyncFunctionDef) for n in ast.walk(tree))
-    }
-    assert with_coroutines, "no owner defines a coroutine; this check went stale"
-    assert sorted(with_coroutines - listed) == []
-
-
 def test_a_second_facade_import_recomposes_the_owners_onto_it(tmp_path: Path) -> None:
     """A test that purges the facade and imports it again gets owners that run on
     the NEW namespace, and the orchestrator's qualnames are not prefixed twice."""
@@ -1302,7 +1285,7 @@ def test_a_fresh_facade_import_loads_every_owner(tmp_path: Path) -> None:
 #: guards at its new home (``slack-gateway.md``, Composition).
 _GUARDED_TOKEN_HOMES: dict[str, frozenset[str]] = {
     "persist_token_record": frozenset({"cron_turn", "gateway", "heartbeat_turns"}),
-    ".read_messages": frozenset({"cron_delivery", "nudge_wiring"}),
+    ".read_messages": frozenset({"nudge_wiring"}),
     "begin_turn": frozenset({"nudge_channel_fire"}),
     "os._exit": frozenset({"exit_path"}),
     "save_conversation_turn_off_loop": frozenset(
@@ -1311,10 +1294,8 @@ _GUARDED_TOKEN_HOMES: dict[str, frozenset[str]] = {
     "session_store_for_turn": frozenset(
         {"gateway", "heartbeat_turns", "nudge_channel_fire", "subagent_injection"}
     ),
-    "create_subprocess_": frozenset({"gateway", "install_repair", "update_apply"}),
-    "isolated_python_argv": frozenset({"install_repair", "update_apply"}),
-    "respawn_executable": frozenset({"update_apply", "update_schedule"}),
-    "reexec_python_module": frozenset({"update_schedule"}),
+    "create_subprocess_": frozenset({"gateway", "install_repair"}),
+    "isolated_python_argv": frozenset({"install_repair"}),
     "_running_script_ids.add": frozenset({"cron_exec"}),
     "caused_by_this_session": frozenset({"runtime_charge"}),
     "note_shared_death": frozenset({"runtime_charge"}),

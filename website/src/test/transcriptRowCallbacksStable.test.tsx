@@ -160,7 +160,7 @@ describe('row callbacks keep their identity across streamed frames', () => {
       slotRunning: false, splitMode: false, crewWindow: null, slotHasMore: false, slotOldestIndex: 0,
       cursorIsForActiveSlot: true, loadingOlder: false, activeViewIsBoundedPage: false, isWelcomeState: false, activeSlotRemoteBound: false,
       scrollerRef: { current: null }, search: { isOpen: false } as never, navToDisplayIndex, pinnedJumpChrome: () => 0,
-      scrollToPinnedPrompt: vi.fn(), setHighlightTs: vi.fn(), splitFeatureEnabled: false, regenerating: false, setEditLast: vi.fn(),
+      scrollToPinnedPrompt: vi.fn(), markStep: vi.fn(), markJump: vi.fn(), splitFeatureEnabled: false, regenerating: false, setEditLast: vi.fn(),
       editSeqRef: { current: 0 },
     }
     const build = (messages: ChatMessage[]) => ({
@@ -200,5 +200,24 @@ describe('row callbacks keep their identity across streamed frames', () => {
     dispatch.mockClear()
     act(() => { rollback() })
     expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ type: 'chat/replaceMessages', payload: next }))
+  })
+
+  it('useMessageActions: a refused edit-and-resend answers false so the open editor keeps its draft', () => {
+    // An editor opened before a turn started stays open with Send enabled. When
+    // the turn is running at the press, nothing is sent; UserMessage keeps the
+    // editor only on `=== false`, so any other answer closes it and drops the text.
+    const base = {
+      dispatch: vi.fn() as never, navigate: vi.fn() as never, filteredSlotsRef: { current: [] }, connected: true, activeSlot: 'slot-a',
+      activityOpen: false, activeSlotRef: { current: 'slot-a' }, activeSlotRemoteBound: false,
+      showActionError: vi.fn(), handleFileOpen: vi.fn() as never, handleFolderOpen: vi.fn(), search: { isOpen: false } as never,
+      tabsCtl: {} as never, sessionTitles: new Map(), selectSessionTab: vi.fn(), linkPreviewsOn: false, planTaskId: '',
+      setSidebarPinned: vi.fn(), sidebarAutoHidden: { current: null }, sidebarWidth: 280, setRegenerating: vi.fn(),
+    }
+    const { result } = renderHook(() => useMessageActions({ ...base, slotRunning: true, messages: first, messagesRef: { current: first } }), { wrapper })
+    calls.rewindWithRollback.mockClear()
+    let answer: unknown
+    act(() => { answer = result.current.handleEditResend(2, 't3', 'edited') })
+    expect(answer).toBe(false)
+    expect(calls.rewindWithRollback).not.toHaveBeenCalled()
   })
 })

@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import { ChevronDown, ChevronLeft, ChevronRight, Download, ExternalLink, FileText, Film, Moon, Music, Sparkles, Sun } from 'lucide-react'
 
 import { i18nT } from '../i18n/t'
+import { fmtNumber } from '../i18n/format'
 import { ExcalidrawBlock } from './ExcalidrawBlock'
 import ErrorNotice from './ErrorNotice'
 import FileDownloadLink from './FileDownloadLink'
@@ -12,6 +13,8 @@ import { sendErrorToChat } from '../utils/errorReport'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 import { useIsDark } from '../hooks/useIsDark'
 import { usePinchZoom, wheelZoomFactor } from '../hooks/usePinchZoom'
+import { usePagerFocus } from '../hooks/usePagerFocus'
+import { useScrollEdges } from '../hooks/useScrollEdges'
 import { IS_MAC } from '../hooks/useKeyboardShortcuts'
 import { pathBasename } from '../utils/pathBasename'
 import { AUDIO_EXTS, VIDEO_EXTS } from '../utils/mediaExts'
@@ -321,7 +324,7 @@ export const CsvViewer = memo(function CsvViewer({ content, filePath }: { conten
           ))}
         </tbody>
       </table>
-      {body.length > 500 && <div className="text-center text-muted text-[11px] py-2">{i18nT('components.fileRenderers.showing_first_rows', { shown: 500, count: body.length })}</div>}
+      {body.length > 500 && <div className="text-center text-muted text-[11px] py-2">{i18nT('components.fileRenderers.showing_first_rows', { count: body.length, shown: fmtNumber(500), total: fmtNumber(body.length) })}</div>}
     </div>
   )
 })
@@ -351,7 +354,7 @@ export const JsonViewer = memo(function JsonViewer({ content }: { content: strin
           askAgent
           testId="json-viewer-error"
         />
-        <div className="text-[11px] text-muted mb-1 font-mono">{content.length > preview.length ? i18nT('components.fileRenderers.showing_raw_content_truncated_count', { count: content.length, shown: preview.length }) : i18nT('components.fileRenderers.showing_raw_content_count', { count: content.length })}</div>
+        <div className="text-[11px] text-muted mb-1 font-mono">{content.length > preview.length ? i18nT('components.fileRenderers.showing_raw_content_truncated_count', { count: fmtNumber(content.length), shown: fmtNumber(preview.length) }) : i18nT('components.fileRenderers.showing_raw_content_count', { count: fmtNumber(content.length) })}</div>
         <pre className="text-[13px] font-mono whitespace-pre-wrap break-all text-text">{preview}{content.length > preview.length ? '\n…' : ''}</pre>
       </div>
     )
@@ -388,7 +391,7 @@ function JsonString({ value }: { value: string }) {
       >
         {expanded
           ? i18nT('components.fileRenderers.json_string_show_less')
-          : i18nT('components.fileRenderers.json_string_show_all', { count: value.length })}
+          : i18nT('components.fileRenderers.json_string_show_all', { count: value.length, n: fmtNumber(value.length) })}
       </button>
     </>
   )
@@ -410,7 +413,7 @@ function JsonNode({ value, depth }: { value: unknown; depth: number }) {
       <button className="text-muted hover:text-text cursor-pointer bg-transparent border-none font-mono text-sm" aria-expanded={open} onClick={() => setOpen(!open)}>
         {open
           ? <ChevronDown size={12} className="lucide-inline" aria-hidden="true" />
-          : <ChevronRight size={12} className="lucide-inline" aria-hidden="true" />} {bracket[0]}{!open && <span className="text-muted"> {i18nT('components.fileRenderers.items_count', { count: entries.length })} {bracket[1]}</span>}
+          : <ChevronRight size={12} className="lucide-inline" aria-hidden="true" />} {bracket[0]}{!open && <span className="text-muted"> {i18nT('components.fileRenderers.items_count', { count: entries.length, n: fmtNumber(entries.length) })} {bracket[1]}</span>}
       </button>
       {open && (
         <div style={{ paddingLeft: 16 }}>
@@ -421,7 +424,7 @@ function JsonNode({ value, depth }: { value: unknown; depth: number }) {
               <JsonNode value={v} depth={depth + 1} />
             </div>
           ))}
-          {entries.length > 200 && <div className="text-muted">… {i18nT('components.fileRenderers.more_count', { count: entries.length - 200 })}</div>}
+          {entries.length > 200 && <div className="text-muted">… {i18nT('components.fileRenderers.more_count', { count: entries.length - 200, n: fmtNumber(entries.length - 200) })}</div>}
         </div>
       )}
       {open && <span className="text-muted">{bracket[1]}</span>}
@@ -448,14 +451,14 @@ export const JsonlViewer = memo(function JsonlViewer({ content }: { content: str
 
   return (
     <div ref={containerRef} onScroll={onScroll} className="h-full overflow-auto p-3 bg-bg-elevated border border-border rounded-md space-y-2">
-      <div className="text-muted text-[11px]">{i18nT('components.fileRenderers.lines_count', { count: lines.length })}</div>
+      <div className="text-muted text-[11px]">{i18nT('components.fileRenderers.lines_count', { count: lines.length, n: fmtNumber(lines.length) })}</div>
       {lines.slice(0, visible).map((line, i) => (
         <div key={i} className="border-b border-border/50 pb-2">
           <JsonViewer content={line} />
         </div>
       ))}
       {visible < lines.length && (
-        <div className="text-muted text-xs text-center py-2">{i18nT('components.fileRenderers.scroll_for_more_count', { count: lines.length - visible })}</div>
+        <div className="text-muted text-xs text-center py-2">{i18nT('components.fileRenderers.scroll_for_more_count', { count: fmtNumber(lines.length - visible) })}</div>
       )}
     </div>
   )
@@ -756,9 +759,21 @@ function OfficeHeading({ level, text }: { level: number; text: string }) {
  * Cell text keeps its newlines — a cell can hold several paragraphs. */
 function OfficeTable({ rows, truncatedCols }: { rows: string[][]; truncatedCols?: boolean }) {
   const [head, ...body] = rows
+  // Cells are plain text, so nothing inside ever takes focus: while the table
+  // hides columns the scroller itself is the named Tab stop the arrow keys
+  // scroll. A table that fits gets no stop.
+  const [attachScroller, edges, , attachTable] = useScrollEdges<HTMLDivElement>()
+  const clipped = edges.left || edges.right
   return (
-    <div className="my-2 overflow-x-auto">
-      <table className="min-w-full border-collapse">
+    <div
+      ref={attachScroller}
+      className="my-2 overflow-x-auto"
+      // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- the tab stop IS the fix: a scroller that hides columns and holds nothing focusable is skipped by an engine that does not focus scrollers itself and unnamed in one that does, and axe's scrollable-region-focusable asks for the explicit stop.
+      tabIndex={clipped ? 0 : undefined}
+      role={clipped ? 'region' : undefined}
+      aria-label={clipped ? i18nT('components.markdownRenderer.table_region') : undefined}
+    >
+      <table ref={attachTable} className="min-w-full border-collapse">
         {head && (
           <thead>
             <tr>
@@ -1071,6 +1086,8 @@ function SlidePager({ filePath, filename, manifest, onRerender }: {
     el?.scrollIntoView?.({ block: 'nearest', inline: 'center' })
   }, [current])
   const go = useCallback((delta: number) => setCurrent(c => Math.min(count, Math.max(1, c + delta))), [count])
+  const pager = usePagerFocus()
+  const { pressedPrev, pressedNext } = pager
   // Arrow / Page / Home / End paging while focus is anywhere inside the pager
   // (the prev/next buttons and the thumbnails are its focusable parts). Bound
   // on the container as a native listener: the keys belong to the pager as a
@@ -1081,14 +1098,14 @@ function SlidePager({ filePath, filename, manifest, onRerender }: {
     const root = rootRef.current
     if (!root) return
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'ArrowLeft' || e.key === 'PageUp') { e.preventDefault(); go(-1) }
-      else if (e.key === 'ArrowRight' || e.key === 'PageDown') { e.preventDefault(); go(1) }
-      else if (e.key === 'Home') { e.preventDefault(); setCurrent(1) }
-      else if (e.key === 'End') { e.preventDefault(); setCurrent(count) }
+      if (e.key === 'ArrowLeft' || e.key === 'PageUp') { e.preventDefault(); go(-1); pressedPrev() }
+      else if (e.key === 'ArrowRight' || e.key === 'PageDown') { e.preventDefault(); go(1); pressedNext() }
+      else if (e.key === 'Home') { e.preventDefault(); setCurrent(1); pressedPrev() }
+      else if (e.key === 'End') { e.preventDefault(); setCurrent(count); pressedNext() }
     }
     root.addEventListener('keydown', onKeyDown)
     return () => root.removeEventListener('keydown', onKeyDown)
-  }, [go, count])
+  }, [go, count, pressedPrev, pressedNext])
   const slideLabel = (n: number) => i18nT('components.fileRenderers.slide_n_of_count', { n, count })
   return (
     <div ref={rootRef} role="group" aria-label={filename} className="h-full flex flex-col bg-bg-elevated rounded-md border border-border overflow-hidden" data-testid="office-slides">
@@ -1126,16 +1143,18 @@ function SlidePager({ filePath, filename, manifest, onRerender }: {
           first line and the file actions drop to a second, both fully visible. */}
       <div className="shrink-0 flex flex-wrap items-center gap-x-2 gap-y-1 px-3 py-1.5 border-t border-border bg-bg">
         <button
+          ref={pager.prevRef}
           type="button"
-          onClick={() => go(-1)}
+          onClick={() => { go(-1); pressedPrev() }}
           disabled={current <= 1}
           aria-label={i18nT('components.fileRenderers.slide_previous')}
           className="p-1 rounded text-muted hover:text-text disabled:opacity-40 disabled:cursor-default cursor-pointer bg-transparent border-none"
         ><ChevronLeft size={16} aria-hidden="true" /></button>
         <span className="text-xs text-text tabular-nums whitespace-nowrap" aria-live="polite">{slideLabel(current)}</span>
         <button
+          ref={pager.nextRef}
           type="button"
-          onClick={() => go(1)}
+          onClick={() => { go(1); pressedNext() }}
           disabled={current >= count}
           aria-label={i18nT('components.fileRenderers.slide_next')}
           className="p-1 rounded text-muted hover:text-text disabled:opacity-40 disabled:cursor-default cursor-pointer bg-transparent border-none"
@@ -1482,11 +1501,11 @@ export const SheetViewer = memo(function SheetViewer({ filePath }: { filePath: s
       </div>
       {sheet && (sheet.truncated_rows || sheet.truncated_cols || payload.truncated_sheets) && (
         <div className="text-center text-muted text-[11px] py-1.5 border-t border-border bg-chrome shrink-0">
-          {sheet.truncated_rows && i18nT('components.fileRenderers.sheet_showing_rows', { shown: sheet.rows.length })}
+          {sheet.truncated_rows && i18nT('components.fileRenderers.sheet_showing_rows', { shown: fmtNumber(sheet.rows.length) })}
           {sheet.truncated_rows && (sheet.truncated_cols || payload.truncated_sheets) ? ' · ' : ''}
           {sheet.truncated_cols && i18nT('components.fileRenderers.sheet_cols_truncated')}
           {sheet.truncated_cols && payload.truncated_sheets ? ' · ' : ''}
-          {payload.truncated_sheets && i18nT('components.fileRenderers.sheet_tabs_truncated', { shown: payload.sheets.length, total: payload.total_sheets })}
+          {payload.truncated_sheets && i18nT('components.fileRenderers.sheet_tabs_truncated', { shown: fmtNumber(payload.sheets.length), total: fmtNumber(payload.total_sheets) })}
           {(sheet.truncated_rows || sheet.truncated_cols || payload.truncated_sheets) && (
             <>
               {' · '}

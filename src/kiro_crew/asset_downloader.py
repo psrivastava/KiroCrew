@@ -80,6 +80,7 @@ import hashlib
 import io
 import logging
 import os
+import socket
 import ssl
 import stat
 import time
@@ -346,6 +347,22 @@ def redact_url(url: str) -> str:
         return urllib.parse.urlunsplit((parts.scheme, host, "", "", ""))
     except Exception:
         return "<unparseable-url>"
+
+
+def network_failure_cause(exc: BaseException) -> str:
+    """Why a connection failed, in a user's words, or ``""`` for any other failure.
+
+    Read from the exception types, never their text: urllib carries the socket
+    error in ``URLError.reason``, aiohttp in ``ClientConnectorError.os_error``.
+    """
+    for err in (exc, getattr(exc, "reason", None), getattr(exc, "os_error", None)):
+        if isinstance(err, socket.gaierror):
+            return "the host name could not be resolved"
+        if isinstance(err, ConnectionRefusedError):
+            return "connection refused"
+        if isinstance(err, TimeoutError):
+            return "timed out"
+    return ""
 
 
 #: ``O_BINARY`` exists only on Windows (where a text-mode descriptor translates
@@ -1019,12 +1036,15 @@ def download_to(
             # unsatisfiable range on every later attempt, so the next one starts
             # from zero.
             _discard(where, staging_name)
-        # TYPE and a redacted url, never `exc`. This string is RETURNED, and the
-        # feature-video caller puts it in the cache's failure state, which /status
-        # serves to the dashboard — so an unredacted url here is a wider leak than a
-        # log line. `http.client.InvalidURL` carries the url verbatim in its message
-        # ("nonnumeric port: 'secretpw@…'"), which is how a credentialed override
-        # reaches a reader. The type is the diagnostic that matters anyway.
+        # The plain cause or the TYPE, and a redacted url, never `exc`. This string is
+        # RETURNED, and the feature-video caller puts it in the cache's failure state,
+        # which /status serves to the dashboard — so an unredacted url here is a wider
+        # leak than a log line. `http.client.InvalidURL` carries the url verbatim in
+        # its message ("nonnumeric port: 'secretpw@…'"), which is how a credentialed
+        # override reaches a reader.
+        cause = network_failure_cause(exc)
+        if cause:
+            return False, f"{_ERROR_PREFIX} from {redact_url(url)}: {cause}"
         return False, f"{_ERROR_PREFIX}: {type(exc).__name__} from {redact_url(url)}"
     except Exception as exc:
         # A resumable partial is KEPT on a transport failure — that is the whole
@@ -1057,6 +1077,7 @@ __all__ = [
     "file_identity",
     "install_verified",
     "make_ssl_context",
+    "network_failure_cause",
     "open_staging_nofollow",
     "redact_url",
 ]

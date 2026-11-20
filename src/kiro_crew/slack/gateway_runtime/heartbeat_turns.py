@@ -125,7 +125,11 @@ async def _init_heartbeat(self: GatewayOrchestrator) -> None:
     # once-at-init snapshot would let a heartbeat session keep enforcing a
     # just-disabled rule — or skip a just-added one — until restart.
     assert self.ctx_builder is not None
+    # Imported here: this module's functions run on the gateway's globals (see the
+    # module docstring), so a module-level import would not be in scope.
+    from kiro_crew.tracing import surfaces as trace_surfaces
 
+    @trace_surfaces.rooted(trace_surfaces.TRIGGER_HEARTBEAT)
     async def _heartbeat_task(task_text: str, deliver: str) -> str | None:
         assert self.sessions is not None
         assert self.ctx_builder is not None
@@ -246,7 +250,7 @@ async def _init_heartbeat(self: GatewayOrchestrator) -> None:
             )
             _missing = declared_mcp_not_ready_note(client)
             if _missing:
-                result_text = f"⚠ {_missing}.\n\n{result_text}"
+                result_text = f"Warning: {_missing}.\n\n{result_text}"
 
             # ── Per-turn usage row: attribute heartbeat spend. ──
             await _persist_turn_row(
@@ -345,7 +349,7 @@ async def _init_heartbeat(self: GatewayOrchestrator) -> None:
         else:
             task_safe = redact_and_truncate(task_text, 100)
             await self._deliver_result(
-                "💓 Heartbeat",
+                "Heartbeat",
                 task_safe,
                 display_text,
                 deliver,

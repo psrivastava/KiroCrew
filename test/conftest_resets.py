@@ -15,8 +15,36 @@ import warnings
 import pytest
 from conftest_opt_in import drain_breadcrumb_writes
 
-from kiro_crew.safety_override import reset_singleton as _reset_safety_override
-from kiro_crew.safety_override import reset_yolo_policy_state as _reset_yolo_policy_state
+
+@pytest.fixture(autouse=True)
+def _ledger_create_ignores_live_memory(_floor_monkeypatch):
+    """A work-ledger ``create`` never depends on this runner's free memory.
+
+    ``_create_item`` refuses ``host_memory_critical`` when the live admission
+    verdict refuses, and that verdict probes live memory, which a CI runner can
+    have at under 2 GB. So every create in the suite would pass or fail by runner.
+    The refusal is pinned off here; the refusal tests put the real one back.
+    """
+    from kiro_crew import work_ledger
+
+    # Through the facade, which writes the patch into every module holding the name.
+    _floor_monkeypatch.setattr(work_ledger, "_refuse_if_host_critical", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_host_posture_published(_floor_monkeypatch):
+    """No test inherits a host posture an earlier notifier test published.
+
+    The work-ledger probe wakes on ``resource_pressure.current_posture()``, a
+    module value the notifier writes on every sample; left set, it would add a
+    posture wake to whichever probe test runs next on the worker.
+    """
+    from kiro_crew.notifications import resource_pressure
+
+    _floor_monkeypatch.setattr(resource_pressure, "_current_posture", None)
+    _floor_monkeypatch.setattr(resource_pressure, "_worsened", None)
+    _floor_monkeypatch.setattr(resource_pressure, "_worker_growth", {})
+    _floor_monkeypatch.setattr(resource_pressure, "_session_marks", {})
 
 
 @pytest.fixture(autouse=True)
@@ -55,9 +83,11 @@ def _fresh_reexec_environment(_floor_monkeypatch):
     ``platform_compat._KEPT_FOR_REEXEC`` for the gateway's own exec restart, and
     ``launched_as_managed_service`` reads it there; a value one test's launch
     consumed must not make a later test's gateway read as service-launched, nor
-    be written into the environment by a later test's stubbed exec.
+    be written into the environment by a later test's stubbed exec. The boot-time
+    ssh-agent socket a ``gateway`` launch records is reset for the same reason.
     """
     from kiro_crew import platform_compat, platform_compat_runtime
+    from kiro_crew.mcp_gateway import agent_socket
 
     # ONE fresh dict bound in both modules: ``keep_for_reexec`` and the
     # ``reexec_*`` seams resolve ``_KEPT_FOR_REEXEC`` in
@@ -68,6 +98,8 @@ def _fresh_reexec_environment(_floor_monkeypatch):
     fresh: dict[str, str] = {}
     _floor_monkeypatch.setattr(platform_compat, "_KEPT_FOR_REEXEC", fresh)
     _floor_monkeypatch.setattr(platform_compat_runtime, "_KEPT_FOR_REEXEC", fresh)
+    _floor_monkeypatch.setattr(agent_socket, "_recorded", False)
+    _floor_monkeypatch.setattr(agent_socket, "_boot_socket", None)
 
 
 @pytest.fixture(autouse=True)
@@ -170,6 +202,95 @@ def _drop_live_config_snapshot():
 
 
 @pytest.fixture(autouse=True)
+def _forget_tracing_switch():
+    """Give every test an unread tracing switch.
+
+    ``kiro_crew.tracing.provider`` resolves the switch once and serves the cached
+    answer until ``reset_for_testing()``. A test that boots the gateway services
+    (``service_boot`` calls ``watch_config``, which resolves it) leaves "off" cached,
+    so a later test on the same worker that writes its own config is told tracing
+    is off and exports nothing, with no log line. Measured: ``test_slack_gateway.py``'s
+    ``test_init_services_creates_all`` followed by ``test_tracing_otlp.py``'s
+    ``test_a_traced_turn_reaches_a_loopback_receiver_with_its_vault_header``.
+
+    Reset at setup, not teardown, so ``_no_leaked_telemetry_exporter`` still sees
+    (and reports) an exporter thread a test left running. A test that never
+    imported the module pays one dict lookup.
+    """
+    provider = sys.modules.get("kiro_crew.tracing.provider")
+    if provider is not None:
+        provider.reset_for_testing()
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _forget_observed_people():
+    """Give every test an empty Shared Crew people registry.
+
+    Every authorized dashboard request records its principal in the
+    process-wide ``kiro_crew.shared_crew.people`` registry, and nothing in
+    production clears it: one gateway owns the process. A test that makes a
+    request as a teammate (relay, Tailscale, SSM invite) leaves that person
+    seen, so a later test on the same worker reads the Crew mode as
+    ``network``. Measured: ``test_shared_crew_teammate_redaction.py``'s
+    ``test_the_sse_stream_redacts_what_a_teammate_reads_with_redaction_off``
+    followed by ``test_shared_crew_v_y2_mode_route.py``'s
+    ``test_with_the_preview_off_the_read_does_not_walk_the_catalog``.
+
+    Reset at setup, so a test that installs its own clocked registry keeps it.
+    A test that never imported the module pays one dict lookup.
+    """
+    people = sys.modules.get("kiro_crew.shared_crew.people")
+    if people is not None:
+        people.reset_for_tests()
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _forget_offered_instance_types():
+    """Give every test an empty EC2 instance-type offering cache.
+
+    ``instance_types.clear_cache()`` empties ``_cache``, where ``cloud.instance_types`` keeps each (profile, Region) listing for five
+    minutes. The key does not include the fake AWS reader a test installs, so a
+    listing one test read through its fake would answer a later test on the same
+    worker that uses the same (profile, Region), and that test's own fake would
+    never be called. Cleared before and after, so a test that never imported the
+    module pays one dict lookup.
+    """
+    offered = sys.modules.get("kiro_crew.cloud.instance_types")
+    if offered is not None:
+        offered.clear_cache()
+    yield
+    offered = sys.modules.get("kiro_crew.cloud.instance_types")
+    if offered is not None:
+        offered.clear_cache()
+
+
+@pytest.fixture(autouse=True)
+def _forget_gatewayd_telemetry_override():
+    """Give every test the platform-context telemetry provider, not gatewayd's.
+
+    ``gatewayd._prepare_telemetry`` (run by ``gatewayd.main()``) installs a
+    process-level provider factory through ``use_telemetry_provider`` and marks the
+    process as gatewayd. Nothing in production undoes that, so a test that drives
+    ``main()`` in process leaves it set, and every later test on the worker resolves
+    OTLP egress through gatewayd's provider instead of ``current_context().telemetry``.
+    A test that installs a raising provider with ``set_context`` is then answered
+    "no egress". Measured: ``test_mcp_gatewayd_coverage.py``'s
+    ``TestMain::test_exits_with_the_amain_return_code`` followed by
+    ``test_config_patch.py``'s
+    ``test_enable_is_refused_when_the_egress_posture_cannot_be_resolved`` (200, not 409).
+
+    Reset at setup, and only when the override is set, so a test that never reached
+    gatewayd pays one dict lookup and two attribute reads.
+    """
+    provider = sys.modules.get("kiro_crew.metrics.provider")
+    if provider is not None and (provider._provider_factory is not None or provider._is_gatewayd):
+        provider.reset_for_testing()
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _reset_env_boot_record_and_ownership():
     """Give every test an empty boot ``.env`` record and ``.env`` ownership set.
 
@@ -229,9 +350,12 @@ def _release_stt_engine():
     reading a different setting would silently get the earlier one.
     """
     yield
-    from kiro_crew.stt import engine as stt_engine
-
-    stt_engine._engine = None
+    # Read, never imported, here: this runs before the test's ``monkeypatch`` is
+    # undone, so a first import would execute the module (and numpy with it) under
+    # whatever ``sys.platform`` the test set. A module nobody imported holds no engine.
+    stt_engine = sys.modules.get("kiro_crew.stt.engine")
+    if stt_engine is not None:
+        stt_engine._engine = None
 
 
 @pytest.fixture(autouse=True)
@@ -248,6 +372,11 @@ def _reset_safety_override_between_tests():
     present. Resetting it here makes the next reader resolve the ceiling actually
     installed.
     """
+    # Imported in the body so collection does not load the safety stack
+    # (test/test_conftest_import_budget.py holds that line).
+    from kiro_crew.safety_override import reset_singleton as _reset_safety_override
+    from kiro_crew.safety_override import reset_yolo_policy_state as _reset_yolo_policy_state
+
     _reset_safety_override()
     _reset_yolo_policy_state()
     yield
@@ -320,9 +449,19 @@ def forget_home_bound_caches() -> None:
     the test's ``monkeypatch`` included, so a stand-in a test patched in is
     already gone and only a real leftover is cleared. Never called before a
     test, so that pre-boot check still catches a leak this does not know about.
+
+    It also empties aiohttp's middleware cache, which no boot check reads.
     """
     import sys
 
+    # aiohttp memoizes each app's middleware chain in a module-level lru_cache keyed
+    # on the Application, so every app a test served stays alive, with its app state
+    # and every mock in it, for the life of the worker. The name is private to aiohttp,
+    # so a version without it is skipped rather than failed.
+    web_app = sys.modules.get("aiohttp.web_app")
+    cached = getattr(web_app, "_cached_build_middleware", None)
+    if callable(getattr(cached, "cache_clear", None)):
+        cached.cache_clear()
     governance = sys.modules.get("kiro_crew.platform.governance")
     if governance is not None:
         governance._CONFIRM_PATTERNS_MEMO = None
@@ -338,6 +477,7 @@ def forget_home_bound_caches() -> None:
     token_auth = sys.modules.get("kiro_crew.dashboard.token_auth")
     if token_auth is not None:
         token_auth._app_perms_cache.clear()
+        token_auth._app_perms_denied.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -356,6 +496,20 @@ def _forget_legacy_auth_sweep_clean_roots(_floor_monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _forget_app_declared_row_listings():
+    """Forget the tool gate's listings of the apps' declared rows before each test.
+
+    ``paths_targets._APP_CREDENTIAL_MASK_ROWS`` is reused on every thread for up to a
+    second, keyed on ``KIROCREW_HOME``, so a test that patches ``config_dir`` under the
+    same variable would otherwise read the previous test's installed apps.
+    """
+    from kiro_crew.security import paths_targets
+
+    paths_targets._APP_CREDENTIAL_MASK_ROWS.reset()
+    paths_targets._APP_READONLY_ROWS.reset()
+
+
+@pytest.fixture(autouse=True)
 def _forget_mount_source_sweep_pacing(_floor_monkeypatch):
     """Forget when the periodic mount-source pass last ran and where it stopped.
 
@@ -368,6 +522,28 @@ def _forget_mount_source_sweep_pacing(_floor_monkeypatch):
 
     _floor_monkeypatch.setattr(sandbox_mount_sweep, "_SWEEP_STATE", {}, raising=False)
     _floor_monkeypatch.setattr(sandbox_mount_sweep, "_SWEEP_CURSORS", {}, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _forget_registry_ssh_sign_in_refusals():
+    """Forget the store listing's remembered ssh sign-in refusals around each test.
+
+    ``registry_pipeline.manifests._SSH_SIGN_IN_REFUSED`` lives for the process, so a
+    refusal one test records would make a later test's ssh row at that destination
+    skip its fetch. Read from ``sys.modules`` so a test that never imports the
+    registry pays nothing. A module without the name is left alone: this autouse
+    reset must not error every test's setup on a tree without it (``prove.py``
+    reverts the production hunks and needs the tests' own assertions to run).
+    """
+    module = sys.modules.get("kiro_crew.apps.registry_pipeline.manifests")
+    refused = getattr(module, "_SSH_SIGN_IN_REFUSED", None)
+    if refused is not None:
+        refused.clear()
+    yield
+    module = sys.modules.get("kiro_crew.apps.registry_pipeline.manifests")
+    refused = getattr(module, "_SSH_SIGN_IN_REFUSED", None)
+    if refused is not None:
+        refused.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -469,6 +645,69 @@ def _fresh_aws_bin_dir_trust(_floor_monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _cold_vault_read_audit(_floor_monkeypatch):
+    """Start each test with the vault read audit's caches empty.
+
+    ``secrets.read_audit`` keeps two process globals: ``_loaded``, the switch it
+    read from ``config.json`` and reuses for ``CONFIG_TTL_SECS`` when there is no
+    live snapshot, and ``_seen``, the per-secret rate-limit windows. Every vault
+    read that returns a secret consults them, so a read in one test decided
+    whether a later test on the same worker loads config once or twice, and
+    whether its first read writes a row. Patched only when the module is already
+    imported, like the AWS bin-dir trust above.
+    """
+    audit = sys.modules.get("kiro_crew.secrets.read_audit")
+    if audit is not None:
+        _floor_monkeypatch.setattr(audit, "_loaded", None)
+        _floor_monkeypatch.setattr(audit, "_seen", {})
+
+
+@pytest.fixture(autouse=True)
+def _cold_source_link_settings(_floor_monkeypatch):
+    """Start each test with the source-link settings snapshot a fresh process holds.
+
+    ``dashboard.source_providers.hosts`` keeps the provider host allowlists and the
+    session-card chip switch as process globals, published by the config refresh and
+    by the ``/api/dashboard/config`` PUT. A test that drives that PUT with
+    ``session_card_source_links: false`` leaves the switch off, and every later
+    ``to_dict`` on the same worker reports no chips and a ``source_links_total`` of 0.
+    The generation counter is left alone: it only ever grows, and the per-slot link
+    cache keys on it. Patched only when the module is already imported, like the
+    vault read audit above.
+    """
+    hosts = sys.modules.get("kiro_crew.dashboard.source_providers.hosts")
+    if hosts is not None:
+        _floor_monkeypatch.setattr(hosts, "_session_card_chips_snapshot", True)
+        for name in (
+            "_gitlab_hosts_snapshot",
+            "_jira_hosts_snapshot",
+            "_github_hosts_snapshot",
+            "_bitbucket_server_hosts_snapshot",
+            "_gerrit_hosts_snapshot",
+        ):
+            _floor_monkeypatch.setattr(hosts, name, frozenset())
+        _floor_monkeypatch.setattr(hosts, "_gitlab_hosts_loaded_at", 0.0)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_hardlink_spec_warnings():
+    """Start each test with no hardlink refusal of an agent spec already warned about.
+
+    ``agent_discovery_parts.spec_reads._HARDLINK_WARNED`` holds the resolved paths
+    whose refusal this process logged at WARNING; a path an earlier test on the same
+    worker refused would turn this test's first WARNING into DEBUG. The facade and
+    its owner hold one set, so it is cleared in place. Only when already imported,
+    and read with ``getattr`` so a tree without the set (``prove.py``'s revert of the
+    fix) still runs its tests.
+    """
+    spec_reads = sys.modules.get("kiro_crew.agent_discovery_parts.spec_reads")
+    warned = getattr(spec_reads, "_HARDLINK_WARNED", None)
+    if warned is not None:
+        warned.clear()
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _reset_cjk_segmenter():
     """Forget session search's registered Chinese segmenter around each test.
 
@@ -489,6 +728,23 @@ def _reset_cjk_segmenter():
 
 
 @pytest.fixture(autouse=True)
+def _forget_app_turn_approver():
+    """Forget the gateway's app-turn approval prompt around each test.
+
+    ``agent_turn_sdk.set_turn_approver`` fills one process-global slot, and the
+    gateway boot fills it (``_init_task_runner``). A test that boots the gateway
+    would leave every later app turn in the worker asking that test's gateway.
+    """
+    module = sys.modules.get("kiro_crew.apps.agent_turn_sdk")
+    if module is not None:
+        module.set_turn_approver(None)
+    yield
+    module = sys.modules.get("kiro_crew.apps.agent_turn_sdk")
+    if module is not None:
+        module.set_turn_approver(None)
+
+
+@pytest.fixture(autouse=True)
 def _disable_dev_fleet_background_tasks(_floor_monkeypatch):
     """Stop dev-fleet's app-startup hook from starting its background loops.
 
@@ -501,6 +757,23 @@ def _disable_dev_fleet_background_tasks(_floor_monkeypatch):
     via ``monkeypatch.setattr(worktree_ops, "_background_tasks_disabled", lambda: False)``.
     """
     _floor_monkeypatch.setenv("KIROCREW_DEVFLEET_NO_BACKGROUND", "1")
+
+
+@pytest.fixture(autouse=True)
+def _fresh_dev_fleet_service_reads(_floor_monkeypatch):
+    """Start each test with no cached start identity and no in-flight service read.
+
+    ``dev_fleet.live_service`` keeps the health route's start-id cache and the two
+    in-flight tasks (start id, service probe) as process globals. A value one test
+    cached would answer the next test's ``/api/health`` inside the TTL, and a task
+    left in flight belongs to that test's closed event loop. Patched only when the
+    module is already imported, so a test that never loads Dev Fleet pays nothing.
+    """
+    live_service = sys.modules.get("kiro_crew.apps.builtins.dev_fleet.live_service")
+    if live_service is not None:
+        _floor_monkeypatch.setattr(live_service, "_GATEWAY_START_ID_CACHE", None)
+        _floor_monkeypatch.setattr(live_service, "_GATEWAY_START_ID_INFLIGHT", None)
+        _floor_monkeypatch.setattr(live_service, "_GATEWAY_SERVICE_INFLIGHT", None)
 
 
 @pytest.fixture(autouse=True)
@@ -613,6 +886,46 @@ def _history_cleanup_throttle_closed(_floor_monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_context_store_caches(_floor_monkeypatch):
+    """Keep the ``kiro_crew.context`` memory and lesson stores a test caches inside it.
+
+    ``ContextBuilder.__init__`` registers its own ``MemoryStore`` as the
+    process-wide default, and ``get_memory_for`` / ``get_lessons_for`` cache a
+    store per target. A test that builds a ``ContextBuilder`` (the eval runner
+    does, over a ``TemporaryDirectory`` it then deletes) therefore points every
+    later test's default-store writes at its own workspace: on a Windows shard a
+    change-card write re-created the deleted ``kirocrew_eval_*`` directory and
+    the temp-residue floor failed the run. Only a module already imported can
+    hold a cached store, so a run that never imports ``kiro_crew.context`` pays
+    nothing and is not made to import it.
+
+    Each test gets a COPY, so an entry a module- or class-scoped fixture made
+    before it is still there, and the undo puts the original back, dropping
+    whatever the test added.
+    """
+    context = sys.modules.get("kiro_crew.context")
+    if context is None:
+        return
+    _floor_monkeypatch.setattr(context, "_memory_stores", dict(context._memory_stores))
+    _floor_monkeypatch.setattr(context, "_lesson_stores", dict(context._lesson_stores))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_member_identity_cache(_floor_monkeypatch):
+    """Give each test an empty cache of passed member-database identity checks.
+
+    A kept answer is keyed on the file's path and stat, and tests reuse temporary
+    paths, so a passed check from one test must not answer for another's file.
+    Only an imported module can hold one, so a run that never imports it pays
+    nothing.
+    """
+    member_db = sys.modules.get("kiro_crew.vector_memory_member")
+    if member_db is None:
+        return
+    _floor_monkeypatch.setattr(member_db, "_IDENTITY_CACHE", {})
+
+
+@pytest.fixture(autouse=True)
 def _isolate_advertised_model_cache(_floor_monkeypatch):
     """Keep one session's advertised model spellings and labels inside its own test."""
     from kiro_crew import model_registry
@@ -620,6 +933,23 @@ def _isolate_advertised_model_cache(_floor_monkeypatch):
     _floor_monkeypatch.setattr(model_registry, "_ADVERTISED_MODELS", {})
     _floor_monkeypatch.setattr(model_registry, "_ADVERTISED_META", {})
     _floor_monkeypatch.setattr(model_registry, "_PENDING_ADVERTISED_SHRINK", {}, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_config_load_debug_memories(_floor_monkeypatch):
+    """Start each test with no config-load DEBUG line already logged.
+
+    ``model_registry._passthrough_logged`` and ``config.resolution._logged_extra_key_sets``
+    remember which unregistered ids and unmodelled key sets this process has logged, so
+    an earlier test on the same worker would silence this test's first line.
+    ``raising=False`` keeps a tree without the sets (``prove.py``'s revert of the fix)
+    running its tests.
+    """
+    from kiro_crew import model_registry
+    from kiro_crew.config import resolution
+
+    _floor_monkeypatch.setattr(model_registry, "_passthrough_logged", set(), raising=False)
+    _floor_monkeypatch.setattr(resolution, "_logged_extra_key_sets", set(), raising=False)
 
 
 @pytest.fixture(autouse=True)
@@ -730,6 +1060,59 @@ def _reset_live_execution_records():
         if execution is not None:
             execution._vouched_overflow_reported = False
             execution._vouched_overflow_count = 0
+
+    clear()
+    try:
+        yield
+    finally:
+        clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_subagent_not_due_memo():
+    """Start each test with no remembered not-yet-due runs from the tombstone sweep.
+
+    The memo is keyed by agent id and a tombstone's inode, size and mtime. Tests
+    reuse agent ids and temporary paths, so a verdict one test left could let the
+    next test's sweep skip a run it should evaluate.
+    """
+
+    def clear():
+        module = sys.modules.get("kiro_crew.subagent_persistence")
+        if module is not None:
+            module._NOT_DUE_MEMO.clear()
+
+    clear()
+    try:
+        yield
+    finally:
+        clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_resource_subscription_state():
+    """Start each test with no MCP resource-subscription state another test left.
+
+    A session whose store removal failed stays in ``_UNRETIRED``, and the next
+    service's start removes that key's records from its own store; a service left
+    in ``_ACTIVE`` answers ``retire_session`` for a later test. The late-close
+    sets and the daemon's live-connection table are process-wide the same way.
+    """
+    base = "kiro_crew.mcp_gateway."
+
+    def clear():
+        for module_name, name in (
+            ("resource_subscriptions", "_UNRETIRED"),
+            ("resource_subscriptions_retire", "_LATE_RETIRES"),
+            ("resource_subscriptions_budgets", "_LATE_HOLDER_CLOSES"),
+            ("daemon.session_describe", "_LIVE_CONNS"),
+        ):
+            module = sys.modules.get(base + module_name)
+            if module is not None:
+                getattr(module, name).clear()
+        retire = sys.modules.get(base + "resource_subscriptions_retire")
+        if retire is not None:
+            retire.set_active_service(None)
 
     clear()
     try:
@@ -1200,3 +1583,21 @@ def _reset_materialized_agents_snapshot():
         yield
     finally:
         clear()
+
+
+@pytest.fixture(autouse=True)
+def _published_redaction_verdict_on():
+    """Every test starts and ends with redaction published ON in this process.
+
+    The owner's setting defaults to OFF, so a test that boots the dashboard
+    (``seed_pushed_switch``) publishes OFF; left in place, every later output-seam
+    test in that xdist worker would read raw text. A test that wants OFF publishes
+    it itself.
+    """
+    seams = sys.modules.get("kiro_crew.redaction_seams")
+    if seams is not None:
+        seams.publish(False)
+    yield
+    seams = sys.modules.get("kiro_crew.redaction_seams")
+    if seams is not None:
+        seams.publish(False)

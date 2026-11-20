@@ -319,6 +319,32 @@ def _tool_definitions() -> list[dict[str, Any]]:
                             "define its own complete design in view.html."
                         ),
                     },
+                    "widgets": {
+                        "type": "array",
+                        "maxItems": 4,
+                        "items": {"type": "object"},
+                        "description": (
+                            "Optional phone home-screen widgets for this page, shown "
+                            "to the Bot's owner only. Leave it out to keep the stored "
+                            "widgets; pass [] to remove them. Up to 4 widgets, each "
+                            '`{"id", "title", "sizes", "blocks", "tap"}`: `id` is '
+                            "lowercase letters, digits and '-' (at most 32, unique, "
+                            "never `status`); `title` 1-40 characters; `sizes` a subset "
+                            "of `small`, `medium`, `large`; `tap` only "
+                            '`{"open": "bot"}` (the default); 1-6 `blocks`, most '
+                            "important first (small draws 2, medium 4). A block's "
+                            "`type` is `title` (`text` or `field`), `metric` (`label`, "
+                            "`field`, `format`, `unit`, `warn_at`, `bad_at`, "
+                            "`higher_is_worse`), `list` (`label`, `field`, `item_text`, "
+                            "`item_detail`, `max_items` 1-5), `progress` (`label`, "
+                            "`field`, `total` or `total_field`), `sparkline` (`label`, "
+                            "`field`, `point`, `max_points` 2-48) or `status` (`label`, "
+                            "`field`, `tones` mapping values to ok/warn/bad/idle). "
+                            "`field` names a field of this `model.types`; a widget "
+                            "holds no HTML and no values, and the phone shows every "
+                            "string as plain text. The dashboard skill has an example."
+                        ),
+                    },
                 },
                 "required": ["model", "view"],
             },
@@ -360,10 +386,7 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "argument. A preview is OPTIONAL, never a step before applying: use "
                 "it only when the person asks to look first. dashboard_apply with "
                 "the `template_id` puts it live. A page you composed yourself is "
-                "saved with dashboard_save, not previewed here. While the person has "
-                "locked the layout (your [DASHBOARD] block says LOCKED), you can "
-                "still preview a page for them to look at, but do not apply it: "
-                "ask them to unlock it first."
+                "saved with dashboard_save, not previewed here."
             ),
             "inputSchema": {
                 "type": "object",
@@ -389,9 +412,7 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "dashboard_templates to use a shipped or operator page, or pass "
                 "nothing to put live the page you saved with dashboard_save. Every "
                 "earlier version stays on disk, so dashboard_rollback goes back in "
-                "one call. Tell the person what you changed. Refused with "
-                "`dashboard_locked` while the page is locked (your [DASHBOARD] "
-                "block says LOCKED)."
+                "one call. Tell the person what you changed."
             ),
             "inputSchema": {
                 "type": "object",
@@ -417,9 +438,7 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "versions you can still reach; a version the store has dropped is "
                 "refused, so read that list rather than guessing. A rollback moves "
                 "FORWARD: restoring version 1 over version 2 writes version 3, so "
-                "nothing is lost and you can roll back again. Refused with "
-                "`dashboard_locked` while the page is locked (your [DASHBOARD] "
-                "block says LOCKED)."
+                "nothing is lost and you can roll back again."
             ),
             "inputSchema": {
                 "type": "object",
@@ -608,6 +627,16 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
                     "`view` and a `theme`, and all three are saved together"
                 )
             page[key] = part
+        # Optional fourth: forwarded only when sent, so a save without it keeps the
+        # stored widgets exactly as it did before widgets existed.
+        widgets = args.get("widgets")
+        if widgets is not None:
+            if not isinstance(widgets, list):
+                return (
+                    "Error: `widgets` must be a list of widgets -- leave it out to "
+                    "keep the stored ones, or pass [] to remove them"
+                )
+            page["widgets"] = widgets
         sk, err = _strict_session_key()
         if err:
             return err

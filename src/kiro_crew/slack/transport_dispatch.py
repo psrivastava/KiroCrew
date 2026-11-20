@@ -23,8 +23,8 @@ import re
 import time
 from typing import TYPE_CHECKING, Any, cast
 
-from kiro_crew import runtime_death
-from kiro_crew.agent_sdk.drivers.acp_vocab import is_user_worded_failure
+from kiro_crew import redaction_seams, runtime_death
+from kiro_crew.agent_sdk.drivers.acp_vocab import STOP_REASON_CANCELLED, is_user_worded_failure
 from kiro_crew.context import session_store_for_turn
 from kiro_crew.dashboard.chat_utils import (
     expire_slack_options,
@@ -49,11 +49,13 @@ from kiro_crew.messaging.dispatch import (
     driver_turn_landed,
     rearm_reinjection,
     rollback_skill_bodies,
+    session_stop_generation,
 )
 from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE, TurnDriver
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
 from kiro_crew.messaging.inbound_spool import InboundRoute, spool_refused_turn
 from kiro_crew.messaging.link import SLACK_NAMESPACE, canonical_key
+from kiro_crew.messaging.renderer import DONE, OutputEvent
 from kiro_crew.messaging.script_hooks import ScriptHookTurn
 from kiro_crew.messaging.turn_ceiling import TurnCeilingExceeded
 from kiro_crew.parent_turns import note_turn_landed
@@ -77,11 +79,13 @@ from kiro_crew.slack.handler import (
     _thread_agents,
     get_dashboard_state,
     get_orch_cfg,
+    is_shared_listed,
     is_slack_session_trusted,
     is_thread_temporary,
     maybe_apply_privacy_modifiers,
     maybe_handle_keyword_command,
     maybe_route_linked_thread,
+    shared_user_refused_for_session,
     track_background_task,
 )
 from kiro_crew.slack.renderer import PARTIAL_TURN_MARKER
@@ -89,6 +93,7 @@ from kiro_crew.slack.renderer import SlackApprovalDecider
 from kiro_crew.slack.renderer import SlackApprovalDecider as _APPROVAL_REGISTRY
 from kiro_crew.slack.renderer import SlackRenderer, _display_safe
 from kiro_crew.slack.script_hooks import runs_script_hooks
+from kiro_crew.slack.shared_access import SHARED_OWNER_ONLY_TEXT, shared_command_refused
 from kiro_crew.slack.thread_parent import (
     ThreadParent,
     fetch_thread_parent,
@@ -285,6 +290,7 @@ def flat_dm_session_key(channel: str, thread_ts: str | None, *, enabled: bool) -
     return f"{SLACK_NAMESPACE}:{channel}"
 
 
+@redaction_seams.in_seam(redaction_seams.CHANNELS)
 @fenced_turn
 async def handle_message_transport(
     slack: SlackClientOps,
@@ -312,6 +318,7 @@ async def handle_message_transport(
     start_priority: StartPriority = StartPriority.BACKGROUND,
     spool_text: str | None = None,
     spool_attachments: int = 0,
+    spool_attachment_names: tuple[str, ...] = (),
     had_voice_input: bool = False,
 ) -> None:
     """Drive a Slack message through the new transport path end-to-end.
@@ -319,8 +326,9 @@ async def handle_message_transport(
     ``start_priority``: as for ``handler.handle_message`` (rule:
     ``kiro_crew.start_priority``).
 
-    ``spool_text`` / ``spool_attachments``: as for ``handler.handle_message`` --
-    the pre-ingestion message the shutdown spool records instead of *text*.
+    ``spool_text`` / ``spool_attachments`` / ``spool_attachment_names``: as for
+    ``handler.handle_message`` -- the pre-ingestion message the shutdown spool
+    records instead of *text*, and the names of its files.
 
     ``had_voice_input``: as for ``handler.handle_message`` -- the message carried a
     transcribed voice memo, answered in kind under ``voice_reply.auto_reply_to_voice``.
@@ -465,6 +473,7 @@ async def handle_message_transport(
         thread_id=reply_ts,
         message_id=msg_ts,
         attachments_dropped=spool_attachments,
+        attachment_names=spool_attachment_names,
     )
     if not await admit_inbound_callback(
         sessions,
@@ -498,6 +507,20 @@ async def handle_message_transport(
     # Shared with native handle_message so a thread linked via
     # /kirocrew link-to-dashboard routes into its dashboard slot (with the same
     # auth recheck + bang fall-through) instead of spawning a fresh session.
+    # A shared user (slack.shared_access) sends no harness `/` command and no
+    # privacy modifier; refused before the linked-thread hand-off, as on native.
+    # Judged on what the user typed, not the ingested text (see handle_message).
+    if shared_command_refused(user_id, inbound_text):
+        sel().log_api_access(
+            caller=user_id,
+            operation="slack.owner_command",
+            outcome="denied",
+            source="slack",
+            resources=channel,
+            error="shared user command",
+        )
+        await slack.post_message(channel, SHARED_OWNER_ONLY_TEXT, reply_ts)
+        return
     if await maybe_route_linked_thread(text, session_key, user_id, channel, slack, reply_ts):
         return
 
@@ -524,7 +547,8 @@ async def handle_message_transport(
 
     # ── Quick shortcuts (no session needed) ──
     _lower = text.strip().lower()
-    if _lower == "status":
+    # Owner-only: the counts are the host's (slack.shared_access).
+    if _lower == "status" and not is_shared_listed(user_id):
         # Use the platform identity seam (native migrated to this) rather than
         # importing the OSS SSO stub directly — keeps the CPP boundary intact
         # and returns the real SSO line under the enterprise companion context.
@@ -641,6 +665,8 @@ async def handle_message_transport(
     # handling the original error.
     _logged_user_turn = False
     _stamped_turn = False
+    # Whether a re-projection left this turn holding the replay gap.
+    _reprojected = False
     # Post-compaction re-injection bookkeeping for the finally: whether this
     # turn consumed the one-shot flag, and whether it landed (recorded success).
     _needs_reinjection = False
@@ -665,7 +691,7 @@ async def handle_message_transport(
         # kiro-cli to warm up. on_turn_start is idempotent (the driver's later
         # call no-ops). ──
         decider = (
-            SlackApprovalDecider(session_key=session_key)
+            SlackApprovalDecider(session_key=session_key, requester=user_id)
             if approval_mode == APPROVAL_INTERACTIVE
             else None
         )
@@ -714,6 +740,10 @@ async def handle_message_transport(
                 raise
             if sessions.get_session_for_thread(reply_ts) == owner_before_memory:
                 break
+        # The owner may have linked this thread to a code channel's session since the
+        # linked-thread check ran: a shared user's turn never runs there.
+        if await shared_user_refused_for_session(user_id, session_key, reply_ts, channel):
+            return
         if decider is not None:
             # The decider was constructed with the pre-reroute key, and that key
             # is what maps a human's Trust click back to a session. Leaving it
@@ -753,16 +783,55 @@ async def handle_message_transport(
         _alloc: dict[str, Any] = (
             _channel_crew.allocation_kwargs() if _channel_crew else {"agent": _agent}
         )
-        client, is_new, resumed = await sessions.get_or_create(
-            session_key, channel_id=channel, start_priority=start_priority, **_alloc
+        # The claim token is minted inside the acquire, the instant get_or_create
+        # returns and before any await, so the fenced re-projection reads this
+        # turn's session and never a successor; the Stop count it carries cancels
+        # the turn before it streams.
+        from kiro_crew.agent_sdk.spec_hooks import (
+            acquire_with_token,
+            reproject_unattended_claim,
+            running_agent,
+        )
+
+        (client, is_new, resumed), _claim_token = await acquire_with_token(
+            sessions, session_key, channel_id=channel, start_priority=start_priority, **_alloc
         )
         _acquired = True
-        # Taken on acquisition: a Stop from here on cancels the turn before it streams.
+        _stop_gen_at_entry = _claim_token.stop_gen
         hook_turn = (
             ScriptHookTurn.stoppable(sessions, session_key, text)
             if runs_script_hooks(channel, user_id)
             else None
         )
+        # A KAS batch that auto-approves what a PreToolUse hook now covers is reset
+        # and claimed again under the replay gap, which the ``finally`` closes after
+        # the release.
+
+        async def _reclaim() -> tuple[tuple[Any, bool, bool], Any]:
+            got, tok = await acquire_with_token(
+                sessions, session_key, channel_id=channel, start_priority=start_priority, **_alloc
+            )
+            return got, tok.entry
+
+        _reprojection = await reproject_unattended_claim(
+            sessions,
+            session_key,
+            running_agent(client, _agent),
+            (client, is_new, resumed),
+            _reclaim,
+            _claim_token,
+        )
+        client, is_new, resumed = _reprojection.claimed
+        assert client is not None
+        _reprojected = _reprojection.reprojected
+        if _reprojection.superseded or (
+            _reprojection.reprojected
+            and session_stop_generation(sessions, session_key) != _stop_gen_at_entry
+        ):
+            # A Stop while the session was re-projected, or a hard Stop that
+            # replaced it with a successor another turn owns: nothing ran.
+            await renderer.dispatch(OutputEvent(kind=DONE, stop_reason=STOP_REASON_CANCELLED))
+            return
         # Authorize the outbound-image root, which only exists once the provider
         # does. Unauthorized, `_upload_root` stays empty and `_uploads_enabled()`
         # is permanently False, so the whole extract-and-upload path is dead while
@@ -1402,6 +1471,7 @@ async def handle_message_transport(
                     thread_id=reply_ts,
                     message_id=msg_ts,
                     attachments_dropped=spool_attachments,
+                    attachment_names=spool_attachment_names,
                 ),
             )
         with contextlib.suppress(Exception):
@@ -1531,10 +1601,12 @@ async def handle_message_transport(
             try:
                 await slack.post_message(channel, _transport_error_text(exc), post_thread_ts)
             except Exception:
+                # A failed error reply must not raise out of this handler.
                 pass
         try:
             await slack.set_thread_status(channel, reply_ts, "")
         except Exception:
+            # Clearing the thread status is cosmetic.
             pass
     finally:
         if _live is not None:
@@ -1590,6 +1662,11 @@ async def handle_message_transport(
         finally:
             if _acquired:
                 sessions.release(session_key)
+                if _reprojected:
+                    # After the release, as the shared pipeline closes its own.
+                    from kiro_crew.agent_sdk.spec_hooks import close_reprojection_gap
+
+                    close_reprojection_gap(sessions, session_key)
                 # The release is what ends the turn for an open dashboard tab
                 # bound to this thread (it reads the lease as the turn running),
                 # and a release raises no slots push of its own. Refresh once

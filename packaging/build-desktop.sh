@@ -46,6 +46,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# The backend bytecode steps (bytecode_coverage_gate, precompile_macos_backend).
+. "$ROOT/packaging/desktop-bytecode.sh"
+# The electron-builder call and its transient-failure retry
+# (run_electron_builder_with_retry).
+. "$ROOT/packaging/desktop-electron-builder.sh"
+
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 # Git Bash / MSYS on Windows reports MINGW64_NT-10.0-... / MSYS_NT-...;
 # normalize to "windows" so the branches below read naturally.
@@ -438,80 +444,6 @@ rm_rf_resilient() {
   done
 }
 
-# Invoke electron-builder. Split into its own function purely so a test can
-# shadow it with a stub -- CSC_IDENTITY_AUTO_DISCOVERY=false disables macOS
-# codesign identity auto-discovery for local/CI builds.
-_eb_invoke() {
-  CSC_IDENTITY_AUTO_DISCOVERY=false ./node_modules/.bin/electron-builder "$@"
-}
-
-# Run electron-builder (EB_ARGS as "$@"), retrying a bounded number of times
-# on two transient failure classes -- and still failing the build on anything
-# else, or once the retry budget is exhausted:
-#
-#   - macOS .DS_Store/ENOTEMPTY temp-dir race (electron-userland/electron-builder#6890):
-#     the universal build's lipo-merge stage removes dist/mac-universal-<arch>-temp
-#     dirs with a recursive fs.rm that has no retries of its own, and Desktop
-#     Services (Finder/Spotlight) can drop a fresh .DS_Store into one mid-removal.
-#   - transient network/TLS failures in electron-builder's OWN mid-build
-#     fetches: the AppImage and NSIS/Squirrel targets pull their own tooling
-#     through `got` AFTER the electron zip has already reported
-#     progress=100%. A dropped connection ("socket hang up"), a
-#     TLS-intercepted response ("self-signed certificate"), or an HTTP-level
-#     answer from the artifact CDN that is retryable rather than final
-#     ("Response code 504") aborts the whole build there. These are
-#     per-execution network events, not build errors -- the same commit
-#     passes on a plain re-run, and one matrix leg can fail while its
-#     siblings go green in the same attempt (#3088, #6795).
-#
-# Split out of the packaging step (rather than left inline) so the
-# retry/classification logic is testable in isolation, mirroring
-# rm_rf_resilient above: a test extracts this function's body, shadows
-# _eb_invoke with a stub that fails N times, and asserts the real retry/
-# classification logic here recovers (or correctly gives up).
-run_electron_builder_with_retry() {
-  local attempt=1 max_attempts=3 eb_log eb_transient eb_backoff
-  while : ; do
-    eb_log="$(mktemp "${TMPDIR:-/tmp}/kc-eb.XXXXXX")"
-    if _eb_invoke "$@" 2>&1 | tee "$eb_log"; then
-      rm -f "$eb_log"; return 0
-    fi
-    # Classify the failure before deciding: each transient class needs its
-    # own cleanup, and anything unrecognised must still abort on the first
-    # failure.
-    eb_transient=""
-    if grep -q "ENOTEMPTY" "$eb_log"; then
-      eb_transient="ds_store"
-    # Socket-level errno strings and HTTP-level statuses share ONE class
-    # because the class boundary here is cleanup, not protocol layer (see the
-    # header comment): both arise in the same `got` fetches, and both recover
-    # by simply re-fetching on the next attempt with nothing to sweep first.
-    # A 5xx is transient by definition and a 429 is a rate limit that clears;
-    # every OTHER 4xx (401/403/404/400) is a configuration or authorisation
-    # fault that would fail identically on all three attempts, so it stays
-    # unrecognised and still aborts on the first one.
-    elif grep -qE "socket hang up|self[- ]signed certificate|ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENOTFOUND" "$eb_log" \
-      || grep -qE "Response code (429|5[0-9][0-9])" "$eb_log"; then
-      eb_transient="network"
-    fi
-    if [ -n "$eb_transient" ] && [ "$attempt" -lt "$max_attempts" ]; then
-      if [ "$eb_transient" = "ds_store" ]; then
-        echo "  ⚠ macOS .DS_Store/ENOTEMPTY temp-dir race (attempt $attempt/$max_attempts); sweeping .DS_Store and retrying…" >&2
-        find dist -name .DS_Store -delete 2>/dev/null || true
-        rm -rf dist/*-temp 2>/dev/null || true
-        eb_backoff=2
-      else
-        echo "  ⚠ transient network/TLS/HTTP failure in an electron-builder fetch (attempt $attempt/$max_attempts); retrying…" >&2
-        eb_backoff=$((attempt * 10))
-      fi
-      rm -f "$eb_log"; attempt=$((attempt + 1)); sleep "$eb_backoff"; continue
-    fi
-    rm -f "$eb_log"
-    echo "❌ electron-builder failed (not a known transient class, or retries exhausted)." >&2
-    return 1
-  done
-}
-
 # --- 1. Frontend ------------------------------------------------------------
 if [ "${SKIP_FRONTEND:-0}" != "1" ]; then
   log "Building dashboard (npm)…"
@@ -615,6 +547,9 @@ build_backend() {
   # nothing to do with. The cloud transports go in unconditionally, then
   # the recogniser is attempted on its own. Codex remains opt-in and its media
   # packages load only when selected; a sealed bundle cannot pip-install later.
+  # A target without aiortc or PyAV wheels ships without Codex dictation instead
+  # of failing the build: the provider is experimental, and Settings reports the
+  # missing extra as `stt_codex_extra_missing`.
   #
   # `--only-binary pywhispercpp` (scoped to that one name, so kirocrew itself still
   # installs from this checkout) prevents a surprise CMake/C++ source build. Missing
@@ -624,10 +559,12 @@ build_backend() {
     "$out/bin/python3.12" -m pip install --prefer-binary \
     --no-warn-script-location --disable-pip-version-check \
     "$ROOT[voice-aws]"
-  env PYTHONNOUSERSITE=1 PYTHONPATH= KIROCREW_SKIP_FRONTEND=1 \
-    "$out/bin/python3.12" -m pip install --prefer-binary \
-    --no-warn-script-location --disable-pip-version-check \
-    "$ROOT[voice-codex]"
+  if ! env PYTHONNOUSERSITE=1 PYTHONPATH= KIROCREW_SKIP_FRONTEND=1 \
+      "$out/bin/python3.12" -m pip install --prefer-binary \
+      --no-warn-script-location --disable-pip-version-check \
+      "$ROOT[voice-codex]"; then
+    log "Codex dictation media packages did not install for ${OS}/${want_arch:-$HOST_ARCH}; this bundle ships without Codex dictation."
+  fi
   if ! env PYTHONNOUSERSITE=1 PYTHONPATH= KIROCREW_SKIP_FRONTEND=1 \
       "$out/bin/python3.12" -m pip install --prefer-binary \
       --only-binary pywhispercpp \
@@ -641,11 +578,9 @@ build_backend() {
     fi
   fi
 
-  # The Feishu channel SDK. Settings offers no install command for this bundle,
-  # and every app update replaces the whole bundle, so it ships here or not at all.
-  env PYTHONNOUSERSITE=1 PYTHONPATH= KIROCREW_SKIP_FRONTEND=1 \
-    "$out/bin/python3.12" -m pip install --prefer-binary \
-    --no-warn-script-location --disable-pip-version-check "$ROOT[feishu]"
+  # The Feishu channel SDK is NOT bundled: about 11,000 files per backend that
+  # most users never load. The app installs it into the data home when the owner
+  # presses Install in Settings (src/kiro_crew/sdk_extras.py).
 
   # Stage the dashboard dist into the package's static dir.
   sp="$out/lib/python3.12/site-packages"
@@ -703,6 +638,10 @@ unset PYTHONPATH PYTHONHOME
 exec "$DIR/python3.12" -s -P -m kiro_crew "$@"
 LAUNCH
   chmod +x "$out/bin/kirocrew"
+  # Every other pip console script in bin/ (httpx, tqdm, f2py, ...) names this
+  # build's absolute bin/python3.12, and env.py puts bin/ on every agent's PATH.
+  # Rewrite each header to start the interpreter beside it; before signing.
+  "$out/bin/python3.12" -B -s "$ROOT/packaging/relocate_posix_scripts.py" --root "$out"
 
   # Arch gate: the bundled interpreter must be the arch this tree claims to be
   # (a mismatch ships an app whose backend crashes at launch on the other arch).
@@ -742,72 +681,38 @@ LAUNCH
   # After pruning, so it validates what actually ships.
   stdlib_probe_gate "$out"
 
-  # Compile the WHOLE shipped tree as checked-hash pycs, then let the runtime
-  # forbid writing any.
+  # Ship hash-based bytecode beside the sources, never TIMESTAMP bytecode.
   #
-  # This is what keeps the signed .app's seal intact. codesign seals every file
-  # under Contents/, so bytecode written there after signing invalidates the
-  # signature and Gatekeeper refuses the app as "damaged" -- which is what
+  # The prune above deletes the TIMESTAMP pycs pip left behind, and deleting
+  # them is not squeamishness -- a timestamp pyc records the mtime of the source
+  # it was built from, `ditto` restamps sources at extraction, so every shipped
+  # timestamp pyc is guaranteed to look stale on the user's machine and be
+  # rewritten in place. On macOS that rewrite IS the corruption: codesign seals
+  # every file under Contents/, so bytecode written there after signing
+  # invalidates the signature and Gatekeeper refuses the app as "damaged" (what
   # managed Macs report, because their policy re-evaluates instead of reusing a
-  # cached accept verdict.
+  # cached accept verdict). CHECKED_HASH validates against contents, so an
+  # extraction-restamped source still matches.
   #
-  # Deliberately the whole tree, not the traced startup closure the Windows lane
-  # ships. The pipeline signs a COMPLETE bundle, so nothing on a user's machine
-  # has any business writing into it -- and a module left uncompiled is exactly
-  # what creates the reason to. Windows can afford the narrower closure because
-  # Authenticode seals no resource tree, so a later write there is harmless; on
-  # macOS an uncovered module is a latent signature break, so coverage has to be
-  # total rather than measured.
-  #
-  # The MODE is the other half. The prune above deletes the TIMESTAMP pycs pip
-  # left behind, and deleting them is not squeamishness -- a timestamp pyc
-  # records the mtime of the source it was built from, `ditto` restamps sources
-  # at extraction, so every shipped timestamp pyc is guaranteed to look stale on
-  # the user's machine and be rewritten in place. That rewrite IS the corruption.
-  # CHECKED_HASH validates against contents, so an extraction-restamped source
-  # still matches.
-  #
-  # `-q -f`: quiet, and force so nothing is skipped on a stale timestamp cache.
-  # A failure to compile one module must not fail the build -- compileall exits
-  # non-zero on a syntax error in any file it walks, including vendored samples
-  # that are not importable on this interpreter -- so the exit code is reported
-  # and tolerated while the coverage assertion below is what actually gates.
-  log "Precompiling the shipped tree as checked-hash pycs ($(basename "$out"))…"
-  env PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 PYTHONPATH= \
-    "$out/bin/python3.12" -s -m compileall -q -f \
-    --invalidation-mode checked-hash "$out/lib" \
-    || echo "    compileall reported errors (unimportable vendored samples are expected)"
-
-  # Coverage gate: the point of the exercise is that the runtime never needs to
-  # write, so a tree that shipped without caches would silently reintroduce the
-  # defect the moment PYTHONDONTWRITEBYTECODE is honoured.
-  "$out/bin/python3.12" -s - "$out/lib" <<'COVERAGE'
-import os, sys
-root = sys.argv[1]
-missing = []
-for dirpath, dirnames, filenames in os.walk(root):
-    if os.path.basename(dirpath) == "__pycache__":
-        continue
-    cache = os.path.join(dirpath, "__pycache__")
-    for name in filenames:
-        if not name.endswith(".py"):
-            continue
-        stem = name[:-3]
-        if not any(
-            f.startswith(stem + ".") and f.endswith(".pyc")
-            for f in (os.listdir(cache) if os.path.isdir(cache) else ())
-        ):
-            missing.append(os.path.join(dirpath, name))
-if missing:
-    print(f"    {len(missing)} module(s) shipped without a bytecode cache", file=sys.stderr)
-    for path in missing[:10]:
-        print(f"      {os.path.relpath(path, root)}", file=sys.stderr)
-    # A handful of unimportable vendored samples is tolerable; a wholesale miss
-    # means compileall did not run and every launch would want to write.
-    if len(missing) > 50:
-        print("ERROR: bytecode coverage is too low to forbid runtime writes", file=sys.stderr)
-        raise SystemExit(1)
-COVERAGE
+  # macOS ships caches for the standard library and the traced startup closure
+  # only, and bars the bundled interpreter from writing any other: see
+  # precompile_macos_backend. Linux keeps the whole tree compiled.
+  if [ "$OS" = "darwin" ]; then
+    precompile_macos_backend "$out"
+  else
+    # `-q -f`: quiet, and force so nothing is skipped on a stale timestamp
+    # cache. A failure to compile one module must not fail the build --
+    # compileall exits non-zero on a syntax error in any file it walks,
+    # including vendored samples that are not importable on this interpreter --
+    # so the exit code is reported and tolerated while the coverage gate is what
+    # actually gates.
+    log "Precompiling the shipped tree as checked-hash pycs ($(basename "$out"))…"
+    env PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 PYTHONPATH= \
+      "$out/bin/python3.12" -s -m compileall -q -f \
+      --invalidation-mode checked-hash "$out/lib" \
+      || echo "    compileall reported errors (unimportable vendored samples are expected)"
+    bytecode_coverage_gate "$out" "$out/lib" ""
+  fi
 
   echo "    $(basename "$out") size: $(du -sh "$out" 2>/dev/null | cut -f1)"
 }
@@ -859,11 +764,7 @@ build_backend_windows() {
     --only-binary pywhispercpp \
     --no-warn-script-location --disable-pip-version-check \
     "kirocrew[voice] @ $root_uri"
-  # The Feishu channel SDK, for the same reason as in build_backend.
-  env PYTHONNOUSERSITE=1 PYTHONPATH= KIROCREW_SKIP_FRONTEND=1 \
-    "$out/python.exe" -m pip install --prefer-binary \
-    --no-warn-script-location --disable-pip-version-check \
-    "kirocrew[feishu] @ $root_uri"
+  # The Feishu channel SDK is installed on first use, as in build_backend.
 
   sp="$out/Lib/site-packages"
   install_desktop_decoder "$out/python.exe" "$sp" ""
@@ -899,6 +800,10 @@ build_backend_windows() {
   # root like bin\, so "%~dp0..\python.exe" resolves the same interpreter.
   rm -f "$out/Scripts/kirocrew.exe" "$out/Scripts/kirocrew-script.py"
   printf '@echo off\r\nsetlocal\r\nset "PYTHONPATH="\r\nset "PYTHONHOME="\r\n"%%~dp0..\\python.exe" -s -P -m kiro_crew %%*\r\n' > "$out/Scripts/kirocrew.cmd"
+  # Every other pip console script in Scripts\ (httpx, pwcpp, tqdm, ...) has
+  # the same frozen shebang, and env.py puts Scripts\ on every agent's PATH.
+  # Turn each into a relocatable <name>.cmd; native uv.exe is left alone.
+  "$out/python.exe" -B -s "$ROOT/packaging/relocate_windows_scripts.py" --root "$out"
 
   log "Verifying self-containment ($(basename "$out"))…"
   PYTHONNOUSERSITE=1 "$out/python.exe" -s -P -m kiro_crew --version >/dev/null \
@@ -933,16 +838,24 @@ build_backend_windows() {
   # checked-hash pyc makes the loader read and hash each .py in ADDITION to the
   # .pyc, which measured 43.55 MB and 1639 extra cold file opens per boot -- a
   # median 12.5 s on a cold file cache. Both hash modes ignore mtime, which is
-  # the property this needs; only the re-read is dropped. The posix tree above
-  # stays checked-hash: it is a different mechanism (whole tree, codesigned) and
-  # does not show the symptom. lark_oapi is traced too: the Feishu channel
-  # imports its ~11k modules on the gateway loop, and compiling them there on
-  # the first start stalls that loop.
+  # the property this needs; only the re-read is dropped. The POSIX trees above
+  # are checked-hash: a codesigned macOS bundle and a Linux package, neither of
+  # which shows the symptom. The Feishu SDK is not in the bundle; its on-demand
+  # install compiles its own caches (sdk_extras.py).
   log "Precompiling Windows gateway startup modules ($(basename "$out"))…"
   env PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 PYTHONPATH= \
     "$out/python.exe" -s "$ROOT/packaging/precompile_windows.py" \
-    --root "$out" --module kiro_crew.cli_server --module lark_oapi
+    --root "$out" --module kiro_crew.cli_server
 
+  # An update moves every installed file into %TEMP% first, and a file whose
+  # moved path passes MAX_PATH abandons the update (the script states the
+  # arithmetic). A cache written just above may be that deep, so
+  # drop each over-budget cache (its module compiles from source instead) and
+  # fail the build on any other over-budget file. -B: measuring writes nothing.
+  log "Checking the Windows update path budget ($(basename "$out"))…"
+  "$out/python.exe" -B -I "$ROOT/packaging/check_windows_path_budget.py" \
+    --root "$out" --prefix 'resources\backend-dist\kirocrew-backend' --prune-caches \
+    || { echo "ERROR: the backend payload has a path over the Windows update budget" >&2; exit 1; }
   echo "    $(basename "$out") size: $(du -sh "$out" 2>/dev/null | cut -f1)"
 }
 
@@ -1111,7 +1024,7 @@ if [ -n "${KIROCREW_MANAGED_INSTALL_MARKER:-}" ]; then
     let parsed;
     try { parsed = JSON.parse(buf.toString("utf8")); } catch (e) { console.error(`marker is not JSON: ${e.message}`); process.exit(1); }
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) { console.error("marker must be a JSON object"); process.exit(1); }
-    const allowed = ["managedBy", "updateCommand", "checkCommand", "relaunchPath"];
+    const allowed = ["managedBy", "updateCommand", "checkCommand", "relaunchPath", "updatePrompts"];
     // The reader TRIMS each field and slices it to a cap (auto-update.js:
     // MANAGED_BY_MAX_CHARS / UPDATE_COMMAND_MAX_CHARS / CHECK_COMMAND_MAX_CHARS).
     // Validate the value the reader will actually see: a whitespace-only
@@ -1122,8 +1035,11 @@ if [ -n "${KIROCREW_MANAGED_INSTALL_MARKER:-}" ]; then
       if (!allowed.includes(k)) { console.error(`marker has unknown field "${k}" (allowed: ${allowed.join(", ")})`); process.exit(1); }
       if (typeof parsed[k] !== "string") { console.error(`marker field "${k}" must be a string`); process.exit(1); }
       if (parsed[k].trim() !== parsed[k]) { console.error(`marker field "${k}" has leading/trailing whitespace the reader would trim`); process.exit(1); }
-      if (parsed[k].length > caps[k]) { console.error(`marker field "${k}" is ${parsed[k].length} chars; the reader caps at ${caps[k]} and would truncate the command`); process.exit(1); }
+      if (k in caps && parsed[k].length > caps[k]) { console.error(`marker field "${k}" is ${parsed[k].length} chars; the reader caps at ${caps[k]} and would truncate the command`); process.exit(1); }
     }
+    // The reader honours one updatePrompts value and ignores any other, which
+    // would ship the core update dialogs beside the edition widget meant to own them.
+    if ("updatePrompts" in parsed && parsed.updatePrompts !== "edition") { console.error("marker field \"updatePrompts\" must be \"edition\", the only value the reader honours"); process.exit(1); }
     if (!parsed.updateCommand) { console.error("marker has no updateCommand: it would disable updates without offering any"); process.exit(1); }
     if (!parsed.checkCommand) { console.error("marker has updateCommand but no checkCommand: every managed-lane check will fail; no update will ever be offered"); process.exit(1); }
     // resolveRelaunchPath (auto-update.js) drops anything that is not absolute
@@ -1873,10 +1789,10 @@ log "Packaging desktop app (electron-builder, version: $KC_VERSION)…"
   rm_rf_resilient dist
 
   # Each electron-builder invocation below goes through
-  # run_electron_builder_with_retry (defined above, alongside rm_rf_resilient)
-  # so the macOS .DS_Store/ENOTEMPTY race AND transient network/TLS failures
-  # in electron-builder's own mid-build fetches are both retried, not just
-  # the former.
+  # run_electron_builder_with_retry (packaging/desktop-electron-builder.sh)
+  # so the macOS .DS_Store/ENOTEMPTY race, dmgbuild's "Resource busy" eject
+  # and transient network/TLS failures in electron-builder's own mid-build
+  # fetches are all retried.
   if [ "$OS" = "darwin" ]; then
     EB_ARGS+=( --mac )
     if [ "$UNIVERSAL" = "1" ]; then

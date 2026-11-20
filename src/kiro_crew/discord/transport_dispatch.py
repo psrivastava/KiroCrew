@@ -127,6 +127,7 @@ from kiro_crew.messaging.dispatch import (  # noqa: F401
     TurnRecord,
     Verdict,
     admit_inbound_callback,
+    inbound_permitted,
 )
 from kiro_crew.messaging.display_safety import redact_for_display  # noqa: F401
 from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE
@@ -227,7 +228,7 @@ _MAX_COLLAPSED_ATTACHMENTS = IngestLimits().max_attachments
 #: Commands that still run while this conversation owes the user a detach notice.
 #: Everything else targets a session or is a plain turn and must be refused until
 #: the user has been told — including a bare message, whose ``cmd`` is ``None``.
-_DETACH_EXEMPT_COMMANDS = frozenset({"new", "unlink", "sessions", "help", "status"})
+_DETACH_EXEMPT_COMMANDS = frozenset({"new", "unlink", "sessions", "bot", "help", "status"})
 
 #: Refusal for an option press whose provenance tag does not name the
 #: conversation's CURRENT target session (rebound, `!new`, or idle-rotated).
@@ -507,23 +508,6 @@ class DiscordDispatcher:
             MonitorDispatchResult.UNAVAILABLE if monitor_completion is not None else None
         )
         channel_id = msg.conversation_id
-        self._routing_checks[channel_id] = self._routing_checks.get(channel_id, 0) + 1
-        # Inbound channels-governance gate (off-loop). The startup gate only stops
-        # a transport from CONNECTING; a host-profile deny added after it connected
-        # would otherwise keep dispatching inbound messages until restart. Recheck
-        # per message so a runtime deny takes effect immediately — silently drop
-        # (no reply) on deny, matching how an unauthorized user is ignored.
-        try:
-            permitted = await channel_inbound_permitted("discord")
-        finally:
-            remaining = self._routing_checks[channel_id] - 1
-            if remaining:
-                self._routing_checks[channel_id] = remaining
-            else:
-                self._routing_checks.pop(channel_id)
-        if not permitted:
-            logger.info("discord inbound dropped: denied by channels governance policy")
-            return monitor_result
         user_id = msg.user_id
         thread_id = msg.thread_id or ""
         scope_id = self._scope_id(user_id, thread_id)
@@ -580,6 +564,45 @@ class DiscordDispatcher:
 
         # ── Command intercept (no LLM session needed) ──
         cmd = parse_command(text) if interpret_as_command and override_mode is None else None
+        self._routing_checks[channel_id] = self._routing_checks.get(channel_id, 0) + 1
+        # Inbound channels-governance gate (off-loop). The startup gate only stops
+        # a transport from CONNECTING; a host-profile deny added after it connected
+        # would otherwise keep dispatching inbound messages until restart. Recheck
+        # per message so a runtime deny takes effect immediately — silently drop
+        # (no reply) on deny, matching how an unauthorized user is ignored. Only a
+        # message this dispatcher acts on as a stop claims the pure-cancel
+        # exemption, so a halt stays reachable on a denied channel.
+        try:
+            permitted = await inbound_permitted("discord", text=text if cmd == "stop" else "")
+        finally:
+            remaining = self._routing_checks[channel_id] - 1
+            if remaining:
+                self._routing_checks[channel_id] = remaining
+            else:
+                self._routing_checks.pop(channel_id)
+        if not permitted:
+            return monitor_result
+        # A reply answering a bridged approval note is decided here and starts no
+        # turn; a re-entered drain was checked already, a stop is never an answer, and
+        # a message carrying a file is content for a turn, not an answer.
+        from kiro_crew.discord.bridge_reply import consume_bridged_reply
+
+        client = self.client
+        # The gateway wires the state on the session-resume controller; a
+        # register_channel_transport attachment comes first when there is one.
+        state = getattr(self, "dashboard_state", None) or getattr(
+            self._session_resume, "dashboard_state", None
+        )
+        if (
+            interpret_as_command
+            and cmd != "stop"
+            and await consume_bridged_reply(
+                state,
+                msg,
+                lambda note: client.send_message(channel_id, note),
+            )
+        ):
+            return monitor_result
         # `!compact` and `!stop` act on the resolved session, so after a binding was
         # destroyed they would compact or cancel the NATIVE DM session while the user
         # believes they drive the resumed one; deciding here makes that structural.
@@ -620,7 +643,7 @@ class DiscordDispatcher:
             self._conv.clear_awaiting(scope_id)
             await self._handle_compact(user_id, channel_id, thread_id, route.resumed_key)
             return monitor_result
-        if cmd == "sessions":
+        if cmd in ("sessions", "bot"):
             # DM-ONLY. The owner gate answers WHO may resume, not WHERE the
             # result may be shown: in an allow-listed guild thread the picker
             # would post private session TITLES and the bind would replay five
@@ -630,9 +653,18 @@ class DiscordDispatcher:
             if thread_id:
                 await self.client.send_message(
                     channel_id,
-                    "🔒 `!sessions` works only in a direct message — it lists and "
+                    f"🔒 `!{cmd}` works only in a direct message — it lists and "
                     "replays private conversations, so it will not post "
                     "them into a shared thread. DM me instead.",
+                )
+                return monitor_result
+            if cmd == "bot":
+                await self._session_resume.show_bot_picker(
+                    self.client,
+                    user_id,
+                    channel_id,
+                    query=parse_command_argument(text),
+                    native_key=self._session_key(user_id, thread_id),
                 )
                 return monitor_result
             await self._session_resume.show_picker(

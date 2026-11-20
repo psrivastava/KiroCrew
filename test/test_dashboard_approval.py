@@ -29,6 +29,7 @@ from dashboard_approval_helpers import (
     _set_stream,
 )
 from named_cases_helpers import named_cases
+from redaction_structured_cases import github_classic
 
 from kiro_crew.dashboard import chat_runner
 from kiro_crew.dashboard.chat import _run_chat
@@ -37,6 +38,7 @@ from kiro_crew.dashboard.state import (
     DashboardState,
     _ChatSlot,
     build_refusal_recovery_prompt,
+    row_mid,
 )
 from kiro_crew.dashboard.turn_dispatch import format_approval_no_budget_card
 from kiro_crew.hooks import HOOK_EVENT_PRE_TOOL_USE, ScriptHookResult, ToolHookResult
@@ -163,6 +165,20 @@ def _assert_block_reason_recovered(slot, client, reason: str) -> None:
         f"{[m.get('content', '')[:40] for m in slot.messages if m.get('role') == 'inject']}"
     )
     assert any(reason.lower() in recovery.lower() for recovery in recoveries)
+
+
+def _recovery_prompts(client) -> list[str]:
+    """The prompts the turns after the blocked one sent to the model.
+
+    The recovery continuation is the model's copy of the reason when the harness
+    has no mid-turn steer, so these are what the model reads.
+    """
+    return [str(call.args[0]) for call in client.stream.call_args_list[1:] if call.args]
+
+
+#: ``HOOK_DENY_REASON_MAX_CHARS``, written out so these tests still collect, and
+#: fail on their assertions, when the limit is missing.
+_DENY_REASON_LIMIT = 2000
 
 
 class TestRefusalRecovery:
@@ -687,6 +703,40 @@ class TestPreToolUseHookBlockRecovery:
 
         _assert_block_reason_recovered(slot, client, reason)
 
+    @pytest.mark.asyncio
+    async def test_a_multi_sentence_recovery_instruction_reaches_the_model_whole(self, tmp_path):
+        """A deny hook's instruction is often longer than a sentence; none of it is lost."""
+        reason = "Write the plan file before editing. " + "x" * 450 + " END"
+        state, client = _make_state(
+            tmp_path,
+            context_builder=_context_builder(),
+            hook_store=_blocking_hook_store(reason),
+        )
+        slot = _make_slot()
+
+        await _drive_hook_blocked_turn(state, client, slot)
+
+        _assert_block_reason_recovered(slot, client, reason)
+        assert any(reason in prompt for prompt in _recovery_prompts(client))
+
+    @pytest.mark.asyncio
+    async def test_a_deny_reason_past_the_limit_reaches_the_model_cut_at_its_head(self, tmp_path):
+        """The bound holds: the head up to the limit arrives, nothing after it."""
+        head = "a" * _DENY_REASON_LIMIT
+        state, client = _make_state(
+            tmp_path,
+            context_builder=_context_builder(),
+            hook_store=_blocking_hook_store(head + "TAIL-PAST-THE-LIMIT"),
+        )
+        slot = _make_slot()
+
+        await _drive_hook_blocked_turn(state, client, slot)
+
+        _assert_block_reason_recovered(slot, client, head)
+        prompts = _recovery_prompts(client)
+        assert any(head in prompt for prompt in prompts)
+        assert not any("TAIL-PAST-THE-LIMIT" in prompt for prompt in prompts)
+
     def test_every_hook_deny_path_routes_through_the_shared_helper(self) -> None:
         """A fifth permission path must not be able to deny without recording the reason.
 
@@ -723,14 +773,12 @@ class TestPreToolUseHookBlockRecovery:
         ``event.title`` is LLM-controlled (``_select_tool_title``) and must be redacted
         (``_safe_reject_title``) before the broadcast, persisted row and the audit.
         """
-        # Assembled at runtime, never written as one literal: the redactor only
+        # Built at runtime, never written as one literal: the redactor only
         # fires on credential-SHAPED input (a plain sentinel passes through
-        # untouched, so this test would prove nothing), but a real key shape
-        # sitting in the source trips the source-text scanners --
-        # internal-content-scan and Semgrep's
-        # `detected-aws-access-key-id-value`. Splitting satisfies both, and
-        # matches the existing sentinels in code_review_sage's tests.
-        secret = "AKIA" + "1234567890ABCDEF"
+        # untouched, so this test would prove nothing), but a real token shape
+        # sitting in the source trips the source-text scanners. A GitHub token
+        # with a valid checksum is redacted; an AWS key ID would stay visible.
+        secret = github_classic(seed=11)
         state, client = _make_state(
             tmp_path,
             context_builder=_context_builder(),
@@ -874,10 +922,10 @@ class TestDenyRowTitleRedaction:
     Triggers: a title over ``MAX_TOOL_NAME_LEN``, and a PreToolUse hook that raises.
     """
 
-    # Assembled at runtime, never as one literal: the redactor only fires on
-    # credential-SHAPED input, and a real key shape in the source trips the
-    # source-text scanners (internal-content-scan, Semgrep).
-    _SECRET = "AKIA" + "1234567890ABCDEF"
+    # Built at runtime, never as one literal: the redactor only fires on
+    # credential-SHAPED input, and a real token shape in the source trips the
+    # source-text scanners. A GitHub token with a valid checksum is redacted.
+    _SECRET = github_classic(seed=12)
 
     def _invalid_title(self) -> str:
         # Over MAX_TOOL_NAME_LEN with is_shell False, so _validate_tool_name
@@ -1043,7 +1091,10 @@ class TestDenyRowTitleRedaction:
             ]
             if turn_file.name != "__init__.py"
         )
-        assert source.count("🚫 {event.title}") == 0, (
+        assert (
+            source.count("🚫 {event.title}") == 0
+            and source.count('"refused", f"{event.title}') == 0
+        ), (
             "a transcript row interpolates the raw model-authored title -- "
             "route the deny through _reject_invalid_tool/_reject_hook_error"
         )
@@ -1052,8 +1103,8 @@ class TestDenyRowTitleRedaction:
             "(reuse an in-scope redacted variable or _redact_display_text)"
         )
         # Each deny shape is rendered in exactly one place — its helper.
-        assert source.count('f"🚫 {title} (invalid: {error})"') == 1
-        assert source.count('f"🚫 {title} (hook error)"') == 1
+        assert source.count('tool_row("refused", f"{title} (invalid: {error})")') == 1
+        assert source.count('tool_row("refused", f"{title} (hook error)")') == 1
 
 
 # ── Long read titles carrying a canonical identity ──
@@ -1217,6 +1268,7 @@ class TestHostPreDeclinedRowIsBornResolved:
         # the Slack card's durable-Trust proof must be readable off that same
         # row (``_linked_trust_grantable``).
         seen_at_post: dict[str, object] = {}
+        passed: dict[str, asyncio.Future] = {}
 
         async def _mirror(_slack, _chan, _ts, request_id, *_a, **_k):
             await asyncio.sleep(0.01)
@@ -1225,6 +1277,10 @@ class TestHostPreDeclinedRowIsBornResolved:
             )
             seen_at_post["frames"] = len(self._permission_frames(timeline))
             seen_at_post["pending_pushed"] = ("push", True) in timeline
+            # The card a click settles is this slot's own request, not any one
+            # holding the same id.
+            seen_at_post["slot_key"] = _k["slot_key"]
+            passed["future"] = _k["future"]
             if failure == "delivery-raises":
                 raise RuntimeError("slack down")
             return None
@@ -1234,11 +1290,19 @@ class TestHostPreDeclinedRowIsBornResolved:
             await _run_chat(state, slot, "hello")
 
         mirror.assert_awaited_once()
-        assert seen_at_post == {"proof": "1", "frames": 1, "pending_pushed": True}, (
+        assert seen_at_post == {
+            "proof": "1",
+            "frames": 1,
+            "pending_pushed": True,
+            "slot_key": slot.key,
+        }, (
             "while the Slack post was in flight the dashboard must already hold the "
             "row (one frame out), the Board its pending state, and the mirror its "
-            "Trust proof"
+            "Trust proof and the slot that asked"
         )
+        # The future handed to the mirror is the one the turn parked on: the
+        # failed delivery declined it.
+        assert passed["future"].result() == "rejected"
         (frame,) = self._permission_frames(timeline)
         assert frame["request_id"] == "req-1"
         # The accepted residual: the frame went out before the delivery outcome
@@ -1250,7 +1314,15 @@ class TestHostPreDeclinedRowIsBornResolved:
             for i, t in enumerate(timeline)
             if t[:2] == ("ws", "approval_resolved") and t[2].get("id") == "req-1"
         )
-        assert timeline[retire_at][2] == {"id": "req-1", "approved": False, "slot": slot.key}
+        (permission_row,) = [m for m in slot.messages if m.get("role") == "permission"]
+        assert timeline[retire_at][2] == {
+            "id": "req-1",
+            "approved": False,
+            "slot": slot.key,
+            # The runner's own request, named by the row it wrote.
+            "origin": "native",
+            "mid": row_mid(permission_row),
+        }
         denied_at = next(i for i, t in enumerate(timeline) if t[:2] == ("row", "tool"))
         assert retire_at < denied_at, (
             "the failed post did not retire the card before the turn moved on to "
@@ -1317,9 +1389,10 @@ class TestHostPreDeclinedRowIsBornResolved:
             m.get("role") == "error" and m.get("content") == no_budget_card for m in slot.messages
         ), "the no-budget card was rendered for a prompt the user had already approved"
         retire = [t for t in timeline if t[:2] == ("ws", "approval_resolved")]
-        assert retire == [
-            ("ws", "approval_resolved", {"id": "req-1", "approved": True, "slot": slot.key})
-        ]
+        (row,) = [m for m in slot.messages if m.get("role") == "permission"]
+        # The runner's own request, named by the row it wrote.
+        resolved = {"id": "req-1", "approved": True, "slot": slot.key, "origin": "native"}
+        assert retire == [("ws", "approval_resolved", {**resolved, "mid": row_mid(row)})]
         (stored,) = [m for m in slot.messages if m.get("role") == "permission"]
         assert json.loads(stored["cls"])["resolved"] == "approved"
         # The posted Slack card is cleaned up now that the decision is in.
@@ -1368,9 +1441,10 @@ class TestHostPreDeclinedRowIsBornResolved:
         client.approve_tool.assert_awaited_once_with("req-1")
         client.reject_tool.assert_not_awaited()
         retire = [t for t in timeline if t[:2] == ("ws", "approval_resolved")]
-        assert retire == [
-            ("ws", "approval_resolved", {"id": "req-1", "approved": True, "slot": slot.key})
-        ]
+        (row,) = [m for m in slot.messages if m.get("role") == "permission"]
+        # The runner's own request, named by the row it wrote.
+        resolved = {"id": "req-1", "approved": True, "slot": slot.key, "origin": "native"}
+        assert retire == [("ws", "approval_resolved", {**resolved, "mid": row_mid(row)})]
         (stored,) = [m for m in slot.messages if m.get("role") == "permission"]
         assert json.loads(stored["cls"])["resolved"] == "approved"
         # Nothing was posted, so nothing is cleaned up on the Slack side.

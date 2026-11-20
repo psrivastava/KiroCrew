@@ -245,6 +245,44 @@ def bots_may_run_on_kas(config: Any) -> bool:
     return False
 
 
+def kas_runs_here(config: Any) -> bool:
+    """Whether a session here runs on KAS, and so signs in with the Kiro sign-in. In memory.
+
+    The main harness, the Bot harness as loaded once some Bot has no pin and so
+    inherits it (an inherited Kiro CLI and a stored ``kiro`` both load as KAS), a
+    Bot pin that runs on KAS (a KAS pin, or one to a
+    harness Bots cannot run on), or a Bot with no pin whose worker spec moves it
+    onto KAS (:func:`worker_spec_forces_kas`, the held answer on the event loop).
+    Unlike :func:`bots_may_run_on_kas`, an inherited Bot harness alone is not
+    enough: the dashboard shows the Kiro sign-in on this answer, and a gateway
+    where nothing runs on KAS has no use for it. A ``spawn_run(backend=...)``
+    override is a per-spawn choice, not config, so it is not read here.
+    """
+    kas = _backends.ACP_BACKEND_KAS
+    if kas not in _backends.selectable_backends():
+        # A Bot pinned to a harness Bots cannot run on lands on the floor instead.
+        return False
+    agent = getattr(config, "agent", None)
+    if getattr(agent, "acp_backend", "") == kas:
+        return True
+    # The Bot harness is only a harness something runs on once a Bot inherits it:
+    # it loads as KAS on a Kiro CLI gateway with no Bots at all.
+    bots_inherit_kas = getattr(agent, "member_acp_backend", "") == kas
+    for crew in list(getattr(config, "agents", {}) or {}):
+        pin = crewmate_pin_for(config, str(crew))
+        if pin is None:
+            if bots_inherit_kas or worker_spec_forces_kas(config, str(crew)):
+                return True
+            continue
+        try:
+            runtime = pin.resolve()
+        except CrewmateHarnessUnavailable:
+            continue
+        if runtime == kas or bots_cannot_run_on(runtime):
+            return True
+    return False
+
+
 def _note_pin_fallback(crew: str, pinned: str, landed: str) -> None:
     """Say once per process per Bot and harness where its pin runs instead (H3, H17)."""
     with _VERDICT_LOCK:
@@ -706,6 +744,29 @@ def _note_worker_spec_fallback(crew: str, inherited: str, fields: tuple[str, ...
     )
 
 
+#: ``(Bot, model)`` pairs whose unread own-file model was logged in this process.
+_file_model_logged: set[tuple[str, str]] = set()
+
+
+def note_unread_file_model(bot: str, file_id: str, model: str) -> None:
+    """Say once per process per Bot and value that its own file's ``model`` is not read.
+
+    No session reads that key on any backend (``rfc-mate-owned-agent-config`` §5),
+    so a model named there would otherwise never run without a word.
+    """
+    with _VERDICT_LOCK:
+        if (bot, model) in _file_model_logged:
+            return
+        _file_model_logged.add((bot, model))
+    logger.warning(
+        "Bot %r: its own file %r sets model %r, which is not read; its chat runs on "
+        "its Model setting and its workers on its Worker model setting. Set the model there.",
+        bot,
+        file_id,
+        model,
+    )
+
+
 def selectable_harnesses() -> list[str]:
     """Every harness a crewmate may be pinned to, in the stored spelling, sorted."""
     return sorted(_backends.backend_to_stored(b) for b in _backends.selectable_backends())
@@ -753,7 +814,7 @@ def crewmate_harnesses(config: Any) -> list[str]:
     The one list the harness picker offers and a save accepts: selectable on this
     gateway now (``selectable_backends()``, which the ``agent_backend`` governance
     scope already narrows), able to start here, AND crewmate-capable
-    (:data:`CREWMATE_CAPABLE_BACKENDS`: KAS, Claude Code, Codex today; never pi or
+    (:data:`CREWMATE_CAPABLE_BACKENDS`: KAS, Claude Code, Codex and Pi today; never
     deepseek), judged on the runtime the pin starts on.
     So a Kiro CLI pin counts as KAS where kiro-cli's v3 engine takes it, and as
     kiro-cli, which is not crewmate-capable, everywhere else.

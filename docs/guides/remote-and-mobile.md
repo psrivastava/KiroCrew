@@ -72,9 +72,12 @@ git config --global user.email "you@example.com"
 
 ### Install the agent backend
 
-Kiro Crew drives the `kiro-cli` agent over ACP, and it is the only provider
-(`agent.provider = acp`). Install `kiro-cli` per its own docs, put it on your
-`PATH`, and log in:
+Kiro Crew drives its agent over ACP (`agent.provider = acp` is the only
+provider). The default harness is KAS, `kiro-cli`'s own agent engine;
+`agent.acp_backend` selects another one (see
+[local-and-hosted-models.md](local-and-hosted-models.md) and
+[custom-llm-backend.md](custom-llm-backend.md)). Install `kiro-cli` per its own
+docs, put it on your `PATH`, and log in:
 
 ```bash
 kiro-cli login
@@ -83,8 +86,8 @@ kiro-cli login
 The credentials Kiro Crew itself reads from `~/.kiro/crew/.env` are chat-platform
 and owner-identity credentials (`SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`,
 `KIROCREW_OWNER_ID`, and the equivalents for Discord / Telegram / Teams / WeCom
-/ Webex). There is no model API key to configure: `kiro-cli` owns the model
-credential, and `kiro-cli login` is where it is set.
+/ Webex). On the default harness there is no model API key to configure:
+`kiro-cli` owns the model credential, and `kiro-cli login` is where it is set.
 
 Two channels do not travel to an arbitrary remote host. **iMessage** needs the
 gateway on a Mac running macOS 14 or newer, with Full Disk Access and Automation
@@ -286,11 +289,14 @@ Works on macOS, Linux, and Windows (OpenSSH ships with Windows 10+; the config
 file is at `%USERPROFILE%\.ssh\config`).
 
 A hand-rolled tunnel dies whenever the laptop sleeps. The desktop app can hold
-it for you instead: tick **Keep an SSH tunnel to this crew open** in the
-**Add/Edit Remote Crew** form the "no gateway is answering" dialog opens, or in
-**Set Remote Host…** on the app's own launch tab (where you can also turn it off
-later), and the app keeps the forward up and rebuilds it after sleep
-(macOS and Linux; see `website/electron/README.md`).
+it for you instead: **Keep an SSH tunnel to this crew open** starts ticked when
+you add a crew in the **Add/Edit Remote Crew** form the "no gateway is answering"
+dialog opens, or in **Set Remote Host…** on the app's own launch tab (where you
+can also turn it off later), and the app keeps the forward up and rebuilds it
+after sleep (macOS and Linux; see `website/electron/README.md`). With the local
+gateway off, the app also opens it for a crew saved unticked when nothing else
+answers or listens on that port at launch, until you quit or save the crew
+unticked again.
 
 If your browser reaches the dashboard on a *different* local port than the
 remote one (`ssh -L 8777:localhost:5476`), the browser sends Origin
@@ -308,7 +314,9 @@ The pane's error then says it cannot reach the port and names it. It also gives
 one `ssh -L` line that forwards every crew's pane port, each with the same
 number on both sides. Run it beside your dashboard forward, with your gateway
 host in place of `<gateway-host>`, or open the dashboard on the gateway host
-itself.
+itself. The desktop app does this for you when it holds the tunnel (**Keep an SSH
+tunnel to this crew open**, above): it forwards each pane's port as the pane
+opens, and again after Retry moves it.
 
 ### Named HTTPS tunnel (phone)
 
@@ -378,8 +386,7 @@ the same and the difference is the whole security story:
   identity-bound restart persistence without asking you to hand-edit an
   allowlist.
   `kirocrew tailnet up` runs `tailscale serve` for you — HTTPS on 443 in front of
-  the dashboard's loopback port — and prints the URL to open on your phone. That is
-  the half that used to be an undocumented command you had to know and type.
+  the dashboard's loopback port — and prints the URL to open on your phone.
 
   The URL `tailnet up` prints carries **no session**, so opening it alone lands on a
   login you cannot complete from the phone. `kirocrew token` is the step that hands you
@@ -487,9 +494,10 @@ the same and the difference is the whole security story:
   }
   ```
   `allowed_logins` is mandatory — `trust_identity` with an empty list is refused
-  at startup, and a verified peer who is not allowed is denied. Who is allowed
-  comes from the Shared Crew access set (you, accepted invites and approvals;
-  see [Share one Crew with teammates](#share-one-crew-with-teammates)); this list
+  at startup (identity trust stays off and the error is logged), and a verified
+  peer who is not allowed is denied. Under the Shared Crew preview, who is
+  allowed comes from the Shared Crew access set (you and accepted invites; see
+  [Share one Crew with teammates](#share-one-crew-with-teammates)), and this list
   is read once, at the first start, as its starting point. The
   identity is resolved from the local `tailscale whois` daemon, never from a
   header. When identity cannot be resolved (daemon stopped, Tailscale absent,
@@ -643,6 +651,13 @@ In the Chat composer, tap `+` to open the device's native Files picker and
 attach an image or a regular file. This direct touch path does not open the
 desktop-style command menu first.
 
+On a phone, Return starts a new line in the chat composers (the Chat page, a
+mate's chat, the side panel), in a mate thread reply and in Edit & Resend.
+Tap Send to send. A phone's on-screen keyboard has no Shift+Return, so a
+Return that sent would leave no way to write a second line. On a tablet or a
+desktop, **Settings → Chat → Composer → Send shortcut** decides what Return
+does.
+
 ### Session duration
 
 Three clocks. The first two are signed into the access token payload
@@ -741,6 +756,16 @@ on the gateway host itself.
 **On iOS Safari**, open the dashboard, tap Share → *Add to Home Screen*, then
 launch from the new icon. The manifest's `"display": "standalone"` is what drops
 Safari's address bar.
+
+**The installed app can reopen the last page it showed.** iOS opens the
+manifest's `/`, not the page you added, so the app opens at Sessions. To change
+that on one device, turn on **Settings > Display > Reopen where I left off**.
+The switch is off by default and shows only in the installed app. With it on, a
+launch at `/` replaces it with the last dashboard page the app was on on that
+device, such as one crewmate's chat. A link or notification that names a page
+still opens that page. Only same-origin dashboard pages are reopened, and
+parameters that look like credentials are never stored. A normal browser tab
+always opens the URL you typed.
 
 **The service worker provides a limited offline shell.**
 [`website/public/sw.js`](../../website/public/sw.js) caches exactly `/` and
@@ -919,7 +944,7 @@ the stock root dashboard. A value with a scheme, a host, a query, or a `.`/`..`
 segment stops the build.
 
 The proxy strips the prefix before forwarding, relays cookies, and rewrites
-`Location` headers on redirects. It no longer needs to rewrite the JavaScript.
+`Location` headers on redirects. It does not need to rewrite the JavaScript.
 
 ---
 
@@ -938,13 +963,12 @@ shows a plain link to share:
 http://<this-machine>.<your-tailnet>.ts.net:<port>/
 ```
 
-The link carries no token. Tailscale tells the gateway who is connecting. By
-default (`dashboard.shared_crew.local_authorization` is `false`), any verified,
-untagged person whom the Tailscale access rules let reach this machine can open
-the Crew, even without a Crew invite. Tailscale decides who gets in: Crew has no
-waiting list and nothing to approve. Manage who can connect through Tailscale's
-users and access rules. Settings > People names each person by their Tailscale
-account under **Seen in this Crew**.
+The link carries no token. Tailscale tells the gateway who is connecting. Any
+verified, untagged person whom the Tailscale access rules let reach this machine
+can open the Crew, even without a Crew invite. Tailscale decides who gets in:
+Crew has no waiting list and nothing to approve. Manage who can connect through
+Tailscale's users and access rules. Settings > People names each person by their
+Tailscale account in its **People** list.
 The machine's own Tailscale account has owner rights, including settings,
 the API key and invites; irreversible actions still require confirmation.
 
@@ -966,7 +990,7 @@ The easiest way to add a teammate is to invite them from Crew:
    an **API access key**. An OAuth client will not work: Tailscale only lets a
    user's own key create share invites. The key expires (you choose 1 to 90 days);
    Crew warns a week before.
-2. In Crew, open **Settings > People > Invite over Tailscale**, paste the key and
+2. In Crew, open **Settings > People**, select **Invite…**, paste the key and
    select **Connect**. Crew stores it in its protected vault and never shows it
    again. **Remove key** deletes it.
 3. Type one or more email addresses and select **Send invite**, or switch to
@@ -1214,8 +1238,10 @@ kirocrew service uninstall   # remove the unit / plist
 ```
 
 **Sudo scope on Linux:** the install shells out to `sudo install` (to place the
-unit as root-owned `0644`) and `sudo systemctl` (daemon-reload, enable,
-restart). No kirocrew, MCP, or LLM code path runs under sudo. Once started the
+unit as root-owned `0644`), `sudo systemctl` (daemon-reload, enable,
+restart) and, unless linger is already on or the host has no per-user
+manager, `sudo loginctl enable-linger` for your account. No kirocrew, MCP, or
+LLM code path runs under sudo. Once started the
 gateway runs as `User=$USER Group=$(id -gn)`, not root. The unit also caps
 crash-looping with `StartLimitBurst=3` / `StartLimitIntervalSec=300` and pins
 `LimitNOFILE=65536`, because a stock 1024 FD limit fails the frontend

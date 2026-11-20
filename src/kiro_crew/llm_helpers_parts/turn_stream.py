@@ -31,7 +31,9 @@ from kiro_crew.agent_sdk.drivers.acp_turn_vocab import (
 from kiro_crew.agent_sdk.drivers.acp_vocab import (
     STOP_REASON_STALE_RECOVER,
     STOP_REASON_TIMEOUT,
+    STOP_RECOVERY_MAX_RETRIES,
     AcpTimeoutError,
+    timed_out_continuation,
 )
 from kiro_crew.hooks import fire_tool_hooks, get_global_hook_store, unattended_turn
 from kiro_crew.llm_helpers_parts.backend_errors import (
@@ -101,6 +103,11 @@ def unfinished_turn_error(event: LLMEvent, partial_output: str) -> AcpTimeoutErr
     return error
 
 
+def _join_continued(before: str, after: str) -> str:
+    """A timed-out prompt's text and its continuation's, as one reply."""
+    return f"{before}\n\n{after}" if before and after else before + after
+
+
 async def stream_and_collect(
     provider: LLMProvider,
     message: str,
@@ -118,6 +125,7 @@ async def stream_and_collect(
     session_key: str = "",
     agent: str = "",
     app: str = "",
+    app_run: tuple[str, str] = ("", ""),
     unattended: bool = False,
     model_fallback: bool = False,
     fallback_models: Sequence[str] = (),
@@ -130,6 +138,13 @@ async def stream_and_collect(
 
     This is the core pattern used by cron, heartbeat, subagent, consolidator,
     taskrunner, and title generation.
+
+    A prompt that ends because a call's own silence timer ran out is not the turn's
+    end: the model has not heard that the call timed out. The same session is sent
+    the timed-out continuation (``acp.timed_out_continuation``), at most
+    ``STOP_RECOVERY_MAX_RETRIES`` times, and the turn goes on. Its text follows the
+    stalled prompt's, its billing is summed with it, and ``on_complete`` sees only
+    the completion the turn ends on.
 
     Args:
         provider: The LLM provider to stream through.
@@ -186,6 +201,10 @@ async def stream_and_collect(
         agent: Calling agent name, forwarded to the gate alongside *session_key*.
         app: Owning app name, forwarded to the gate so the app's governance
             PROFILE is resolved — not just the enterprise ceiling.
+        app_run: ``(app, agent)`` of an unattended run with no slot: the app the
+            gateway stamped on it and the agent that ran it, read by the gate's
+            ``app-own-tools`` grant alone (``ToolCall.app_run``). Never a
+            governance input.
 
             All three matter for ``AUTO_APPROVE``, ``HOOK_BASED``, and
             ``READ_ONLY`` callers. The gate resolves ``ceiling ∩ profile``, and
@@ -261,8 +280,16 @@ async def stream_and_collect(
     # Accumulates across attempts, so it lives OUTSIDE the retry loop: a turn that
     # was billed and then retried must report the sum, not the last attempt.
     turn_billed = TurnUsage()
+    # The timed-out continuations this turn has sent, the text of the prompts they
+    # followed, and the continuation the next pass sends instead of the message.
+    timed_out_sent = 0
+    continued_text = ""
+    continuation = ""
     while True:
         result_text = ""
+        # Set when this prompt ended on a call's silence timer and the turn goes
+        # on with the continuation: unlike a retry, what it did stands.
+        continuing = False
         tool_call_count = 0
         # Consumption is committed on every exit EXCEPT a retry. A retry re-sends the
         # original message without the steer, so committing there would mark a steer
@@ -289,13 +316,17 @@ async def stream_and_collect(
         # baseline an attempt that was billed and then failed is invisible.
         attempt_stats_before = _billing_stats(provider)
         try:
-            message = _active_line.current()
+            message = continuation or _active_line.current()
             events = (
                 provider.stream(message)
                 if allow_image
                 else provider.stream(message, allow_image=False)
             )
             async for event in events:
+                if continuing:
+                    # Past a completion the continuation follows: the rest of
+                    # this prompt's stream is read to its end, never acted on.
+                    continue
                 if _undelivered_watch is not None:
                     # A dispatched worker's report the harness never delivered.
                     if event.kind == EVENT_TOOL_CALL:
@@ -331,6 +362,7 @@ async def stream_and_collect(
                             session_key=session_key,
                             agent=agent,
                             app=app,
+                            app_run=app_run,
                             on_decision=lambda outcome, mech, why: _decision.append(
                                 (outcome, mech, why)
                             ),
@@ -394,19 +426,37 @@ async def stream_and_collect(
                         except Exception:
                             logger.debug("on_compaction callback failed", exc_info=True)
                 elif event.kind == EVENT_COMPLETE:
+                    follow_up = (
+                        timed_out_continuation(event)
+                        if timed_out_sent < STOP_RECOVERY_MAX_RETRIES
+                        else ""
+                    )
+                    if follow_up:
+                        # A call's own silence timer ended this prompt: its
+                        # completion is not the turn's. Once the stream has run
+                        # out, the same session is told the call timed out.
+                        timed_out_sent += 1
+                        continuation = follow_up
+                        continuing = True
+                        continue
                     if on_complete:
                         try:
                             on_complete(event)
                         except Exception:
                             logger.debug("on_complete callback failed", exc_info=True)
-                    unfinished = unfinished_turn_error(event, result_text)
+                    unfinished = unfinished_turn_error(
+                        event, _join_continued(continued_text, result_text)
+                    )
                     if unfinished is not None:
                         raise unfinished
                     break
+            if continuing:
+                continued_text = _join_continued(continued_text, result_text)
+                continue
             # kiro-cli's [STEERING steer-…] ack is protocol, not the answer.
             from kiro_crew.messaging.driver import strip_steering_markers
 
-            return strip_steering_markers(result_text)
+            return strip_steering_markers(_join_continued(continued_text, result_text))
         except AcpError as exc:
             msg = str(exc)
             if is_context_overflow_error(exc):
@@ -617,7 +667,7 @@ async def stream_and_collect(
             turn_billed = _sum_usage(
                 turn_billed, _attempt_usage(provider, since=attempt_stats_before)
             )
-            if not retrying:
+            if not retrying and not continuing:
                 try:
                     setattr(
                         provider,
@@ -661,11 +711,13 @@ async def stream_and_collect_json(
     on_chunk: Callable[[str], None] | None = None,
     model_fallback: bool = False,
     allow_image: bool = True,
+    on_event: Callable[[LLMEvent], Awaitable[None]] | None = None,
 ) -> dict | None:
     """Stream a message and parse the response as JSON.
 
     Combines ``stream_and_collect`` with ``parse_llm_json``.
-    Returns parsed dict or None on failure.
+    Returns parsed dict or None on failure. *on_event* is handed to
+    ``stream_and_collect`` unchanged.
     """
     text = await stream_and_collect(
         provider,
@@ -675,5 +727,6 @@ async def stream_and_collect_json(
         on_chunk=on_chunk,
         model_fallback=model_fallback,
         allow_image=allow_image,
+        on_event=on_event,
     )
     return parse_llm_json(text)

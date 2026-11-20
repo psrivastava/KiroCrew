@@ -3,13 +3,18 @@
 const fs = require("fs");
 const path = require("path");
 
-const { createTokenRetryHandler, dashboardRetryPath, loadDashboardWithToken } = require("./token-retry");
+const {
+  createTokenRetryHandler,
+  dashboardRetryPath,
+  dashboardUrlFor,
+  loadDashboardWithToken,
+} = require("./token-retry");
 const { createRendererRecovery, withSafeReload, hasSafeReload } = require("./renderer-recovery");
 const { createRendererExhaustedNotice } = require("./renderer-exhausted-notice");
-const { createHangRecovery } = require("./hang-recovery");
+const { createHangRecovery, endHungRenderer } = require("./hang-recovery");
 const { armSplashHistoryClear, fileShellPageBasename } = require("./splash-history");
 const { armSwipeHistory, browserPanelUnderCursor } = require("./swipe-history");
-const { armScrollTouch } = require("./scroll-touch");
+const { armScrollTouch, readNaturalScrolling } = require("./scroll-touch");
 const { hideToTray, cancelPendingTrayHide, shouldKeepAppHidden } = require("./hide-to-tray");
 const {
   createCloseHandler,
@@ -17,6 +22,7 @@ const {
   setCloseAction,
 } = require("./close-action");
 const { getTrayIcon, setTrayIcon } = require("./tray-icon");
+const { createMinimizeToTray } = require("./minimize-to-tray");
 const { attachHtmlFullScreen } = require("./html-fullscreen");
 const { menuBarCanOverlap } = require("./fullscreen-top-reserve");
 const {
@@ -28,11 +34,13 @@ const { sanitizeWindowState, captureWindowState } = require("./window-state");
 const { stepZoomFactor } = require("./zoom");
 const { registerCaptureSurface } = require("./capture-trust");
 const { isLoopbackUrl } = require("./browser-view");
+const { shownRelayPane } = require("./relay-crew-window");
 const { runAnnotateOp } = require("./browser-annotate");
 const { attachContextMenu } = require("./context-menu");
 const {
   TUNNEL_OPTION_LABEL,
   parseRemoteCrewFields,
+  remoteCrewDraft,
   saveRemoteCrewConfig,
   tunnelOptionHint,
 } = require("./remote-crew-setup");
@@ -92,6 +100,33 @@ const WINDOWS_TITLEBAR_MENU_IDS = new Set([
   "window-menu",
   "help-menu",
 ]);
+
+/**
+ * The dashboard session's request headers with the Referer cut down.
+ *
+ * The dashboard URL can carry its sign-in token, so no request sends it. A frame
+ * the page embeds keeps the referring page's origin, never its path or query:
+ * an embed host such as YouTube refuses to play without one (its Error 153), and
+ * the dashboard CSP `frame-src` already limits frames to the origins it admits
+ * (an app's are the `ui.frameSources` the owner approved). Every other request
+ * sends no Referer. Chromium never sends one a page's policy withholds, so this
+ * only ever narrows.
+ */
+function dashboardRequestHeaders(details) {
+  const headers = { ...details.requestHeaders };
+  const referer = headers.Referer;
+  delete headers.Referer;
+  if (referer && details.resourceType === "subFrame") {
+    let origin = "null";
+    try {
+      origin = new URL(referer).origin;
+    } catch {
+      /* no usable referrer: send none */
+    }
+    if (origin !== "null") headers.Referer = `${origin}/`;
+  }
+  return headers;
+}
 
 /**
  * Own every dashboard window and the security policy of the sessions they use.
@@ -302,23 +337,31 @@ function createWindowLifecycle(options) {
   function setupWindowContents(win, windowBackendUrl) {
     const windowPort = defaultedPort(windowBackendUrl);
     let customName = null;
-    // isGatewayLocalForWindow reads this, and the preload argument below needs
-    // it. The argument is fixed for the view's life.
+    // isGatewayLocalForWindow reads this.
     win._mcBackendUrl = windowBackendUrl;
-    const remoteGateway = !isGatewayLocalForWindow(win);
 
     const view = new WebContentsView({
       webPreferences: {
         preload: path.join(__dirname, "preload.js"),
         contextIsolation: true,
         nodeIntegration: false,
-        // Launch-time decisions the preload reads: frameless Linux reserves
-        // caption-control space; a remote gateway withholds local-only bridges.
-        additionalArguments: [
-          ...(LINUX_FRAMELESS ? ["--kc-linux-frameless"] : []),
-          ...(remoteGateway ? ["--kc-remote-gateway"] : []),
-        ],
+        // Frameless Linux is a launch-time decision, not a platform constant.
+        // The preload reads this argument to reserve caption-control space.
+        additionalArguments: LINUX_FRAMELESS ? ["--kc-linux-frameless"] : [],
       },
+    });
+    // The preload asks this on every load, so a crew configured or cleared for
+    // the port applies from the next load. The ask is synchronous: the listener
+    // is on this view's own WebContents before anything loads, and every path
+    // answers, so the renderer never waits on a reply that does not come.
+    view.webContents.ipc.on("dashboard:is-remote-gateway", (event) => {
+      let remote = true;
+      try {
+        remote = !isGatewayLocalForWindow(win);
+      } catch (err) {
+        glog(`dashboard:is-remote-gateway: ${err && err.message}`);
+      }
+      event.returnValue = remote;
     });
     view.setBackgroundColor("#00000000");
     win.contentView.addChildView(view);
@@ -338,9 +381,12 @@ function createWindowLifecycle(options) {
     });
     // The trackpad's real finger-down / finger-up, so a two-finger drag in the
     // dashboard releases on the lift-off instead of a guessed gap (macOS only).
+    // It also tells the page the Natural scrolling setting, which decides
+    // which way the fingers moved for a given wheel sign.
     armScrollTouch(view.webContents, {
       platform,
       isAlive: () => !win.isDestroyed() && !view.webContents.isDestroyed(),
+      readNatural: () => readNaturalScrolling(systemPreferences),
     });
 
     // Teardown order is load-bearing: no embedded view may outlive the page it
@@ -618,12 +664,11 @@ function createWindowLifecycle(options) {
     };
     armWindowOpen(view.webContents);
 
-    // Do not leak the dashboard URL/token as a Referer to resources it embeds.
+    // Do not leak the dashboard URL/token as a Referer (dashboardRequestHeaders).
     // This listener remains attached at the same per-window setup point; moving
     // it to a one-time global policy would be a behavior change.
     view.webContents.session.webRequest.onBeforeSendHeaders((details, callback) => {
-      delete details.requestHeaders.Referer;
-      callback({ requestHeaders: details.requestHeaders });
+      callback({ requestHeaders: dashboardRequestHeaders(details) });
     });
 
     // Give renderer-triggered downloads (e.g. the Portability "Download Export
@@ -924,7 +969,10 @@ function createWindowLifecycle(options) {
       log: glog,
       forceCrash: () => {
         if (mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) return;
-        mainWindow.webContents.forcefullyCrashRenderer();
+        const outcome = endHungRenderer(mainWindow.webContents, {
+          underTranslation: process.platform === "darwin" && app.runningUnderARM64Translation === true,
+        });
+        if (outcome !== "force-crashed") glog(`hung renderer under Rosetta: ${outcome} by pid`);
       },
     });
     mainWindow.webContents.on("unresponsive", () => hangRecovery.handleUnresponsive());
@@ -983,6 +1031,7 @@ function createWindowLifecycle(options) {
         persist();
       },
     }));
+    mainWindow.on("minimize", minimizeToTray.minimizeHandler(mainWindow));
 
     return mainWindow;
   }
@@ -1104,6 +1153,9 @@ function createWindowLifecycle(options) {
     return state;
   }
 
+  // Minimize to tray needs a tray to bring the window back (minimize-to-tray.js).
+  const minimizeToTray = createMinimizeToTray({ store, platform, trayShown: () => tray !== null, log: glog });
+
   async function promptRemoteHost() {
     const focused = BaseWindow.getFocusedWindow() || mainWindow;
     if (!focused || focused.isDestroyed() || !focused._mcBackendUrl) return;
@@ -1120,12 +1172,12 @@ function createWindowLifecycle(options) {
     const currentBin = config?.binPath || DEFAULT_REMOTE_BIN;
     const currentRemotePort = config?.remotePort || "";
     const currentRemotePath = config?.remotePath || "";
-    const currentManageTunnel = config?.manageTunnel === true;
     // The app keeps a tunnel only for the port it launched on, so this form
     // offers the option there alone; for any other tab it carries the stored
     // choice over unchanged.
     const isLaunchPort = String(focusedPort) === String(port);
     const offerTunnel = isLaunchPort && !IS_WINDOWS;
+    const currentManageTunnel = remoteCrewDraft(config || {}, { tunnelByDefault: offerTunnel }).manageTunnel;
 
     const css = await getModalCSS();
     const esc = (value) => value
@@ -1173,7 +1225,8 @@ function createWindowLifecycle(options) {
           window.close();
         }
         document.addEventListener('keydown', event => {
-          if (event.key === 'Enter') save();
+          // Enter on a focused button is that button's own press: Cancel must not save.
+          if (event.key === 'Enter' && !(event.target instanceof HTMLButtonElement)) save();
           if (event.key === 'Escape') window.close();
         });
       </script>
@@ -1359,8 +1412,8 @@ function createWindowLifecycle(options) {
         ({ token: tokenValue } = await fetchRemoteToken(connectionPort));
       }
       if (tokenValue && !connWin.isDestroyed()) {
-        const target = new URL(retryTarget || "", connectionBackendUrl);
-        await loadDashboardWithToken(connWin.webContents, target.toString(), tokenValue);
+        const target = dashboardUrlFor(connectionBackendUrl, retryTarget);
+        await loadDashboardWithToken(connWin.webContents, target, tokenValue);
       }
     });
     connWin.webContents.on("did-navigate", (_event, url, httpCode) => {
@@ -1489,11 +1542,17 @@ function createWindowLifecycle(options) {
       appName: app.name,
       openSettings: () => openSettingsPage(),
       openAbout: () => openSettingsPage("about"),
+      // A relay Crew tab in front takes Reload, as its own window did,
+      // instead of the dashboard reloading and closing every tab.
       reload: () => {
+        const pane = shownRelayPane(BaseWindow.getFocusedWindow());
+        if (pane) { pane.menuReload({ ignoreCache: false }); return; }
         const wc = focusedDashboardWebContents();
         if (wc) wc.reload();
       },
       forceReload: () => {
+        const pane = shownRelayPane(BaseWindow.getFocusedWindow());
+        if (pane) { pane.menuReload({ ignoreCache: true }); return; }
         const wc = focusedDashboardWebContents();
         if (wc) wc.reloadIgnoringCache();
       },
@@ -1526,28 +1585,46 @@ function createWindowLifecycle(options) {
     return appMenu;
   }
 
-  function menuItems(sender, id) {
+  // senderIsLocal is threaded down from the ipc-registrar boundary the same
+  // way it reaches `executeMenu` — computed once via `assertLocalDashboard`
+  // and cached per WebContents, then handed here. `serializeMenuItems`
+  // marks LOCAL_ONLY leaves `enabled: false` for a remote sender so a
+  // connection window paints a greyed row rather than an enabled one that
+  // silently no-ops when clicked. Strict `=== true` matches the fail-closed
+  // rule executeMenuItem uses.
+  function menuItems(sender, id, senderIsLocal) {
     if (!IS_WINDOWS || !WINDOWS_TITLEBAR_MENU_IDS.has(id)) return [];
     const menu = appMenu || Menu.getApplicationMenu();
     const item = menu && menu.getMenuItemById(id);
     const win = windowForWebContents(sender);
     if (!item || !item.submenu || !win || win.isDestroyed()) return [];
-    return serializeMenuItems(item.submenu);
+    return serializeMenuItems(item, senderIsLocal === true);
   }
 
-  function executeMenu(sender, id, index) {
+  // Returns whether the click DISPATCHED. `app-menu:execute` answers the
+  // renderer with it, and the renderer refetches its rows on a `false` — so a
+  // bare `return` here (reporting `undefined` for a guard refusal) would
+  // silently become "dispatched" at the strict check on the IPC boundary. Every
+  // exit says so explicitly.
+  function executeMenu(sender, id, index, senderIsLocal) {
     if (
       !IS_WINDOWS
       || !WINDOWS_TITLEBAR_MENU_IDS.has(id)
       || !Number.isInteger(index)
-    ) return;
+    ) return false;
     const menu = appMenu || Menu.getApplicationMenu();
     const topLevelItem = menu && menu.getMenuItemById(id);
     const win = windowForWebContents(sender);
-    if (!win || win.isDestroyed()) return;
+    if (!win || win.isDestroyed()) return false;
     // sender is the focused dashboard WebContents: titlebar menu interaction
     // itself gives it focus, which is what Electron role items expect.
-    executeMenuItem(topLevelItem, index, win, sender);
+    //
+    // `senderIsLocal` is computed once at the IPC boundary in
+    // ipc-registrar.js via `assertLocalDashboard` (origin + local-gateway +
+    // primary-port-owner). Forwarded here with strict `=== true` so any
+    // non-boolean (undefined from a caller that forgot the arg, a truthy
+    // proxy, a stringy value) drops to the LOCAL_ONLY refusal branch.
+    return executeMenuItem(topLevelItem, index, win, sender, senderIsLocal === true);
   }
 
   function setDevMode(enabled) {
@@ -1764,6 +1841,7 @@ function createWindowLifecycle(options) {
       get: () => getTrayIcon(store, { isMac: IS_MAC }),
       set: setTrayIconAndLog,
     },
+    minimizeToTray: { get: minimizeToTray.get, set: minimizeToTray.set },
     getSummonWindow,
     focusedDashboardWindow,
     focusedDashboardWebContents,
@@ -1825,4 +1903,5 @@ module.exports = {
   HEADER_CSS_PX,
   WINDOWS_TITLEBAR_MENU_IDS,
   createWindowLifecycle,
+  dashboardRequestHeaders,
 };

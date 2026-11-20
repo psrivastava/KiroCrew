@@ -177,7 +177,11 @@ export function DefaultMcpGrantsSection() {
           <Btn onClick={() => mut.mutate('add')} disabled={busy || !states.includes('off')}>
             {i18nT('pages.settings.defaultMcpGrantsSection.add_button')}
           </Btn>
-          <Btn onClick={() => { void remove() }} disabled={busy || !states.includes('recorded')}>
+        </div>
+        {/* The removal sits apart from Add, on its own row, so a destructive
+            action is never one slip away from the constructive one. */}
+        <div className="mt-6 pt-4 border-t border-border">
+          <Btn danger onClick={() => { void remove() }} disabled={busy || !states.includes('recorded')}>
             {i18nT('pages.settings.defaultMcpGrantsSection.remove_button')}
           </Btn>
         </div>

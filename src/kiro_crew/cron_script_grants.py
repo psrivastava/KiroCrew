@@ -29,8 +29,10 @@ from typing import Any
 from kiro_crew import platform_compat
 from kiro_crew.atomic_write import replace_with_retry
 from kiro_crew.config.loader import config_dir
-from kiro_crew.cron_script_child_env import _CRON_ENV_DENY
+from kiro_crew.config.sections_agent_env import _agent_env_denied
+from kiro_crew.cron_script_child_env import _CRON_ENV_DENY, _GRANTED_ENV_KEYS
 from kiro_crew.cron_script_paths import resolve_script_path
+from kiro_crew.env import sanitize_spec_env
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes_nolink
 from kiro_crew.secrets import SecretVault
 
@@ -579,6 +581,48 @@ def _resolve_secret_env(secret_env: dict[str, str]) -> dict[str, str]:
     return resolved
 
 
+def _overlay_job_env(
+    env: dict[str, str], job_env: dict[str, str] | None, *, granted: bool, job_id: str | None
+) -> None:
+    """Add a cron job's own ``env`` block to *env*, a ``_clean_cron_env`` result.
+
+    ``job.env`` is untrusted input (an app manifest's ``crons[].env``), and the command
+    text it runs beside was vetted without it, so only data variables pass: the names a
+    grant may never use (``HOME``, ``PATH``, ``BASH_ENV``, loader and ``KIROCREW`` names,
+    the cron deny set), bash exported functions, the names ``agent.env`` refuses as code
+    channels (:func:`kiro_crew.config.sections_agent_env._agent_env_denied`), the granted
+    secret names and everything
+    :func:`kiro_crew.env.sanitize_spec_env` drops are left out, case-insensitively. The
+    runner sets its own keys (temp triple, session identity, secret file) AFTER this call.
+
+    shortcut: a secret-granted run (*granted*) gets no job env. The grant pin does not
+    cover ``job.env`` and the cron store is agent-writable, so an approved script that
+    reads its destination from env could be redirected under a still-valid pin. Bind a
+    sanitized ``job.env`` into the pin to lift this.
+    """
+    if not job_env:
+        return
+    if granted:
+        logger.warning("cron %s: job env not applied to a secret-granted run", job_id)
+        return
+    exact = {k.upper() for k in (*_SECRET_ENV_DENIED_EXACT, *_GRANTED_ENV_KEYS)}
+    # ``BASH_FUNC_echo%%`` redefines ``echo`` in a bash-backed ``sh`` child.
+    prefixes = (*_SECRET_ENV_DENIED_PREFIXES, "BASH_FUNC_")
+    # ``_agent_env_denied`` is the ``agent.env`` rule for names that make a shell, the
+    # loader, a runtime or a tool run code the command did not name (``SHELLOPTS`` with
+    # ``PS4``, ``GIT_SSH_COMMAND``, ``NODE_OPTIONS``, ``*EDITOR``, ``*PAGER``). An
+    # ungranted child's ``cc`` sandbox leaves ``~/.ssh`` readable, so such a helper
+    # would read past the vetted command.
+    allowed = (
+        (k, v)
+        for k, v in job_env.items()
+        if str(k).upper() not in exact
+        and not str(k).upper().startswith(prefixes)
+        and not _agent_env_denied(str(k).upper())
+    )
+    env.update(sanitize_spec_env(allowed))
+
+
 def _filter_grant_env(resolved: dict[str, str]) -> dict[str, str]:
     """Drop protected keys from a resolved grant (defense in depth).
 
@@ -631,6 +675,23 @@ def _scrub_grant_values(text: str, resolved: dict[str, str]) -> str:
     return text
 
 
+#: The two precheck refusals the operator heals by approving the SAME mapping
+#: again over the job's current code: the stored pin is missing, or it fails to
+#: verify (the script body, message or delivery controls changed, or the epoch
+#: moved). The runner flags a run refused with one of these as ``grant_stale`` so
+#: the scheduler can resurface a pending re-approval request (see
+#: :mod:`kiro_crew.cron_service.grant_resurface`); every other refusal (unreadable
+#: vault, missing secret) is not healed by re-approval and is not flagged.
+GRANT_PIN_MISSING_ERROR = "secret grant has no code pin; re-approve it in the dashboard"
+GRANT_PIN_STALE_ERROR = (
+    "cron code changed (or its delivery session was rewired) since "
+    "its secret grant was approved; secrets were NOT injected. "
+    "Re-approve the grant in the dashboard (Schedule > job > "
+    "Secrets) to run it again."
+)
+GRANT_REAPPROVAL_ERRORS = frozenset({GRANT_PIN_MISSING_ERROR, GRANT_PIN_STALE_ERROR})
+
+
 def _secret_env_precheck(
     secret_env: dict[str, str] | None,
     secret_env_pin: str,
@@ -654,7 +715,7 @@ def _secret_env_precheck(
     if not secret_env:
         return {}, None
     if not secret_env_pin:
-        return {}, "secret grant has no code pin; re-approve it in the dashboard"
+        return {}, GRANT_PIN_MISSING_ERROR
 
     try:
         current = _pin_digest(
@@ -667,12 +728,7 @@ def _secret_env_precheck(
     except ValueError as exc:  # vault store without key — never inject
         return {}, str(exc)
     if not hmac.compare_digest(current, secret_env_pin):
-        return {}, (
-            "cron code changed (or its delivery session was rewired) since "
-            "its secret grant was approved; secrets were NOT injected. "
-            "Re-approve the grant in the dashboard (Schedule > job > "
-            "Secrets) to run it again."
-        )
+        return {}, GRANT_PIN_STALE_ERROR
     try:
         return _resolve_secret_env(secret_env), None
     except ValueError as exc:

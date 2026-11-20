@@ -40,6 +40,8 @@ _ETC_GLOB = os.path.join(_ETC, "**")
 _OPEN_SCOPES: dict[str, str] = {
     "mcp": "@other/tool",
     "tools": "fs_write",
+    # With no ``ask`` rule, trust approves a KAS web call as before (``web_ask_rule``).
+    "unattended_web_tools": "web_fetch",
     "commands": "ls",
     "filesystem.read": _ETC_FILE,
     "filesystem.write": _WORKSPACE_FILE,
@@ -53,6 +55,8 @@ _OPEN_SCOPES: dict[str, str] = {
     "capabilities.theme_persona": "",
     "capabilities.milestones": "",
     "capabilities.decisions_local": "",
+    # Discover keeps querying every registry until a policy names the key.
+    "external_access.registry_hosts": "skills.sh",
 }
 
 # scope -> (items the baseline permits, items it denies). One row per catalog scope.
@@ -67,11 +71,31 @@ _BASELINE_TABLE: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "agent_backend": (("kas",), ("claude", "kiro")),
     "webhooks": ((), ("agent", "ops-mission-control")),
     "capabilities.publish": (
-        ("", "destinations:default"),
-        ("destinations:s3", "regions:us-east-1", "audience:private", "accounts:123456789012"),
+        (),
+        (
+            "",
+            "destinations:default",
+            "destinations:s3",
+            "regions:us-east-1",
+            "audience:private",
+            "accounts:123456789012",
+        ),
     ),
     "bind_address": (("127.0.0.1",), ("0.0.0.0", "::", "10.0.0.5")),
     "dashboard_origins": ((), ("https://crew.example.com", "http://localhost:3000")),
+    # RFC D13: on, every decision model but hosted Jev. The code
+    # lock on Jev and hand-written endpoints is ``test_decisions_lts_jev_lock.py``.
+    "capabilities.decisions": (
+        (
+            "",
+            "providers:plumb-4b",
+            "providers:strands-decider-2b",
+            "providers:laya",
+            "providers:sagemaker",
+            "providers:clef",
+        ),
+        ("providers:jev", "providers:other"),
+    ),
 }
 
 
@@ -120,7 +144,7 @@ def test_open_scopes_are_ungated_and_kept_off_scopes_are_not() -> None:
         "yolo_duration",
         # Kept off by the owner (D3).
         "capabilities.app_dev_mode",
-        # ``capabilities.decisions_local`` only narrows this row, so it stays inert.
+        # On with a ``providers`` allow list that leaves hosted Jev out.
         "capabilities.decisions",
     ):
         assert kept_off in BASELINE_CONTROLS, kept_off
@@ -155,6 +179,7 @@ def test_lts_unnamed_open_scope_keeps_crews_default(
 _OPEN_DENIES: dict[str, dict[str, object]] = {
     "mcp": {"mcp": {"mode": "deny", "deny": ["@other"]}},
     "tools": {"tools": {"mode": "deny", "deny": ["fs_write"]}},
+    "unattended_web_tools": {"unattended_web_tools": {"mode": "deny", "deny": ["web_fetch"]}},
     "commands": {"commands": {"mode": "allow", "allow": []}},
     "filesystem.read": {"filesystem": {"read": {"mode": "deny", "deny": [_ETC_GLOB]}}},
     "filesystem.write": {"filesystem": {"write": {"mode": "allow", "allow": []}}},
@@ -167,6 +192,9 @@ _OPEN_DENIES: dict[str, dict[str, object]] = {
     "capabilities.theme_persona": {"capabilities": {"theme_persona": {"enabled": False}}},
     "capabilities.milestones": {"capabilities": {"milestones": {"enabled": False}}},
     "capabilities.decisions_local": {"capabilities": {"decisions_local": {"enabled": False}}},
+    "external_access.registry_hosts": {
+        "external_access": {"registry_hosts": {"mode": "deny", "deny": ["skills.sh"]}}
+    },
 }
 
 

@@ -417,9 +417,10 @@ tab, shows nothing new.
 
 ## Backend Modules
 
-### `dashboard/ws.py` — `broadcast_side_queue`
+### `dashboard/ws_side_frames.py` — `broadcast_side_queue`
 
-Emits `chat.side_queue` frames — `{kind, slot, action, queue_id, content?, depth,
+Defined in `ws_side_frames.py` and re-exported by `dashboard/ws.py`, like the two
+broadcasts below. Emits `chat.side_queue` frames — `{kind, slot, action, queue_id, content?, depth,
 ts, front?, steer_id?, origin_client?}` where `action` is `push` | `edit` |
 `cancel` | `drain`, to owner sockets only (`broadcast_ws_owners`). Held apart from
 `chat.side_result` so a queue mutation never enters the transcript reducer, and
@@ -703,7 +704,7 @@ so it still loads. `_run_side_turn` requests the base agent's session with
 `AcpProvider` to `AcpClient`. A pooled child was started without that shape, and
 none can serve the session: a `side:` (or `thread:`) key is stateless, so it never
 claims from the warm pool (`bypass_stateless`). The claude client then starts the
-session confined (`AcpClient._claude_session_meta`):
+session confined (`ClaudeAcpClient._claude_session_meta`):
 
 - `tools` holds only the read built-ins (`Read`, `Grep`, `Glob`, `WebFetch`,
   `WebSearch`; `acp/harness_tool_names.CLAUDE_READ_ONLY_BUILTINS`), so no write
@@ -759,7 +760,8 @@ named on every session instead (`harness_tool_id`, through
 refuse a call. The shape rides
 `_meta.claudeCode.options`, which only an adapter at
 `CLAUDE_ACP_SETTING_SOURCES_MIN_VERSION` or newer is verified to honour. Below it
-(read from the installed package by `claude_adapter_honours_session_options`) the
+(read by `claude_adapter_honours_session_options` from the adapter's package.json,
+or for a wrapper script from the version it reported at its latest handshake) the
 turn runs `REJECT_ALL` and a warning names the upgrade, and a handshake that
 reports an older version stops the session before its first prompt. The session
 has no shell, so its boundary prompt is `SIDE_BOUNDARY_PROMPT_NO_SHELL`, which
@@ -794,9 +796,10 @@ it (measured on goose 1.50.1: with `shell` listed, a `touch` ran unasked).
   a `Permission.yaml` on case-insensitive storage stays out too. A side session
   with no scratch window, a home that cannot be built, or a `config.yaml` that
   does not parse as a mapping, is refused rather than started on the user's home.
-  POSIX only (`side_home_supported`): on Windows goose keeps its secrets under
-  `%APPDATA%`, outside the credential leaf the sensitive-path deny names, so a
-  goose side turn there keeps running `REJECT_ALL`, and the footer says so.
+  POSIX only (`side_home_supported`): on Windows goose keeps its config under
+  `%APPDATA%`, which `goose_config_dir` does not resolve, and linking needs a
+  symlink privilege, so a goose side turn there keeps running `REJECT_ALL`, and
+  the footer says so.
 - places no MCP server on the session array (`_goose_session_mcp_servers`), as
   on claude. A server named `developer` would also replace goose's builtin
   read tools.
@@ -939,13 +942,13 @@ egress from the side chat denies the two tools with an `auto_deny_tools` rule
 or a governance profile — both bind on this surface exactly as on the main
 chat.
 
-### `dashboard/ws.py` — `broadcast_side_result`
+### `dashboard/ws_side_frames.py` — `broadcast_side_result`
 
 Module-level helper emitting `chat.side_result` frames to owner sockets only
 (`broadcast_ws_owners`), never to app sockets, matching `_check_slot_ownership`.
 Deliberately separate from `broadcast_ws` main-channel events.
 
-### `dashboard/ws.py` — `broadcast_side_closed`
+### `dashboard/ws_side_frames.py` — `broadcast_side_closed`
 
 Emits `chat.side_closed` to owner sockets only, from `api_side_close`, whether or
 not a conversation was open: a tab can still show one the gateway lost in a
@@ -1026,6 +1029,33 @@ memo on the second pass and eats the user's punctuation).
 `website/src/test/SideChat.imeEnter.test.tsx` drives this file's real textarea,
 because the IME defect was in the WIRING and a hook test cannot see it. A
 source-level guard fails if this file re-grows a local copy of any of them.
+
+A side question can carry attachments the way a main-composer message can: the
+attach control, Sketch, paste and drop all upload.
+`pages/chat/useSideChatUploads.ts` runs the main composer's upload flow
+(`useChatPaneUploads`, imported through the `components/ChatPane` facade; it uploads
+through `api.uploadFiles`) under a side key of its own (`sideUploadKey(slot)`), so
+the `composerSendHolds` hold, the cancel registry and the arrivals inbox of a side
+upload never touch the main composer's Send for the same slot, and the other way
+round. Finished paths are staged in the slot's `sideChatDrafts` entry (`files`),
+beside the text, so a chip survives an unmount. An upload that finishes while the
+panel is gone waits in the arrivals inbox (mirrored to `sessionStorage`, so a chip
+waiting there outlives a reload) until the panel is back. An upload failure while
+the panel shows another slot, or none, is held for the side key
+(`slotUploadFailures`) and enters the side composer's banner when the panel shows
+that slot again. Send waits while an upload runs. On submit, `buildOutgoingTurn`
+turns the staged images into leading `![image](path)` lines of the question (other
+files become `[attached_file N]` markers) and the paths clear with the text. A
+refused or unconfirmed send hands them back as chips beside the typed text
+(`restoreSideChatDraft`), never as the wire lines. The backend needs nothing extra:
+`build_side_message` returns a plain string, a single user segment, so
+`build_prompt_blocks` sends the picture as an ACP image block within the same
+`_MAX_QUESTION_BYTES` limit. A follow-up chip carries its own text and no
+attachments. `website/src/test/SideChat.attachImage.test.tsx` pins the attach
+control, the upload, the side-only Send hold, the image line on the wire and the
+hand-back. A steer into a running turn sends text only, so a steered question's
+image reaches the model as its path, not as a block, and a cancelled queued question
+comes back as its wire text, image line included.
 
 The transcript is the shared `app-sdk/ChatMessageList`, and `SideChat` takes two
 of the host's openers as props — `onFileOpen` and `onArtifactOpen`, the ones

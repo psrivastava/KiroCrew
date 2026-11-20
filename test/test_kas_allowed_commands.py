@@ -23,6 +23,7 @@ from test_tool_call_classification_kas import _kas_builtin_flow
 from kiro_crew.acp import kas_agents
 from kiro_crew.acp._dispatch import attach_kas_custom_agents
 from kiro_crew.acp.kas_permissions import (
+    _MAX_ALLOWED_COMMANDS,
     CREW_ANSWERED_COMMANDS_KEY,
     allowed_command_pattern,
     crew_answered_commands,
@@ -118,8 +119,6 @@ def test_a_command_no_pattern_fullmatches_still_prompts(pattern: str, command: s
 @pytest.mark.parametrize(
     "command",
     [
-        "git status > out.txt",
-        "git status < in.txt",
         "git status $(whoami)",
         "git status `whoami`",
         "git status ${HOME}",
@@ -284,6 +283,42 @@ def test_a_ceiling_with_an_opinion_on_the_shell_withholds_the_grant() -> None:
     verdict = _judge(_shell("git status --porcelain"), ["git status.*"])
     assert verdict.action == TOOL_ALLOW
     assert verdict.tier != "spec-builtin-grant"
+
+
+def _builtin_pins() -> list[str]:
+    """The built-in self-protection deny patterns, as an edition pins them in ``commands``."""
+    from kiro_crew.security import BUILTIN_DENIED_RULES
+
+    return [r.pattern for r in BUILTIN_DENIED_RULES if r.category == "self-protection"]
+
+
+def test_a_ceiling_that_only_pins_built_in_rules_keeps_the_grant() -> None:
+    """The deny floor already enforces every pinned rule, so the pins say nothing
+    about other commands: ``git status`` is still answered without a prompt."""
+    _install_governance({"commands": {"mode": "deny", "deny": _builtin_pins()}})
+    verdict = _judge(_shell("git status"), ["git status"])
+    assert (verdict.action, verdict.tier) == (TOOL_AUTO_APPROVE, "spec-builtin-grant")
+
+
+def test_a_pinned_command_is_still_refused_under_a_wide_grant() -> None:
+    _install_governance({"commands": {"mode": "deny", "deny": _builtin_pins()}})
+    pinned = "kirocrew app dev --confirm-" + "out-of-install-root"
+    verdict = _judge(_shell(pinned), [".*"])
+    assert (verdict.action, verdict.tier) == (TOOL_DENY, "deny-rules")
+
+
+def test_a_pin_beside_any_other_command_deny_withholds_the_grant() -> None:
+    _install_governance({"commands": {"mode": "deny", "deny": [*_builtin_pins(), "*backdoor*"]}})
+    verdict = _judge(_shell("git status"), ["git status"])
+    assert verdict.action == TOOL_ALLOW
+    assert verdict.tier != "spec-builtin-grant"
+
+
+def test_the_projection_records_the_patterns_under_built_in_pins() -> None:
+    _install_governance({"commands": {"mode": "deny", "deny": _builtin_pins()}})
+    spec = _spec(toolsSettings={"shell": {"allowedCommands": ["git status"]}})
+    out = kas_agents.to_client_custom_agent("a", spec, "p")
+    assert out[CREW_ANSWERED_COMMANDS_KEY] == ["git status"]
 
 
 def test_confirm_tools_withholds_the_grant() -> None:
@@ -598,10 +633,10 @@ def test_allowed_commands_are_named_only_when_a_pattern_cannot_be_used() -> None
     ]
 
 
-def test_an_allow_list_over_the_bound_is_named() -> None:
-    patterns = [f"make target{i}" for i in range(65)]
+def test_an_allow_list_over_the_bound_keeps_its_first_entries_and_is_named() -> None:
+    patterns = [f"make target{i}" for i in range(_MAX_ALLOWED_COMMANDS + 1)]
     settings = {"shell": {"allowedCommands": patterns}}
-    assert len(crew_answered_commands(settings)) == 64
+    assert crew_answered_commands(settings) == patterns[:_MAX_ALLOWED_COMMANDS]
     assert tools_settings_to_permissions(settings)[1] == ["shell.allowedCommands"]
 
 

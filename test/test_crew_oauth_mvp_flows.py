@@ -97,7 +97,7 @@ def test_an_unreadable_vault_is_unknown_not_absent(monkeypatch):
 
     monkeypatch.setattr(crew_oauth, "TokenStore", _Broken)
     assert crew_oauth.holds_grant("github") is None
-    assert crew_oauth.holds_grant("slack") is False
+    assert crew_oauth.holds_grant("hubspot") is False
 
 
 def test_the_sign_in_uses_the_products_one_pkce_implementation():
@@ -343,7 +343,9 @@ async def test_a_client_id_carrying_a_key_id_fails_the_row(monkeypatch, github_o
 
 
 @pytest.mark.asyncio
-async def test_a_declined_consent_fails_the_row(monkeypatch, github_on_port_zero):
+async def test_a_refused_consent_fails_the_row_with_its_closed_code(
+    monkeypatch, github_on_port_zero
+):
     import aiohttp
 
     mint = github_on_port_zero
@@ -353,10 +355,10 @@ async def test_a_declined_consent_fails_the_row(monkeypatch, github_on_port_zero
     state = dict(p.split("=", 1) for p in row["oauth_url"].split("?", 1)[1].split("&"))["state"]
     async with aiohttp.ClientSession() as http:
         callback = f"http://127.0.0.1:{sign_in.bound_port}/callback"
-        async with http.get(callback, params={"state": state}) as resp:
+        async with http.get(callback, params={"state": state, "error": "access_denied"}) as resp:
             assert resp.status == 200
     await async_wait_until(lambda: mint._mints["github"].get("state") == "failed")
-    assert mint._mints["github"]["reason"] == "crew_oauth_consent_declined"
+    assert mint._mints["github"]["reason"] == "crew_oauth_callback_access_denied"
 
 
 @pytest.mark.asyncio

@@ -24,7 +24,8 @@ from typing import Any
 
 from kiro_crew.cron import CronJob, lookup_cron_folder_id
 from kiro_crew.cron_script import resolve_script_path
-from kiro_crew.mcp_core import _post, _resolve_session_key
+from kiro_crew.mcp_core_parts.gateway import _post
+from kiro_crew.mcp_core_parts.identity import _resolve_session_key
 from kiro_crew.mcp_cron_shell_scan import (
     _BACKSLASH_ESCAPE_RE,
     _CRON_BRACE_EXPANSION_RE,
@@ -207,11 +208,11 @@ def _command_cron_platform_refusal() -> str | None:
     # Imported here: a module-scope import would surface both names on the
     # mcp_cron facade, whose served-name inventory is pinned.
     from kiro_crew import platform_compat
-    from kiro_crew.cron_script import _no_command_shell_message
+    from kiro_crew.cron_script import _no_command_shell_message, _strip_error_lead
 
     if not platform_compat.IS_WINDOWS:
         return None
-    return "Error: " + _no_command_shell_message().removeprefix("❌ ")
+    return "Error: " + _strip_error_lead(_no_command_shell_message())
 
 
 def _vet_shell_command(command: str, *, governance_checked: bool = False) -> str | None:

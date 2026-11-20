@@ -1,4 +1,5 @@
 """Entity extraction using the LLM pool."""
+
 from __future__ import annotations
 
 import contextlib
@@ -40,17 +41,30 @@ def _source_label() -> str:
 
 
 def _is_harness_refusal(exc: BaseException) -> bool:
-    """Whether *exc* is the LTS pool's harness refusal (RFC D6).
+    """Whether *exc* is the LTS pool's harness refusal (RFC D6) or an unconfirmed spec.
 
     It is not an extraction failure to store past: no chunk can be extracted, so it
     reaches the ingest, which fails the job rather than commit empty metadata.
     """
-    from kiro_crew.knowledge.llm_pool import KnowledgeHarnessUnavailable
+    from kiro_crew.knowledge.llm_pool import KnowledgeHarnessUnavailable, KnowledgeSpecUnconfirmed
 
-    return isinstance(exc, KnowledgeHarnessUnavailable)
+    return isinstance(exc, (KnowledgeHarnessUnavailable, KnowledgeSpecUnconfirmed))
+
+
+def _fails_the_ingest(exc: BaseException) -> bool:
+    """The harness refusal, or the pool shut down under the extraction.
+
+    Either way no reply comes, so the error reaches the ingest instead of an
+    empty extraction it would store under the document's hash.
+    """
+    from kiro_crew.knowledge.llm_pool import LLMPoolClosed
+
+    return _is_harness_refusal(exc) or isinstance(exc, LLMPoolClosed)
 
 
 _PAYLOAD_KEYS = frozenset({"title", "entities", "relations", "category", "summary"})
+# Fields of an entity or relation record that the ingest treats as text.
+_RECORD_TEXT_KEYS = frozenset({"name", "type", "description", "source", "target"})
 
 
 def _extraction_shaped(value: object) -> bool:
@@ -124,7 +138,7 @@ class EntityExtractor:
             )
             response = await self._pool.send(prompt, timeout=EXTRACTION_TIMEOUT)
         except Exception as exc:
-            if _is_harness_refusal(exc):
+            if _fails_the_ingest(exc):
                 raise
             # The type only: an exception's message can echo the prompt, which
             # carries the document text.
@@ -164,7 +178,7 @@ class EntityExtractor:
         try:
             responses = await self._pool.send_batch(prompts, timeout=EXTRACTION_TIMEOUT)
         except Exception as exc:
-            if _is_harness_refusal(exc):
+            if _fails_the_ingest(exc):
                 raise
             # The type only: an exception's message can echo the prompt, which
             # carries the document text.
@@ -227,10 +241,27 @@ class EntityExtractor:
 
     @staticmethod
     def _validate(data: dict) -> dict:
+        # A model reply can parse as JSON yet carry the wrong types. Each field
+        # keeps its default unless it has the shape the ingest reads, so one
+        # odd reply cannot fail the whole document.
+        def _text(key: str, default: str) -> str:
+            value = data.get(key, default)
+            return value if isinstance(value, str) else default
+
+        def _records(key: str) -> list[dict]:
+            value = data.get(key, [])
+            if not isinstance(value, list):
+                return []
+            return [
+                {k: v for k, v in rec.items() if k not in _RECORD_TEXT_KEYS or isinstance(v, str)}
+                for rec in value
+                if isinstance(rec, dict)
+            ]
+
         return {
-            "title": data.get("title", ""),
-            "entities": data.get("entities", []),
-            "relations": data.get("relations", []),
-            "category": data.get("category", "document"),
-            "summary": data.get("summary", ""),
+            "title": _text("title", ""),
+            "entities": _records("entities"),
+            "relations": _records("relations"),
+            "category": _text("category", "document"),
+            "summary": _text("summary", ""),
         }

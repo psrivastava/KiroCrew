@@ -142,11 +142,14 @@ def _deferred_instances(handler_name: str) -> Callable:
 
 def _register_mcp_routes(app: web.Application) -> None:
     """Register API routes used by MCP tools (spawn, lessons, crons, etc.)."""
-    # Both entrypoints register this table, so both start reading the Ultra Mode
+    # Both entrypoints register this table, so both start reading the conductor mode
     # pause file off-loop at startup; the hook returns at once.
-    from kiro_crew import crew_pause
+    from kiro_crew import crew_pause, mcp_listing_gateway
 
     app.on_startup.append(crew_pause.startup_preload)
+    # The same shape: the listing relay's code stamp is read off-loop at startup, and
+    # until it is in, a server that asks builds its own list.
+    app.on_startup.append(mcp_listing_gateway.startup_stamp)
     app.router.add_post("/api/spawn", handlers.api_spawn)
     app.router.add_post("/api/spawn/lost", handlers.api_spawn_lost)
     app.router.add_post("/api/spawn/mark-collected", handlers.api_spawn_mark_collected)
@@ -175,11 +178,32 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_post("/api/lessons", handlers.api_lessons_create)
     app.router.add_delete("/api/lessons", handlers.api_lessons_delete)
     app.router.add_patch("/api/lessons", handlers.api_lessons_update)
+    # MCP resource subscriptions (rfc-mcp-resource-subscriptions §4.9.3): feature-
+    # flagged, so the handlers module loads on first request, never at boot.
+    app.router.add_get(
+        "/api/resource-subscriptions",
+        _deferred("resource_subscriptions", "api_resource_subscriptions_list"),
+    )
+    app.router.add_post(
+        "/api/resource-subscriptions",
+        _deferred("resource_subscriptions", "api_resource_subscribe"),
+    )
+    app.router.add_post(
+        "/api/resource-subscriptions/remove",
+        _deferred("resource_subscriptions", "api_resource_unsubscribe"),
+    )
+    app.router.add_post(
+        "/api/resource-subscriptions/operator",
+        _deferred("resource_subscriptions", "api_resource_subscriptions_operator"),
+    )
     app.router.add_get("/api/session-ledger", handlers.api_session_ledger_get)
     app.router.add_post("/api/session-ledger/record", handlers.api_session_ledger_record)
     app.router.add_get("/api/work-ledger", _deferred_work_ledger("api_work_ledger_get"))
     app.router.add_post("/api/work-ledger/record", _deferred_work_ledger("api_work_ledger_record"))
     app.router.add_get("/api/work-ledger/brief", _deferred_work_ledger("api_work_brief"))
+    app.router.add_get(
+        "/api/work-ledger/accept-eval", _deferred_work_ledger("api_work_ledger_accept_eval")
+    )
     app.router.add_post("/api/work-ledger/report", _deferred_work_ledger("api_work_report"))
     app.router.add_post(
         "/api/work-ledger/rebuild", _deferred_work_ledger("api_work_ledger_rebuild")
@@ -285,10 +309,6 @@ def _register_mcp_routes(app: web.Application) -> None:
     # other.
     app.router.add_get(
         "/api/members/{slug}/dashboard", _deferred("member_dashboard", "api_member_dashboard")
-    )
-    app.router.add_post(
-        "/api/members/{slug}/dashboard/lock",
-        _deferred("member_dashboard", "api_member_dashboard_lock"),
     )
     # The gap refetch: a page that cannot place a patch in order asks for the whole
     # read. A strict suffix of the ``/dashboard`` read path, separated by METHOD, so
@@ -407,6 +427,16 @@ def _register_mcp_routes(app: web.Application) -> None:
         "/api/members/{slug}/dashboard/page-offer",
         _deferred("member_page_offer", "api_member_page_offer"),
     )
+    # A ``crewmate.import`` card's dashboard step adopts a shipped page on the new Bot,
+    # and its Undo takes back that same version; card steps only, owner only.
+    app.router.add_post(
+        "/api/members/{slug}/dashboard/template",
+        _deferred("member_import_dashboard", "api_member_import_dashboard"),
+    )
+    app.router.add_delete(
+        "/api/members/{slug}/dashboard/template",
+        _deferred("member_import_dashboard", "api_member_import_dashboard_undo"),
+    )
     # Change cards. Same split as the guide: the agent half is MCP-only under the
     # strict "/api/cards/agent" prefix, the browser half is owner-only cookie auth.
     # The paths are duplicated from ``change_cards.register_change_card_routes``,
@@ -470,7 +500,7 @@ def _register_mcp_routes(app: web.Application) -> None:
         "/api/chat/slots/{slot}/crew-workers/{worker}/recap",
         _deferred("crew_worker_recap", "api_crew_worker_recap"),
     )
-    # Ultra Mode "Pause all" / "Resume all": the Stop and Continue mechanisms over
+    # Conductor mode "Pause all" / "Resume all": the Stop and Continue mechanisms over
     # the root's whole crew, under the same owner-only, no-app gate.
     app.router.add_post(
         "/api/chat/slots/{slot}/crew-workers/pause", _deferred("crew_pause", "api_crew_pause")
@@ -478,11 +508,18 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_post(
         "/api/chat/slots/{slot}/crew-workers/resume", _deferred("crew_pause", "api_crew_resume")
     )
+    # What became of a Run in terminal: tells the owning crewmate thread, under the
+    # same owner-only, no-app gate as the side-panel routes above.
+    app.router.add_post(
+        "/api/chat/slots/{slot}/terminal-run",
+        _deferred("mate_terminal_run", "api_slot_terminal_run"),
+    )
     app.router.add_get("/api/crons", handlers.api_crons)
     app.router.add_post("/api/crons", handlers.api_crons_create)
     app.router.add_delete("/api/crons", handlers.api_cron_batch_delete)
     app.router.add_get("/api/crons/history", handlers.api_cron_history_all)
     app.router.add_post("/api/crons/tools", handlers.api_cron_tools)
+    app.router.add_get("/api/crons/{job_id}", handlers.api_cron_get)
     app.router.add_delete("/api/crons/{job_id}", handlers.api_cron_delete)
     app.router.add_patch("/api/crons/{job_id}", handlers.api_cron_update)
     # Operator-only vault-secret grants. The "/api/crons" prefix above makes
@@ -516,8 +553,8 @@ def _register_mcp_routes(app: web.Application) -> None:
     # prefix covers it.
     app.router.add_post("/api/notifications/agent/dismiss", handlers.api_notification_agent_dismiss)
     # Session control. Registered here so the headless --slack-only server
-    # serves the same MCP surface as the dashboard; all three are on
-    # _STRICT_INTERNAL_API_PATHS, which test_session_control_routes_are_strict
+    # serves the same MCP surface as the dashboard; every one is on
+    # _STRICT_INTERNAL_API_PATHS, which test_session_control_routes_are_strict_internal
     # pins by deriving the route set from the router rather than a hand-copied list.
     app.router.add_post(
         "/api/session-control/create", _deferred("session_control", "api_session_control_create")
@@ -546,6 +583,10 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_post(
         "/api/session-control/set-color",
         _deferred("session_control", "api_session_control_set_color"),
+    )
+    app.router.add_post(
+        "/api/session-control/set-note",
+        _deferred("session_control", "api_session_control_set_note"),
     )
     app.router.add_post(
         "/api/session-control/reload",
@@ -608,6 +649,18 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_get("/api/crew-sessions/search", _deferred_instances("api_crew_sessions_search"))
     app.router.add_get("/api/crew-sessions/list", _deferred_instances("api_crew_sessions_list"))
     app.router.add_get("/api/crew-sessions/read", _deferred_instances("api_crew_sessions_read"))
+    app.router.add_post(
+        "/api/session-control/queue", _deferred("session_control", "api_session_control_queue")
+    )
+    # crew_list: the remote-dispatch crew roster (handlers/remote_crew_list.py).
+    app.router.add_get(
+        "/api/session-control/crews",
+        _deferred("remote_crew_list", "api_session_control_crews"),
+    )
+    app.router.add_post(
+        "/api/session-control/run-queued",
+        _deferred("session_control", "api_session_control_run_queued"),
+    )
     # Settings -> Browser on Browser Harness (handlers/browser_harness_status.py):
     # the engine's install state and connection, the install job, a bounded
     # connect test and a disconnect. Owner cookie/token only; every one of them

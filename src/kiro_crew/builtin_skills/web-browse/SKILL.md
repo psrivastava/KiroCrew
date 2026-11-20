@@ -16,10 +16,15 @@ Kiro's own headless Chromium. **The page shows live in the chat** while you
 work, in a card attached to your turn. The user can click that card to take
 over with their real mouse and keyboard, and hand it back with Esc.
 
-Other ops: `snapshot` (the page as an outline with element refs), then
-`click` / `type` / `press_key` / `hover` / `drag` / `scroll` / `select_option`
-/ `wait_for` / `back` / `console` / `screenshot` / `tabs`. Call `snapshot`
-first to get refs before a `click` or `type`.
+Other ops: `snapshot` (the page as an outline with element refs), `read`
+(the page's text, the whole page and not only the screen;
+a long page names the `offset` to read next), then
+`click` / `type` / `paste` / `press_key` / `hover` / `drag` / `scroll` /
+`select_option` / `wait_for` / `back` / `console` / `screenshot` / `tabs`. Call `snapshot`
+first to get refs before a `click` or `type`. To read a page's content, use
+`read`, not a scroll and a screenshot per screen. An unselected tab or a
+closed section (`details`) is left out, so click the tab or open the section
+first.
 
 ## What the tool opens
 
@@ -89,8 +94,13 @@ you need opened instead.
 - **View** (this skill): open a URL and show it.
 - **Operate** (click, type, fill, multi-step flows): the same tool, more ops.
   `snapshot` to get refs, then `click`, `type` (with `submit: true` for Enter),
-  `press_key`, `select_option`. Re-snapshot after every page change; a stale
+  `press_key`, `select_option`, and `paste` to put a table or formatted text
+  into an editor in one call. Re-snapshot after every page change; a stale
   ref is refused, never silently redirected.
+  When a result carries `changes` (the user's `browser.report_changes` setting),
+  read it first: it names a new page, an opened dialog, an alert, the fields that
+  failed validation and the controls that came or went, so a snapshot is needed only
+  for fresh refs or a field's validation message.
 - **Human takeover:** the live card carries real mouse and keyboard input, so a
   CAPTCHA or a 2FA prompt is the user's to complete, not yours to work around.
   Say what is blocking and let them take the session.

@@ -42,6 +42,7 @@ from kiro_crew.llm_helpers import (
 from kiro_crew.member_memory_auth import private_memory_store_for_session
 from kiro_crew.start_priority import StartPriority
 from kiro_crew.task_planner import decompose_yaml
+from kiro_crew.taskrunner_switch import task_runner_off
 from kiro_crew.workflow_memory import (
     _RUN_ID_MAX,
     WorkflowMemoryError,
@@ -1320,10 +1321,12 @@ class WorkflowService:
         """
         with self._definition_lock:
             errors: list[str] = []
+            warnings: list[str] = []
             meta: dict[str, Any] = {}
             if source_format == SOURCE_FORMAT_PYTHON:
                 vr = validate(source)
-                errors = list(vr.errors)
+                # A compile-stage error is saved as before and returned as a warning.
+                errors, warnings = vr.save_errors, vr.compile_errors
                 meta = vr.meta or {}
             elif source_format == SOURCE_FORMAT_TASK_PLAN:
                 try:
@@ -1355,7 +1358,7 @@ class WorkflowService:
                 return {"ok": False, "error": str(exc), "errors": [str(exc)], "slug_taken": True}
             except SensitiveWorkflowSourceError as exc:
                 return {"ok": False, "error": str(exc), "errors": [str(exc)]}
-        return {"ok": True, "definition": definition}
+        return _saved(definition, warnings)
 
     async def _reusable_run(self, run_id: str) -> RunHandle | dict[str, Any]:
         """The run whose original source may enter the library, or the refusal.
@@ -1415,11 +1418,11 @@ class WorkflowService:
         source = handle.source
         if handle.source_format == SOURCE_FORMAT_PYTHON:
             validated = validate(source)
-            if not validated.ok:
+            if validated.save_errors:
                 return {
                     "ok": False,
-                    "error": "; ".join(validated.errors),
-                    "errors": validated.errors,
+                    "error": "; ".join(validated.save_errors),
+                    "errors": validated.save_errors,
                 }
             derived_from = declared_lineage(validated.meta or {})
         elif handle.source_format == SOURCE_FORMAT_TASK_PLAN:
@@ -1476,9 +1479,10 @@ class WorkflowService:
             if expected_id is not None and current.get("id") != expected_id:
                 return {"ok": False, "error": _REF_MOVED_ERROR, "conflict": True}
             source_format = str(current.get("format") or SOURCE_FORMAT_PYTHON)
+            warnings: list[str] = []
             if source_format == SOURCE_FORMAT_PYTHON:
                 vr = validate(source)
-                errors = list(vr.errors)
+                errors, warnings = vr.save_errors, vr.compile_errors
             elif source_format == SOURCE_FORMAT_TASK_PLAN:
                 try:
                     decompose_yaml(source)
@@ -1506,7 +1510,7 @@ class WorkflowService:
                 "error": "workflow definition has a newer revision",
                 "conflict": True,
             }
-        return {"ok": True, "definition": definition}
+        return _saved(definition, warnings)
 
     async def update_run_definition(
         self,
@@ -1590,6 +1594,9 @@ class WorkflowService:
                     "error": "task runner is not available for this workflow",
                     "unavailable": True,
                 }
+            # Task Runner plans and runs it, so it obeys Task Runner's switch.
+            if (refusal := await asyncio.to_thread(task_runner_off)) is not None:
+                return {"error": refusal, "app_disabled": True}
             started = await self._task_runner.start_workflow_definition(
                 definition,
                 input_text=effective_input,
@@ -1640,6 +1647,18 @@ class WorkflowService:
             # gateway stop froze, whose driver task has already finished.
             if runner is not None and hasattr(runner, "cancel"):
                 runner.cancel(handle.task_id, exact=True)
+        elif (
+            not cancelled
+            and handle is not None
+            and handle.status == STATUS_PAUSED
+            and handle.driver == "taskrunner"
+            and handle.task_id
+            and runner is not None
+            and hasattr(runner, "cancel_paused")
+        ):
+            # A paused run has no driver task, so the registry has nothing to cancel;
+            # the TaskRunner ends it and says whether it did.
+            return bool(await runner.cancel_paused(handle.task_id))
         return cancelled
 
     @admission_errors
@@ -1755,9 +1774,10 @@ class WorkflowService:
         else:
             derived_id = prior.derived_from_workflow_id
             derived_revision = prior.derived_from_revision
+        # A rerun keeps the limits its run was launched with unless the caller names one.
         started = await self._runner(
             new_id,
-            timeout_secs=timeout_secs,
+            timeout_secs=timeout_secs if timeout_secs is not None else prior.timeout_secs,
             memory_scope=memory_scope,
             session_key=origin,
             default_agent=default_agent,
@@ -1772,6 +1792,9 @@ class WorkflowService:
             now=self._now_fn(),
             name=f"{prior.name} ({label})",
             args=prior.args,
+            budget_total=prior.budget_total,
+            fallback_title=prior.fallback_title,
+            fallback_folder_id=prior.fallback_folder_id,
             author=origin,
             session_key=origin,
             replay_results=replay_results,
@@ -1903,6 +1926,14 @@ def _run_provenance(definition: dict[str, Any]) -> dict[str, Any]:
     if definition.get("shadowed_refs"):
         provenance["shadowed_refs"] = list(definition["shadowed_refs"])
     return provenance
+
+
+def _saved(definition: Any, warnings: list[str]) -> dict[str, Any]:
+    """A save's reply; compile-stage errors ride along as ``warnings``."""
+    if not warnings:
+        return {"ok": True, "definition": definition}
+    logger.warning("workflow saved with a script that cannot run: %s", "; ".join(warnings))
+    return {"ok": True, "definition": definition, "warnings": warnings}
 
 
 def _lineage_exists(value: Any, definitions: list[dict[str, Any]]) -> bool:

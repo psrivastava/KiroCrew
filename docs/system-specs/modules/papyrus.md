@@ -892,6 +892,7 @@ that host reports `supported: false` and keeps the manual install path.
 | `.../papyrus/backend/gitops.py` | Clone/status/commit/push/pull, **and** the repo-config RCE denylist (19 `-c` overrides + the attributes pin + pack-program flags + `GIT_PROXY_COMMAND`) |
 | `.../papyrus/backend/routes.py` | aiohttp handlers + `register_routes` |
 | `.../papyrus/backend/doc_title.py` | Reads `\title{...}` from a cloned paper's main document, once, at clone time |
+| `.../papyrus/backend/procio.py` | Bounded reads from a child process's pipes, shared by `latex.py` and `gitops.py` |
 | `src/kiro_crew/builtin_skills/papyrus-writing/SKILL.md` | Base skill: conduct, paper-quality principles, LaTeX house style, project path, compile workflow |
 | `.../builtin_skills/papyrus-make-fluent/SKILL.md` | Polish English as tracked suggestions |
 | `.../builtin_skills/papyrus-latex-comments/SKILL.md` | Comment layer — `\aicomment` margin notes |
@@ -917,10 +918,8 @@ imports it nor names it where it could act on it:
 - **Backend.** No module outside `src/kiro_crew/apps/builtins/` imports
   `kiro_crew.apps.builtins.papyrus`. The gateway reaches the app only the way it
   reaches every built-in: by name through `BUILTIN_NAMES`, importing the package and
-  calling its `register_routes` at boot. The `app.task.completed` counter labels an
-  app by whether it is a shipped built-in (`metrics.feature_usage.OFFICIAL_APP_IDS`
-  is `BUILTIN_NAMES`), so the core holds no Papyrus row; the app passes its own id to
-  `record_app_task`.
+  calling its `register_routes` at boot. The app records no metric of its own;
+  `kirocrew.app.task.completed`, which counted its compiles, is retired.
 - **Frontend.** The SPA imports the app's UI only through the `/papyrus` row of
   `website/src/apps/builtinRegistry.ts`; the app's tests live in its own directory.
 - **What still names the app, and why.** The five `papyrus-*` skills ship in

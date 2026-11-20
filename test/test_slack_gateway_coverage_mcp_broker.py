@@ -9,7 +9,9 @@ approval-persist arms. No real broker socket.
 from __future__ import annotations
 
 import asyncio
+import builtins
 import contextlib
+import importlib
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -17,8 +19,9 @@ import pytest
 from slack_gateway_coverage_helpers import _make_orchestrator, _mock_dashboard_state
 
 from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.mcp_gateway.manager import GatewayManager, GatewaySpec
 from kiro_crew.slack import gateway as gw
-from kiro_crew.testing.wait import await_until, finished
+from kiro_crew.testing.wait import async_wait_until, await_until, finished
 
 # ═════════════════════════════════════════════════════════════════════════
 # MCP-gateway control plane
@@ -176,6 +179,341 @@ class TestInitMcpGateway:
         ):
             await orch._init_mcp_gateway()
         assert orch._mcp_gateway_manager is manager
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("enabled", [False, True])
+    async def test_resource_subscription_restore_runs_only_after_readiness_when_enabled(
+        self, tmp_path, enabled
+    ):
+        orch = _make_orchestrator()
+        orch._cfg.mcp_gateway.enabled = True
+        orch._cfg.mcp_gateway.stub_servers = ["alpha-mcp"]
+        orch._cfg.mcp_gateway.resource_subscriptions.enabled = enabled
+        orch.dashboard_state = MagicMock()
+        orch.dashboard_state.open_slots_restored = False
+        orch.dashboard_state.slot_exists.return_value = False
+        orch.dashboard_state._slots = {}
+        orch.sessions = MagicMock()
+        orch.sessions.session_keys.return_value = frozenset()
+        orch.dashboard_state.sessions = orch.sessions
+        manager = MagicMock()
+        manager.start = AsyncMock(return_value=True)
+        manager.shutdown = AsyncMock()
+        service_started = asyncio.Event()
+        start_service = AsyncMock(side_effect=lambda *_args, **_kwargs: service_started.set())
+        stop_service = AsyncMock()
+        resource_imports: list[str] = []
+        real_import = builtins.__import__
+        feature_modules = (
+            "kiro_crew.dashboard.resource_wakes",
+            "kiro_crew.mcp_gateway.resource_subscriptions",
+        )
+
+        # Both modules are loaded before tracking starts (the patches below load
+        # resource_subscriptions), so only the broker's own imports are recorded.
+        importlib.import_module("kiro_crew.dashboard.resource_wakes")
+
+        def track_import(name, globals_=None, locals_=None, fromlist=(), level=0):
+            # ``from pkg import mod`` arrives as name="pkg", fromlist=("mod",).
+            for candidate in (name, *(f"{name}.{item}" for item in fromlist or ())):
+                if candidate in feature_modules:
+                    resource_imports.append(candidate)
+            return real_import(name, globals_, locals_, fromlist, level)
+
+        with (
+            patch("kiro_crew.slack.gateway.is_gateway_supported", return_value=True),
+            patch(
+                "kiro_crew.slack.gateway.rewrite_kwargs",
+                side_effect=_gateway_rewrite_inputs(tmp_path),
+            ),
+            patch("kiro_crew.slack.gateway.rewrite_agents", return_value=(None, {})),
+            patch("kiro_crew.slack.gateway.GatewayManager", return_value=manager),
+            patch(
+                "kiro_crew.mcp_gateway.resource_subscriptions.start_active_service",
+                start_service,
+            ),
+            patch(
+                "kiro_crew.mcp_gateway.resource_subscriptions.stop_active_service",
+                stop_service,
+            ),
+            patch("builtins.__import__", side_effect=track_import),
+        ):
+            await orch._init_mcp_gateway()
+            start_service.assert_not_awaited()
+            task = getattr(orch, "_mcp_resource_subscription_task", None)
+            if enabled:
+                assert task is not None
+                assert resource_imports == []
+                orch.dashboard_state.open_slots_restored = True
+                orch._mcp_launch_approval_ready.set()
+                await finished(service_started.wait(), "resource subscription restoration")
+                assert resource_imports == list(feature_modules)
+                start_service.assert_awaited_once()
+                session_is_closed = start_service.await_args.kwargs["session_is_closed"]
+                # Channel sessions get a runtime lazily, so at boot neither an open
+                # tab nor a runtime is evidence about them: they are never closed here.
+                assert await session_is_closed("slack:C1:1700000000.000100") is False
+                assert await session_is_closed("cron:nightly-digest") is False
+                metadata = orch.dashboard_state.conversation_log.get_metadata_status
+                metadata.return_value = ({"closed": True}, True)
+                workflow_slot = MagicMock(
+                    key="workflow-run1", linked_session_key="dashboard:origin"
+                )
+                orch.dashboard_state._slots = {"workflow-run1": workflow_slot}
+                assert await session_is_closed("dashboard:origin") is False
+                orch.dashboard_state._slots = {}
+                assert await session_is_closed("dashboard:closed") is True
+                orch.dashboard_state.slot_exists.assert_called_with("closed")
+                orch.dashboard_state.slot_exists.return_value = True
+                assert await session_is_closed("dashboard:open") is False
+                orch.dashboard_state.slot_exists.return_value = False
+                orch.sessions.session_keys.return_value = frozenset({"dashboard:runtime"})
+                assert await session_is_closed("dashboard:runtime") is False
+                orch.sessions.session_keys.return_value = frozenset()
+                orch.dashboard_state.open_slots_restored = False
+                assert await session_is_closed("dashboard:unknown") is False
+                orch.dashboard_state.open_slots_restored = True
+                orch.dashboard_state.slot_exists.side_effect = RuntimeError("state unavailable")
+                assert await session_is_closed("dashboard:unverifiable") is False
+                orch.dashboard_state.slot_exists.side_effect = None
+                orch.sessions.session_keys.side_effect = RuntimeError("sessions unavailable")
+                assert await session_is_closed("dashboard:unverifiable") is False
+                orch.sessions.session_keys.side_effect = None
+                # Absent with no closure record is missing evidence, never closure.
+                metadata.return_value = ({}, True)
+                assert await session_is_closed("dashboard:absent") is False
+
+                def reopened_during_read(_history_key: str) -> tuple[dict, bool]:
+                    orch.dashboard_state.slot_exists.return_value = True
+                    return {"closed": True}, True
+
+                metadata.side_effect = reopened_during_read
+                assert await session_is_closed("dashboard:reopened") is False
+                metadata.side_effect = None
+                orch.dashboard_state.slot_exists.return_value = False
+                # The started service's events go to the wake dispatcher.
+                from kiro_crew.dashboard.resource_wakes import ResourceWakeDispatcher
+
+                service = MagicMock()
+                sink = start_service.await_args.args[2](service)
+                dispatcher = sink.__self__
+                assert isinstance(dispatcher, ResourceWakeDispatcher)
+                assert sink.__func__ is ResourceWakeDispatcher.handle
+                assert dispatcher._service is service
+                assert (
+                    start_service.await_args.kwargs["backend_spawn_wait_secs"]
+                    == orch._cfg.mcp_gateway.spawn_queue_wait_secs
+                )
+            else:
+                assert task is None
+                assert resource_imports == []
+            await orch._stop_mcp_broker()
+
+        if enabled:
+            # The broker stop ends the task, which closes the dispatcher.
+            assert task.done() and dispatcher._closed
+            stop_service.assert_awaited_once_with()
+        else:
+            stop_service.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_start_retires_a_dashboard_session_only_on_recorded_closure(self, tmp_path):
+        """A tab past the restore budget or with an uncommitted close is not closed.
+
+        Only a readable persisted ``closed`` flag retires its subscriptions at
+        start.
+        """
+        from kiro_crew.config.integration_sections import McpResourceSubscriptionsConfig
+        from kiro_crew.dashboard.channel_slots import note_slot_closed
+        from kiro_crew.mcp_gateway.resource_subscription_store import (
+            HolderRecord,
+            ResourceSubscriptionStore,
+        )
+        from kiro_crew.mcp_gateway.resource_subscriptions import (
+            RecordingSink,
+            ResourceSubscriptionService,
+        )
+
+        orch = _make_orchestrator()
+        orch._cfg.mcp_gateway.enabled = True
+        orch._cfg.mcp_gateway.stub_servers = ["alpha-mcp"]
+        orch._cfg.mcp_gateway.resource_subscriptions.enabled = True
+        orch.dashboard_state = MagicMock()
+        orch.dashboard_state.open_slots_restored = True
+        orch.dashboard_state.slot_exists.return_value = False
+        orch.dashboard_state._slots = {}
+        orch.sessions = MagicMock()
+        orch.sessions.has_session.return_value = False
+
+        def metadata_status(history_key: str) -> tuple[dict, bool]:
+            if "persisted" in history_key:
+                return {"closed": True}, True
+            if "unreadable" in history_key:
+                return {"closed": True}, False
+            if "raising" in history_key:
+                raise OSError("metadata unavailable")
+            return {}, True
+
+        orch.dashboard_state.conversation_log.get_metadata_status.side_effect = metadata_status
+        note_slot_closed(orch.dashboard_state, "tombstoned")
+        manager = MagicMock()
+        manager.start = AsyncMock(return_value=True)
+        manager.shutdown = AsyncMock()
+        service_started = asyncio.Event()
+        start_service = AsyncMock(side_effect=lambda *_args, **_kwargs: service_started.set())
+        with (
+            patch("kiro_crew.slack.gateway.is_gateway_supported", return_value=True),
+            patch(
+                "kiro_crew.slack.gateway.rewrite_kwargs",
+                side_effect=_gateway_rewrite_inputs(tmp_path),
+            ),
+            patch("kiro_crew.slack.gateway.rewrite_agents", return_value=(None, {})),
+            patch("kiro_crew.slack.gateway.GatewayManager", return_value=manager),
+            patch(
+                "kiro_crew.mcp_gateway.resource_subscriptions.start_active_service",
+                start_service,
+            ),
+            patch("kiro_crew.mcp_gateway.resource_subscriptions.stop_active_service", AsyncMock()),
+        ):
+            await orch._init_mcp_gateway()
+            orch._mcp_launch_approval_ready.set()
+            await finished(service_started.wait(), "resource subscription start")
+            session_is_closed = start_service.await_args.kwargs["session_is_closed"]
+
+            store = ResourceSubscriptionStore(tmp_path / "subscriptions.json")
+            names = ("budget-skipped", "persisted", "tombstoned", "unreadable", "raising")
+            for name in names:
+                store.put(
+                    HolderRecord(
+                        session_key=f"dashboard:{name}",
+                        channel_id="",
+                        server="fake",
+                        register={"server_name": "fake"},
+                        initialize={"method": "initialize", "params": {}},
+                        uris=["crux://reviews/CR-1"],
+                    )
+                )
+            service = ResourceSubscriptionService(
+                store=store,
+                socket_path=lambda: None,
+                sink=RecordingSink(),
+                settings=lambda: McpResourceSubscriptionsConfig(enabled=True),
+                session_is_closed=session_is_closed,
+            )
+            started: list[str] = []
+            service._start_holder = lambda record, **_kwargs: started.append(  # type: ignore[method-assign]
+                record.session_key
+            )
+            try:
+                await service.start()
+            finally:
+                await service.close()
+            await orch._stop_mcp_broker()
+
+        kept = [
+            "dashboard:budget-skipped",
+            "dashboard:raising",
+            "dashboard:tombstoned",
+            "dashboard:unreadable",
+        ]
+        assert sorted(r.session_key for r in ResourceSubscriptionStore(store.path).load()) == kept
+        assert sorted(started) == kept
+
+    @pytest.mark.asyncio
+    async def test_a_failed_close_during_start_keeps_the_sessions_subscriptions(
+        self, tmp_path, monkeypatch
+    ):
+        """A close tombstone cannot retire records before its history save commits."""
+        from chat_test_helpers import _make_state
+        from test_mcp_resource_subscription_cleanup import _Req
+
+        from kiro_crew.config.integration_sections import McpResourceSubscriptionsConfig
+        from kiro_crew.dashboard import chat_handlers
+        from kiro_crew.mcp_gateway.resource_subscription_store import (
+            HolderRecord,
+            ResourceSubscriptionStore,
+        )
+        from kiro_crew.mcp_gateway.resource_subscriptions import (
+            RecordingSink,
+            ResourceSubscriptionService,
+        )
+
+        name = "close-refused"
+        session_key = f"dashboard:{name}"
+        state = _make_state(tmp_path / "state")
+        state.open_slots_restored = True
+        state.sessions.has_session.return_value = False
+        slot = state.get_or_create_slot(name)
+        slot.append("user", "watch the review")
+        slot.drain()
+
+        orch = _make_orchestrator()
+        orch._cfg.mcp_gateway.enabled = True
+        orch._cfg.mcp_gateway.stub_servers = ["alpha-mcp"]
+        orch._cfg.mcp_gateway.resource_subscriptions.enabled = True
+        orch.dashboard_state = state
+        orch.sessions = state.sessions
+        manager = MagicMock()
+        manager.start = AsyncMock(return_value=True)
+        manager.shutdown = AsyncMock()
+        service_started = asyncio.Event()
+        start_service = AsyncMock(side_effect=lambda *_args, **_kwargs: service_started.set())
+        with (
+            patch("kiro_crew.slack.gateway.is_gateway_supported", return_value=True),
+            patch(
+                "kiro_crew.slack.gateway.rewrite_kwargs",
+                side_effect=_gateway_rewrite_inputs(tmp_path),
+            ),
+            patch("kiro_crew.slack.gateway.rewrite_agents", return_value=(None, {})),
+            patch("kiro_crew.slack.gateway.GatewayManager", return_value=manager),
+            patch(
+                "kiro_crew.mcp_gateway.resource_subscriptions.start_active_service",
+                start_service,
+            ),
+            patch("kiro_crew.mcp_gateway.resource_subscriptions.stop_active_service", AsyncMock()),
+        ):
+            await orch._init_mcp_gateway()
+            orch._mcp_launch_approval_ready.set()
+            await finished(service_started.wait(), "resource subscription start")
+            session_is_closed = start_service.await_args.kwargs["session_is_closed"]
+
+            store = ResourceSubscriptionStore(tmp_path / "subscriptions.json")
+            store.put(
+                HolderRecord(
+                    session_key=session_key,
+                    channel_id="",
+                    server="fake",
+                    register={"server_name": "fake"},
+                    initialize={"method": "initialize", "params": {}},
+                    uris=["crux://reviews/CR-1"],
+                )
+            )
+            service = ResourceSubscriptionService(
+                store=store,
+                socket_path=lambda: None,
+                sink=RecordingSink(),
+                settings=lambda: McpResourceSubscriptionsConfig(enabled=True),
+                session_is_closed=session_is_closed,
+            )
+            service._start_holder = lambda _record, **_kwargs: None  # type: ignore[method-assign]
+
+            async def fail_after_start(*_args, **_kwargs):
+                await service.start()
+                raise RuntimeError("disk wedged")
+
+            monkeypatch.setattr(chat_handlers, "save_slot_off_loop", fail_after_start)
+            try:
+                response = await chat_handlers.api_chat_slot_delete(_Req(state, name))
+            finally:
+                await service.close()
+                await orch._stop_mcp_broker()
+
+        assert response.status == 500
+        assert b'"code": "history_save_failed"' in response.body
+        assert state._slots[name] is slot
+        assert [r.session_key for r in ResourceSubscriptionStore(store.path).load()] == [
+            session_key
+        ]
 
     @pytest.mark.asyncio
     async def test_the_started_set_is_recorded_and_the_override_wins(self, tmp_path):
@@ -481,6 +819,107 @@ class TestFailedMcpBrokerStartIsRetried:
             await finished(orch._stop_mcp_broker(), "the broker stop")
         old.start.assert_awaited_once()
 
+    @staticmethod
+    def _owner_port_manager(tmp_path, monkeypatch, orch, retry_gate: asyncio.Event):
+        """A real ``GatewayManager`` whose boot start fails and whose retry comes up.
+
+        The election is scripted: the retry's start waits for *retry_gate*. The
+        daemon's end of the control socket records each frame, with whether the
+        broker was already published when it arrived, and acknowledges it.
+        """
+        manager = GatewayManager(GatewaySpec(socket_path=tmp_path / "gw.sock"))
+        attempts = 0
+
+        async def start_locked() -> bool:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                return False
+            await retry_gate.wait()
+            return True
+
+        received: list[tuple[dict, bool]] = []
+
+        async def roundtrip(frame: dict) -> dict:
+            received.append((frame, orch._mcp_gateway_manager is manager))
+            return {"type": "owner-port-set", "port": frame["port"]}
+
+        monkeypatch.setattr(manager, "_start_locked", start_locked)
+        monkeypatch.setattr(manager, "_control_roundtrip", roundtrip)
+        monkeypatch.setattr(manager, "shutdown", AsyncMock())
+        return manager, received
+
+    @pytest.mark.asyncio
+    async def test_a_retry_after_the_wire_sends_the_port_the_wire_stored(
+        self, tmp_path, monkeypatch
+    ):
+        """Boot: the start fails before the dashboard exists, so the wire finds the
+        manager parked for the retry. It stores the port there, and the retry's own
+        start sends it, before the broker is published."""
+        orch = self._orchestrator()
+        orch.dashboard_state = None
+        wired = asyncio.Event()
+        manager, received = self._owner_port_manager(tmp_path, monkeypatch, orch, wired)
+        with contextlib.ExitStack() as stack:
+            self._broker_seams(stack, tmp_path, MagicMock(return_value=manager))
+            stack.enter_context(
+                patch.object(orch, "_mcp_gateway_start_retry_delay", return_value=0.0)
+            )
+            await orch._init_mcp_gateway()
+            assert orch._mcp_gateway_pending is manager
+            ds = _mock_dashboard_state()
+            ds._listener_bound_port = 47211
+            orch.dashboard_state = ds
+            orch._wire_mcp_gateway_dashboard()
+            wired.set()
+            await await_until(
+                orch._mcp_gateway_start_retry, what="the retry bringing the broker up"
+            )
+            assert orch._mcp_gateway_manager is manager
+            await finished(orch._stop_mcp_broker(), "the broker stop")
+        assert received == [({"type": "owner-port", "port": 47211}, False)]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "bound_first", [False, True], ids=["before-the-dashboard", "between-bind-and-wire"]
+    )
+    async def test_a_retry_that_comes_up_before_the_wire_still_reaches_the_daemon(
+        self, tmp_path, monkeypatch, bound_first
+    ):
+        """The other order. A retry that comes up before the dashboard exists
+        leaves the announce to the wire; one that comes up after the bind, while
+        the manager has no port, announces it itself."""
+        orch = self._orchestrator()
+        orch.dashboard_state = None
+        retry_gate = asyncio.Event()
+        manager, received = self._owner_port_manager(tmp_path, monkeypatch, orch, retry_gate)
+        ds = _mock_dashboard_state()
+        ds._listener_bound_port = 47211
+        with contextlib.ExitStack() as stack:
+            self._broker_seams(stack, tmp_path, MagicMock(return_value=manager))
+            stack.enter_context(
+                patch.object(orch, "_mcp_gateway_start_retry_delay", return_value=0.0)
+            )
+            await orch._init_mcp_gateway()
+            if bound_first:
+                orch.dashboard_state = ds
+            retry_gate.set()
+            await await_until(
+                orch._mcp_gateway_start_retry, what="the retry bringing the broker up"
+            )
+            if not bound_first:
+                assert received == [], "nothing to send before the bind"
+                orch.dashboard_state = ds
+                orch._wire_mcp_gateway_dashboard()
+            await async_wait_until(lambda: received, describe=lambda: received)
+            announces = [
+                t for t in orch._background_tasks if t.get_name() == "mcp-gateway-owner-port"
+            ]
+            await finished(asyncio.gather(*announces), "the detached announce")
+            await finished(orch._stop_mcp_broker(), "the broker stop")
+        assert received == [({"type": "owner-port", "port": 47211}, True)]
+        assert manager.owner_port == 47211
+
 
 class TestStopAndApplyMcpBroker:
     """``_stop_mcp_broker`` / ``_apply_mcp_stub`` / ``_wire_mcp_gateway_dashboard``."""
@@ -586,6 +1025,74 @@ class TestStopAndApplyMcpBroker:
         assert ds._mcp_gateway_manager is mgr
         assert ds._mcp_gateway_apply == orch._apply_mcp_gateway_enabled
         assert ds._mcp_gateway_apply_stub == orch._apply_mcp_stub
+
+    @pytest.mark.asyncio
+    async def test_wire_dashboard_announces_the_port_the_listener_bound(self, monkeypatch):
+        """The broker started before the bind, so this is where its daemon learns
+        the port: from the listener's record, never the inherited environment."""
+        monkeypatch.setenv("KIROCREW_PORT", "47299")
+        monkeypatch.setenv("KIROCREW_BOUND_PORT", "47299")
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        ds._listener_bound_port = 47211
+        orch.dashboard_state = ds
+        mgr = MagicMock()
+        mgr.announce_owner_port = AsyncMock(return_value=True)
+        orch._mcp_gateway_manager = mgr
+
+        orch._wire_mcp_gateway_dashboard()
+        await finished(asyncio.gather(*orch._background_tasks), "the announce task")
+
+        mgr.announce_owner_port.assert_awaited_once_with(47211)
+
+    @pytest.mark.parametrize("bound", [0, None, "47211"])
+    def test_wire_dashboard_announces_nothing_without_a_bound_port(self, bound):
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        ds._listener_bound_port = bound
+        orch.dashboard_state = ds
+        mgr = MagicMock()
+        orch._mcp_gateway_manager = mgr
+
+        orch._wire_mcp_gateway_dashboard()
+
+        mgr.announce_owner_port.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bound", [47211, None], ids=["after-the-bind", "at-boot"])
+    async def test_a_broker_started_after_the_bind_takes_the_listeners_port(
+        self, tmp_path, monkeypatch, bound
+    ):
+        """A broker restart (the sharing toggle) builds a new manager; it learns the
+        port from the same record, before ``start()`` spawns the daemon."""
+        monkeypatch.setenv("KIROCREW_PORT", "47299")
+        orch = _make_orchestrator()
+        orch._cfg.mcp_gateway.enabled = True
+        orch._cfg.mcp_gateway.stub_servers = ["alpha-mcp"]
+        if bound is None:
+            orch.dashboard_state = None
+        else:
+            orch.dashboard_state = _mock_dashboard_state()
+            orch.dashboard_state._listener_bound_port = bound
+        manager = MagicMock()
+        manager.start = AsyncMock(return_value=True)
+        with (
+            patch("kiro_crew.slack.gateway.is_gateway_supported", return_value=True),
+            patch(
+                "kiro_crew.slack.gateway.rewrite_kwargs",
+                side_effect=_gateway_rewrite_inputs(tmp_path),
+            ),
+            patch("kiro_crew.slack.gateway.rewrite_agents", return_value=(None, {})),
+            patch("kiro_crew.slack.gateway.GatewayManager", return_value=manager),
+        ):
+            await orch._init_mcp_gateway()
+
+        calls = [name for name, _args, _kw in manager.method_calls]
+        if bound is None:
+            manager.set_owner_port.assert_not_called()
+        else:
+            manager.set_owner_port.assert_called_once_with(47211)
+            assert calls.index("set_owner_port") < calls.index("start")
 
 
 class TestMcpBrokerRefreshPrefetchAndPersistArms:

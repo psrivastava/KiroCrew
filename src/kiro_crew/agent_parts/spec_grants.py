@@ -110,8 +110,10 @@ _MATE_AUTO_GRANTS = (
 #:   distribution: one caller could hold all 500, and every later create — the
 #:   person opening a chat tab included — got the 429. A bounded resource that one
 #:   caller can exhaust is not bounded from anybody else's point of view. Now
-#:   ``MAX_SLOTS_PER_CREATOR`` bounds what a single caller holds, leaving 450 slots
-#:   reachable no matter what the conductor does.
+#:   the per-creator cap (``session.max_per_creator``, default
+#:   ``MAX_SLOTS_PER_CREATOR``) bounds what a single caller holds, leaving 450 slots
+#:   reachable no matter what the conductor does, and never fewer than 50 at the
+#:   highest value the owner can set.
 #:
 #: Every verb this server exposes, against that rule:
 #:
@@ -122,7 +124,7 @@ _MATE_AUTO_GRANTS = (
 #:   keep them.
 #: * ``session_create`` — creates a NEW session in the caller's workspace, bounded
 #:   both globally (``MAX_LIVE_SLOTS``, 409 on breach) and per caller
-#:   (``MAX_SLOTS_PER_CREATOR``), and visible in the sidebar. GRANTED.
+#:   (``session.max_per_creator``), and visible in the sidebar. GRANTED.
 #:   One known side effect, recorded because it is the closest thing to an
 #:   exception here: ``create_session`` mints its slot with
 #:   ``origin=SlotOrigin.USER`` (it is a first-class user-owned session, which is
@@ -142,6 +144,13 @@ _MATE_AUTO_GRANTS = (
 #:   ``session_read_message`` is and returns a digest of the same transcript: a
 #:   verb is granted for a step, and no conductor step calls it yet. A skill that
 #:   adopts it for the patrol cycle adds it here with that step as the reason.
+#: * ``session_queue`` — WITHHELD. Its ``move`` action reorders instructions
+#:   waiting in another session's queue, which is a write to
+#:   what that session runs next, and no conductor step calls it yet. The same
+#:   step-adopts-it rule as ``session_summary`` applies.
+#: * ``session_run_queued`` — WITHHELD. On a running target it stops the turn the
+#:   way ``session_stop`` does, discarding its work, and then chooses what the
+#:   target runs next. No conductor step calls it yet; the same rule applies.
 #: * ``chat_folder_move_session`` — WITHHELD. It writes another session's
 #:   ``folder_id``: the PATCH goes to ``/api/chat/slots/<target>/folder`` where the
 #:   target is the session named in the ARGUMENTS, and the strictly-resolved
@@ -238,6 +247,8 @@ _MATE_AUTO_GRANTS = (
 #: * ``session_set_color`` — WITHHELD. Writes a session other than the
 #:   caller's (its sidebar tint). The route confines it to sessions the
 #:   caller created and refuses the caller's own, but no conductor step needs it.
+#: * ``session_set_note`` — WITHHELD. Writes text another session's next turn
+#:   reads. Same reach as ``session_set_color``, and no conductor step needs it.
 #: * ``session_reload`` — WITHHELD. Tears down another session's agent process
 #:   and relaunches it. The conversation survives, but a reload is still a
 #:   process-level action on a session a person may be watching, and no
@@ -438,23 +449,27 @@ _MEMBER_PANEL_GRANTS: tuple[str, ...] = (
 #: is not an error but a silent approval prompt on every patrol cycle, which is
 #: why they are spelled out rather than left to the whole-server ref.
 #:
-#: The first two are the BASE every conductor spec ships
+#: The first three are the BASE every conductor spec ships
 #: (``_CONDUCTOR_BASE_WORK_GRANTS``): every conductor records its items in the
 #: ledger, because the dashboard's ``workstreams`` fold mints a board only from
-#: ``work/recorded`` entries. This tuple is the goal conductor's superset, shipped
+#: ``work/recorded`` entries, and every conductor relays a worker's question to
+#: the person with ``work_ask_record``, because "needs you" on every surface
+#: counts an item only once it carries that record. This tuple is the goal conductor's superset, shipped
 #: by ``_conductor_spec``, which both ``kirocrew-conductor`` and its deprecated
 #: ``kirocrew-ledger-conductor`` alias call; the name stays because that alias is
 #: still an installed spec.
 #:
 #: ``work_ledger_rebuild`` is the goal conductor's recovery step and no other
-#: conductor's procedure names it. ``work_brief`` is a worker-half verb
+#: conductor's procedure names it. ``work_ask_record`` (in the base) writes only the
+#: ask record on the conductor's own item. ``work_brief`` is a worker-half verb
 #: granted: it only READS the caller's own bound item (or answers ``not_bound``),
-#: which is the same rule the two conductor verbs rest on. It is also a
+#: which is the same rule the base conductor verbs rest on. It is also a
 #: second-level conductor's mandated FIRST call, in a child session nobody opened —
 #: gated, that call is an approval stall before any planning happens.
 _CONDUCTOR_BASE_WORK_GRANTS: tuple[str, ...] = (
     "@kirocrew-work/work_ledger_read",
     "@kirocrew-work/work_ledger_record",
+    "@kirocrew-work/work_ask_record",
 )
 
 

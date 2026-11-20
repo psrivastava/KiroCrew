@@ -40,6 +40,10 @@ def _registry(_floor_monkeypatch):
     _floor_monkeypatch.setattr(crewmate_harness, "_fallback_logged", set())
     _floor_monkeypatch.setattr(crewmate_harness, "_VERDICTS", {})
     _floor_monkeypatch.setattr(crewmate_harness, "_REFRESHING", set())
+    # An installed claude adapter at or above the session-options floor.
+    _floor_monkeypatch.setattr(
+        "kiro_crew.agent_sdk.drivers.acp.claude_adapter_honours_session_options", lambda: True
+    )
 
 
 def _member(agent: dict) -> str:
@@ -68,7 +72,6 @@ class TestResolver:
             # A Crew bot chat could run here, but its workers could not carry their
             # kit (``worker_kit_backend_refusal``), so inheriting it would refuse
             # every worker the Crew bot opens.
-            "pi",
             "deepseek",
         ],
     )
@@ -76,6 +79,12 @@ class TestResolver:
         from kiro_crew.agent_sdk.backends import crewmate_inherited_backend
 
         assert crewmate_inherited_backend(harness) == ("kas", True)
+
+    def test_pi_carries_the_worker_kit_so_it_is_inherited(self):
+        """pi's worker capture landed (RFC 5.4), so a Settings harness of pi runs Bots on pi."""
+        from kiro_crew.agent_sdk.backends import crewmate_inherited_backend
+
+        assert crewmate_inherited_backend(acp_backends.ACP_BACKEND_PI) == ("pi", False)
 
 
 class TestLoadedField:
@@ -716,7 +725,7 @@ class TestKasOnlyWorkerFields:
         from kiro_crew.mate_worker import kas_only_worker_fields
 
         spec["spec"] = {
-            "excludedTools": ["shell"],
+            "excludedTools": ["use_aws"],
             "hooks": {"preToolUse": [{"command": "x"}]},
             "permissions": {"allow": ["read"]},
             "toolsSettings": {"shell": {"allowedCommands": ["ls"]}},
@@ -759,10 +768,10 @@ class TestKasOnlyWorkerFields:
 
         spec["spec"] = {
             "mcpServers": {"github": {"command": "gh", "disabledTools": ["create_issue"]}},
-            "excludedTools": ["shell", "@github/x"],
+            "excludedTools": ["shell", "use_aws", "@github/x"],
         }
         assert kas_only_worker_detail("atlas-0123456789ab", "claude")[1] == (
-            ("excludedTools", "shell"),
+            ("excludedTools", "use_aws"),
         )
 
 
@@ -963,7 +972,7 @@ class TestColdStartRefresh:
 
         source = inspect.getsource(get_or_create._get_or_create_impl)
         refresh = source.index("await refresh_session_verdict(key)")
-        assert refresh < source.index("provider = factory(")
+        assert refresh < source.index("provider = build_provider()")
 
 
 class TestUnrunnablePin:
@@ -976,7 +985,7 @@ class TestUnrunnablePin:
         _floor_monkeypatch.setattr(crewmate_harness_notice, "_announced", set())
         _floor_monkeypatch.setattr(crewmate_harness, "_pin_fallback_logged", set())
 
-    @pytest.mark.parametrize("pinned", ["goose", "opencode", "strands", "pi", "deepseek"])
+    @pytest.mark.parametrize("pinned", ["goose", "opencode", "strands", "deepseek"])
     def test_the_pin_runs_on_kas(self, pinned):
         from kiro_crew.crewmate_harness import crewmate_backend_pin, pinned_backend
 
@@ -985,7 +994,7 @@ class TestUnrunnablePin:
         assert pin is not None and pin.backend == "kas" and pin.harness_fallback
         assert pinned_backend(cfg, "atlas", "claude") == "kas"
 
-    @pytest.mark.parametrize("pinned", ["claude", "codex", "kas"])
+    @pytest.mark.parametrize("pinned", ["claude", "codex", "kas", "pi"])
     def test_a_pin_bots_can_run_on_is_kept(self, pinned):
         from kiro_crew.crewmate_harness import crewmate_backend_pin
 
@@ -1082,8 +1091,8 @@ class TestPinFallbackNeedsKas:
         from kiro_crew import crewmate_harness, crewmate_harness_notice
 
         _floor_monkeypatch.setattr(crewmate_harness_notice, "_announced", set())
-        _floor_monkeypatch.setattr(registry, "_selectable", {"", "claude", "pi"})
-        cfg = _cfg("claude", "claude", pin="pi", inherited=True)
+        _floor_monkeypatch.setattr(registry, "_selectable", {"", "claude", "deepseek"})
+        cfg = _cfg("claude", "claude", pin="deepseek", inherited=True)
         with caplog.at_level(logging.ERROR, logger=crewmate_harness.logger.name):
             pin = crewmate_harness.crewmate_backend_pin(cfg, DM_KEY)
         floor = acp_backends.resolve_selected_backend(acp_backends.ACP_BACKEND_KAS)
@@ -1100,8 +1109,8 @@ class TestPinFallbackNeedsKas:
         from kiro_crew.crewmate_harness import kas_pin_harnesses
 
         listed = kas_pin_harnesses()
-        assert {"goose", "opencode", "pi", "deepseek", "strands"} <= set(listed)
-        assert not {"claude", "codex", "kas", "kiro"} & set(listed)
+        assert {"goose", "opencode", "deepseek", "strands"} <= set(listed)
+        assert not {"claude", "codex", "kas", "kiro", "pi"} & set(listed)
 
 
 class TestUnpinnedModelJudgedOnTheBotsHarness:
@@ -1184,8 +1193,22 @@ class TestCarriedMcpToolLimits:
         assert kas_only_worker_fields("atlas-0123456789ab", "claude") == ()
         assert kas_only_worker_fields("atlas-0123456789ab", "codex") == ("tool limits",)
 
-    def test_a_native_tool_limit_still_needs_kas(self, spec):
+    def test_a_native_tool_limit_no_built_in_covers_still_needs_kas(self, spec):
         from kiro_crew.mate_worker import kas_only_worker_fields
 
+        spec["spec"] = {"excludedTools": ["use_aws"]}
+        assert kas_only_worker_fields("atlas-0123456789ab", "claude") == ("tool limits",)
+        spec["spec"] = {"excludedTools": ["shell"]}
+        assert kas_only_worker_fields("atlas-0123456789ab", "claude") == ()
+
+    def test_a_native_tool_limit_needs_kas_below_the_adapter_options_floor(
+        self, spec, _floor_monkeypatch
+    ):
+        from kiro_crew.mate_worker import kas_only_worker_fields
+
+        _floor_monkeypatch.setattr(
+            "kiro_crew.agent_sdk.drivers.acp.claude_adapter_honours_session_options",
+            lambda: False,
+        )
         spec["spec"] = {"excludedTools": ["shell"]}
         assert kas_only_worker_fields("atlas-0123456789ab", "claude") == ("tool limits",)

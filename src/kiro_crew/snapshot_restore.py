@@ -24,6 +24,7 @@ import os
 import shutil
 import stat as _stat
 from contextlib import ExitStack, closing
+from contextvars import ContextVar
 from datetime import timezone
 from pathlib import Path, PurePosixPath
 from typing import Callable, cast
@@ -64,6 +65,10 @@ from kiro_crew.snapshot_components import (
     safe_tree_root,
 )
 from kiro_crew.user_json import MAX_DOCUMENT_NESTING, exceeds_nesting
+
+host_local_installable: ContextVar[frozenset[str]] = ContextVar(
+    "host_local_installable", default=frozenset()
+)
 
 
 def _save_locked_document_to(backup: Path, rel: str) -> Callable[[Path], None]:
@@ -334,11 +339,25 @@ def _backup_and_copy(
     ``O_EXCL``, not by name through ``shutil.copy2``: a by-name write follows a data-home
     component swapped for a link, or a symlink left at the core file's name. A name still
     occupied after the backup move is refused instead of written through.
+
+    A component's ``host_local`` files are neither moved nor installed unless this
+    caller explicitly marks one installable for its checked import. The others name
+    paths on the machine that made the archive, so this install's copy stays.
     """
+    installable = host_local_installable.get()
+    host_local = frozenset(f for f in COMPONENTS[component].host_local if f not in installable)
+    for f in host_local:
+        if os.path.lexists(snap / f):
+            kept = "; this install's copy is kept" if os.path.lexists(mc / f) else ""
+            print(
+                f"  ↩  {f}: not restored (the backup's copy points at the machine "
+                f"that made it){kept}."
+            )
+    files = [f for f in CORE_FILES.get(component, ()) if f not in host_local]
     if not _facade()._staging_is_pinned(
         allow_unpinned=allow_unpinned, what=f"restore of {component!r}"
     ):
-        for f in CORE_FILES.get(component, ()):
+        for f in files:
             # Validated before the live file is touched, and a symlink at the live name is
             # MOVED aside rather than skipped -- the same two properties the pinned branch
             # has. Skipping would skip both the backup AND the replacement, so the archive's
@@ -388,7 +407,7 @@ def _backup_and_copy(
                 backup, what=f"pre-restore backup for {component!r}"
             )
             try:
-                for f in CORE_FILES.get(component, ()):
+                for f in files:
                     live = mc / f
                     # Checked BEFORE the live file is touched: the archive is untrusted, and
                     # finding a FIFO or directory only after the move would leave nothing
@@ -613,6 +632,8 @@ def _refuse_corrupt_source_databases(
         if not _want(components, component):
             continue
         for name in files:
+            if name in COMPONENTS[component].host_local:
+                continue  # never installed, so its bundle copy cannot refuse the restore
             src = snap / name
             if not src.exists() and not platform_compat.is_link_or_junction(src):
                 continue  # absent from a selective bundle; nothing to validate
@@ -1125,6 +1146,20 @@ def _drop_derived_indexes_absent_from_bundle(
         print(f"  ↩️  {rel} is not in the archive — moved aside so it can be rebuilt")
 
 
+def _rmtree_or_raise(path: Path) -> None:
+    """Remove a tree, read-only files included, and raise when any of it is left.
+
+    Windows refuses to unlink a read-only file, and git writes its objects that way;
+    ``rmtree_force`` clears the bit but never raises, so a surviving tree raises here.
+    POSIX keeps the descriptor-walking ``shutil.rmtree``: the mode never blocks an unlink
+    there, and the hook's retry by full path could follow a swapped symlink.
+    """
+    if platform_compat.IS_POSIX:
+        shutil.rmtree(path)
+    elif not platform_compat.rmtree_force(path):
+        raise OSError(f"could not remove {path}")
+
+
 def _clear_store_directories(root: Path) -> None:
     """Remove everything under ``memory_stores/`` that a bundle can carry, keep the rest.
 
@@ -1137,7 +1172,7 @@ def _clear_store_directories(root: Path) -> None:
         if is_host_local_store_state((MEMORY_STORES_DIR_NAME, entry.name)):
             continue
         if entry.is_dir() and not platform_compat.is_link_or_junction(entry):
-            shutil.rmtree(str(entry))
+            _rmtree_or_raise(entry)
         elif platform_compat.is_link_or_junction(entry) and not entry.is_symlink():
             platform_compat.unlink_link_or_junction(entry)
         else:
@@ -1221,7 +1256,7 @@ def _do_replace_mutations(
             if sd.is_dir():
                 installed.add(dirname)
                 if d.is_dir():
-                    shutil.rmtree(str(d))
+                    _rmtree_or_raise(d)
                 # Skips are fatal: the live tree is gone. `must_create` refuses a root
                 # recreated between the rmtree and the copy.
                 facade._copytree_safe(
@@ -1255,7 +1290,7 @@ def _do_replace_mutations(
                 # archive never carries those entries (`_never_ships`), so no collision.
                 _clear_store_directories(d)
             else:
-                shutil.rmtree(str(d))
+                _rmtree_or_raise(d)
         if sd.is_dir():
             installed.add(tree)
             # The pinned primitive needs the parent chain to exist (a fresh machine has no
@@ -1357,7 +1392,7 @@ def _restore_everything_from_rollback(
                 if platform_compat.is_link_or_junction(target):
                     platform_compat.unlink_link_or_junction(target)
                 elif target.is_dir():
-                    shutil.rmtree(str(target))
+                    _rmtree_or_raise(target)
                 elif target.exists():
                     target.unlink()
                 # MOVED back, not copied: the rollback holds the only copy, and a move also
@@ -1379,7 +1414,7 @@ def _restore_everything_from_rollback(
                     # the held lock inodes; neither may be removed during recovery.
                     _clear_store_directories(target)
                 elif target.is_dir():
-                    shutil.rmtree(str(target))
+                    _rmtree_or_raise(target)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 # The plain copy is lossless for TREES: `_backup_tree_or_refuse` refuses a
                 # link, so a saved tree is links-free. (Saved core files can be links; the
@@ -1435,7 +1470,7 @@ def _restore_everything_from_rollback(
                     if rel == MEMORY_STORES_DIR_NAME:
                         _clear_store_directories(target)
                         continue
-                    shutil.rmtree(str(target))
+                    _rmtree_or_raise(target)
                 else:
                     # Covers a link or junction as well as a plain file, so it goes through
                     # the helper: `Path.unlink` cannot remove a Windows junction, and the

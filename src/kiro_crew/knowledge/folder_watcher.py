@@ -129,6 +129,19 @@ def _prop_str_set(value: object) -> set[str]:
     return {v.strip() for v in value if isinstance(v, str) and v.strip()}
 
 
+def _prop_patterns(value: object) -> list[str]:
+    """Coerce the ``ignore_patterns`` property to a list of non-empty strings.
+
+    The add-source route stores ``properties`` as sent. A bare string would be
+    walked character by character, so its ``*`` ignored every file, and a
+    non-string entry raised inside the walk; either degrades to "no pattern",
+    as the other list properties do. A string entry is kept exactly as stored.
+    """
+    if not isinstance(value, list):
+        return []
+    return [v for v in value if isinstance(v, str) and v]
+
+
 def _prop_extensions(value: object) -> set[str] | None:
     """Coerce the ``include_extensions`` property to a lowercased ``.ext`` set.
 
@@ -233,7 +246,7 @@ def walk_filters(props: dict, source_type: str = "local_folder") -> dict:
     looser set there reports a count for files the scan then skips.
     """
     return {
-        "ignore_patterns": props.get("ignore_patterns", []),
+        "ignore_patterns": _prop_patterns(props.get("ignore_patterns")),
         "extra_skip_dirs": (SOURCE_TYPE_SKIP_DIRS.get(source_type, set())
                             | _prop_str_set(props.get("extra_skip_dirs"))),
         "include_extensions": _prop_extensions(props.get("include_extensions")),
@@ -328,7 +341,8 @@ def max_files_prop(props: dict) -> int:
         return DEFAULT_MAX_FILES
     if isinstance(value, float) and not math.isfinite(value):
         return DEFAULT_MAX_FILES
-    return int(value)
+    # A positive fraction below 1 truncates to 0, which would cap every file.
+    return int(value) or DEFAULT_MAX_FILES
 
 
 def estimate_scan_cost(discovered: list[tuple[str, float]], *,
@@ -454,7 +468,11 @@ class FolderWatcher:
             logger.warning("Folder source %s path missing: %s", source_id, uri)
             return {"error": f"Directory not found: {uri}"}
 
-        max_files = props.get("max_files", DEFAULT_MAX_FILES)
+        # An int cap is used as stored, 0 included. Any other shape (a string, a
+        # float, null) would raise in the comparison or the slice below, so it
+        # reads through max_files_prop, as the preview and spend estimate do.
+        raw_cap = props.get("max_files", DEFAULT_MAX_FILES)
+        max_files = raw_cap if isinstance(raw_cap, int) else max_files_prop(props)
         source_type = source.get("source_type", "local_folder")
         filters = walk_filters(props, source_type)
 
@@ -603,13 +621,16 @@ class FolderWatcher:
         # per-row logic and were already committed in the batch commit below, so
         # deferring them to the flush changes nothing an in-scan reader can see.
         last_seen_batch: list[tuple[str, str, str]] = []
+        stopped_by_pause = False
         for idx, (file_path, mtime) in enumerate(discovered):
             if idx and idx % _PAUSE_RECHECK_FILES == 0:
                 paused = await asyncio.to_thread(self._is_paused, source_id)
             if paused:
-                await asyncio.to_thread(
-                    self._flush_last_seen_and_commit, last_seen_batch)
-                return {**stats, "status": "paused"}
+                # Leaves through the common tail, not a return: the files this
+                # sweep already ingested still count against the sweep's chunk
+                # budget and still get their targeted dedup.
+                stopped_by_pause = True
+                break
 
             state = existing.get(file_path)
 
@@ -714,10 +735,20 @@ class FolderWatcher:
             # For every file, not only an AsciiDoc name: the reader is picked by
             # the resolved suffix, so a `.md` link to an `.adoc` file inlines too.
             included: set[str] = set()
+            # Chunks the pipeline reached, so a failed ingest is charged for the
+            # extraction calls it spent before failing.
+            attempted = [0]
+
+            def _count_extracted(stage: str, done: int, _total: int,
+                                 _attempted: list[int] = attempted) -> None:
+                if stage == "extracting":
+                    _attempted[0] = done
+
             item_ids, outcome = await self._ingest_file(
                 file_path, source_id, namespace, props, old_ids, root=uri,
                 embed_priority=embed_priority,
                 include_paths=include_paths, included=included,
+                on_progress=_count_extracted,
                 on_duplicate=lambda text_hash: self._record_deduped_state(
                     source_id, file_path, content_hash, mtime, now, text_hash, included))
             if item_ids is None:
@@ -739,6 +770,12 @@ class FolderWatcher:
 
                 await run_to_completion(_fail_preserving_reason)
                 stats["failed"] += 1
+                if chunk_budget and attempted[0]:
+                    chunks_ingested += attempted[0]
+                    if chunks_ingested >= chunk_budget:
+                        stats["chunks"] = chunks_ingested
+                        stats["budget_reached"] = 1
+                        break
             elif outcome == "deduped":
                 # Refused by the pre-ingest gate: this exact content is already in
                 # the Library under another source. 'deduped' -- the same status the
@@ -783,6 +820,8 @@ class FolderWatcher:
             # dedup sites in ingestion.py and watcher.py; the RLock-guarded graph plus
             # thread-local sqlite connections make this thread-safe.
             await asyncio.to_thread(self._dedup_ingested, source_id, ingested_paths)
+        if stopped_by_pause:
+            return {**stats, "status": "paused"}
         return stats
 
     def _dedup_ingested(self, source_id: str, paths: list[str]) -> None:
@@ -1316,6 +1355,7 @@ class FolderWatcher:
                            embed_priority: int = PRIORITY_NORMAL,
                            include_paths: frozenset[str] | None = None,
                            included: set[str] | None = None,
+                           on_progress: Callable[[str, int, int], None] | None = None,
                            ) -> tuple[list[str] | None, str]:
         """Ingest one file.
 
@@ -1323,6 +1363,9 @@ class FolderWatcher:
         AsciiDoc ``include::`` may expand into; every other reader ignores it.
         *included* collects the targets the read inlined, and is recorded with
         the committed group.
+
+        *on_progress* is forwarded to the pipeline, so the caller can charge a
+        failed ingest for the chunks it reached.
 
         Returns ``(item_ids, outcome)`` where *outcome* is ``"done"``,
         ``"failed"`` (``item_ids`` is ``None``), or ``"deduped"`` -- the
@@ -1377,20 +1420,19 @@ class FolderWatcher:
         # Taking the ids from there, instead of reading them back afterwards, is
         # what makes two separate hazards unreachable:
         #
-        # * No query. The previous before/after diff read the source's ENTIRE
-        #   item-id set twice per file. `idx_items_source_id` keeps that an index
-        #   scan, but it still materializes one row per item in the SOURCE --
-        #   ~20k rows apiece on a large folder source, measured at >1s each --
-        #   synchronously on the event loop, which trips the loop-stall watchdog
-        #   and crash-loops the gateway.
+        # * No query. A before/after diff would read the source's ENTIRE item-id
+        #   set twice per file. `idx_items_source_id` keeps that an index scan,
+        #   but it still materializes one row per item in the SOURCE (~20k rows
+        #   on a large folder source, measured at >1s each) on the event loop,
+        #   which trips the loop-stall watchdog and crash-loops the gateway.
         # * No skippable await after the commit. An await between the pipeline's
         #   commit and this function's return that a cancellation can skip past
         #   is an orphan window: a shutdown cancelling there leaves committed
         #   items that no `folder_file_state` row names, so the next scan
         #   re-ingests the file and duplicates them while the first group stays
-        #   untracked and undeletable. Offloading the reads with a bare
-        #   `to_thread` would have introduced exactly that window; not needing
-        #   them removes it. The failure branches below DO await, but only
+        #   untracked and undeletable. Offloading those reads with a bare
+        #   `to_thread` would open that window; not needing them avoids it.
+        #   The failure branches below DO await, but only
         #   `_persist_state` (`run_to_completion`-backed, so the write drains
         #   under cancellation) and only where nothing was committed.
         #   `test_knowledge_ingest_scan_off_loop.py` ratchets both properties.
@@ -1491,6 +1533,7 @@ class FolderWatcher:
                 on_duplicate=_record_refused,
                 embed_priority=embed_priority,
                 count_toward_import_budget=False,
+                on_progress=on_progress,
                 include_paths=include_paths, included=included)
 
             if refused:
@@ -1506,6 +1549,12 @@ class FolderWatcher:
 
             return committed, "done"
         except Exception as e:
+            from .llm_pool import LLMPoolClosed
+
+            if isinstance(e, LLMPoolClosed):
+                # Gateway exit, not a defect in the file: the 'scanning' marker
+                # stays, and the next start retries it.
+                raise
             # The pipeline already logged an oversized file as a WARNING. The row
             # reads 'failed', not 'skipped', so the Knowledge page shows why, with Retry.
             if not isinstance(e, FileTooLargeError):

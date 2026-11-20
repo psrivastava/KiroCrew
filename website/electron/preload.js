@@ -6,7 +6,15 @@ let cursorAwaySubscribers = 0;
 let navigateReadySent = false;
 // Set for a window whose gateway is not this machine's: the bridges whose
 // channels `assertLocalDashboard` refuses are then withheld, not exposed.
-const REMOTE_GATEWAY = process.argv.includes("--kc-remote-gateway");
+// Asked of the shell on every load; only an explicit `false` exposes them.
+const REMOTE_GATEWAY = ipcRenderer.sendSync("dashboard:is-remote-gateway") !== false;
+// macOS Natural scrolling as main last reported it (scroll-touch.js): true,
+// false, or null until it says. Cached here so the page can read it
+// synchronously on the first wheel of a swipe.
+let naturalScrolling = null;
+ipcRenderer.on("scroll-direction", (_e, value) => {
+  if (typeof value === "boolean") naturalScrolling = value;
+});
 
 contextBridge.exposeInMainWorld("kirocrew", {
   platform: process.platform,
@@ -82,7 +90,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // Report the user's dark/light mode PREFERENCE ("system" | "dark" | "light")
   // so main.js can set `nativeTheme.themeSource` to match. Must be the
   // preference, not the resolved mode: pinning themeSource to dark/light also
-  // pins `prefers-color-scheme`, which is what Auto resolves through.
+  // pins `prefers-color-scheme`, which is what Auto resolves through. Scheduled
+  // has no themeSource, so it sends the resolved mode (themes.md, *Mode preference*).
   setThemeMode: (pref) => ipcRenderer.send("theme-mode-changed", String(pref || "")),
   // Report the RESOLVED dark/light mode ("dark" | "light") so main.js can sync
   // the Windows titleBarOverlay colors. Separate from setThemeMode because that
@@ -129,7 +138,12 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // Windows custom titlebar: menu surfaces render in the dashboard so hover
   // can switch between them; command execution stays in the main process.
   getAppMenuItems: (id) => ipcRenderer.invoke("app-menu:items", id),
-  executeAppMenuItem: (id, index) => ipcRenderer.send("app-menu:execute", id, index),
+  // Answers whether the click DISPATCHED. `invoke`, not `send`, because the
+  // renderer acts on a refusal: a row can be painted enabled and still be
+  // refused by the per-action gate, and the refusal is the only moment the
+  // renderer can learn its rows are stale. It refetches on `false`, which
+  // greys the gated rows and renders the footer naming the reason.
+  executeAppMenuItem: (id, index) => ipcRenderer.invoke("app-menu:execute", id, index),
   // App-menu navigation: main.js sends an in-app path ("/settings",
   // "/settings/about") when the user picks Settings…/About from the
   // native application menu; the SPA routes to it (see App.tsx).
@@ -153,6 +167,13 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.on("focus-mode:toggle", handler);
     return () => ipcRenderer.removeListener("focus-mode:toggle", handler);
   },
+  // The OS session locked (macOS and Windows; see session-lock.js). The page
+  // stops a dictation that is still recording.
+  onSessionLocked: (cb) => {
+    const handler = () => cb();
+    ipcRenderer.on("os-session-locked", handler);
+    return () => ipcRenderer.removeListener("os-session-locked", handler);
+  },
   // A macOS swipe main.js relays as one route-history step: -1 Back, 1 Forward
   // (see swipe-history.js). The SPA takes it through its guarded history step.
   onHistoryStep: (cb) => {
@@ -171,6 +192,10 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.on("scroll-touch", handler);
     return () => ipcRenderer.removeListener("scroll-touch", handler);
   },
+  // macOS Natural scrolling: true on, false off, null not known yet. A wheel's
+  // deltaX flips sign with it, so the swipe reader needs it to follow the
+  // fingers (see scroll-touch.js).
+  getNaturalScrolling: () => naturalScrolling,
   // Second argument: whether the macOS menu bar can slide over the window.
   // Only an explicit `menuBarOverlap: false` from main turns it off, so a
   // missing or malformed payload keeps the renderer's menu-bar band.
@@ -253,6 +278,31 @@ if (!REMOTE_GATEWAY) contextBridge.exposeInMainWorld("remoteCrewSetupAPI", {
   start: () => ipcRenderer.invoke("first-run:use-remote-crew"),
 });
 
+// Settings → About's Restart gateway, for the gateway this app runs.
+// `available` resolves true only where `restart` can work; `restart` resolves
+// "restarting" (the app then replaces this page with its splash and reconnects)
+// or "unavailable". Neither takes an argument: the main process decides from
+// the sender. Absent in plain browsers and in windows on another machine's
+// gateway, which this app does not run.
+if (!REMOTE_GATEWAY) contextBridge.exposeInMainWorld("gatewayRestartAPI", {
+  available: () => ipcRenderer.invoke("gateway:can-restart"),
+  restart: () => ipcRenderer.invoke("gateway:restart"),
+});
+
+// Remote Crew panes reached through the app's managed SSH forward. Each pane
+// loads a port the crew's gateway opened on its own machine, so in client-only
+// mode the app's keeper must carry that port too. `forwardPorts` names the
+// pane ports this window shows and resolves {port: "up" | "down"} once each
+// has been tried, or null where the app keeps no forward. Exposed to a remote
+// gateway's window too, which is the one that needs it; the main process
+// admits only the launch port's dashboard. Absent in plain browsers.
+contextBridge.exposeInMainWorld("remoteCrewPaneAPI", {
+  forwardPorts: (ports) => ipcRenderer.invoke(
+    "remote-crew:forward-pane-ports",
+    Array.isArray(ports) ? ports.slice(0, 64).map(Number) : [],
+  ),
+});
+
 // Crash-artifact notice for the dashboard banner (CrashReportNotice).
 //
 // The app already captures a minidump and, on macOS, the OS writes an .ips
@@ -296,6 +346,14 @@ contextBridge.exposeInMainWorld("trayIconAPI", {
   set: (show) => ipcRenderer.invoke("tray-icon:set", !!show),
 });
 
+// Whether minimizing the main window hides it to the tray, as
+// {on, offered, canEnable}. Answered only to the main window's own dashboard,
+// like closeActionAPI.
+contextBridge.exposeInMainWorld("minimizeToTrayAPI", {
+  get: () => ipcRenderer.invoke("minimize-to-tray:get"),
+  set: (on) => ipcRenderer.invoke("minimize-to-tray:set", on === true),
+});
+
 // File-open bridge for the chat path chip's "Open in editor" affordance. Hands
 // a filesystem PATH — never a URL scheme — to the main process, which validates
 // it and calls shell.openPath so the file opens in the OS default handler on the
@@ -311,9 +369,48 @@ if (!REMOTE_GATEWAY) contextBridge.exposeInMainWorld("fileOpenAPI", {
 // access token and the Crew URL, so neither crosses this bridge, and no token
 // is ever returned. Resolves { ok: true } or { ok: false, error: "<code>" }.
 // Absent in plain browsers and in the PWA; the dashboard hides the relay list
-// when the bridge is missing.
+// when the bridge is missing. `closeAll()` takes nothing and can only close
+// every relay Crew window, after this dashboard's Sign out or Switch account.
+// The pane calls show a Crew in this window instead, below the local top bar:
+// they carry the endpoint ID, the pane's rect with this page's viewport size,
+// or whether a local overlay covers the pane or another tab is in front of it.
+// `onPaneEvent(cb)` hears a pane's switch chord or its close, as `{ type,
+// endpointId, index }` and nothing more, and returns its unsubscribe. An
+// `openPane` from another dashboard window is handed to the main window's
+// dashboard, which hears it through `onOpenRequest(cb)` (the endpoint ID only)
+// while it is subscribed; one subscriber at a time, the newest.
+let openRequestHandler = null;
+let openRequestSeq = 0;
 if (!REMOTE_GATEWAY) contextBridge.exposeInMainWorld("relayCrewAPI", {
   open: (endpointId) => ipcRenderer.invoke("relay-crew:open", String(endpointId || "")),
+  closeAll: () => ipcRenderer.invoke("relay-crew:close-all"),
+  openPane: (endpointId, rect, viewport) => ipcRenderer.invoke("relay-crew:open-pane", String(endpointId || ""), rect, viewport),
+  setPaneBounds: (endpointId, rect, viewport) => ipcRenderer.invoke("relay-crew:pane-bounds", String(endpointId || ""), rect, viewport),
+  setPaneOverlay: (endpointId, active) => ipcRenderer.invoke("relay-crew:pane-overlay", String(endpointId || ""), !!active),
+  setPaneInactive: (endpointId, inactive) => ipcRenderer.invoke("relay-crew:pane-inactive", String(endpointId || ""), !!inactive),
+  closePane: (endpointId) => ipcRenderer.invoke("relay-crew:pane-close", String(endpointId || "")),
+  onPaneEvent: (cb) => {
+    const handler = (_e, m) => cb({
+      type: String(m?.type || ""),
+      endpointId: String(m?.endpointId || ""),
+      index: Number.isInteger(m?.index) ? m.index : -1,
+    });
+    ipcRenderer.on("relay-crew:pane-event", handler);
+    return () => ipcRenderer.removeListener("relay-crew:pane-event", handler);
+  },
+  onOpenRequest: (cb) => {
+    const handler = (_e, endpointId) => { if (typeof endpointId === "string") cb(endpointId); };
+    if (openRequestHandler) ipcRenderer.removeListener("relay-crew:open-request", openRequestHandler);
+    openRequestHandler = handler;
+    ipcRenderer.on("relay-crew:open-request", handler);
+    void ipcRenderer.invoke("relay-crew:open-requests", true, ++openRequestSeq).catch(() => {});
+    return () => {
+      if (openRequestHandler !== handler) return;
+      openRequestHandler = null;
+      ipcRenderer.removeListener("relay-crew:open-request", handler);
+      void ipcRenderer.invoke("relay-crew:open-requests", false, ++openRequestSeq).catch(() => {});
+    };
+  },
 });
 
 // Native folder chooser for the project picker's "Open system folder picker"
@@ -413,7 +510,17 @@ contextBridge.exposeInMainWorld("updateAPI", {
   },
   check: () => ipcRenderer.invoke("update:check"),
   download: () => ipcRenderer.invoke("update:download"),
+  // This shell's install ARMS the update. An older shell's install applies it at
+  // once, so the dashboard offers "Install when I quit" only when this is true.
+  armsOnQuit: true,
+  // ARMS the update: it installs when the user quits, never while the app runs.
   install: () => ipcRenderer.invoke("update:install"),
+  // A plain quit and relaunch with no update command of its own. An armed
+  // update is applied by the quit it triggers.
+  relaunch: () => ipcRenderer.invoke("update:relaunch"),
+  // Whether this window's relaunch would be accepted; false on a window the
+  // relaunch gate refuses, so the dashboard does not offer Restart now there.
+  canRelaunch: () => ipcRenderer.invoke("update:can-relaunch"),
   getInfo: () => ipcRenderer.invoke("update:get-info"),
   // Channel switcher (Settings > About): "" follows the build stamp,
   // "insider"|"stable" opts the production app onto that lane.

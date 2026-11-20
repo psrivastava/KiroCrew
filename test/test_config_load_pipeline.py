@@ -33,6 +33,9 @@ _DECLARED_EXCEPTIONS = {
     ("agent", "sandbox_allow_unsandboxed_exec"): "platform default resolved at load",
     # Passed through the selectable-backend gate, which reads the build's registry.
     ("agent", "member_acp_backend"): "normalized against the selectable backends",
+    # The loader folds the build's default (on in a nightly build only) into the
+    # value; the dataclass default stays false for the schema snapshot.
+    ("agent", "kas_bundle"): "build default resolved at load",
 }
 
 
@@ -168,10 +171,21 @@ class TestBuildConfig:
         assert set(_DECLARED_EXCEPTIONS) == {
             ("agent", "sandbox_allow_unsandboxed_exec"),
             ("agent", "member_acp_backend"),
+            ("agent", "kas_bundle"),
         }
         assert set(_DECLARED_EXCEPTIONS) <= {
             (section, f.name) for section, dto in _section_fields() for f in dataclasses.fields(dto)
         }
+
+    @pytest.mark.parametrize(
+        ("stamp", "expected"), [("nightly", True), ("stable", False), ("", False)]
+    )
+    def test_kas_bundle_takes_the_build_default(self, tmp_path, monkeypatch, stamp, expected):
+        from kiro_crew import build_channel
+
+        monkeypatch.setattr(build_channel, "_BAKED_BUILD_CHANNEL", stamp)
+        agent = loader.build_config(_document(tmp_path, {"agent": {}})).agent
+        assert agent.kas_bundle is expected
 
     def test_it_performs_no_config_file_io(self, tmp_path, monkeypatch):
         def refuse(*_args, **_kwargs):
@@ -420,6 +434,123 @@ class TestReadConfigDocument:
             line,
             line,
         ]
+
+    @pytest.mark.parametrize(
+        ("document", "line"),
+        [
+            # A coercer with a clamp of its own, which keeps 0 as "use the default".
+            (
+                {"session": {"compact_wait_secs": 0.01}},
+                "SessionConfig.compact_wait_secs = 0.01 is outside its allowed range; using 60.0",
+            ),
+            # The same, in a crew record.
+            (
+                {"agents": {"helper": {"autocompact_pct": 1}}},
+                "KiroCrewAgentConfig.autocompact_pct = 1 is outside its allowed range;"
+                f" using {sections.AUTOCOMPACT_PCT_MIN}",
+            ),
+            # Each value of a map.
+            (
+                {"agent": {"lane_weights": {"system": 500}}},
+                "AgentConfig.lane_weights = {'system': 500} is outside its allowed range;"
+                " using {'system': 64}",
+            ),
+            # Read with a fallback of its own: an unreadable bucket is 0, not 100.
+            (
+                {"decisions": {"bucket": 500}},
+                "DecisionsConfig.bucket = 500 is outside its allowed range; using 100",
+            ),
+            # A floor that was a max() around the read.
+            (
+                {"mcp_gateway": {"idle_timeout_secs": 1}},
+                "McpGatewayConfig.idle_timeout_secs = 1 is outside its allowed range; using 10",
+            ),
+            # A range the DTO's __post_init__ held.
+            (
+                {"agent": {"max_channels": 9}},
+                "AgentConfig.max_channels = 9 is outside its allowed range; using 5",
+            ),
+            (
+                {"messaging": {"idle_reset_minutes": -5}},
+                "MessagingConfig.idle_reset_minutes = -5 is outside its allowed range; using 0",
+            ),
+            # Out of 0..23 is "off", not the nearest hour.
+            (
+                {"messaging": {"daily_reset_hour": 30}},
+                "MessagingConfig.daily_reset_hour = 30 is outside its allowed range; using -1",
+            ),
+            (
+                {"agent": {"session_start_concurrency": 500}},
+                "AgentConfig.session_start_concurrency = 500 is outside its allowed range;"
+                " using 64",
+            ),
+            (
+                {"agent": {"cold_start_concurrency": 40}},
+                "AgentConfig.cold_start_concurrency = 40 is outside its allowed range; using 32",
+            ),
+            (
+                {"discord": {"soft_threshold_pct": 150}},
+                "DiscordConfig.soft_threshold_pct = 150 is outside its allowed range; using 100",
+            ),
+            # A soft threshold above the hard one is pulled down to it; hard is in range.
+            (
+                {"wecom": {"soft_threshold_pct": 150, "hard_threshold_pct": 10}},
+                "WeComConfig.soft_threshold_pct = 150 is outside its allowed range; using 10",
+            ),
+            # A list entry, keyed by its position rather than its group id.
+            (
+                {"whatsapp": {"groups": [{"jid": "g1@g.us", "cooldown_s": -3}]}},
+                "WhatsAppConfig.groups[0].cooldown_s = -3 is outside its allowed range; using 0",
+            ),
+        ],
+        ids=[
+            "own-coercer",
+            "crew-record",
+            "map-values",
+            "own-fallback",
+            "floor",
+            "post-init",
+            "idle-reset-floor",
+            "daily-reset-off",
+            "start-width",
+            "cold-start-width",
+            "soft-threshold-range",
+            "threshold-pair",
+            "whatsapp-group-cooldown",
+        ],
+    )
+    def test_a_value_clamped_outside_a_bounded_read_is_reported(
+        self, config_home, caplog, document, line
+    ):
+        caplog.set_level(logging.WARNING, logger=_LOGGER)
+        _write(config_home / "config.json", document)
+        loader.build_config(loader.read_config_document())
+        assert [r.getMessage() for r in caplog.records if "allowed range" in r.getMessage()] == [
+            f"Config: {line}"
+        ]
+
+    def test_in_range_values_of_those_keys_load_as_written_and_log_nothing(
+        self, config_home, caplog
+    ):
+        caplog.set_level(logging.WARNING, logger=_LOGGER)
+        _write(
+            config_home / "config.json",
+            {
+                "messaging": {"idle_reset_minutes": 30, "daily_reset_hour": -1},
+                "agent": {"session_start_concurrency": "auto", "cold_start_concurrency": 8},
+                "wecom": {"soft_threshold_pct": 70, "hard_threshold_pct": 90},
+                "whatsapp": {"groups": [{"jid": "g1@g.us", "cooldown_s": 60}]},
+            },
+        )
+        cfg = loader.build_config(loader.read_config_document())
+        assert (cfg.messaging.idle_reset_minutes, cfg.messaging.daily_reset_hour) == (30, -1)
+        assert (cfg.agent.session_start_concurrency, cfg.agent.cold_start_concurrency) == (
+            "auto",
+            8,
+        )
+        assert (cfg.wecom.soft_threshold_pct, cfg.wecom.hard_threshold_pct) == (70, 90)
+        assert [g["cooldown_s"] for g in cfg.whatsapp.groups] == [60]
+        assert not [r for r in caplog.records if "allowed range" in r.getMessage()]
 
 
 # persist_write_back and the whole load.

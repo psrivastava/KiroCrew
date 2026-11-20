@@ -214,16 +214,19 @@ export function createConfigEndpoints({ post, put, j, jfetch: fetch }: ClientTra
       put('/api/agent-spec-pins/' + encodeURIComponent(agent), { file }).then(j) as Promise<{ ok: boolean; agent: string; file: string }>,
     kirocrewConfig: () => fetch('/api/config/kirocrew').then(j),
     saveKirocrewConfig: (agent: object) => put('/api/config/kirocrew', { agent }).then(j) as Promise<{ ok?: boolean; restart_required?: boolean; error?: string }>,
-    patchConfig: (path: string, value: unknown, opts?: { ifUnset?: boolean }) => fetch('/api/config/kirocrew', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, value, ...(opts?.ifUnset ? { if_unset: true } : {}) }) }).then(j),
+    /** `unset` removes the stored value so the default applies (Settings -> Advanced keys only). */
+    patchConfig: (path: string, value: unknown, opts?: { ifUnset?: boolean; unset?: boolean }) => fetch('/api/config/kirocrew', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, value, ...(opts?.ifUnset ? { if_unset: true } : {}), ...(opts?.unset ? { unset: true } : {}) }) }).then(j),
     // Owner-only, and absent (404) on an older gateway. Both of those reach the
     // caller as a rejection, which is the intended signal: "no probe information",
     // to be treated as fail-open rather than as a verdict.
     // `kiro_selection_runs_on_kas`: `agent.acp_backend` is stored as Kiro CLI and
     // sessions run it on KAS, so the Agent Harness panel offers to save KAS.
+    // `kiro_cli_runs_on_kas`: a Kiro CLI pick would run on KAS here, whatever is saved.
     acpBackends: () =>
       fetch('/api/acp-backends').then(j) as Promise<{
         backends: AcpBackendProbe[]
         kiro_selection_runs_on_kas?: boolean
+        kiro_cli_runs_on_kas?: boolean
         crewmate_harness?: CrewmateHarnessReadout
       }>,
     // Re-take ONE backend's verdict with this gateway's cached absence dropped first,

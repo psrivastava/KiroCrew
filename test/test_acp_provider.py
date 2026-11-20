@@ -27,6 +27,7 @@ from kiro_crew.acp.types import (
 )
 from kiro_crew.agent_sdk import capture_prompt_timeout
 from kiro_crew.providers.acp import AcpProvider
+from kiro_crew.testing.ids import UNALLOCATABLE_PID
 from kiro_crew.testing.wait import await_until
 
 
@@ -69,7 +70,7 @@ class TestServedModel:
         return AcpSessionHandle("s1", asyncio.Queue(), MagicMock())
 
     def test_backend_default_model_is_readable(self):
-        # Regression: a session on the backend-SELECTED default never gets an
+        # A session on the backend-SELECTED default never gets an
         # explicit set_model, so handle._model stays "" — the served model
         # arrives only as currentModelId in the session/new response. The
         # accessor must surface it, or the poisoned-conversation escalation
@@ -1164,6 +1165,7 @@ class TestStartKiroRuntimeResume:
         # failure in this file into a sandbox verdict.
         mock_runtime.saw_sandbox_init_failure = MagicMock(return_value=False)
         mock_runtime.saw_delegate_launch_failure = MagicMock(return_value=False)
+        mock_runtime.kas_extract_broken_message = MagicMock(return_value="")
         # The shared translation settles the stderr drain before it reads
         # the latch, so this has to be awaitable: a plain MagicMock raises
         # "object MagicMock can't be used in 'await' expression".
@@ -1208,6 +1210,7 @@ class TestStartKiroRuntimeResume:
         mock_runtime.saw_not_logged_in = MagicMock(return_value=False)
         mock_runtime.saw_sandbox_init_failure = MagicMock(return_value=False)
         mock_runtime.saw_delegate_launch_failure = MagicMock(return_value=False)
+        mock_runtime.kas_extract_broken_message = MagicMock(return_value="")
         mock_runtime.settle_stderr = AsyncMock()
         # Backend-authored text can carry a line break and a terminal escape;
         # neither may reach the log line, which must stay one line.
@@ -1262,6 +1265,7 @@ class TestStartKiroRuntimeResume:
         mock_runtime.saw_not_logged_in = MagicMock(return_value=False)
         mock_runtime.saw_sandbox_init_failure = MagicMock(return_value=False)
         mock_runtime.saw_delegate_launch_failure = MagicMock(return_value=False)
+        mock_runtime.kas_extract_broken_message = MagicMock(return_value="")
         mock_runtime._stderr_task = asyncio.ensure_future(asyncio.sleep(3600))
         settle_entered = asyncio.Event()
 
@@ -1344,6 +1348,7 @@ class TestKiroStartupMetric:
         mock_runtime.saw_not_logged_in = MagicMock(return_value=bool(spawn_exc))
         mock_runtime.saw_sandbox_init_failure = MagicMock(return_value=False)
         mock_runtime.saw_delegate_launch_failure = MagicMock(return_value=False)
+        mock_runtime.kas_extract_broken_message = MagicMock(return_value="")
         mock_runtime.settle_stderr = AsyncMock()
         mock_runtime.kill = AsyncMock()
         mock_runtime.create_session = AsyncMock(return_value=mock_handle)
@@ -1393,6 +1398,7 @@ class TestKiroStartupMetric:
         mock_runtime.saw_not_logged_in = MagicMock(return_value=True)
         mock_runtime.saw_sandbox_init_failure = MagicMock(return_value=False)
         mock_runtime.saw_delegate_launch_failure = MagicMock(return_value=False)
+        mock_runtime.kas_extract_broken_message = MagicMock(return_value="")
         mock_runtime.settle_stderr = AsyncMock()
         mock_runtime.kill = AsyncMock()
         rec = _CapturingRecorder()
@@ -1885,6 +1891,43 @@ def test_child_fidelity_aware_survives_client_replacement():
     # to the real AcpSessionProvider at replacement time.
     provider._client = MagicMock()
     assert provider.child_fidelity_aware is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("marked", [True, False])
+async def test_the_keepalive_routes_mark_survives_client_replacement(marked):
+    """The registry ``/api/session-keepalive`` reads marks the OUTER provider when it
+    publishes it, which can be before startup REPLACES the placeholder client. The
+    start marks the real ``AcpSessionProvider`` then, so its handle times calls on
+    Kiro Crew's own servers; an unmarked provider (``kirocrew chat``'s) starts one
+    that does not."""
+    provider = TestStartKiroRuntimeModelEntitlement()._kiro_provider("auto")
+    placeholder = provider._client
+    if marked:
+        provider.mark_keepalive_routed()
+        placeholder.mark_keepalive_routed.assert_called_once_with()
+    handle = MagicMock()
+    handle.session_id = "kiro-sess-1"
+    handle.model_pin_refused = ""
+    handle.available_models = []
+    runtime = MagicMock(
+        pid=UNALLOCATABLE_PID, spawn=AsyncMock(), create_session=AsyncMock(return_value=handle)
+    )
+    started: list[MagicMock] = []
+
+    def session_provider(h, r, **_kw):
+        started.append(MagicMock(_handle=h, _runtime=r, resumed=False))
+        return started[-1]
+
+    with (
+        patch("kiro_crew.providers.acp.AcpRuntime", return_value=runtime),
+        patch("kiro_crew.providers.acp.AcpSessionProvider", side_effect=session_provider),
+        patch("pathlib.Path.exists", return_value=False),
+    ):
+        await provider._start_kiro_runtime()
+
+    assert provider._client is started[0]
+    assert started[0].mark_keepalive_routed.called is marked
 
 
 def test_to_llm_event_preserves_provenance_flags():

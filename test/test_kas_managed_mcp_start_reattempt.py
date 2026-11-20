@@ -17,6 +17,7 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+from session_handle_helpers import bare_session_handle
 
 from kiro_crew.acp.mcp_session_report import McpSessionReport
 from kiro_crew.acp.session_handle import AcpSessionHandle
@@ -70,7 +71,7 @@ class _Recorder:
 def _handle(
     *frames: JsonRpcMessage, recorder: _Recorder | None = None, reattempts: bool = True
 ) -> AcpSessionHandle:
-    handle = AcpSessionHandle.__new__(AcpSessionHandle)
+    handle = bare_session_handle(runtime=None)
     handle._session_id = _SID
     handle._mcp_report = McpSessionReport()
     handle._mcp_report.begin_session([])
@@ -130,8 +131,14 @@ async def test_the_gateway_deadline_reason_qualifies_as_the_stub_reports_it():
     async def _shutdown() -> None:
         return None
 
+    # A live process: the deadline takes the timed-out branch, not the died-in-handshake one.
     backend = SimpleNamespace(
-        _init_state="in_flight", _dead_reason=None, _fail_init=_fail_init, shutdown=_shutdown
+        _init_state="in_flight",
+        _dead_reason=None,
+        _gateway_ending=False,
+        process=SimpleNamespace(returncode=None),
+        _fail_init=_fail_init,
+        shutdown=_shutdown,
     )
     await backend_handshake._init_deadline(backend, 0)
 

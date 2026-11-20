@@ -18,16 +18,20 @@ from typing import Any
 
 from aiohttp import web
 
+from kiro_crew import edition
 from kiro_crew.agent import SharedAgentHomeRefused
 from kiro_crew.dashboard.handlers._shared import rebuild_agent_spec
 from kiro_crew.dashboard.handlers.mcp import (
+    _builtin_server_refusal,
     _find_server_spec_anywhere,
     _get_mcp_lock,
     _is_valid_mcp_name,
+    _mcp_config_corrupt,
     _offload_config_write,
     _set_kirocrew_entry,
 )
 from kiro_crew.discovery_featured import featured_entries
+from kiro_crew.extension_governance import extension_install_denied
 from kiro_crew.external_text import redact_external_text as _redact_external
 from kiro_crew.mcp_cleanup import mcp_entry_is_muted
 from kiro_crew.mcp_providers.base import (
@@ -406,9 +410,11 @@ async def api_mcp_discover_install(request: web.Request) -> web.Response:
     try:
         body = await request.json()
     except Exception:
-        return web.json_response({"error": "Invalid JSON body"}, status=400)
+        return web.json_response({"error": "Invalid JSON body", "code": "invalid_json"}, status=400)
     if not isinstance(body, dict):
-        return web.json_response({"error": "Request body must be a JSON object"}, status=400)
+        return web.json_response(
+            {"error": "Request body must be a JSON object", "code": "body_not_object"}, status=400
+        )
     provider_name = body.get("provider")
     server_id = body.get("id")
     if not isinstance(provider_name, str) or not isinstance(server_id, str):
@@ -444,6 +450,16 @@ async def official_install_plan(server_id: str) -> tuple[str, dict[str, Any], st
     route answers. Also read by a crewmate's capability request, which writes the same
     spec into the crewmate's own file instead of the global config.
     """
+    if edition.is_lts():
+        # RFC D13: the ``mcp`` term says which servers may be installed, asked by
+        # registry id before the entry is fetched or anything is written.
+        denied = await asyncio.to_thread(extension_install_denied, "mcp", server_id)
+        if denied:
+            raise OfficialPlanError(
+                403,
+                "blocked_by_policy",
+                _redact_external(f"Blocked by governance policy: {denied}"),
+            )
     registry = await asyncio.to_thread(_get_registry)
     provider = registry.get("official")
     if provider is None or not provider.is_available():
@@ -453,7 +469,9 @@ async def official_install_plan(server_id: str) -> tuple[str, dict[str, Any], st
             provider.fetch_detail(server_id), timeout=_DETAIL_TIMEOUT_SECS
         )
     except (ProviderUnavailableError, asyncio.TimeoutError) as exc:
-        logger.warning("MCP install fetch failed for %s: %s", server_id, exc)
+        # The id and the error can carry a caller's credential, so only the kind
+        # of failure is logged.
+        logger.warning("MCP install fetch failed (%s)", type(exc).__name__)
         raise OfficialPlanError(
             503, "provider_unavailable", "Provider 'official' is not available"
         ) from None
@@ -484,6 +502,11 @@ async def _install_from_official(request: web.Request, server_id: str) -> web.Re
     # written spec (and filling any env vars) — is the consent step before
     # the process can ever spawn. Install never flips anything on.
     enable_now = False
+    # An install lands disabled, so one under a Kiro Crew server's own name
+    # would mute that server through the store.
+    builtin = await _builtin_server_refusal(name)
+    if builtin is not None:
+        return builtin
 
     async with _get_mcp_lock():
         existing = await asyncio.to_thread(_find_server_spec_anywhere, name)
@@ -502,7 +525,47 @@ async def _install_from_official(request: web.Request, server_id: str) -> web.Re
             # Fresh install: always written disabled (consent default).
             # The store write can apply a Windows owner-only DACL —
             # blocking filesystem work kept off the event loop.
-            await _offload_config_write(_set_kirocrew_entry, name, enabled=enable_now, spec=spec)
+            action = await _offload_config_write(
+                _set_kirocrew_entry, name, enabled=enable_now, spec=spec
+            )
+            if action == "corrupt":
+                # The store exists but is not a readable MCP config, so nothing
+                # was written: report that, not an install.
+                sel().log_api_access(
+                    caller="dashboard",
+                    operation="mcp_discover_install",
+                    outcome="error",
+                    source="dashboard",
+                    resources=f"official:{name} store unreadable",
+                )
+                return _mcp_config_corrupt("the Kiro Crew mcp.json")
+            if action == "ambiguous":
+                # Two store keys alias to this name and nothing was written:
+                # the same refusal the toggle answers, not an install.
+                sel().log_api_access(
+                    caller="dashboard",
+                    operation="mcp_discover_install",
+                    outcome="denied",
+                    source="dashboard",
+                    resources=f"official:{name} ambiguous",
+                )
+                return web.json_response(
+                    {"error": "name already in use", "code": "mcp_server_name_ambiguous"},
+                    status=409,
+                )
+            if action == "registry":
+                # The name is a catalog-governed registry pointer: left as it is.
+                sel().log_api_access(
+                    caller="dashboard",
+                    operation="mcp_discover_install",
+                    outcome="denied",
+                    source="dashboard",
+                    resources=f"official:{name} registry pointer",
+                )
+                return web.json_response(
+                    {"error": "name already in use", "code": "mcp_server_name_in_use"},
+                    status=409,
+                )
         else:
             # Identical spec already present — a reinstall is a pure no-op:
             # the user's env values AND enabled/disabled state survive.
@@ -558,6 +621,8 @@ async def _install_via_capability(request: web.Request, server_id: str) -> web.R
     from kiro_crew.dashboard.handlers.mcp import (
         _agent_home_not_owned,
         _agent_home_not_owned_response,
+        _mcp_config_busy,
+        _mcp_write_failed,
         _sync_mcp_to_agent,
     )
 
@@ -577,8 +642,8 @@ async def _install_via_capability(request: web.Request, server_id: str) -> web.R
             source="dashboard",
             resources=f"capability:{server_id}",
         )
-        message = (res.message or "install failed")[:500]
-        return web.json_response({"error": _redact_external(message)}, status=500)
+        message = _redact_external(res.message or "install failed")[:500]
+        return web.json_response({"error": message}, status=500)
 
     async with _get_config_lock():
         # Off the loop: _sync_mcp_to_agent takes bridges' synchronous _mcp_lock
@@ -591,6 +656,10 @@ async def _install_via_capability(request: web.Request, server_id: str) -> web.R
             # before it. Answered as the refusal it is, like every other write
             # failure on this path.
             return _agent_home_not_owned_response(server_id)
+        except PermissionError:
+            return _mcp_config_busy("mcp discover install")
+        except OSError:
+            return _mcp_write_failed("mcp discover install", "kirocrew.json")
     state = request.app["state"]
     state.push_refresh("agents")
 

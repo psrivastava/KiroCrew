@@ -73,13 +73,13 @@ def test_declared_servers_skip_disabled_ones_and_survive_until_the_next_session(
 
 
 def test_servers_past_the_cap_are_counted_and_never_read_as_ready():
-    from kiro_crew.acp.mcp_session_report import BUCKET_CAP
+    from kiro_crew.acp.mcp_session_report import STATUS_CAP
 
     report = McpSessionReport()
     report.begin_session([])
-    names = [f"s{i}" for i in range(BUCKET_CAP + 1)]
+    names = [f"s{i}" for i in range(STATUS_CAP + 1)]
     report.record_declared({"mcpServers": {name: {} for name in names}})
-    for name in names[:BUCKET_CAP]:
+    for name in names[:STATUS_CAP]:
         report.record_event(EVENT_MCP_SERVER_INITIALIZED, name)
 
     assert report.declared_omitted == 1
@@ -87,6 +87,20 @@ def test_servers_past_the_cap_are_counted_and_never_read_as_ready():
 
     report.begin_session([])
     assert report.declared_omitted == 0
+
+
+def test_65_declared_servers_that_all_connected_leave_nothing_not_ready():
+    """One bound for every reader: the wait, the notice and the live reading agree."""
+    report = McpSessionReport()
+    report.begin_session([])
+    names = [f"s{i}" for i in range(65)]
+    report.record_declared({"mcpServers": {name: {} for name in names}})
+    for name in names:
+        report.record_event(EVENT_MCP_SERVER_INITIALIZED, name)
+
+    assert report.declared_not_ready() == ()
+    assert report.declared_never_reported() == ()
+    assert report.not_ready() == {}
 
 
 def test_a_server_muted_with_a_non_boolean_disabled_is_not_waited_for():
@@ -259,6 +273,12 @@ def test_without_the_opt_in_the_global_mcp_json_is_not_waited_for(tmp_path, monk
 # ── The shared-runtime session handle ───────────────────────────────────────
 
 
+def _deliver(handle: AcpSessionHandle, frame) -> None:
+    """Hand *frame* to the session as the runtime's reader does: report, then queue."""
+    handle.mcp_session_report().fold_frame(frame)
+    handle._queue.put_nowait(frame)
+
+
 @pytest.mark.asyncio
 async def test_handle_holds_the_first_prompt_for_a_slow_declared_server():
     """drain_init gives up on the slow server; the unattended wait does not."""
@@ -269,13 +289,13 @@ async def test_handle_holds_the_first_prompt_for_a_slow_declared_server():
     report.begin_session([])
     report.record_declared(_SPEC)
 
-    q["sA"].put_nowait(_initialized("sA", "atlassian"))
+    _deliver(handle, _initialized("sA", "atlassian"))
     await handle.drain_init(duration=0.2, idle_exit=0.01, no_report_ceiling=0.05)
     # The defect: the session would now prompt without the slow server.
     assert report.declared_unreported() == ("azure-devops",)
 
     waiter = asyncio.ensure_future(handle.wait_for_declared_mcp(60.0))
-    q["sA"].put_nowait(_initialized("sA", "azure-devops"))
+    _deliver(handle, _initialized("sA", "azure-devops"))
     missing = await await_until(waiter, what="the wait to end once the server reported")
 
     assert missing == ()
@@ -300,7 +320,7 @@ async def test_handle_declared_wait_counts_an_owed_compaction_terminal():
             params={"status": {"type": "failed"}},
         )
     )
-    q["sA"].put_nowait(_initialized("sA", "atlassian"))
+    _deliver(handle, _initialized("sA", "atlassian"))
 
     missing = await handle.wait_for_declared_mcp(1.0)
 
@@ -317,7 +337,7 @@ async def test_handle_wait_is_bounded_and_names_the_server_that_never_reported()
     report = handle.mcp_session_report()
     report.begin_session([])
     report.record_declared(_SPEC)
-    q["sA"].put_nowait(_initialized("sA", "atlassian"))
+    _deliver(handle, _initialized("sA", "atlassian"))
 
     missing = await _bounded(handle.wait_for_declared_mcp(0.05), what="the bounded wait")
 
@@ -650,6 +670,10 @@ class _WorkflowSessions:
     async def destroy(self, key):
         return None
 
+    async def recycle_if_sandbox_tightened(self, key):
+        # The sandbox tier never tightens in these tests.
+        return False
+
 
 @pytest.fixture()
 def workflow_stream(monkeypatch):
@@ -764,5 +788,69 @@ async def test_a_heartbeat_still_missing_a_server_names_it_in_the_result(monkeyp
 async def test_a_reused_heartbeat_session_does_not_wait_again(monkeypatch):
     client = _FakeClient(slow_reports=True)
     await _heartbeat_result(client, monkeypatch, is_new=False)
+
+    assert client.waits == []
+
+
+# ── A sub-agent spawn ───────────────────────────────────────────────────────
+
+
+def _spawn_coordinator(client: _FakeClient, *, is_new: bool = True) -> MagicMock:
+    """A run coordinator whose manager hands *client* out on either arm."""
+    manager = MagicMock()
+    manager._create_shared_session = AsyncMock(return_value=client)
+    manager._ensure_dedicated_start_priced = AsyncMock()
+    manager._is_cc_provider = MagicMock(return_value=False)
+    manager._sessions.get_or_create = AsyncMock(return_value=(client, is_new, False))
+    return MagicMock(_manager=manager)
+
+
+@pytest.fixture()
+def spawn_facade(monkeypatch):
+    """The session re-checks ``acquire_session`` reads off ``kiro_crew.subagent``, inert."""
+    import kiro_crew.subagent as sa
+
+    async def keep(client, *_a, **_k):
+        return client
+
+    async def reproject(_sessions, _key, _agent, claimed, _claim):
+        return claimed
+
+    monkeypatch.setattr(sa, "replace_stale_shared_session", keep)
+    monkeypatch.setattr(sa, "invalidate_stale_kas_session", AsyncMock())
+    monkeypatch.setattr(sa, "reproject_claimed_session", reproject)
+
+
+async def _acquire(client: _FakeClient, *, shared: bool, is_new: bool = True) -> None:
+    from kiro_crew.subagent_manager import turn_session
+
+    info = MagicMock(id="sub1", parent_session_key="parent")
+    await turn_session.acquire_session(
+        _spawn_coordinator(client, is_new=is_new),
+        info,
+        "subagent:sub1",
+        "kirocrew",
+        parent_policy="auto",
+        extra_kwargs={},
+        use_session_sharing=shared,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shared", [True, False], ids=["shared-runtime", "dedicated"])
+async def test_a_spawn_waits_for_its_slow_server_before_its_first_prompt(spawn_facade, shared):
+    """A spawn prompts as soon as its session opens, so the start's brief wait
+    left a routed server that takes a few seconds out of its first turn."""
+    client = _FakeClient(slow_reports=True)
+    await _acquire(client, shared=shared)
+
+    assert client.waits == [mcp_problems.UNATTENDED_MCP_WAIT_SECS]
+    assert client._report.declared_not_ready() == ()
+
+
+@pytest.mark.asyncio
+async def test_a_spawn_on_a_reused_session_does_not_wait_again(spawn_facade):
+    client = _FakeClient(slow_reports=True)
+    await _acquire(client, shared=False, is_new=False)
 
     assert client.waits == []

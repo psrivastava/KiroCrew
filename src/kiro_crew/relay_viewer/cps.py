@@ -7,7 +7,8 @@ call (:mod:`kiro_crew.relay_client.lease`), and both carry the person's sign-in.
 
 So each call is made the way the lease call is: no credential is read from the
 environment (``trust_env=False``), a redirect is never followed, a call takes at
-most 15 seconds and an answer is read to 64 KiB at most. Nothing logged here
+most 15 seconds and an answer is read to 64 KiB at most. Host names resolve on
+:func:`~kiro_crew.executors.relay_viewer_executor`, not the default executor. Nothing logged here
 carries the sign-in, the access token, a body, or the service's message text.
 
 Every failure is a :class:`CpsRefused` with one of the typed codes below, so
@@ -29,6 +30,8 @@ from urllib.parse import urlsplit
 import aiohttp
 
 from kiro_crew.auth.login.control_plane import cps_headers
+from kiro_crew.executor_resolver import executor_connector
+from kiro_crew.executors import relay_viewer_executor
 from kiro_crew.relay_client.connection import env_proxy_for
 from kiro_crew.relay_client.lease import (
     ANSWER_MAX_BYTES,
@@ -140,18 +143,28 @@ class _Answer:
 
 
 async def list_crew_endpoints(
-    cps_url: str, bearer: str, *, crew_domain: str = "", token_type: str = ""
+    cps_url: str,
+    bearer: str,
+    *,
+    crew_domain: str = "",
+    token_type: str = "",
+    profile_arn: str = "",
 ) -> tuple[CrewEndpoint, ...]:
     """Every Crew this person can open, in the service's order, checked entry by entry.
 
-    *crew_domain* is the relay's domain, lower case. When set, an entry is kept
+    *crew_domain* is a dev relay domain, lower case. When set, an entry is kept
     only when its host is exactly ``<endpointId>.<crew_domain>`` with no port.
-    Empty keeps the host check that has no domain. *token_type* is
-    ``EXTERNAL_IDP`` for an external IdP sign-in, else empty.
+    Empty trusts the address CPS lists: any ``https://<endpointId>.<host>`` with no
+    port is kept, so a new relay Region needs no release. *token_type* is
+    ``EXTERNAL_IDP`` for an external IdP sign-in, else empty. *profile_arn* is
+    sent as ``profileArn`` on every page when set, which CPS needs to tell which
+    account is asking; with it CPS lists the personal Crews of that profile
+    only. Empty sends no profile.
     """
     crews: dict[str, CrewEndpoint] = {}
     dropped = 0
-    body: dict[str, Any] = {}
+    profile: dict[str, Any] = {"profileArn": profile_arn} if profile_arn else {}
+    body: dict[str, Any] = dict(profile)
     for _ in range(MAX_PAGES):
         answer = await _call(cps_url, bearer, LIST_TARGET, body, token_type)
         payload = answer.payload
@@ -178,7 +191,7 @@ async def list_crew_endpoints(
         token = payload.get("nextToken")
         if not (isinstance(token, str) and 0 < len(token) <= NEXT_TOKEN_MAX_CHARS):
             break
-        body = {"nextToken": token}
+        body = {**profile, "nextToken": token}
     else:
         logger.warning(
             "relay viewer: the Crew list has more than %d pages; showing those", MAX_PAGES
@@ -197,15 +210,20 @@ async def list_crew_endpoints(
 
 
 async def create_crew_access_token(
-    cps_url: str, bearer: str, endpoint_id: str, *, token_type: str = ""
+    cps_url: str, bearer: str, endpoint_id: str, *, token_type: str = "", profile_arn: str = ""
 ) -> CrewAccessToken:
     """A fresh access token for the Crew *endpoint_id*.
 
     *token_type* is ``EXTERNAL_IDP`` for an external IdP sign-in, else empty.
+    *profile_arn* is sent as ``profileArn`` when set, which CPS needs to open a
+    personal Crew. Empty sends the endpoint alone, as for a team Crew.
     """
     if not isinstance(endpoint_id, str) or not ENDPOINT_ID_RE.match(endpoint_id):
         raise CpsRefused(INVALID_REQUEST, "not a Crew endpoint ID")
-    answer = await _call(cps_url, bearer, MINT_TARGET, {"endpointId": endpoint_id}, token_type)
+    body: dict[str, Any] = {"endpointId": endpoint_id}
+    if profile_arn:
+        body["profileArn"] = profile_arn
+    answer = await _call(cps_url, bearer, MINT_TARGET, body, token_type)
     payload = answer.payload if isinstance(answer.payload, dict) else {}
     token = payload.get("accessToken")
     expires = parse_time(payload.get("expiresAt"))
@@ -237,15 +255,18 @@ def _crew_endpoint(raw: Any, crew_domain: str) -> Optional[CrewEndpoint]:
         return None
     if not isinstance(url, str) or crew_url_problem(url) is not None:
         return None
-    # The token goes only to this origin, so it must be this endpoint's own name.
-    # With the relay's domain set, it must be exactly that name under the domain,
-    # on the default port.
-    # shortcut: one relay domain, change to a list when the viewer must reach a second relay region.
+    # The token goes only to this origin, so it must be this endpoint's own name,
+    # on the default port. The domain after it is the one CPS lists, trusted as is
+    # (crew_url_problem has already refused userinfo, a path and a trailing dot).
+    # A dev relay domain pins it: exactly that name under the domain.
     parts = urlsplit(url)
+    if parts.port is not None:
+        return None
+    host = parts.hostname or ""
     if crew_domain:
-        if parts.port is not None or parts.hostname != f"{endpoint}.{crew_domain}":
+        if host != f"{endpoint}.{crew_domain}":
             return None
-    elif not (parts.hostname or "").startswith(f"{endpoint}."):
+    elif not host.startswith(f"{endpoint}."):
         return None
     crew_type = raw.get("crewType")
     if not is_display_name(name) or not isinstance(crew_type, str) or crew_type not in CREW_TYPES:
@@ -334,7 +355,8 @@ async def _post(url: str, bearer: str, target: str, body: dict, token_type: str)
     try:
         # trust_env=False: no netrc or other credential from the environment. A
         # proxy the environment names is still used, as for the lease call.
-        async with aiohttp.ClientSession(trust_env=False) as session:
+        connector = executor_connector(relay_viewer_executor())
+        async with aiohttp.ClientSession(trust_env=False, connector=connector) as session:
             async with session.post(
                 url,
                 data=json.dumps(body).encode("utf-8"),

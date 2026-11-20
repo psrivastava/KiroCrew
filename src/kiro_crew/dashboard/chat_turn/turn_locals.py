@@ -89,7 +89,8 @@ class _ChatTurn:
     _directive_loop_id: "str"
     _directive_loop_gen: "int"
     # The loop whose own cycle this turn is, for its fault counts: the delivered
-    # wake's, or the one a recovery entry carried (``_recovered_wake``).
+    # wake's, the one a recovery or requeued wake entry carried
+    # (``_recovered_wake``), or a steered wake's this turn took (``steer_queue``).
     _wake_cycle: "tuple[str, int] | None"
     _skill_trigger_text: "str | None"
     _directive_channel_origin: "bool"
@@ -98,6 +99,7 @@ class _ChatTurn:
     _commands_off: "bool"
     _recovery_echo_owed: "bool"
     _card_origin: "bool"
+    _prompt_on_channel: "bool"
     _turn_actor: "str"
     regenerate_hint: "str"
     _on_consumed: "Callable[[bool], None] | None"
@@ -155,6 +157,12 @@ class _ChatTurn:
     died_notice: "_TurnDiedNote | None"
     _deferred_options_expiry: "bool"
     _deny_override: "DenyOverrideOffer | None"
+    # The web term an organisation's ``ask`` rule names for this request, or ""
+    # (``web_ask_rule.needs_person``); set with ``_deny_override``.
+    _web_ask: "str"
+    # No auto-approve answers this request: a card's turn, a held Bot limit or an
+    # organisation's web ``ask``; set with ``_web_ask``.
+    _no_auto_approve: "bool"
     _dir_consumed_out: "dict[str, str]"
     _dispatch_lock: "Lock"
     _dispatch_lock_held: "bool"
@@ -169,7 +177,13 @@ class _ChatTurn:
     _first_turn_history_assembled: "bool"
     _had_empty_response_verdict: "bool"
     _held_after_terminal: "list[Any]"
+    _echo_held: "list[tuple[Any, bool]]"
     _held_runs: "list[tuple[dict[str, Any], str, int | None, int]]"
+    # Harness notice rows ``(content, meta)`` held while a text segment is open,
+    # appended by ``_finish_harness_notices``. Set in __init__ so every exit can read it.
+    _held_harness_notices: "list[tuple[str, dict[str, Any] | None]]"
+    # Rows refused at ``session_events.MAX_HELD_HARNESS_NOTICES``, said at release.
+    _held_harness_notices_dropped: "int"
     _incoming_message: "str"
     _interrupted_turn_preamble: "str"
     _irreversible_consumption_reported: "bool"
@@ -240,12 +254,14 @@ class _ChatTurn:
     _saw_terminal_event: "bool"
     _saw_text_chunk: "bool"
     _seen_tool_identity: "dict[str, tuple[str, str]]"
+    _sel_tool_labels: "dict[str, tuple[str, str]]"
     _send_receipt_selectors: "dict[str, str]"
     _session_deny_waivers: "frozenset[str]"
     #: Built on the turn's first tool call (the provider is known by then).
     _undelivered_watch: "Any"
     _session_stop_gen_at_entry: "int"
     _shell_tool_calls: "set[str]"
+    _slim_resume_pending: "bool"
     _span_base_len: "int"
     _span_probe: "str"
     _prompt_segments: "tuple[Any, ...]"
@@ -278,6 +294,8 @@ class _ChatTurn:
     _ttft_t0: "float | None"
     _ttft_visible: "_FirstVisibleClock"
     _turn_billed: "bool"
+    _turn_cache_rewrite: "bool"
+    _turn_cache_likely: "bool"
     _turn_boundary_set: "bool"
     _turn_cost_usd: "float"
     _turn_credits: "float"
@@ -379,6 +397,7 @@ class _ChatTurn:
         _commands_off: "bool",
         _recovery_echo_owed: "bool",
         _card_origin: "bool",
+        _prompt_on_channel: "bool" = False,
         _turn_actor: "str",
         regenerate_hint: "str",
         _on_consumed: "Callable[[bool], None] | None",
@@ -417,6 +436,7 @@ class _ChatTurn:
         self._commands_off = _commands_off
         self._recovery_echo_owed = _recovery_echo_owed
         self._card_origin = _card_origin
+        self._prompt_on_channel = _prompt_on_channel
         self._turn_actor = _turn_actor
         self.regenerate_hint = regenerate_hint
         self._on_consumed = _on_consumed
@@ -433,6 +453,12 @@ class _ChatTurn:
         self._live_context_reading = None
         self._live_context_at = float("-inf")
         self._drained_subagent_notices = []
+        self._held_harness_notices = []
+        self._held_harness_notices_dropped = 0
+        # Text chunks held while the open segment could still be the backend's
+        # alternation placeholder, with each one's ``released`` flag: dropped or
+        # replayed by ``stream_chunks._settle_echo_hold`` at the segment's end.
+        self._echo_held = []
 
     @property
     def assistant_text(self) -> str:

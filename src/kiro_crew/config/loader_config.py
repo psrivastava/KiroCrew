@@ -23,7 +23,11 @@ from kiro_crew.agent_sdk.backends import (
     resolve_cc_permission_mode,
 )
 from kiro_crew.agent_sdk.capabilities import MODEL_NAMESPACE_ACP, capabilities_for
-from kiro_crew.config.integration_sections import AppSettingsConfig, AwsConfig
+from kiro_crew.config.integration_sections import (
+    AppSettingsConfig,
+    AwsConfig,
+    TemplateSettingsConfig,
+)
 from kiro_crew.config.loader_agents import resolve_crew_identity
 from kiro_crew.config.loader_builders import (
     _restore_stored_harness_fields,
@@ -52,9 +56,10 @@ from kiro_crew.config.loader_document import (
     _config_write_lock,
     _invalidate_config_cache,
     _notify_live_watch,
+    _raw_agent_section,
     read_config_for_update,
     stamp_config_meta,
-    unsandboxed_exec_declared,
+    strip_undeclared_resolved_defaults,
     write_config_atomically,
 )
 from kiro_crew.config.loader_locations import (
@@ -126,11 +131,24 @@ from kiro_crew.config.sections import (
     WorkspaceConfig,
     _meta,
     coerce_effort,
+    normalize_agent_model,
 )
 from kiro_crew.effort import is_valid_effort, model_supports_effort
-from kiro_crew.mcp_gateway.rewriter import default_overlay_dir, default_socket_path
 
 logger = logging.getLogger("kiro_crew.config.loader")
+
+
+def template_model_pin(config: KiroCrewConfig, template: str | None) -> str:
+    """The user's model for the agent template *template* (``templates.<name>.model``).
+
+    ``""`` and ``"auto"`` both INHERIT the template's own pin. Total: a config
+    without the table, an unknown template, or a malformed entry reads ``""``.
+    """
+    if not template:
+        return ""
+    templates = getattr(config, "templates", None)
+    entry = templates.get(template) if isinstance(templates, dict) else None
+    return normalize_agent_model(getattr(entry, "model", ""))
 
 
 @dataclass
@@ -374,7 +392,8 @@ class KiroCrewConfig:
                             "(@server, @server/tool*, Running: @server/*, *), that always "
                             "ask before running. A matching MCP server stays mounted but "
                             "loses its blanket auto-approve grant, and a match outranks an "
-                            "auto_approve_tools grant at the gate. The gate follows a change "
+                            "auto_approve_tools or auto_approve_tool_identities grant at the "
+                            "gate. The gate follows a change "
                             "at once; a grant already in the agent spec is withdrawn at the "
                             "next restart, when the spec is rebuilt."
                         ),
@@ -409,6 +428,22 @@ class KiroCrewConfig:
                             "on the command's program and subcommand words, never on "
                             "argument text. Has no effect unless the batch write guard "
                             "is on."
+                        ),
+                    },
+                },
+                "return_answer": {
+                    "type": "boolean",
+                    "default": False,
+                    "x-meta": {
+                        "label": "Webhook answer return",
+                        "help": (
+                            "Off by default. When true, a POST /api/hooks/agent call that "
+                            "sends wait (seconds, at most 300) is held until its run ends "
+                            "or the wait runs out, and a run that finished its turn answers "
+                            "with its outcome and the redacted text delivery sends (a "
+                            "timeout or error run, with its outcome alone). Without it, "
+                            "wait is ignored with a warning and the call returns the "
+                            "accept receipt."
                         ),
                     },
                 },
@@ -459,13 +494,20 @@ class KiroCrewConfig:
         default_factory=dict,
         metadata=_meta("Apps", "Per-app user settings, keyed by the app's manifest name."),
     )
+    templates: dict[str, TemplateSettingsConfig] = field(
+        default_factory=dict,
+        metadata=_meta(
+            "Templates", "Per-template user settings, keyed by the agent template's name."
+        ),
+    )
     auto_update: bool = field(
         default=True,
         metadata=_meta(
             "Auto Update",
-            "Where the install can apply updates, true installs them once no work is "
-            "running and restarts; false only notifies. Elsewhere it has no effect. "
-            "On those same installs a policy minimum version applies regardless.",
+            "Where the install can apply updates, true downloads and prepares them "
+            "automatically and they take effect the next time you restart Kiro Crew; "
+            "nothing restarts by itself. False only notifies. Elsewhere it has no "
+            "effect. On those same installs a policy minimum version applies regardless.",
         ),
     )
     #: Opt-in for the Connections gallery, which is merged but held for a later
@@ -557,6 +599,14 @@ class KiroCrewConfig:
         metadata=_meta(
             "Registries",
             "External app registries (org-owned repos). " "Each entry: {name, repo, branch}.",
+        ),
+    )
+    market_registries: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Kiro Space Stores",
+            "Ids of the Kiro Space stores added as App Store sources. Only an id a "
+            "store provider offers is used; the address lives in the provider's code.",
         ),
     )
     # Unknown top-level config.json sections captured verbatim at load() and
@@ -727,6 +777,7 @@ class KiroCrewConfig:
             "memory_stores": {name: asdict(ms_cfg) for name, ms_cfg in self.memory_stores.items()},
             "default_memory_store": self.default_memory_store,
             "apps": {name: asdict(app_cfg) for name, app_cfg in self.apps.items()},
+            "templates": {name: asdict(t_cfg) for name, t_cfg in self.templates.items()},
             "stt": asdict(self.stt),
             "computer_use": asdict(self.computer_use),
             "aws": asdict(self.aws),
@@ -762,6 +813,7 @@ class KiroCrewConfig:
         }
         # External registries (always serialized so save() round-trips the field)
         d["registries"] = [asdict(r) for r in self.registries]
+        d["market_registries"] = list(self.market_registries)
         # ``mcp_gateway.stub_servers`` is the ROSTER in the file but the EFFECTIVE
         # set on the dataclass, so a straight ``asdict`` round-trip would rewrite
         # the file without the servers the operator opted out of -- turning a
@@ -876,10 +928,27 @@ class KiroCrewConfig:
         # reader about one host. On a fresh install there is no file yet, which reads
         # as undeclared and is exactly right: the document this call creates should
         # not contain the key at all.
-        if not unsandboxed_exec_declared():
-            agent_section = d.get("agent")
-            if isinstance(agent_section, dict):
-                agent_section.pop("sandbox_allow_unsandboxed_exec", None)
+        # ``agent.kas_bundle`` is stripped the same way: undeclared, it resolves
+        # through ``kas_bundle_build_default()`` (on in a nightly build only).
+        strip_undeclared_resolved_defaults(d)
+        # Same rule for ``telemetry.enabled``: its absence is load-bearing too.
+        # The default is on, and ``metrics.provider.outbound_consented`` reads a
+        # WRITTEN ``true`` as the operator's own opt-in to recording, which also
+        # permits export. A whole-document save (the boot default-config write,
+        # a CLI one-shot) would otherwise freeze the default in as that opt-in.
+        # Absent stays absent until someone writes the key through a delta
+        # writer (Settings, the Privacy chapter, ``kirocrew telemetry``).
+        # The base file only: an overlay value is not in config.json, and keeping
+        # the snapshot's default there would invent an opt-in under the overlay.
+        # A stored value that is not a bool goes back as stored, so the next load
+        # reads it as false again rather than as a written ``true``.
+        base_telemetry = _raw_agent_section(config_path(), "telemetry") or {}
+        telemetry_section = d.get("telemetry")
+        if isinstance(telemetry_section, dict):
+            if "enabled" not in base_telemetry:
+                telemetry_section.pop("enabled", None)
+            elif not isinstance(base_telemetry["enabled"], bool):
+                telemetry_section["enabled"] = base_telemetry["enabled"]
         # The harness fields go back to disk exactly as ``config.json`` stores
         # them, never from the in-memory value, which is RESOLVED: "no choice"
         # (absent or "") reads as today's default, and a pick this deployment
@@ -1057,6 +1126,7 @@ class KiroCrewConfig:
         if model_override:
             candidates.append((model_override, "model_override"))
         if agent and agent != "kirocrew":
+            candidates.append((template_model_pin(self, agent), f"templates.{agent}.model"))
             candidates.append((self._resolve_named_agent_model(agent), f"agent spec {agent}"))
         candidates.append((global_model, "agent.model"))
         # A pin says WHAT was picked, never for WHICH harness, so a backend switch
@@ -1412,6 +1482,11 @@ class KiroCrewConfig:
         # backend is ACQUIRED, and on its own routes nothing.
         _gw = self.mcp_gateway
         if _gw.stub_servers:
+            # Imported on the one branch that reads it: the rewriter loads the gateway
+            # manager and the sandbox, which a process that only reads config (every
+            # stdio MCP server, most CLI commands) never uses.
+            from kiro_crew.mcp_gateway.rewriter import default_overlay_dir, default_socket_path
+
             _gw_overlay = _gw.overlay_dir or str(default_overlay_dir())
             _gw_socket = _gw.socket_path or str(default_socket_path())
         else:
@@ -1468,7 +1543,8 @@ class KiroCrewConfig:
             #   1. model_override — the caller's explicit pick. The dashboard
             #      passes the slot's own model, else the Kiro Crew agent's
             #      configured default (see chat_runner._run_chat).
-            #   2. the bound kiro agent's own pinned model, for a named agent.
+            #   2. the bound kiro agent's model, for a named agent: the user's
+            #      templates.<name>.model, else the template's own pin.
             #      Custom agents MUST resolve here because the ACP
             #      session/set_mode path switches prompt/tools but not the model,
             #      so an unset model makes kiro fall back to cli.json's

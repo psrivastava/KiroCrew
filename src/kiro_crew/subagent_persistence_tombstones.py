@@ -129,6 +129,20 @@ def write_finished_result(
 _OWED_TOMBSTONES_MAX = 4096
 _OWED_TOMBSTONE_MAX_BYTES = 16_384
 _owed_tombstones: dict[str, dict[str, object]] = {}
+#: Where :func:`clear_tombstone` moves a tombstone it clears. Only
+#: ``tombstone.json`` keeps a folder out of orphan recovery; this file is read
+#: only by the next tombstone write, to carry the run's ending forward.
+_CLEARED_TOMBSTONE = "tombstone.cleared.json"
+#: The ``cause`` of the tombstone a restart's orphan reconciliation writes. It records
+#: that the gateway lost the run, not how the run ended, so the boot reconcile reads
+#: past it to ``state.json``.
+RESTART_TOMBSTONE_CAUSE = "gateway_restart"
+#: The ``cause`` of the tombstone that records a parent end for a claimed row the
+#: teardown left to its claimer (``record_parent_end``). The boot reconcile settles
+#: the row on it, ``cancelled``, and the retained-claim retry reads it instead of
+#: the in-memory teardown mark, which ages out. A restart tombstone written over it
+#: keeps this cause, since the restart did not end the row.
+PARENT_END_TOMBSTONE_CAUSE = "parent_end"
 #: Held for a whole retry, so two retries never write at once (see
 #: :func:`retry_owed_tombstones`).
 _owed_retry_lock = threading.Lock()
@@ -281,6 +295,44 @@ def write_tombstone(
     _write_tombstone_file(agent_id, cause, recovery_action, extra, owed_retry=False)
 
 
+def write_tombstone_if_absent(
+    agent_id: str,
+    *,
+    cause: str,
+    recovery_action: str,
+    attempt: int | None = None,
+    **extra: object,
+) -> bool:
+    """Write ``tombstone.json`` unless the run has its own; True when *cause* is on disk.
+
+    The create is exclusive, so a tombstone the run itself writes at the same moment
+    is never replaced: the first one to land is the record. The run folder is the
+    row id's, so a row claimed again keeps the tombstone of an earlier attempt: a
+    failure before a retry, or the restart that stopped a recovered row's run. Given
+    *attempt*, the generation of the row's current claim, the write records it as
+    ``taskq_attempt`` and replaces a tombstone that names no attempt or another one,
+    keeping its ``leaked_process`` mark. A tombstone that names *attempt* stays. It is
+    the attempt's own ending, and the call answers False, unless its cause is *cause*:
+    then it is this record, written earlier, and the call answers True.
+    """
+    ensure_directory(_agent_dir(agent_id))
+    if attempt is not None:
+        extra = {**extra, "taskq_attempt": attempt}
+    try:
+        _write_tombstone_file(agent_id, cause, recovery_action, extra, owed_retry=True)
+    except FileExistsError:
+        prior, _present = _read_tombstone_at(_agent_dir(agent_id) / "tombstone.json")
+        if not isinstance(prior, dict):
+            prior = {}
+        named = prior.get("taskq_attempt")
+        if attempt is None or (type(named) is int and named == attempt):
+            return prior.get("cause") == cause
+        if prior.get("leaked_process") is True:
+            extra = {**extra, "leaked_process": True}
+        _write_tombstone_file(agent_id, cause, recovery_action, extra, owed_retry=False)
+    return True
+
+
 def _write_tombstone_file(
     agent_id: str,
     cause: str,
@@ -321,8 +373,13 @@ def _write_tombstone_file(
     # is absent would put synchronous file I/O on sync writers called from a
     # coroutine.
     carried: dict[str, object] = {}
+    from_cleared = False
     if "outcome" not in extra:
-        prior, _present = _read_tombstone_at(d / "tombstone.json")
+        prior, present = _read_tombstone_at(d / "tombstone.json")
+        if not present:
+            # A tombstone the shutdown drain cleared (:func:`clear_tombstone`)
+            # still holds the run's ending, which this write carries the same way.
+            prior, from_cleared = _read_tombstone_at(d / _CLEARED_TOMBSTONE)
         if isinstance(prior, dict):
             if prior.get("outcome"):
                 carried["outcome"] = prior["outcome"]
@@ -337,6 +394,16 @@ def _write_tombstone_file(
             attempt = prior.get("taskq_attempt")
             if "taskq_attempt" not in extra and type(attempt) is int and attempt > 0:
                 carried["taskq_attempt"] = attempt
+            if (
+                present
+                and cause == RESTART_TOMBSTONE_CAUSE
+                and prior.get("cause") == PARENT_END_TOMBSTONE_CAUSE
+            ):
+                # A restart records no ending, and the parent end it would replace
+                # is what stops the claimed row (``record_parent_end``).
+                cause = PARENT_END_TOMBSTONE_CAUSE
+                if "stop_origin" not in extra and prior.get("stop_origin"):
+                    carried["stop_origin"] = prior["stop_origin"]
     tombstone = {
         "id": agent_id,
         "task": state.get("task", ""),
@@ -366,6 +433,12 @@ def _write_tombstone_file(
         # Retried with the same fields and the same ``died``: the tombstone a
         # retry writes describes this ending, not the moment space came back.
         _owe_tombstone(agent_id, d, cause, recovery_action, {**extra, "died": tombstone["died"]})
+    else:
+        if from_cleared:
+            try:
+                (d / _CLEARED_TOMBSTONE).unlink(missing_ok=True)
+            except OSError:
+                logger.debug("Could not remove %s's cleared tombstone", agent_id, exc_info=True)
     state_sid = cleanup_identity.get("session_id")
     if not live_cleanup_identities and isinstance(state_sid, str) and state_sid:
         # The run folder is agent-writable. Preserve only the retention/exemption
@@ -499,14 +572,19 @@ def clear_tombstone(agent_id: str) -> bool:
     still hand the result to the parent, losing it permanently.
 
     Clearing it re-admits the folder to the next start's reconciliation, which
-    sees ``result.txt`` and re-delivers. Returns True if a tombstone was
-    removed. Best-effort: never raises to the caller.
+    sees ``result.txt`` and re-delivers. The file is renamed to
+    :data:`_CLEARED_TOMBSTONE` rather than deleted, so the tombstone that
+    reconciliation writes still carries the run's ``outcome``, ``died``,
+    ``leaked_process`` and ``taskq_attempt``: without them a stopped run reads as
+    completed and a process its kill left standing is forgotten. Returns True if
+    a tombstone was cleared. Best-effort: never raises to the caller.
     """
     try:
-        p = _agent_dir(agent_id) / "tombstone.json"
-        existed = p.exists()
-        p.unlink(missing_ok=True)
-        return existed
+        d = _agent_dir(agent_id)
+        os.replace(d / "tombstone.json", d / _CLEARED_TOMBSTONE)
+        return True
+    except FileNotFoundError:
+        return False
     except OSError:
         logger.warning("clear_tombstone failed for %s", agent_id, exc_info=True)
         return False

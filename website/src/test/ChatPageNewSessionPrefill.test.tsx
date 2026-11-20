@@ -38,6 +38,7 @@ import { loadSessionRefDrafts, saveSessionRefDrafts, __resetSessionRefDraftsForT
 import { formatToken } from '../utils/pasteTokens'
 import { openPopout, __resetForTests as resetChatPopouts } from '../utils/chatPopout'
 import { performSlotSwitch } from '../lib/slotSwitch'
+import { captureUrlToken } from '../lib/urlToken'
 import { bindSlotReadSender, flushSlotRead, _resetSlotReadRelayForTest } from '../lib/slotReadRelay'
 import { i18nT } from '../i18n/t'
 import type { useKnowledgeFetch } from '../pages/chat/useKnowledgeFetch'
@@ -66,6 +67,7 @@ const answerQuestion = vi.fn()
 const cancelQueuedRequest = vi.fn()
 const deleteChatSlot = vi.fn()
 const discardChatSlot = vi.fn()
+const slackLink = vi.fn()
 vi.mock('../api/client', () => ({
   api: {
     answerQuestion: (...a: unknown[]) => answerQuestion(...a),
@@ -88,6 +90,7 @@ vi.mock('../api/client', () => ({
     discardChatSlot: (...a: unknown[]) => discardChatSlot(...a),
     chatSlotContext: vi.fn().mockResolvedValue({ ok: true }),
     suggestions: vi.fn().mockResolvedValue({ suggestions: [] }),
+    slackLink: (...a: unknown[]) => slackLink(...a),
   },
   SEARCH_MIN_CHARS: 2,
 }))
@@ -1103,5 +1106,138 @@ describe('App SDK chat launch intent', () => {
       expect(discardChatSlot).not.toHaveBeenCalled()
       expect(isListed(store)).toBe(true)
     })
+  })
+})
+
+
+describe('Signed channel link', () => {
+  /** Hand the boot-time token capture a signed chat link, the shape the channel redirect issues. */
+  function openLink(payload: Record<string, unknown>) {
+    const token = `${btoa(JSON.stringify(payload)).replace(/\+/g, '-').replace(/\//g, '_')}.sig`
+    captureUrlToken({
+      location: { href: `http://localhost/chat?token=${token}` },
+      history: { state: null, replaceState: () => {} },
+    } as unknown as Pick<Window, 'location' | 'history'>)
+  }
+
+  beforeEach(() => {
+    slackLink.mockReset()
+    slackLink.mockResolvedValue({ ok: true })
+  })
+
+  it('sends the link prompt tagged as already in the channel thread, and nothing after it', async () => {
+    openLink({ prompt: PROMPT, channel: 'C123', thread_ts: '1700.5' })
+    await renderAt('/chat')
+    await waitFor(() => expect(sendChat).toHaveBeenCalledTimes(1))
+    expect(slackLink).toHaveBeenCalledWith(NEW_SLOT, 'C123', '1700.5')
+    const [message, slot, , , meta] = sendChat.mock.calls[0]
+    expect(message).toBe(PROMPT)
+    expect(slot).toBe(NEW_SLOT)
+    // The gateway's mirror reads this to skip quoting the person's own message back.
+    expect(meta).toMatchObject({ origin: 'channel_challenge' })
+
+    // The next message is typed in the dashboard, so the thread gets its quote.
+    await act(async () => { fireEvent.change(composer(), { target: { value: PROMPT } }) })
+    await act(async () => { fireEvent.keyDown(composer(), { key: 'Enter', code: 'Enter' }) })
+    await waitFor(() => expect(sendChat).toHaveBeenCalledTimes(2))
+    expect(sendChat.mock.calls[1][4]).not.toHaveProperty('origin')
+  })
+
+  it('empties the composer and drops the seed once the link prompt is sent', async () => {
+    openLink({ prompt: PROMPT, channel: 'C123', thread_ts: '1700.5' })
+    await renderAt('/chat')
+    await waitFor(() => expect(sendChat).toHaveBeenCalledTimes(1))
+    // The prompt is in the transcript now; a copy left in the box would be sent twice on Enter.
+    await waitFor(() => expect(composer().value).toBe(''))
+    expect(sessionStorage.getItem(PREFILL_STORAGE_KEY)).toBeNull()
+  })
+
+  it('leaves the link prompt in the composer exactly once when its send is refused', async () => {
+    sendChat.mockResolvedValueOnce({ ok: false, status: 403, json: async () => ({ ok: false, error: 'refused' }) })
+    openLink({ prompt: PROMPT, channel: 'C123', thread_ts: '1700.5' })
+    await renderAt('/chat')
+    await waitFor(() => expect(sendChat).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(composer().value).toBe(PROMPT))
+  })
+
+  it('leaves the link prompt in the composer exactly once when its send never reaches the server', async () => {
+    sendChat.mockRejectedValueOnce(new TypeError('Failed to fetch'))
+    openLink({ prompt: PROMPT, channel: 'C123', thread_ts: '1700.5' })
+    await renderAt('/chat')
+    await waitFor(() => expect(sendChat).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(composer().value).toBe(PROMPT))
+  })
+
+  it('empties the composer when the link prompt is queued behind a running turn', async () => {
+    sendChat.mockResolvedValueOnce({ ok: true, json: async () => ({ ok: true, queued: true, queue_id: 'q-1' }) })
+    openLink({ prompt: PROMPT, channel: 'C123', thread_ts: '1700.5' })
+    await renderAt('/chat')
+    await waitFor(() => expect(sendChat).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(composer().value).toBe(''))
+    expect(sessionStorage.getItem(PREFILL_STORAGE_KEY)).toBeNull()
+  })
+
+  it('empties the composer when tying the chat to the thread answers late', async () => {
+    // The real Slack call takes a network round trip; the fill, the send and the
+    // clear all run after it resolves, in that order.
+    let release: (v: unknown) => void = () => {}
+    slackLink.mockReturnValueOnce(new Promise(resolve => { release = resolve }))
+    openLink({ prompt: PROMPT, channel: 'C123', thread_ts: '1700.5' })
+    await renderAt('/chat')
+    await waitFor(() => expect(slackLink).toHaveBeenCalledTimes(1))
+    expect(sendChat).not.toHaveBeenCalled()
+    await act(async () => { release({ ok: true }) })
+    await waitFor(() => expect(sendChat).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(composer().value).toBe(''))
+    expect(sessionStorage.getItem(PREFILL_STORAGE_KEY)).toBeNull()
+  })
+
+  it('empties the composer when the link reopens the chat already on screen', async () => {
+    // A reply in an already-tied thread carries that chat's session key. The
+    // composer is already on it, so the prompt is written straight into the box.
+    openLink({ prompt: PROMPT, channel: 'C123', thread_ts: '1700.5', session_key: 'dashboard:chat-old' })
+    await renderAt('/chat', undefined, 'chat-old')
+    await waitFor(() => expect(sendChat).toHaveBeenCalledTimes(1))
+    expect(sendChat.mock.calls[0][1]).toBe('chat-old')
+    expect(createChatSlot).not.toHaveBeenCalled()
+    await waitFor(() => expect(composer().value).toBe(''))
+    expect(sessionStorage.getItem(PREFILL_STORAGE_KEY)).toBeNull()
+  })
+
+  it('empties the composer when the link reopens a chat that was not on screen', async () => {
+    openLink({ prompt: PROMPT, channel: 'C123', thread_ts: '1700.5', session_key: 'dashboard:chat-old' })
+    const store = await renderAt('/chat', undefined, 'chat-other')
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-old'))
+    await waitFor(() => expect(sendChat).toHaveBeenCalledTimes(1))
+    expect(sendChat.mock.calls[0][1]).toBe('chat-old')
+    await waitFor(() => expect(composer().value).toBe(''))
+    expect(sessionStorage.getItem(PREFILL_STORAGE_KEY)).toBeNull()
+  })
+
+  it('does not bring the sent prompt back after switching away and back', async () => {
+    openLink({ prompt: PROMPT, channel: 'C123', thread_ts: '1700.5' })
+    const store = await renderAt('/chat')
+    await waitFor(() => expect(sendChat).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(composer().value).toBe(''))
+    await act(async () => { await store.dispatch(switchSlot('chat-other')) })
+    // A marker in the other chat's box, so the return is seen in the DOM, not only in the store.
+    await act(async () => { fireEvent.change(composer(), { target: { value: 'other chat words' } }) })
+    await act(async () => { await store.dispatch(switchSlot(NEW_SLOT)) })
+    await waitFor(() => expect(composer().value).not.toBe('other chat words'))
+    expect(composer().value).toBe('')
+    expect(sendChat).toHaveBeenCalledTimes(1)
+  })
+
+  it('still unstages the files a reopened chat sends with the link prompt', async () => {
+    // A reply in an already-tied thread reopens that chat with its staged chips.
+    // The link's send carries them, so they must not stay staged for the next turn.
+    const files = ['/sample/unsent.txt']
+    saveFileDrafts({ 'chat-old': files })
+    openLink({ prompt: PROMPT, channel: 'C123', thread_ts: '1700.5', session_key: 'dashboard:chat-old' })
+    await renderAt('/chat', undefined, 'chat-old')
+    await waitFor(() => expect(sendChat).toHaveBeenCalledTimes(1))
+    expect(sendChat.mock.calls[0][4]).toMatchObject({ files, origin: 'channel_challenge' })
+    await waitFor(() => expect(loadFileDrafts()['chat-old'] ?? []).not.toContain(files[0]))
+    await waitFor(() => expect(composer().value).toBe(''))
   })
 })

@@ -76,6 +76,7 @@ from kiro_crew.crew_log.projection import (
     TREE_PROJECTION_NAMES,
 )
 from kiro_crew.dashboard_templates.parity import ExtractionRefused, html_fields
+from kiro_crew.user_json import loads_user_json
 
 __all__ = [
     "FIELD_TYPES",
@@ -90,10 +91,9 @@ __all__ = [
     "parse_manifest",
 ]
 
-#: Every name set below is checked with ``in``, which HASHES the candidate, so each
-#: membership test requires a string of its own first: a manifest is free to carry a
-#: list or an object where a name belongs, and an unhashable candidate raises out of
-#: the loader instead of being collected as one more refusal.
+#: Every name set below is checked with ``in``, which HASHES the candidate, so each test
+#: needs a string first: a manifest may carry a list or an object where a name belongs,
+#: and an unhashable candidate would raise out of the loader instead of becoming a refusal.
 FIELD_TYPES: Final[frozenset[str]] = frozenset({"number", "string", "boolean", "array", "object"})
 #: Every fold a template may bind, built from the kernel's sets so a new fold needs no
 #: edit here. A template's reader, :func:`~kiro_crew.dashboard_feed.DashboardFeed`,
@@ -110,11 +110,11 @@ PACKAGE_FOLD_NAMES: Final[frozenset[str]] = FOLD_NAMES | frozenset(TREE_PROJECTI
 #: gates whether a page may EXECUTE, and the catalogue's scan checks a directory's
 #: declared source against where the directory actually sits.
 #:
-#: An agent-composed dashboard package gets a fourth value when a manifest is
-#: synthesized from one -- it has no directory and carries no page, so it has to be
-#: distinguishable from a template a person wrote. That value ships with the
-#: synthesis, because a source no manifest declares is a word both consumers would
-#: accept off disk and nothing would ever produce.
+#: A manifest synthesized from an agent-composed dashboard package uses ``"package"``
+#: (``member_dashboard_fields.package_manifest``): it has no directory and no page, so it
+#: must not pass for a template a person wrote. That value is deliberately NOT in this
+#: set: both consumers would then accept it from a manifest on disk, which nothing
+#: legitimate ever writes.
 SOURCES: Final[frozenset[str]] = frozenset({"builtin", "user", "shared"})
 #: ``\Z``, never ``$``: Python's ``$`` also matches before a TRAILING NEWLINE, so
 #: ``"report\n"`` would pass and sit beside ``report`` as a look-alike directory and
@@ -466,7 +466,7 @@ def check_parity(manifest: TemplateManifest, html: str) -> None:
 def load_template(directory: Path) -> tuple[TemplateManifest, str]:
     """Load and fully check one template directory."""
     try:
-        raw = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+        raw = loads_user_json((directory / "manifest.json").read_text(encoding="utf-8"))
         html = (directory / "template.html").read_text(encoding="utf-8")
     # UnicodeDecodeError too, so one non-UTF-8 directory isolates itself: escaping as a
     # bare ValueError would carry past `_scan` and fail the whole registry read.

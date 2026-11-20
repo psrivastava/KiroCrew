@@ -564,11 +564,14 @@ gate accepts them as visual evidence. Dragging a file into the description in th
 UI produces an identical URL, so a human reviewer and the lanes see one convention.
 
 **The one scoped exception: a contributor with no write access on the repository.**
-`gh --attach` uploads through an endpoint that answers read permission with a 404
-(cli/cli#14302), so a fork contributor has no CLI path to an attachment at all; the
-web-UI drag is their only one. For them, and only them, committing the media under
+`gh --attach` on the *upstream* PR uploads through an endpoint that answers read
+permission with a 404 (cli/cli#14302), so a fork contributor cannot attach there. They
+still have off-PR upload paths that keep binaries out of the diff: `--attach` on an
+issue in their OWN fork (where they are admin) mints cross-repo `user-attachments`
+URLs, and the web-UI drag mints the same. Committing the media under
 `temp-screenshots/<topic>/` (`git add -f`, past the ignore rule) and referencing the
-repository-relative path from the body is admissible evidence:
+repository-relative path from the body is admissible evidence too, but only as the last
+resort when neither upload path is available:
 `.github/scripts/pr-committed-evidence.sh` reads the blobs out of the object store for
 the fork lanes, and the screenshot-evidence gate accepts a still-linked committed
 path. The exception does not weaken the rule for anyone who CAN attach: every reason
@@ -689,9 +692,9 @@ falls out of the reading, but the lane's check run finishes with the edit and wa
 the loop. Comments from the loop's own account are left out, so a posted disposition
 does not wake it again.
 
-A merge or close ends a gated dashboard loop with the bell notice and no turn; only
-a Slack or Discord loop gets one last turn. So the Report goes out on the converged
-turn, and the `Merged` step runs only where that last turn exists. The decision is
+A merge or close ends a gated loop after one last turn on every surface, opening
+with the result (when it merged, which head). The Report still goes out on the
+converged turn; the last turn runs the `Merged` step. The decision is
 recorded in the `rfc-gated-pr-poll-loops` RFC
 ([#22440](https://github.com/kirodotdev/KiroCrew/pull/22440)).
 

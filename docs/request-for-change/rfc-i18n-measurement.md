@@ -3,8 +3,8 @@ title: i18n — closing the measurement gap
 status: partial
 author: zezhexu
 created: 2026-08-01
-last-audited: 2026-10-06
-audited-at: 9348a25a34
+last-audited: 2026-11-19
+audited-at: fc89562d69
 doc-pr: 1075
 implementation-prs: [1009, 1047, 1107, 1123, 1321, 14228]
 tracking-issues: [1004]
@@ -13,7 +13,7 @@ superseded-by: []
 ---
 # RFC: i18n — closing the measurement gap
 
-- Status: partial — 2 of 6 proposals shipped, 1 partial, 3 unstarted. **Shipped:** #3, the pseudolocale overflow gate (`website/scripts/check-i18n-render.mjs` + `lib/render-scan.mjs`, real `scrollWidth − clientWidth` measurement against the IBM expansion curve, PR #1107), which CI runs as the `i18n` lane of `scripts/ci_e2e_parallel.py` (`npm run i18n:render`; see `docs/ci/i18n-gates.md`); #5, lazy-loading, shipped in PR #14228 as one dynamic `import()` per authored catalog in `website/src/i18n/lazy.ts`, without `i18next-http-backend`. **Partial:** #4, the `localeCompare` migration — `compareText` has real consumers and the live ceiling is the `BASELINE` constant in `website/src/i18n/localeFormatting.test.ts`; `SessionGridView.tsx` sorts through `byRecentActivity` and calls no `localeCompare`. **Unstarted:** #1 source-hash staleness, #2 GEMBA-MQM/MQM 2.0 scoring, #6 `saveMissing` + word-count coverage.
+- Status: partial — 2 of 6 proposals shipped, 1 partial, 3 unstarted. **Shipped:** #3, the pseudolocale overflow gate (`website/scripts/check-i18n-render.mjs` + `lib/render-scan.mjs`, real `scrollWidth − clientWidth` measurement against the IBM expansion curve, PR #1107), which CI runs as ci.yml's own `i18n-render` job (`npm run i18n:render`; moved out of the `scripts/ci_e2e_parallel.py` lane by #20638; see `docs/ci/i18n-gates.md`); #5, lazy-loading, shipped in PR #14228 as one dynamic `import()` per authored catalog in `website/src/i18n/lazy.ts`, without `i18next-http-backend`. **Partial:** #4, the `localeCompare` migration — `compareText` has real consumers and the live ceiling is the `BASELINE` constant in `website/src/i18n/localeFormatting.test.ts`; `SessionGridView.tsx` sorts through `byRecentActivity` and calls no `localeCompare`. **Unstarted:** #1 source-hash staleness, #2 GEMBA-MQM/MQM 2.0 scoring, #6 `saveMissing` + word-count coverage.
 - **Attribution caveat:** the two proposals that moved first (#3, #4) were already in flight under the pre-existing remediation program (issue #1004, which predates this RFC and already owned the pseudolocale assertions and locale-aware formatting). PR #1009 merged **18 hours before this document did**. The three genuinely novel *measurement* proposals — the ones the title is about — have zero code. Read "partial" accordingly.
 - Author: zezhexu
 - Created: 2026-08-01
@@ -88,7 +88,7 @@ the categories each locale requires, plus 5,014 non-plural keys:
 | `ru` | one, few, many, other | 5014 + 45×4 = 5194 | **5194** |
 
 `catalogParity.test.ts` checks each language against its *own* categories, and
-`scripts/i18n-translate.mjs` rejects an impossible plural form as well as adding
+`website/scripts/i18n-translate.mjs` rejects an impossible plural form as well as adding
 categories English lacks. The failure mode this avoids — shipping `_one`/`_other`
 everywhere and being silently wrong for Russian 2–4 — is what i18next's
 suffix-key dialect makes easy to reach.
@@ -125,7 +125,7 @@ deliberately from the published table — see the appendix.)
 **Per-locale style guides exist for all nine non-English locales and are
 machine-enforced** (`website/src/i18n/style/*.md` + `*Style.test.ts`). I am aware
 of no comparable public example, though I have not surveyed systematically.
-`zhStyle.test.ts` is the strongest — 21 zero-tolerance
+`zhStyle.test.ts` is the strongest — 22 zero-tolerance
 assertions and a 12-pair terminology denylist gated on the *English* source
 rather than blind substring matching.
 

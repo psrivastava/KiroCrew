@@ -11,6 +11,7 @@ import { fmtNumber } from '../i18n/format'
 import { i18nT } from '../i18n/t'
 import type { SubagentActivity } from '../types'
 import { breakdownOf, Headline, headlineFigure, MESSAGE_COLOR, TurnBreakdown, type CrewCategory, type LatestTurn } from './ContextEngineBreakdown'
+import { PromptAsSent } from './PromptAsSent'
 import { SessionBreakdownTree } from './SessionBreakdownTree'
 import { CATEGORY_FILL } from './contextSourceColors'
 
@@ -871,6 +872,7 @@ function ContextBreakdownCard({
           ) : null}
           <TurnBreakdown breakdown={breakdown} engine={turn.engine} ttft={turn.ttft_ms} charsPerToken={trace.chars_per_token} />
           <BlockList turn={turn} />
+          <PromptAsSent slot={trace.slot} turn={turn.turn} version={rowVersion(trace, turn.turn)} />
         </div>
       ) : null}
 
@@ -926,7 +928,7 @@ function ContextBreakdownCard({
               ))}
             </div>
             <p className="m-0 mt-2 text-[12px] text-muted">
-              {i18nT('pages.contextBreakdown.pick_hint')} {i18nT('pages.contextBreakdown.chart_note')}
+              {i18nT('pages.contextBreakdown.pick_hint_chart_note')}
               {noTotal ? <span data-testid="chart-no-total"> {i18nT('pages.contextBreakdown.chart_no_total')}</span> : null}
             </p>
             {running ? (

@@ -90,6 +90,7 @@ leaving it on disk for a collector that does not exist.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import logging
 import time
@@ -120,6 +121,7 @@ from kiro_crew.crew_log.projection import (
 )
 from kiro_crew.crew_log.projection_session_log import _log_identity
 from kiro_crew.crew_log.store import (
+    ConsumedSpan,
     CrewLog,
     ResumePoint,
     crew_log_dir,
@@ -764,13 +766,15 @@ def prefix_witness(handle: CrewLog, seq: int) -> PrefixWitness | None:
 
     ``None`` when the boundary does not resolve or the walk falls short of it, which
     costs a savepoint rather than recording one nothing can check.
+
+    One walk finds the boundary and hashes the records up to it, the same bytes
+    :func:`prefix_unchanged` hashes again.
     """
-    records = handle.raw_records_through(seq)
+    hasher = hashlib.sha256()
+    records = handle.raw_records_through(seq, hasher=hasher)
     if records is None:
         return None
-    sha, hashed = handle.raw_prefix_digest(records)
-    if hashed != records:
-        return None
+    sha = hasher.hexdigest()
     return with_extent(handle, PrefixWitness(seq=seq, records=records, sha=sha))
 
 
@@ -832,6 +836,8 @@ def save(
     *,
     prefix: "PrefixWitness | CutWitness | None",
     owes_point: bool = False,
+    final: bool = False,
+    span: "ConsumedSpan | None" = None,
 ) -> SessionProjections:
     """*bundle*, with its savepoints on disk brought forward when a write is owed.
 
@@ -847,6 +853,12 @@ def save(
     state folded from its earlier value, and every later resume would recompute the
     same changed bytes, match, and serve that state instead of folding cold. ``None``
     -- no witness, or one whose prefix moved during the pass -- writes nothing.
+
+    *span* is the digest of the records the pass framed, taken as it read them. It is
+    framed again from disk just before the write, and a difference writes nothing:
+    the (size, mtime) fingerprint cannot see a same-size rewrite inside one mtime
+    tick, and the extent's tail digest cannot see one further back than its tail. The
+    re-read costs the bytes the pass consumed, and only on a pass that writes.
 
     Never raises, and never reports a write it did not make: the bundle comes back
     unchanged unless every fold in it reached its file.
@@ -868,14 +880,18 @@ def save(
     # this pass has one to give them. Owed only with a position in hand, so a pass that
     # read nothing cannot rewrite five files for no gain.
     owed = owes_point and prefix is not None and prefix.resume is not None
-    if bundle.last_seq - bundle.saved_seq < MIN_ADVANCE_ENTRIES and not owed:
+    # *final* is :func:`~kiro_crew.crew_log.projection_session_memo.seal_session_folds`'s
+    # write on a closed unit: owed for any advance, since the unit will not be written
+    # again.
+    sealed = final and bundle.last_seq > bundle.saved_seq
+    if bundle.last_seq - bundle.saved_seq < MIN_ADVANCE_ENTRIES and not owed and not sealed:
         return bundle
     if prefix is not None and bundle.size is not None:
-        # The files must be exactly as they were BEFORE the pass (the bundle's segment
-        # set fingerprint), or the extent taken below would describe bytes the pass never
-        # read: a record rewritten between the pass and this write would be pinned as if
-        # it were the one folded. A file that moved at all -- even by an append -- costs
-        # this write, and the next pass writes instead.
+        # The files must be exactly as they were when the pass ENDED (the bundle's
+        # segment set fingerprint), or the extent taken below would describe bytes the
+        # pass never read: a record rewritten between the pass and this write would be
+        # pinned as if it were the one folded. A file that moved at all -- even by an
+        # append -- costs this write, and the next pass writes instead.
         _origin, live_size, live_mtime = _log_identity(handle)
         if (live_size, live_mtime) != (bundle.size, bundle.mtime_ns):
             return bundle
@@ -914,6 +930,13 @@ def save(
     #: leaves the counter below a value to read.
     counted: "tuple[int, int, float]" = (0, 0, 0.0)
     try:
+        if span is not None and not _span_holds(handle, span):
+            # Under the lease and after every other refusal, so only a write that is
+            # about to happen pays the re-read. A same-size rewrite between this and the
+            # write below is not seen; the window is this function's own few file writes.
+            # The bundle comes back with no identity and no custody, so no memo keeps it
+            # and no later pass persists it: the next one folds from the older savepoint.
+            return dataclasses.replace(bundle, origin=None, cuts=None)
         directory = _ensure_dir(handle)
         if directory is None:
             return bundle
@@ -1507,6 +1530,24 @@ def _resume_one(
 # --------------------------------------------------------------------------- #
 # The unit
 # --------------------------------------------------------------------------- #
+
+
+def _span_holds(handle: CrewLog, span: "ConsumedSpan") -> bool:
+    """Whether the records *span* framed still read the same; ``False`` when unprovable."""
+    try:
+        held = span.holds(crew_log_dir(handle.kind, handle.id), handle.id)
+    except CrewLogError:
+        log_exception_text(
+            logger, logging.DEBUG, "crew log %s: savepoint span check refused its path", handle.id
+        )
+        return False
+    if not held:
+        logger.debug(
+            "crew log %s: the records a pass folded changed before its savepoint, "
+            "so none is written",
+            handle.id,
+        )
+    return held
 
 
 def _hold(handle: CrewLog) -> str | None:

@@ -159,11 +159,12 @@ class TestNotice:
 
     def test_trusted_agents_dropped_by_the_ceiling_are_named(self, monkeypatch):
         spec = _spec(toolsSettings={"subagent": {"trustedAgents": ["reviewer"]}})
-        monkeypatch.setattr(kas_agents, "may_skip_gate_now", lambda ref: False)
+        withhold, permit = (lambda ref: False), (lambda ref: True)
+        monkeypatch.setattr(kas_agents, "may_skip_gate_for_session", lambda *_a: withhold)
         assert spec_keys_without_carrier(spec, translates_tools_settings=True) == [
             "toolsSettings.subagent.trustedAgents"
         ]
-        monkeypatch.setattr(kas_agents, "may_skip_gate_now", lambda ref: True)
+        monkeypatch.setattr(kas_agents, "may_skip_gate_for_session", lambda *_a: permit)
         assert spec_keys_without_carrier(spec, translates_tools_settings=True) == []
 
     @pytest.mark.parametrize(
@@ -190,7 +191,8 @@ class TestNotice:
         ],
     )
     def test_a_kept_alias_is_named_as_the_spec_wrote_it(self, monkeypatch, settings, named):
-        monkeypatch.setattr(kas_agents, "may_skip_gate_now", lambda ref: False)
+        # The session's own predicate, which the trustedAgents check asks.
+        monkeypatch.setattr(kas_agents, "may_skip_gate_for_session", lambda *_a: lambda ref: False)
         spec = _spec(toolsSettings=settings)
         got = spec_keys_without_carrier(spec, translates_tools_settings=True)
         assert got == [f"toolsSettings.{path}" for path in named]
@@ -272,7 +274,7 @@ class TestPwshProcessControl:
 
 class TestOtherReadersAgree:
     def test_the_spawn_gate_reads_the_alias_kiro_cli_keeps(self):
-        from kiro_crew.subagent_parts.agent_policy import spawn_allowlist
+        from kiro_crew.subagent_parts.spawn_allowlists import spawn_allowlist
 
         assert spawn_allowlist({"toolsSettings": {"crew": {"availableAgents": []}}}) == ()
         both = {"crew": {"availableAgents": []}, "subagent": {"availableAgents": ["*"]}}
@@ -326,7 +328,7 @@ class TestOtherReadersAgree:
 
     def test_the_notice_never_calls_an_enforced_use_subagent_list_unapplied(self):
         from kiro_crew.agent_sdk.tools_settings_reach import tools_settings_unapplied
-        from kiro_crew.subagent_parts.agent_policy import spawn_allowlist
+        from kiro_crew.subagent_parts.spawn_allowlists import spawn_allowlist
 
         only = {"use_subagent": {"availableAgents": ["reviewer"]}}
         assert spawn_allowlist({"toolsSettings": only}) == ("reviewer",)

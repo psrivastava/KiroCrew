@@ -150,6 +150,7 @@ from kiro_crew.history_locks import (  # noqa: F401 - facade re-exports
     _FLOCK_POLL_INTERVAL_S,
     HistoryLockTimeout,
 )
+from kiro_crew.history_metadata_line import METADATA_READ_ATTEMPTS, METADATA_READ_RETRY_SECS
 from kiro_crew.history_offload import (  # noqa: F401 - facade re-exports
     _ON_LOOP_FALSY,
     _ON_LOOP_TRUTHY,
@@ -306,13 +307,10 @@ _SESSION_MAX_BYTES = 10 * 1024 * 1024  # 10MB
 _SESSION_KEEP_LINES = 200
 
 
-# Metadata reads retry briefly before reporting "no metadata": on Windows a
-# just-written session file can be transiently unopenable while an indexer or AV
-# scanner holds it (ERROR_SHARING_VIOLATION -> PermissionError). Those holds are
-# measured in milliseconds, and the caller that matters here (the open-tab
-# restore) treats an empty result as "session never existed" and drops the tab.
-_METADATA_READ_ATTEMPTS = 3
-_METADATA_READ_RETRY_SECS = 0.02
+# How often, and how far apart, a metadata read retries before reporting "no
+# metadata". Defined with the line's reader; these names stay the patch seam.
+_METADATA_READ_ATTEMPTS = METADATA_READ_ATTEMPTS
+_METADATA_READ_RETRY_SECS = METADATA_READ_RETRY_SECS
 
 
 class ConversationLog:
@@ -640,6 +638,15 @@ class ConversationLog:
         """
         return self._listing_index.has_messages(key)
 
+    def listing_identities(self) -> dict[str, CacheIdentity] | None:
+        """The listing index's cache identity per transcript stem, else None.
+
+        For the rows :meth:`list_sessions_indexed` just returned: as current as those
+        rows and costs no ``stat``. A caller passes one to
+        :meth:`read_file_change_messages` as ``identity``.
+        """
+        return self._listing_index.identities()
+
     def session_mtime(self, key: str) -> float | None:
         """Return the session file's mtime, or None if it can't be stat'd.
 
@@ -733,9 +740,14 @@ class ConversationLog:
         return self._catalog_projection.agent_usage()
 
     def search_sessions(
-        self, query: str, limit: int = 50, *, keys: Container[str] | None = None
+        self,
+        query: str,
+        limit: int = 50,
+        *,
+        keys: Container[str] | None = None,
+        snippets: bool = True,
     ) -> list[dict]:
-        return self._catalog_projection.search_sessions(query, limit, keys=keys)
+        return self._catalog_projection.search_sessions(query, limit, keys=keys, snippets=snippets)
 
     def warm_search(self) -> None:
         self._catalog_projection.warm_search()
@@ -775,8 +787,10 @@ class ConversationLog:
     def read_messages(self, key: str) -> list[dict]:
         return self._read_projection.read_messages(key)
 
-    def read_file_change_messages(self, key: str) -> list[dict]:
-        return self._read_projection.read_file_change_messages(key)
+    def read_file_change_messages(
+        self, key: str, *, identity: CacheIdentity | None = None
+    ) -> list[dict]:
+        return self._read_projection.read_file_change_messages(key, identity=identity)
 
     def read_messages_chained(self, key: str) -> list[dict]:
         return self._read_projection.read_messages_chained(key)
@@ -981,6 +995,9 @@ class ConversationLog:
     def last_row_ts(self, key: str) -> str | None:
         return self._read_projection.last_row_ts(key)
 
+    def last_speech_row_ts(self, key: str) -> str | None:
+        return self._read_projection.last_speech_row_ts(key)
+
     @staticmethod
     def _cache_key_identities(key: str) -> tuple[str, ...]:
         """Every cache-key spelling that can refer to *key*'s session.
@@ -1122,6 +1139,7 @@ class ConversationLog:
     _persist_inline_attachments = _history_append._persist_inline_attachments
     append = _history_append.append
     append_if_absent = _history_append.append_if_absent
+    store_ingested_images = _history_append.store_ingested_images
     _holds_identical_row = _history_append._holds_identical_row
 
     # -- Consolidation marker and retry ledger (``history_marker``).
@@ -1139,6 +1157,9 @@ class ConversationLog:
     record_consolidation_failure = _history_marker.record_consolidation_failure
     record_consolidation_environment_failure = (
         _history_marker.record_consolidation_environment_failure
+    )
+    clear_consolidation_environment_backoff = (
+        _history_marker.clear_consolidation_environment_backoff
     )
 
 

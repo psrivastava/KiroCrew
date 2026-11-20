@@ -230,6 +230,12 @@ def _start_kas_cli_floor(cfg: KiroCrewConfig) -> "asyncio.Task[None]":
 
     async def _run() -> None:
         try:
+            # A kiro-cli found only through PATH has its version read inside the
+            # sandbox, on a thread of its own. Started here, with the other
+            # boot-time kiro-cli probes, so the first session finds the answer.
+            from kiro_crew import kiro_cli_path_probe
+
+            kiro_cli_path_probe.warm()
             main_default, member_default = await asyncio.to_thread(_kas_floor_gates_spawns, cfg)
             kas_floor_wait.release_kas_floor_wait(
                 task, main=not main_default, member=not member_default
@@ -489,6 +495,14 @@ async def run_gateway(
 
     start_plaintext_credentials_notice()
 
+    # ── Container memory limit notice ──
+    # One WARNING when the container's memory limit is at or under
+    # agent.resource_critical_gb, naming the settings to lower. Read-only cgroup
+    # read, scheduled in the background and never awaited.
+    from kiro_crew.resource_status_container_limit import start_container_limit_notice
+
+    start_container_limit_notice(cfg)
+
     # ── KAS kiro-cli floor ──
     # A configured KAS on a kiro-cli that cannot select the KAS engine falls back
     # to kiro-cli, with the notice in the log. Scheduled in the background, never
@@ -636,6 +650,16 @@ async def run_gateway(
                     await asyncio.to_thread(staging.sweep_staging)
                 except Exception:
                     logging.getLogger(__name__).debug("staging sweep failed", exc_info=True)
+                # The dashboard import extracts under its own sandbox-hidden leaf;
+                # the same idle sweep reclaims a tree that a killed import left there.
+                try:
+                    from kiro_crew import staging
+
+                    await asyncio.to_thread(
+                        staging.sweep_staging, leaf=staging.IMPORT_STAGING_DIRNAME
+                    )
+                except Exception:
+                    logging.getLogger(__name__).debug("import staging sweep failed", exc_info=True)
                 # The per-run work directories of subagent and stateless cron
                 # sessions ride the same wake. The ordinary end of a run reclaims
                 # its own (AcpProvider.shutdown); the boot sweep took what a dead
@@ -703,22 +727,12 @@ async def run_gateway(
     # reasoning in embeddings_download.py). Errors are swallowed inside ``send``; a failed
     # heartbeat is invisible by design. ``test_mode`` skips it entirely so the
     # offline E2E gate can never make an outbound request.
-    #
-    # ``acked`` withholds the FIRST heartbeat until the user has actually been
-    # shown the disclosure and its opt-out. Boot runs before the dashboard has
-    # ever rendered, so on a fresh install this thread would otherwise ping
-    # before the user could possibly decline, making the opt-out an offer
-    # arriving after the fact. Established installs are unaffected: the gate
-    # applies only while `is_first_send()` holds.
     if not test_mode:
         with contextlib.suppress(Exception):
             threading.Thread(
                 target=beacon.send,
                 args=(cfg.telemetry.beacon_endpoint, kiro_crew.__version__),
-                kwargs={
-                    "enabled": cfg.telemetry.beacon_enabled,
-                    "acked": cfg.dashboard.privacy_acked,
-                },
+                kwargs={"enabled": cfg.telemetry.beacon_enabled},
                 name="kirocrew-beacon",
                 daemon=True,
             ).start()

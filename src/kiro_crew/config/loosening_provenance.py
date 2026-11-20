@@ -19,7 +19,18 @@ on-disk bytes differ from it, so a later unrelated save cannot re-endorse a tamp
 file. Every key is covered, tightening and loosening alike; there is
 no key table. A file that differs is pending, and an ordinary save of it is refused
 (:func:`refuse_save_if_pending`) until the owner applies or discards the change, so the
-change is neither endorsed nor silently overwritten.
+change is neither endorsed nor silently overwritten. A file with no endorsed copy yet
+(one written before this check existed) is endorsed as it is once, at gateway start
+before any session of the run (:func:`adopt_unendorsed`); one it cannot take as written
+(missing, malformed, or not stored as Kiro Crew writes it) is served as written until the
+gateway's first save of it or a later start that can adopt it. A ``config.json`` that
+differs from its copy, whose writer stamp names an older Kiro Crew release and which
+changes only the usage-data switches and dashboard look (:data:`_OLDER_WRITER_KEYS`,
+an allow list), is adopted as the new copy instead of being
+held pending (:func:`adopt_known_writer`): a release from before this check saves the
+file without updating the copy. A save stopped between its endorsement and its rename
+leaves the version endorsed before; the next start takes it back from a note the save
+left in the provenance directory (:func:`adopt_interrupted_save`).
 
 **Where it applies.** The per-file bind, and the rename-detach that lapses it, exist
 ONLY in the Linux namespace sandbox, so the check runs on a Linux host that can build
@@ -37,8 +48,9 @@ that differs from its endorsed copy keeps loading as the endorsed copy, and is r
 as pending (:func:`pending_changes`: the leaf, a signature of the on-disk bytes, and a
 plain changed-key diff with secret-bearing values withheld). The owner applies or
 discards it from Settings (``dashboard/handlers/config_pending.py``, owner-gated and
-CSRF-guarded like every Settings write, never reachable by the agent or an MCP tool);
-both go through the leaf's normal endorsing writer. Users may hand-edit; nothing
+CSRF-guarded like every Settings write, never reachable by the agent or an MCP tool), or
+without the dashboard from their own terminal (``kirocrew config pending``, refused
+inside a sandbox); both go through the leaf's normal endorsing writer. Users may hand-edit; nothing
 requires it, and nothing an in-sandbox process writes takes effect on its own. A file
 that is deleted or made unreadable is the same case: every reader serves the endorsed
 copy (:func:`reconciled_bytes`) and the leaf is pending as removed until the owner
@@ -63,6 +75,7 @@ this content check together.
 from __future__ import annotations
 
 import asyncio
+import codecs
 import contextlib
 import errno
 import hashlib
@@ -70,6 +83,7 @@ import json
 import logging
 import math
 import os
+import secrets
 import stat
 import sys
 import threading
@@ -77,10 +91,10 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
-from kiro_crew import sandbox_launch_mark
-from kiro_crew.atomic_write import atomic_write
+from kiro_crew import pinned_fs, sandbox_launch_mark
+from kiro_crew.atomic_write import atomic_write, atomic_write_at
 from kiro_crew.config.paths import config_dir, peek_data_home
-from kiro_crew.user_json import strict_json_equal
+from kiro_crew.user_json import strict_json_equal, strip_utf8_bom
 
 logger = logging.getLogger("kiro_crew.config.loader")
 
@@ -116,6 +130,15 @@ _reported: set[str] = set()
 #: ``(leaf, pending signature)`` pairs whose refused migration write-back was already
 #: logged, so a pending file logs once per version per process, not on every load.
 _writeback_refusals_logged: set[tuple[str, str]] = set()
+
+#: Endorsed copies a rollback could not put back, keyed by the copy's path:
+#: ``(what the copy file still holds, the copy it should hold)``. While the file still
+#: holds the first, :func:`endorsed_bytes` answers the second, so a failed publish whose
+#: restore also failed leaves this process where a good restore would have.
+#: shortcut: in-process only; a restart or another process (the CLI, an in-sandbox
+#: loader) reads the stale file and shows the leaf as pending until the next save
+#: endorses it. Persist it beside the copies if that ever matters.
+_unrestored: dict[str, tuple[bytes | None, bytes | None]] = {}
 
 
 #: This process's answer to "can the namespace sandbox be built here", set once by
@@ -216,6 +239,17 @@ def _read_regular(path: Path) -> bytes:
         return handle.read()
 
 
+def read_regular_with_retry(path: Path) -> bytes:
+    """:func:`_read_regular`, retrying the Windows sharing-violation window.
+
+    For a reader that must survive a concurrent atomic replace without giving up the
+    non-blocking open and ``fstat`` check a bare ``read_bytes`` would drop.
+    """
+    from kiro_crew.atomic_write import retry_read_sharing_window
+
+    return retry_read_sharing_window(lambda: _read_regular(path), path)
+
+
 def _refuse_special(path: Path) -> None:
     """Raise ``OSError`` when *path* exists and is not a regular file (a missing one is
     left to the reader).
@@ -293,6 +327,7 @@ def record(leaf: str, content: bytes, *, strict: bool = False) -> None:
         (config_dir() / RECORD_DIR_LEAF).mkdir(mode=_DIR_MODE, exist_ok=True)
         _endorsed_dir().mkdir(mode=_DIR_MODE, exist_ok=True)
         atomic_write(_endorsed_path(leaf), content, mode=_FILE_MODE)
+        _unrestored.pop(str(_endorsed_path(leaf)), None)
     except Exception:
         if strict:
             raise
@@ -304,17 +339,22 @@ def record(leaf: str, content: bytes, *, strict: bool = False) -> None:
         )
 
 
-#: The refusal every ordinary save of a pending file gets, CLI and dashboard alike. Plain
-#: words, no terminal step: the dashboard shows its own translation of the same sentence
-#: (keyed by :attr:`PendingEditBlocksSave.code`) with a link to the pending card.
+#: The refusal every ordinary save of a pending file gets, CLI and dashboard alike. The
+#: dashboard shows its own translation of the same sentence (keyed by
+#: :attr:`PendingEditBlocksSave.code`) with a link to the pending card; the command is for
+#: a gateway running without the dashboard.
 PENDING_SAVE_REFUSED = (
     "This settings file was changed outside Kiro Crew, so this save was not made. "
-    "Review the change in Settings > Security first (Apply or Discard), then try again."
+    "Review the change in Settings > Security first (Apply or Discard), then try again. "
+    "Without the dashboard, run `kirocrew config pending`."
 )
 
 
 def leaf_pending(leaf: str) -> bool:
     """Whether *leaf* is pending: :func:`pending_changes` would list it.
+
+    A differing ``config.json`` written by an older Kiro Crew is adopted here instead
+    (:func:`adopt_known_writer`), so its save goes ahead.
 
     Raises ``OSError`` when the endorsed copy exists but cannot be read, as
     :func:`endorsed_bytes` does.
@@ -322,7 +362,9 @@ def leaf_pending(leaf: str) -> bool:
     if not enforcement_active():
         return False
     endorsed = endorsed_bytes(leaf)
-    return endorsed is not None and endorsed != _disk_bytes(leaf)
+    if endorsed is None or endorsed == _disk_bytes(leaf):
+        return False
+    return adopt_known_writer(leaf) is None
 
 
 def refuse_save_if_pending(leaf: str | None) -> None:
@@ -373,23 +415,19 @@ def endorsing(
     enforcing = enforcement_active()
     # raises under enforcement when the copy is unreadable
     prior = endorsed_bytes(leaf)
-    record(leaf, content, strict=enforcing)
+    _mark_inflight(leaf, prior)
+    try:
+        record(leaf, content, strict=enforcing)
+    except BaseException:
+        _clear_inflight(leaf)
+        raise
     try:
         yield
+        _clear_inflight(leaf)
     except BaseException:
+        _clear_inflight(leaf)
         if enforcing:
-            try:
-                if prior is None:
-                    _endorsed_path(leaf).unlink(missing_ok=True)
-                else:
-                    record(leaf, prior, strict=True)
-            except Exception:
-                logger.warning(
-                    "loosening provenance: could not restore the endorsed copy for %s "
-                    "after a failed write",
-                    leaf,
-                    exc_info=True,
-                )
+            _restore_endorsed(leaf, prior, "after a failed write")
             # A load inside the window served the attempted copy and cached it under
             # the unchanged on-disk fingerprint; drop it as a successful write does.
             # Function-local: loader_document imports this module.
@@ -397,6 +435,86 @@ def endorsing(
 
             _invalidate_config_cache()
         raise
+
+
+def _open_dir_at(parent_fd: int, name: str, *, create: bool) -> int:
+    if create:
+        return pinned_fs.create_and_open_dir_at(
+            parent_fd, name, what="endorsed copy directory", refusal=OSError
+        )
+    return os.open(name, pinned_fs.dir_flags(), dir_fd=parent_fd)
+
+
+def _endorsed_dir_at(home_fd: int, *, create: bool) -> int:
+    record_fd = _open_dir_at(home_fd, RECORD_DIR_LEAF, create=create)
+    try:
+        return _open_dir_at(record_fd, ENDORSED_SUBDIR, create=create)
+    finally:
+        os.close(record_fd)
+
+
+def _copy_at(dir_fd: int, leaf: str) -> bytes | None:
+    """The copy *leaf* under *dir_fd*, ``None`` when absent; a non-regular file raises."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(leaf, flags, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(fd, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise OSError(errno.EINVAL, "not a regular file", leaf)
+        return handle.read()
+
+
+def endorsed_copy_at(home_fd: int, leaf: str) -> bytes | None:
+    """The endorsed copy of *leaf* in ANOTHER data home held by *home_fd* (POSIX).
+
+    For a writer whose own data home is not the one it writes (a pod's seed and restart
+    step runs in the operator's process). Every level is opened no-follow relative to
+    the held descriptor, so no name under that home can redirect the read. ``None`` when
+    the directory or the copy does not exist.
+    """
+    try:
+        dir_fd = _endorsed_dir_at(home_fd, create=False)
+    except FileNotFoundError:
+        return None
+    try:
+        return _copy_at(dir_fd, leaf)
+    finally:
+        os.close(dir_fd)
+
+
+@contextlib.contextmanager
+def endorsing_at(home_fd: int, leaf: str, content: str) -> Iterator[None]:
+    """:func:`endorsing` for ANOTHER data home held by *home_fd* (POSIX).
+
+    Writes *content* as that home's endorsed copy of *leaf* before the ``with`` body
+    publishes the file, and puts the previous copy back (or removes the new one) when the
+    body raises. It does not refuse a pending leaf: :func:`refuse_save_if_pending` reads
+    this process's own data home, so the caller decides what the copy and the file hold.
+    """
+    dir_fd = _endorsed_dir_at(home_fd, create=True)
+    try:
+        prior = _copy_at(dir_fd, leaf)
+        atomic_write_at(dir_fd, leaf, content, fsync=True, mode=_FILE_MODE)
+        try:
+            yield
+        except BaseException:
+            try:
+                if prior is None:
+                    os.unlink(leaf, dir_fd=dir_fd)
+                else:
+                    atomic_write_at(dir_fd, leaf, prior, fsync=True, mode=_FILE_MODE)
+            except OSError:
+                logger.warning(
+                    "loosening provenance: could not restore the endorsed copy for %s "
+                    "after a failed write",
+                    leaf,
+                    exc_info=True,
+                )
+            raise
+    finally:
+        os.close(dir_fd)
 
 
 def endorsed_bytes(leaf: str) -> bytes | None:
@@ -407,15 +525,60 @@ def endorsed_bytes(leaf: str) -> bytes | None:
     read error would silently drop the content check. Every reader already maps an
     ``OSError`` to its unreadable-file path (defaults, refuse the write, disabled).
     """
+    path = _endorsed_path(leaf)
     try:
-        return _endorsed_path(leaf).read_bytes()
+        held: bytes | None = path.read_bytes()
     except FileNotFoundError:
-        return None
+        held = None
     except OSError:
         if enforcement_active():
             raise
         logger.debug("loosening provenance: endorsed copy for %s unreadable", leaf, exc_info=True)
         return None
+    stuck = _unrestored.get(str(path))
+    if stuck is None:
+        return held
+    left, intended = stuck
+    if held == left:
+        return intended
+    # Something has written the copy since; it holds the current endorsement.
+    _unrestored.pop(str(path), None)
+    return held
+
+
+def _restore_endorsed(leaf: str, prior: bytes | None, when: str) -> None:
+    """Put *prior* back as the endorsed copy of *leaf* (``None``: no copy).
+
+    When that write fails too, the copy file is left holding bytes that were never
+    published, and the next save would read the leaf as edited outside Kiro Crew. So
+    :func:`endorsed_bytes` is told to answer *prior* for as long as the file still holds
+    those bytes.
+    """
+    path = _endorsed_path(leaf)
+    try:
+        if prior is None:
+            path.unlink(missing_ok=True)
+            _unrestored.pop(str(path), None)
+        else:
+            record(leaf, prior, strict=True)
+        return
+    except Exception:
+        logger.warning(
+            "loosening provenance: could not restore the endorsed copy for %s %s; "
+            "this process keeps using the previous copy",
+            leaf,
+            when,
+            exc_info=True,
+        )
+    try:
+        left: bytes | None = path.read_bytes()
+    except FileNotFoundError:
+        left = None
+    except OSError:
+        logger.debug("loosening provenance: endorsed copy for %s unreadable", leaf, exc_info=True)
+        return
+    if left != prior:
+        _unrestored[str(path)] = (left, prior)
 
 
 def reconcile(leaf: str, disk_bytes: bytes) -> bytes:
@@ -424,10 +587,12 @@ def reconcile(leaf: str, disk_bytes: bytes) -> bytes:
     Where the sandbox seals these files (:func:`enforcement_active`): when the on-disk
     bytes differ from the gateway-endorsed copy, the endorsed copy is returned and the
     substitution is logged once -- so a direct in-sandbox rewrite of ANY key is ignored.
-    Elsewhere, or when there is no endorsed copy yet (a file the gateway has not saved
-    since this check shipped), the on-disk bytes are returned unchanged. Every gateway
-    publish of these files endorses first (:func:`endorsing`), so the gateway's own
-    rename never unseals a file with no copy. An existing but unreadable copy raises
+    The config loaders pass their normalized read (:func:`_as_config_text`), so a copy
+    that equals the file once normalized the same way is the same file. Elsewhere, or
+    when there is no endorsed copy (the gateway's start endorses each file
+    that has none and can be taken as written, :func:`adopt_unendorsed`), the on-disk
+    bytes are returned unchanged. Every gateway publish of these files endorses first
+    (:func:`endorsing`), so the gateway's own rename never unseals a file with no copy. An existing but unreadable copy raises
     ``OSError`` (:func:`endorsed_bytes`).
     shortcut: a host-side rename by another program (an editor saving by rename) also
     detaches the bind, and a file with no copy then loads an in-sandbox write as
@@ -436,10 +601,315 @@ def reconcile(leaf: str, disk_bytes: bytes) -> bytes:
     if not enforcement_active():
         return disk_bytes
     endorsed = endorsed_bytes(leaf)
-    if endorsed is None or endorsed == disk_bytes:
+    if endorsed is None or endorsed == disk_bytes or _as_config_text(endorsed) == disk_bytes:
+        return disk_bytes
+    if adopt_known_writer(leaf) == disk_bytes:
         return disk_bytes
     _report_once(leaf, "is not the gateway's own write")
     return endorsed
+
+
+#: The security-event-log operation a known-writer adoption is recorded under, beside
+#: the owner's Apply and Discard (``dashboard/handlers/config_pending.py``).
+OP_ADOPT_KNOWN_WRITER = "security.config_pending.adopt_known_writer"
+
+
+def _release(version: str) -> tuple[int, int, int] | None:
+    """The ``major.minor.patch`` of a Kiro Crew version stamp, or ``None`` for garbage.
+
+    Read with the config migration's own stamp pattern, so a build suffix
+    (``0.13.0.2``, ``0.14.0-insider.3``) is allowed and compared by its release only.
+    """
+    from kiro_crew.config.migration import _VERSION_STAMP
+
+    match = _VERSION_STAMP.fullmatch(version)
+    if match is None:
+        return None
+    return int(match[1]), int(match[2]), int(match[3])
+
+
+#: Beside the endorsed copies, not among them: that folder holds one copy per leaf.
+_INFLIGHT_SUBDIR = "inflight"
+
+
+def _inflight_path(leaf: str) -> Path:
+    return config_dir() / RECORD_DIR_LEAF / _INFLIGHT_SUBDIR / f"{leaf}.sha256"
+
+
+def _mark_inflight(leaf: str, prior: bytes | None) -> None:
+    """Note, before a save endorses new bytes, the digest of the copy it replaces.
+
+    A save endorses before it renames, so a gateway stopped in between (a crash, a
+    kill, a restart or an update mid-save) leaves the file holding *prior*, the
+    version the gateway endorsed before, beside a copy it never published. The note
+    sits in the directory no sandbox can write, and names only bytes the gateway
+    itself endorsed. Best effort: a failure here only loses that recovery.
+    """
+    if leaf != LEAF_CONFIG or prior is None:
+        return
+    try:
+        _inflight_path(leaf).parent.mkdir(mode=_DIR_MODE, exist_ok=True)
+        digest = hashlib.sha256(prior).hexdigest()
+        atomic_write(_inflight_path(leaf), f"{digest}\n".encode("ascii"), mode=_FILE_MODE)
+    except Exception:
+        logger.debug("loosening provenance: could not note %s's save", leaf, exc_info=True)
+
+
+def _clear_inflight(leaf: str) -> None:
+    if leaf != LEAF_CONFIG:
+        return
+    with contextlib.suppress(OSError):
+        _inflight_path(leaf).unlink(missing_ok=True)
+
+
+def _inflight_digest(leaf: str) -> str | None:
+    try:
+        text = _read_regular(_inflight_path(leaf)).decode("ascii").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return text if len(text) == 64 else None
+
+
+def adopt_interrupted_save() -> None:
+    """At gateway start, take back a ``config.json`` a stopped save left behind.
+
+    :func:`adopt_unendorsed` runs this once at start, before any session. When the
+    last run stopped between a save's endorsement and its rename, the file still
+    holds the version endorsed before that save (:func:`_mark_inflight`): it is
+    endorsed again instead of being held pending. Anything else on disk stays
+    pending. All of it runs under the config writers' lock, taken without waiting: a
+    writer that holds it (a CLI save beside this start) owns the note and removes it
+    itself, so nothing is read or removed then. Otherwise the note is removed once
+    this start has decided, so it never outlives one start, and kept when the
+    recovery itself could not be written.
+    """
+    leaf = LEAF_CONFIG
+    if _inflight_digest(leaf) is None:
+        return
+    # Function-local: loader_document imports this module.
+    from kiro_crew.config.loader_document import try_config_write_lock
+
+    with try_config_write_lock(config_dir() / leaf) as locked:
+        if not locked:
+            return
+        digest = _inflight_digest(leaf)
+        if digest is None:
+            return
+        disk = _disk_bytes(leaf)
+        if disk is None or hashlib.sha256(disk).hexdigest() != digest:
+            _clear_inflight(leaf)
+            return
+        try:
+            # Read directly: endorsed_bytes asks enforcement_active, which off-loop with
+            # nothing cached runs the userns probe.
+            endorsed = _endorsed_path(leaf).read_bytes()
+        except OSError:
+            return
+        if endorsed == disk or _adopt(leaf, disk, "interrupted-save") is not None:
+            _clear_inflight(leaf)
+
+
+#: The only keys an older writer's ``config.json`` may change and still be adopted:
+#: the writer stamp, the two usage-data switches (turned off only), and dashboard
+#: look-and-feel. An
+#: allow list, not a list of dangerous keys: any key not named here (a new one
+#: included) keeps the file pending, because the stamp is text in the file itself.
+_OLDER_WRITER_KEYS = (
+    "meta",
+    "telemetry.enabled",
+    "telemetry.beacon_enabled",
+    "dashboard.privacy_acked",
+    "dashboard.privacy_ack_version",
+    "dashboard.kiro_telemetry_ack_version",
+    "dashboard.theme_mode",
+    "dashboard.theme_schedule_light",
+    "dashboard.theme_schedule_dark",
+    "dashboard.theme_color",
+    "dashboard.language",
+    "dashboard.preferred_language",
+    "dashboard.verbosity",
+    "dashboard.widget_density",
+    "dashboard.show_unread_dot",
+)
+
+
+def _changed_paths(before: Any, after: Any, path: list[str], out: list[str]) -> None:
+    if isinstance(before, dict) and isinstance(after, dict):
+        for key in set(before) | set(after):
+            # A section added or removed whole counts as each key under it.
+            old = before.get(key, {} if isinstance(after.get(key), dict) else _ABSENT)
+            new = after.get(key, {} if isinstance(before.get(key), dict) else _ABSENT)
+            if old is _ABSENT or new is _ABSENT:
+                out.append(".".join(path + [str(key)]))
+            elif not strict_json_equal(old, new):
+                _changed_paths(old, new, path + [str(key)], out)
+        return
+    out.append(".".join(path))
+
+
+def _only_older_writer_keys_changed(leaf: str, disk: bytes) -> bool:
+    """Whether *disk* differs from the endorsed *leaf* only in :data:`_OLDER_WRITER_KEYS`."""
+    try:
+        endorsed = endorsed_bytes(leaf)
+    except OSError:
+        return False
+    before = _parse_object(endorsed) if endorsed is not None else None
+    after = _parse_object(disk)
+    if before is None or after is None:
+        return False
+    changed: list[str] = []
+    _changed_paths(before, after, [], changed)
+    for dotted in changed:
+        if not any(dotted == key or dotted.startswith(key + ".") for key in _OLDER_WRITER_KEYS):
+            return False
+        # A usage-data switch is taken only when it turns OFF: turning one on is the
+        # owner's to approve, never a stamped file's.
+        if (
+            dotted.startswith("telemetry.")
+            and after.get("telemetry", {}).get(dotted.split(".", 1)[1], _ABSENT) is not False
+        ):
+            return False
+    return True
+
+
+def _known_writer(leaf: str, content: bytes) -> str | None:
+    """``writer:<stamp>`` when an older release wrote *content*, else ``None``.
+
+    Only when every change is one of :data:`_OLDER_WRITER_KEYS`: the stamp is text
+    in the file itself, so it can never be what lets any other change through.
+    """
+    stamp = _older_writer_stamp(content)
+    if stamp is None or not _only_older_writer_keys_changed(leaf, content):
+        return None
+    return f"writer:{stamp}"
+
+
+def _older_writer_stamp(content: bytes) -> str | None:
+    """The ``meta.lastTouchedVersion`` of *content* when it names an OLDER release.
+
+    ``None`` when the stamp is missing, not a string, unparseable, or names this
+    release or a newer one, and for a file not stored as Kiro Crew writes one (a JSON
+    object with no byte-order mark or carriage return), which no Kiro Crew wrote.
+    """
+    if content.startswith(codecs.BOM_UTF8) or b"\r" in content:
+        return None
+    doc = _parse_object(content)
+    meta = doc.get("meta") if doc is not None else None
+    stamp = meta.get("lastTouchedVersion") if isinstance(meta, dict) else None
+    if not isinstance(stamp, str):
+        return None
+    from kiro_crew import __version__
+
+    written, running = _release(stamp), _release(__version__)
+    if written is None or running is None or written >= running:
+        return None
+    return stamp
+
+
+def adopt_known_writer(leaf: str) -> bytes | None:
+    """Endorse an on-disk ``config.json`` an older Kiro Crew release wrote; return it.
+
+    A release that predates the endorsed copy saves the file without updating it (an
+    upgrade, a downgrade, or the older build running beside this one), which would
+    otherwise refuse every later save as an outside edit. Its writer stamp
+    (``meta.lastTouchedVersion``) names an older release, so the file becomes the
+    endorsed copy instead of being held pending, logged once and recorded in the
+    security event log, as long as every change is one of :data:`_OLDER_WRITER_KEYS`
+    (:func:`_known_writer`); any other change stays pending for the owner.
+
+    The owner accepted the cost: a process that can write the file can also write an
+    old stamp into it, and the gateway then loads its changes to those keys: a theme,
+    a language, usage data turned off. ``None`` (the
+    leaf stays pending) for any other leaf, a missing or unreadable file, any other
+    content, inside a sandbox (the copies are read-only there; the gateway's next
+    read adopts the file), while another writer holds the config lock, or when the
+    copy cannot be written.
+    """
+    if leaf != LEAF_CONFIG or sandbox_launch_mark.launched_in_sandbox():
+        return None
+    seen = _disk_bytes(leaf)
+    if seen is None or _known_writer(leaf, seen) is None:
+        return None
+    return _adopt(leaf, None, "")
+
+
+def _adopt(leaf: str, expected: bytes | None, reason: str) -> bytes | None:
+    """Endorse the on-disk *leaf* under the writers' lock; return its bytes or ``None``.
+
+    *expected* (with its *reason*) is the exact file to take; ``None`` re-reads the
+    file and takes it only when :func:`_known_writer` still names its writer.
+    """
+    # Under the config writers' lock, never waiting: a save between its own
+    # endorsement and its rename would otherwise have this re-endorse the file it
+    # is replacing, leaving the save it just made pending. Inside that save (this
+    # thread holds the lock) it adopts directly. Function-local: loader_document
+    # imports this module.
+    from kiro_crew.config.loader_document import try_config_write_lock
+
+    with try_config_write_lock(config_dir() / leaf) as locked:
+        if not locked:
+            return None
+        disk = _disk_bytes(leaf)
+        if disk is None:
+            return None
+        if expected is None:
+            reason = _known_writer(leaf, disk) or ""
+        elif disk != expected:
+            return None
+        if not reason:
+            return None
+        try:
+            record(leaf, disk, strict=True)
+        except Exception:
+            logger.warning(
+                "loosening provenance: could not adopt %s (%s)", leaf, reason, exc_info=True
+            )
+            return None
+    from kiro_crew import __version__
+
+    _reported.discard(leaf)
+    logger.warning(
+        "%s on disk differs from its endorsed copy but Kiro Crew wrote it (%s); "
+        "this build (%s) adopted it as the gateway-endorsed copy",
+        leaf,
+        reason,
+        __version__,
+    )
+    _audit_adoption(leaf, reason)
+    # A load before this served the previous copy under the unchanged file's
+    # fingerprint. Function-local: loader_document imports this module.
+    from kiro_crew.config.loader_document import _invalidate_config_cache
+
+    _invalidate_config_cache()
+    return disk
+
+
+def _audit_adoption(leaf: str, reason: str) -> None:
+    """Record an older-writer adoption in the security event log; never fails the read."""
+    try:
+        from kiro_crew.sel import sel
+
+        sel().log_api_access(
+            caller="config",
+            operation=OP_ADOPT_KNOWN_WRITER,
+            outcome="ok",
+            resources=f"{leaf}={reason}",
+        )
+    except Exception:
+        logger.debug("loosening provenance: could not audit the adoption", exc_info=True)
+
+
+def _as_config_text(content: bytes) -> bytes | None:
+    """*content* as ``read_config_text`` reads it: one leading BOM dropped, universal newlines.
+
+    A restore endorses the archive's own bytes (:func:`endorse_installed`), which can carry
+    a byte-order mark or CRLF; neither means anything to JSON. ``None`` when not UTF-8.
+    """
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    return strip_utf8_bom(text.replace("\r\n", "\n").replace("\r", "\n")).encode("utf-8")
 
 
 def reconciled_bytes(
@@ -478,7 +948,7 @@ def _report_once(leaf: str, what: str) -> None:
         _reported.add(leaf)
         logger.warning(
             "%s on disk %s; using the gateway-endorsed copy until the change is applied "
-            "or discarded in Settings",
+            "or discarded in Settings > Security or with `kirocrew config pending`",
             leaf,
             what,
         )
@@ -499,6 +969,62 @@ def endorse_installed(path: Path, content: bytes) -> None:
         record(leaf, content, strict=enforcement_active())
 
 
+def adopt_unendorsed() -> None:
+    """Endorse each protected leaf that has no endorsed copy yet, as it is on disk.
+
+    The gateway runs this once at start, before any session of the run, so a file
+    written before this check existed is protected from the start instead of from the
+    gateway's first save of it. A leaf with anything at its copy's name is skipped, also
+    when a writer endorses it after that check (the copy is hard-linked into place, which
+    never replaces a name): the copy is the record that it was adopted, so a file that
+    differs from its copy stays pending. Read with the pending scan's own reader (:func:`_read_regular`), so a link
+    to a FIFO or ``/dev/zero`` cannot hang the start. Only a JSON object stored as Kiro
+    Crew writes one is adopted: a malformed file would become a baseline that blocks
+    Apply and Discard, and one with a byte-order mark or a carriage return is left as
+    written until the gateway's first save of it. Never asks
+    :func:`enforcement_active`, which off-loop with nothing cached runs the userns probe.
+    Last, it takes back a file a save stopped mid-way left (:func:`adopt_interrupted_save`).
+    """
+    for leaf in PROTECTED_LEAVES:
+        if os.path.lexists(_endorsed_path(leaf)):
+            continue
+        try:
+            content = _read_regular(config_dir() / leaf)
+        except OSError:
+            continue
+        if content.startswith(codecs.BOM_UTF8) or b"\r" in content:
+            continue
+        if _parse_object(content) is None:
+            continue
+        # Written whole under a private name, then hard-linked into place: a partial copy
+        # is never visible, and a link refuses a name another writer took meanwhile.
+        target = _endorsed_path(leaf)
+        staging = target.with_name(f".{leaf}.{secrets.token_hex(8)}.adopt")
+        created = False
+        try:
+            (config_dir() / RECORD_DIR_LEAF).mkdir(mode=_DIR_MODE, exist_ok=True)
+            _endorsed_dir().mkdir(mode=_DIR_MODE, exist_ok=True)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+            fd = os.open(staging, flags, _FILE_MODE)
+            created = True
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.link(staging, target)
+            _unrestored.pop(str(target), None)
+        except FileExistsError:
+            pass  # another writer's copy is in place: it is never replaced
+        except OSError:
+            # No hard links on this volume, a full disk: the leaf loads as written.
+            logger.warning("loosening provenance: could not adopt %s at start", leaf, exc_info=True)
+        finally:
+            if created:
+                with contextlib.suppress(OSError):
+                    os.unlink(staging)
+    adopt_interrupted_save()
+
+
 @contextlib.contextmanager
 def endorsements_restored_on_error() -> Iterator[None]:
     """Put every endorsed copy back as it was when the ``with`` body raises.
@@ -512,18 +1038,7 @@ def endorsements_restored_on_error() -> Iterator[None]:
         yield
     except BaseException:
         for leaf, content in prior.items():
-            try:
-                if content is None:
-                    _endorsed_path(leaf).unlink(missing_ok=True)
-                else:
-                    record(leaf, content, strict=True)
-            except Exception:
-                logger.warning(
-                    "loosening provenance: could not restore the endorsed copy for %s "
-                    "after a failed restore",
-                    leaf,
-                    exc_info=True,
-                )
+            _restore_endorsed(leaf, content, "after a failed restore")
         raise
 
 
@@ -546,6 +1061,8 @@ _CONFIG_SECURITY_KEYS = (
     "agent.sandbox_allow_unsandboxed_exec",
     "agent.apps_allow_third_party",
     "hooks.auto_approve_tools",
+    # The per-tool "Always allow" grants, which widen what runs the same way.
+    "hooks.auto_approve_tool_identities",
     # The standing approve-every-tool grant, in each spelling the loader reads.
     "agent.dangerously_skip_permissions",
     "agent.dangerouslySkipPermissions",
@@ -764,9 +1281,11 @@ def pending_changes() -> list[dict]:
     """Each protected leaf whose on-disk bytes differ from its endorsed copy.
 
     ``[]`` wherever the content check does not apply (:func:`enforcement_active`).
-    A leaf with no endorsed copy is not pending (it is served as written until the
-    gateway's first save of it endorses it), and a leaf
-    whose copy cannot be read is skipped (its loaders already fail closed). A file that
+    A leaf with no endorsed copy is not pending: the gateway's start endorses each one
+    it can take as written (:func:`adopt_unendorsed`), and any other is served as
+    written until the gateway's first save of it or a later start adopts it. Nor is a
+    ``config.json`` an older Kiro Crew wrote: it is adopted (:func:`adopt_known_writer`).
+    A leaf whose copy cannot be read is skipped (its loaders already fail closed). A file that
     is missing or unreadable while its copy exists is pending as ``removed`` (signature
     :data:`REMOVED_SIGNATURE`): every reader serves the copy (:func:`reconciled_bytes`),
     and Discard puts the file back. Each entry is
@@ -785,6 +1304,8 @@ def pending_changes() -> list[dict]:
             continue
         disk = _disk_bytes(leaf)
         if endorsed is None or endorsed == disk:
+            continue
+        if disk is not None and adopt_known_writer(leaf) == disk:
             continue
         if disk is None:
             pending.append(

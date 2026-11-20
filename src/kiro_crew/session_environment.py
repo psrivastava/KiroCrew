@@ -287,6 +287,11 @@ LOCAL_ONLY_SERVERS: frozenset[str] = frozenset({"kirocrew-computer", "kirocrew-c
 #: The ``mcpServers`` name the local engine sees for the remote workspace, for
 #: every provider; governance keys the workspace tools' policy on it.
 WORKSPACE_SERVER_NAME = "workspace"
+#: Prefix of the ``mcpServers`` name of each local MCP server a connected computer
+#: exposes (``connected-computer-<its name>``). Governance never auto-approves
+#: these (``platform.governance.may_skip_gate``): each call acts on the user's
+#: computer. Distinctive so a person's own ``computer-use`` keeps its answer.
+CONNECTED_MCP_SERVER_PREFIX = "connected-computer-"
 #: The ACP kind of the built-in each workspace tool stands in for.
 WORKSPACE_TOOL_KINDS: dict[str, str] = {
     "read_file": "read",
@@ -317,6 +322,13 @@ REMOTE_NEEDS_KAS = (
 REMOTE_AGENT_RESTRICTED = (
     "this agent's own rules limit shell commands or file paths, and a remote "
     "workspace cannot enforce them yet; remove those rules or run on This machine"
+)
+#: The session-start notice naming the sub-agents a remote session leaves out of its
+#: batch for the same reason, so the session starts and only that hand-off fails.
+REMOTE_SUBAGENTS_RESTRICTED = (
+    "ℹ In this remote workspace, agent {agent} cannot hand work to {targets}. Their "
+    "own rules limit shell commands or file paths, and a remote workspace cannot "
+    "enforce them yet; remove those rules or run on This machine."
 )
 
 

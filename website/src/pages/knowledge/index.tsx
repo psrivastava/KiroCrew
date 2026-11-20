@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo, lazy, Suspense } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Search, BookOpen, Network, FolderSync, HelpCircle, FileText, X, Copy, Settings } from 'lucide-react'
+import { Search, BookOpen, Circle, Network, FolderSync, HelpCircle, FileText, X, Copy, Settings } from 'lucide-react'
 import { Btn, Input, SearchInput, Badge, EmptyState, ContentSkeleton } from '../../components/ui'
 import Clickable from '../../components/Clickable'
 import Modal from '../../components/Modal'
@@ -38,9 +38,13 @@ const STATUS_LABEL_KEY = {
 } as const
 
 import { i18nT } from '../../i18n/t'
+import { uiLocation } from '../../uiLocations/uiLocation'
+import { useGuideRevealScope } from '../../guide/GuideRevealScope'
 import { useImeGuard } from '../../hooks/useImeGuard'
 import { editableEventTarget } from '../../utils/editableTarget'
 import { useRovingTabs } from '../../components/Tablist'
+import { useConfirm } from '../../components/ConfirmDialog'
+import { openModalDialog } from '../../guide/openModalDialog'
 const KnowledgeGraph = lazy(() => import('./KnowledgeGraph'))
 
 const TABS = ['list', 'graph', 'sources', 'settings'] as const
@@ -141,6 +145,7 @@ function BulkActions({ selectedIds, items, onDone, onActed }: { selectedIds: Set
     queryClient.invalidateQueries({ queryKey: ['knowledge-items'] }),
     queryClient.invalidateQueries({ queryKey: ['knowledge-stats'] }),
   ])
+  const { confirm, confirmDialog, confirmOpen } = useConfirm()
 
   const bulkArchiveMutation = useMutation({
     mutationFn: async ({ status, ids }: { status: string; ids: string[] }) => {
@@ -215,8 +220,20 @@ function BulkActions({ selectedIds, items, onDone, onActed }: { selectedIds: Set
   // The rollback puts the rows back; this says why they came back.
   const failed = bulkArchiveMutation.isError ? bulkArchiveMutation : bulkDeleteMutation.isError ? bulkDeleteMutation : null
 
+  const handleBulkDelete = async () => {
+    if (pending || selectedIds.size === 0 || confirmOpen) return
+    const ids = Array.from(selectedIds)
+    const ok = await confirm({
+      title: i18nT('pages.knowledge.index.delete'),
+      body: i18nT('pages.knowledge.index.delete_items_permanently', { count: ids.length }),
+      confirmLabel: i18nT('pages.knowledge.index.delete'),
+    })
+    if (ok) bulkDeleteMutation.mutate({ ids })
+  }
+
   return (
     <>
+    {confirmDialog}
     {/* Only the toolbar follows the selection. The optimistic update hides the
         selected rows, which empties the selection, so the notice and the
         mutations that own it must stay mounted without one. */}
@@ -224,7 +241,7 @@ function BulkActions({ selectedIds, items, onDone, onActed }: { selectedIds: Set
     <div className="flex items-center gap-2 px-3 py-2 bg-accent/5 border border-accent/20 rounded-lg mb-3">
       <span className="text-[13px] text-text-strong font-medium">{i18nT('pages.knowledge.index.selected_count', { count: selectedIds.size })}</span>
       <Btn disabled={pending} onClick={() => bulkArchiveMutation.mutate({ status: 'archived', ids: Array.from(selectedIds) })}>{i18nT('pages.knowledge.index.archive')}</Btn>
-      <Btn disabled={pending} onClick={() => { if (confirm(i18nT('pages.knowledge.index.delete_items_permanently', { count: selectedIds.size }))) bulkDeleteMutation.mutate({ ids: Array.from(selectedIds) }) }}>{i18nT('pages.knowledge.index.delete')}</Btn>
+      <Btn disabled={pending} onClick={() => { void handleBulkDelete() }}>{i18nT('pages.knowledge.index.delete')}</Btn>
       <Btn onClick={copySelected}><Copy size={12} /> {copied ? i18nT('pages.knowledge.index.copied') : i18nT('pages.knowledge.index.copy_content')}</Btn>
       <button onClick={onDone} className="ml-auto text-[12px] text-muted hover:text-text bg-transparent border-none cursor-pointer">{i18nT('pages.knowledge.index.clear')}</button>
     </div>
@@ -273,6 +290,8 @@ export default function KnowledgePage({ embedded = false }: { embedded?: boolean
   const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set())
   const selectTab = (t: Tab) => { setTab(t); setSelectedId(null); setSelectedItems(new Set()) }
   const rovingTab = useRovingTabs(ROVING_TABS, tab, selectTab)
+  // find_ui's guide to Add Source steps through the Sources tab until this reads open.
+  useGuideRevealScope('open:knowledge.sources-tab', tab === 'sources')
   // Items currently rendered by each expanded SourceGroup. Selection-wide
   // actions read this instead of the react-query cache, so they can never reach
   // an item that is not on screen (a retained cache from a previously expanded
@@ -494,8 +513,9 @@ export default function KnowledgePage({ embedded = false }: { embedded?: boolean
         // Modal that closes it now (bubble-phase window listener, registered
         // when the dialog opened). This branch only has to keep the PRECEDENCE
         // the chain below documents: one Escape must not both dismiss the help
-        // and clear the page's selection underneath it.
-        if (showHelp) return
+        // and clear the page's selection underneath it. Any other open modal
+        // (such as a delete confirmation) owns Escape the same way.
+        if (showHelp || openModalDialog()) return
         if (selectedId) { setSelectedId(null); e.preventDefault() }
         else if (selectedItems.size > 0) { setSelectedItems(new Set()); e.preventDefault() }
       } else if (e.key === 'ArrowRight' && !e.altKey && !e.ctrlKey) {
@@ -695,15 +715,26 @@ export default function KnowledgePage({ embedded = false }: { embedded?: boolean
           sits outside it because a tablist may only own tabs. */}
       <div className="flex gap-1 px-4 md:px-6 border-b border-border overflow-x-auto">
         <div role="tablist" aria-label={i18nT('pages.knowledge.index.knowledge_library')} className="flex gap-1">
-          {TABS.map((t, i) => (
-            <button key={t} type="button" role="tab" id={tabId(t)}
-              aria-selected={tab === t} aria-controls={TAB_PANEL_ID}
-              {...rovingTab(i)}
-              onClick={() => selectTab(t)}
-              className={`flex items-center gap-1.5 px-3 py-2 text-[13px] font-medium border-b-2 transition-all bg-transparent cursor-pointer shrink-0 whitespace-nowrap ${tab === t ? 'border-accent text-text font-semibold' : 'border-transparent text-muted hover:text-text'}`}>
-              {TAB_ICON[t]} {i18nT(TAB_LABEL_KEY[t])}
-            </button>
-          ))}
+          {TABS.map((t, i) => {
+            const { ref, ...roving } = rovingTab(i)
+            const tabClass = `flex items-center gap-1.5 px-3 py-2 text-[13px] font-medium border-b-2 transition-all bg-transparent cursor-pointer shrink-0 whitespace-nowrap ${tab === t ? 'border-accent text-text font-semibold' : 'border-transparent text-muted hover:text-text'}`
+            return t === 'sources' ? (
+              // Its own render site, so find_ui can read the registered tab's label key.
+              <button key={t} type="button" role="tab" id={tabId(t)}
+                aria-selected={tab === t} aria-controls={TAB_PANEL_ID}
+                {...roving} {...uiLocation('knowledge.sources-tab', ref)}
+                onClick={() => selectTab(t)} className={tabClass}>
+                <FolderSync size={14} /> {i18nT('pages.knowledge.index.sources_tab')}
+              </button>
+            ) : (
+              <button key={t} type="button" role="tab" id={tabId(t)}
+                aria-selected={tab === t} aria-controls={TAB_PANEL_ID}
+                {...roving} ref={ref}
+                onClick={() => selectTab(t)} className={tabClass}>
+                {TAB_ICON[t]} {i18nT(TAB_LABEL_KEY[t])}
+              </button>
+            )
+          })}
         </div>
         {embedded && (
           <span className="ml-auto self-center shrink-0 pb-0.5">
@@ -868,10 +899,10 @@ export default function KnowledgePage({ embedded = false }: { embedded?: boolean
           <div className="whitespace-nowrap">{i18nT('pages.knowledge.index.stats_sources', { count: stats.sources })}</div>
           {stats.embeddings?.enabled ? (
             <div className={`whitespace-nowrap ${stats.embeddings.available ? 'text-ok' : 'text-warn'}`} title={stats.embeddings.available ? `${stats.embeddings.model} — ${stats.embeddings.embedded_items} embedded` : i18nT('pages.knowledge.index.embedding_model_loading', { name: stats.embeddings.model })}>
-              ● {stats.embeddings.available ? i18nT('pages.knowledge.index.embeddings_count', { value: stats.embeddings.embedded_items }) : i18nT('pages.knowledge.index.embeddings_loading')}
+              <Circle className="lucide-inline scale-75" fill="currentColor" strokeWidth={0} /> {stats.embeddings.available ? i18nT('pages.knowledge.index.embeddings_count', { value: stats.embeddings.embedded_items }) : i18nT('pages.knowledge.index.embeddings_loading')}
             </div>
           ) : (
-            <div className="text-muted whitespace-nowrap" title={i18nT('pages.knowledge.index.embedding_model_is_downloading_in_the_background')}>{i18nT('pages.knowledge.index.embeddings_initializing')}</div>
+            <div className="text-muted whitespace-nowrap" title={i18nT('pages.knowledge.index.embedding_model_is_downloading_in_the_background')}><Circle className="lucide-inline scale-75" /> {i18nT('pages.knowledge.index.embeddings_initializing')}</div>
           )}
           {tab === 'list' && <div className="ml-auto text-[10px] hidden sm:block">{i18nT('pages.knowledge.index.to_search_esc_to_back_to_page')}</div>}
         </div>

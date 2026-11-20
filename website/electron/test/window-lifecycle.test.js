@@ -1012,10 +1012,12 @@ function dashboardWindowHarness({ platform, frameless = false, remoteHosts = nul
   const log = [];
   const prompts = [];
   const sessionListeners = new Map();
+  const ipcListeners = new Map();
   const firstLine = (text) => String(text).split("\n").map((line) => line.trim()).find(Boolean);
   const viewEvents = recordingEmitter("view", log);
   const viewContents = {
     ...viewEvents,
+    ipc: { on(channel, listener) { ipcListeners.set(channel, listener); } },
     mainFrame: { url: "http://localhost:5476/" },
     session: {
       webRequest: {
@@ -1105,7 +1107,7 @@ function dashboardWindowHarness({ platform, frameless = false, remoteHosts = nul
     env: {},
     downloadExpectations,
   }));
-  return { lifecycle, win, viewContents, log, panelViews, openedExternally, prompts, sessionListeners };
+  return { lifecycle, win, viewContents, log, panelViews, openedExternally, prompts, sessionListeners, ipcListeners };
 }
 
 async function wireDashboardWindow(t, options) {
@@ -1114,9 +1116,11 @@ async function wireDashboardWindow(t, options) {
   const harness = dashboardWindowHarness(options);
   harness.lifecycle.setupWindowContents(harness.win, "http://localhost:5476");
   const wiring = harness.log.splice(0);
+  // The preload asks before any load event fires, so read what exists by then.
+  const ipcBeforeLoad = new Map(harness.ipcListeners);
   harness.viewContents.emit("did-finish-load");
   const onLoad = harness.log.splice(0);
-  return { ...harness, wiring, onLoad };
+  return { ...harness, wiring, onLoad, ipcBeforeLoad };
 }
 
 const COMMON_WIRING_HEAD = [
@@ -1134,6 +1138,7 @@ describe("dashboard window wiring order", () => {
       "view.on:did-finish-load",
       "win.on:swipe",
       "view.on:input-event",
+      "view.on:did-finish-load",
       "win.on:closed",
       "win.on:resize",
       "win.on:closed",
@@ -1188,12 +1193,21 @@ describe("dashboard window wiring order", () => {
     assert.equal(onLoad[2], "view.insertCSS:#electron-drag-bar {");
   });
 
-  it("a window whose port names a configured crew withholds the local-only bridges", async (t) => {
-    const { wiring } = await wireDashboardWindow(t, {
-      platform: "darwin",
-      remoteHosts: { 5476: { host: "crew.example.test" } },
-    });
-    assert.equal(wiring[0], "new WebContentsView:[\"--kc-remote-gateway\"]");
+  it("each load asks whether the window's gateway is remote, so a crew configured or cleared later applies", async (t) => {
+    const remoteHosts = {};
+    const { ipcBeforeLoad } = await wireDashboardWindow(t, { platform: "darwin", remoteHosts });
+    const ask = () => {
+      const event = {};
+      ipcBeforeLoad.get("dashboard:is-remote-gateway")(event);
+      return event.returnValue;
+    };
+    assert.equal(ask(), false, "no crew on the port: local");
+    remoteHosts[5476] = { host: "crew.example.test" };
+    assert.equal(ask(), true, "a crew configured after the view was made");
+    delete remoteHosts[5476];
+    assert.equal(ask(), false, "that crew cleared again");
+    Object.defineProperty(remoteHosts, "5476", { get() { throw new Error("store unreadable"); }, configurable: true });
+    assert.equal(ask(), true, "an unreadable store still answers, as remote");
   });
 
   it("a frameless Linux window injects caption controls after the drag band", async (t) => {
@@ -1440,7 +1454,10 @@ describe("window chrome controls", () => {
     const stored = {};
     const nativeTheme = { themeSource: "system", shouldUseDarkColors: false };
     const lifecycle = createWindowLifecycle(validOptions({
-      electron: { nativeTheme },
+      electron: {
+        nativeTheme,
+        BaseWindow: { getFocusedWindow: () => null, getAllWindows: () => [] },
+      },
       store: { get: () => null, set: (key, value) => { stored[key] = value; } },
     }));
     lifecycle.chrome.setThemeAccent("#abc");
@@ -1964,5 +1981,20 @@ describe("tray icon setting", () => {
     h.lifecycle.syncTray();
     assert.deepEqual(h.lifecycle.trayIcon.set(false), { show: false, canHide: true });
     assert.equal(h.live(), 0);
+  });
+
+  it("offers minimize to tray on Windows while the icon shows, and never on macOS", async () => {
+    const h = trayHarness({ closeAction: "quit" }, "win32");
+    h.lifecycle.syncTray();
+    assert.deepEqual(await h.lifecycle.minimizeToTray.set(true), { on: true, offered: true, canEnable: true });
+    h.lifecycle.trayIcon.set(false);
+    assert.deepEqual(await h.lifecycle.minimizeToTray.get(), { on: false, offered: true, canEnable: false });
+    assert.equal(h.data.minimizeToTray, true, "the choice returns with the icon");
+    assert.equal((await trayHarness({}, "darwin").lifecycle.minimizeToTray.get()).offered, false);
+  });
+
+  it("wires the main window's minimize to the tray hide, reading the live icon", () => {
+    assert.match(SOURCE, /mainWindow\.on\("minimize", minimizeToTray\.minimizeHandler\(mainWindow\)\);/);
+    assert.match(SOURCE, /createMinimizeToTray\(\{ store, platform, trayShown: \(\) => tray !== null, log: glog \}\)/);
   });
 });

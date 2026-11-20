@@ -28,12 +28,14 @@ from kiro_crew.cron_service.model import (
     CronSchedule,
     validate_alert_after_failures,
     validate_auto_pause_after_failures,
+    validate_on_tab_close,
 )
 from kiro_crew.cron_service.schedule import (
     LOCAL_TIMEZONE,
     is_local_timezone,
     is_valid_skip_date,
     is_valid_timezone,
+    pin_random_cron_fields,
     runs_more_than_once_a_day,
     validate_cron_expr,
 )
@@ -167,6 +169,7 @@ _CRON_STRING_FIELD_CAPS: tuple[tuple[str, int], ...] = (
     # this length gate). Per the no-schema convention they use the general ID cap.
     ("secret_env_pin", MAX_SHORT_STRING),
     ("secret_env_pending_pin", MAX_SHORT_STRING),
+    ("secret_env_resurfaced_pin", MAX_SHORT_STRING),
 )
 
 
@@ -303,6 +306,7 @@ def build_job(
     strict_schedule: bool = False,
     hide_in_chat: bool = False,
     new_chat_per_run: bool = False,
+    on_tab_close: str = "resume",
     folder_id: str = "",
     chat_folder_id: str = "",
     project_path: str = "",
@@ -387,6 +391,7 @@ def build_job(
         raise ValueError(_CHAT_FOLDER_NEEDS_PERSISTENT)
     if new_chat_per_run and persistent_session:
         raise ValueError(_NEW_CHAT_PER_RUN_NEEDS_STATELESS)
+    on_tab_close = validate_on_tab_close(on_tab_close)
     if new_chat_per_run and (command or script or agent_sequence_dispatches(agent_sequence or [])):
         raise ValueError(_NEW_CHAT_PER_RUN_AGENT_ONLY)
     if project_path and (command or script):
@@ -410,10 +415,11 @@ def build_job(
     for _d in skip_dates:
         if not is_valid_skip_date(_d):
             raise ValueError(f"Invalid skip_date: {_d!r} (expected YYYY-MM-DD)")
+    job_id = uuid.uuid4().hex[:8]
     if cron_expr:
         if not validate_cron_expr(cron_expr):
             raise ValueError(f"Invalid cron expression: {cron_expr}")
-        schedule = CronSchedule(kind="cron", cron_expr=cron_expr)
+        schedule = CronSchedule(kind="cron", cron_expr=pin_random_cron_fields(cron_expr, job_id))
     elif every_secs:
         schedule = CronSchedule(kind="every", every_secs=max(every_secs, _MIN_INTERVAL_SECS))
     elif at_ts:
@@ -424,7 +430,7 @@ def build_job(
         raise ValueError(_NEW_CHAT_PER_RUN_TOO_OFTEN)
 
     return CronJob(
-        id=uuid.uuid4().hex[:8],
+        id=job_id,
         name=name,
         message=message,
         schedule=schedule,
@@ -432,6 +438,7 @@ def build_job(
         thread_ts=thread_ts,
         enabled=enabled,
         user_paused=not enabled,
+        user_pause_requested=not enabled,
         created_ts=time.time(),
         delete_after_run=delete_after_run,
         created_by=created_by,
@@ -445,6 +452,7 @@ def build_job(
         strict_schedule=strict_schedule,
         hide_in_chat=hide_in_chat,
         new_chat_per_run=bool(new_chat_per_run),
+        on_tab_close=on_tab_close,
         folder_id=folder_id,
         chat_folder_id=chat_folder_id,
         project_path=project_path,
@@ -464,7 +472,10 @@ def build_job(
 
 
 def apply_job_update(
-    job: CronJob, kwargs: dict[str, Any], chat_folder_out: dict[str, str] | None
+    job: CronJob,
+    kwargs: dict[str, Any],
+    chat_folder_out: dict[str, str] | None,
+    resolved_project_path: str | None = None,
 ) -> None:
     """Validate the update ``kwargs`` against ``job``, then apply it.
 
@@ -472,6 +483,9 @@ def apply_job_update(
     ``ValueError`` with ``job`` untouched. ``chat_folder_out`` is the caller's
     transition sink (see :meth:`CronService._update_job_locked`): filled with the
     prior ``chat_folder_id`` only when this update actually changes it.
+    ``resolved_project_path`` is ``resolve_project_path(kwargs["project_path"])``
+    as the caller ran it before taking the store lock, so the filesystem probe
+    stays outside that lock; ``None`` resolves it here.
     """
     # Validate approval_mode if provided
     if "approval_mode" in kwargs:
@@ -512,6 +526,8 @@ def apply_job_update(
         job.command or job.script or agent_sequence_dispatches(job.agent_sequence)
     ):
         raise ValueError(_NEW_CHAT_PER_RUN_AGENT_ONLY)
+    if "on_tab_close" in kwargs:
+        validate_on_tab_close(kwargs["on_tab_close"])
     if (
         "cron_expr" in kwargs
         and kwargs["cron_expr"]
@@ -541,7 +557,9 @@ def apply_job_update(
     # leaves; only a request that names either one is checked.
     _schedule = job.schedule
     if kwargs.get("cron_expr"):
-        _schedule = CronSchedule(kind="cron", cron_expr=kwargs["cron_expr"])
+        _schedule = CronSchedule(
+            kind="cron", cron_expr=pin_random_cron_fields(kwargs["cron_expr"], job.id)
+        )
     elif kwargs.get("every_secs"):
         _schedule = CronSchedule(kind="every", every_secs=int(kwargs["every_secs"]))
     _per_run = (
@@ -663,7 +681,9 @@ def apply_job_update(
     # job untouched. ``""`` clears it (back to today's cwd).
     _project_path: str | None = None
     if "project_path" in kwargs:
-        _project_path = resolve_project_path(kwargs["project_path"] or "")
+        _project_path = resolved_project_path
+        if _project_path is None:
+            _project_path = resolve_project_path(kwargs["project_path"] or "")
         if _project_path and (job.command or job.script):
             raise ValueError(_PROJECT_PATH_AGENT_ONLY)
     # Resolved here, before the first assignment, because a member schedule
@@ -714,6 +734,8 @@ def apply_job_update(
     elif job.persistent_session:
         # One shared session again: every run lands in the job's one tab.
         job.new_chat_per_run = False
+    if "on_tab_close" in kwargs:
+        job.on_tab_close = kwargs["on_tab_close"]
     if "folder_id" in kwargs:
         job.folder_id = kwargs["folder_id"] or ""
     if "chat_folder_id" in kwargs:
@@ -758,6 +780,8 @@ def apply_job_update(
             # Withdraw/deny clears the whole request record.
             job.secret_env_pending_pin = ""
             job.secret_env_pending_ts = 0.0
+    if "secret_env_resurfaced_pin" in kwargs and kwargs["secret_env_resurfaced_pin"] is not None:
+        job.secret_env_resurfaced_pin = str(kwargs["secret_env_resurfaced_pin"])
     # Per-wake budget (the asyncio.wait_for deadline in
     # _execute_with_timeout). Distinct from ``timeout``, which
     # bounds only script/command subprocesses. This is the only
@@ -780,7 +804,9 @@ def apply_job_update(
     # deleted after its first run, so a one-shot made recurring clears
     # ``delete_after_run``.
     if "cron_expr" in kwargs and kwargs["cron_expr"]:
-        job.schedule = CronSchedule(kind="cron", cron_expr=kwargs["cron_expr"])
+        job.schedule = CronSchedule(
+            kind="cron", cron_expr=pin_random_cron_fields(kwargs["cron_expr"], job.id)
+        )
         job.delete_after_run = False
     elif "every_secs" in kwargs and kwargs["every_secs"]:
         job.schedule = CronSchedule(kind="every", every_secs=int(kwargs["every_secs"]))
@@ -841,7 +867,10 @@ def auto_job_approver(fallback: Any) -> Any:
     """
 
     async def _approve(event: Any) -> bool:
-        if cron_job_auto_permitted():
+        from kiro_crew.mate_held_rules import call_is_held
+
+        # A call under a Bot limit held for a person always reaches the card.
+        if cron_job_auto_permitted() and not call_is_held():
             return True
         return bool(await fallback(event))
 

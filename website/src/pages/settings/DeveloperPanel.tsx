@@ -6,7 +6,6 @@ import { SettingsSubNav, type SubNavItem } from '../../components/SettingsSubNav
 import { ContentSkeleton } from '../../components/ui'
 import { useLocalGateway } from '../../hooks/useLocalGateway'
 import { FeaturePreviewsSection } from './FeaturePreviewsSection'
-import { CrewmatesSection } from './CrewmatesSection'
 import { DefaultMcpGrantsSection } from './DefaultMcpGrantsSection'
 import AutomaticCardSetting from '../chat/command-center/AutomaticCardSetting'
 import { i18nT } from '../../i18n/t'
@@ -30,6 +29,8 @@ const ConfigPage = lazy(() => import('../overview').then(m => ({
 })))
 const DebugToolsTab = lazy(() => import('../developer/DebugToolsTab').then(m => ({ default: m.DebugToolsTab })))
 const MemoryGraphTab = lazy(() => import('../overview/MemoryGraphTab'))
+/** Its own chunk too: the Settings chunk sits at its 500 KB budget (`scripts/check-bundle-size.mjs`). */
+const SessionControlSection = lazy(() => import('./SessionControlSection').then(m => ({ default: m.SessionControlSection })))
 
 /** One lazy page under its loading skeleton. */
 const loading = (page: ReactNode) => (
@@ -55,7 +56,7 @@ export function DeveloperPanel({ basePath }: { basePath?: string } = {}) {
   // An LTS build hides Debug tools (RFC D12); a link to it self-heals to the first page.
   const debugToolsLocked = useControlLocked(LOCKED_DEBUG_TOOLS)
 
-  // MCP Management lives in Customize → Connections → MCP Servers. Its old
+  // MCP Management lives on Customize → MCP Servers. Its old
   // page key here survives in bookmarks and older links; without this the
   // SubNav would quietly show Feature Previews instead. REPLACE, so back
   // does not return to the redirecting URL; passive effect because
@@ -91,8 +92,11 @@ export function DeveloperPanel({ basePath }: { basePath?: string } = {}) {
         switch (active) {
 
         case 'feature-previews':
+          // One page, one reading column: the grouped preview cards first, then
+          // the developer settings that are not previews, in the same group boxes.
           return (
-            <>
+            <div className="max-w-[720px]">
+              <FeaturePreviewsSection />
               {/* Automatic cards for every session: a gateway-wide spend
                   opt-in, off by default. Its own card because it is a server
                   setting, not a per-device switch. */}
@@ -103,38 +107,40 @@ export function DeveloperPanel({ basePath }: { basePath?: string } = {}) {
                   </div>
                 </SettingsCard>
               </SettingsSection>
-              <FeaturePreviewsSection />
-              {/* The crewmate feature switches (`CrewmatesSection.tsx`). */}
-              <CrewmatesSection />
               {/* The default agent's opt-in MCP sets (`DefaultMcpGrantsSection.tsx`). */}
               <DefaultMcpGrantsSection />
+              {/* The agent.session_control switch (`SessionControlSection.tsx`). */}
+              <Suspense fallback={null}><SessionControlSection /></Suspense>
               {localGatewaySupported && (
                 <SettingsSection title={i18nT('pages.settings.developerPanel.gateway')}>
                   <SettingsCard>
-                    <SettingsToggle
-                      label={i18nT('pages.settings.developerPanel.run_a_local_gateway')}
-                      description={i18nT('pages.settings.developerPanel.turn_it_off_only_when_a_gateway_already_answers_summary')} hint={i18nT('pages.settings.developerPanel.turn_it_off_only_when_a_gateway_already_answers')}
-                      checked={localGatewayEnabled}
-                      onChange={setLocalGatewayEnabled}
-                    />
-                    {/* "Off" has a prerequisite: this app's port must reach a
-                        crew saved for it (Set Remote Host…), through the
-                        app-held tunnel or one the user runs. A hand-run tunnel
-                        with no saved crew is refused as a foreign holder
-                        (#3810). The guide's SSH-tunnel section covers it. */}
-                    <a
-                      href={LOCAL_GATEWAY_TUNNEL_GUIDE}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="inline-flex items-center gap-1.5 text-[13px] font-medium text-accent hover:underline py-1"
-                    >
-                      {i18nT('pages.settings.developerPanel.how_to_set_up_an_ssh_tunnel')}
-                      <ExternalLink size={13} className="lucide-inline" />
-                    </a>
+                    {/* One row: the switch and the guide its "off" depends on. */}
+                    <div>
+                      <SettingsToggle
+                        label={i18nT('pages.settings.developerPanel.run_a_local_gateway')}
+                        description={i18nT('pages.settings.developerPanel.turn_it_off_only_when_a_gateway_already_answers_summary')} hint={i18nT('pages.settings.developerPanel.turn_it_off_only_when_a_gateway_already_answers')}
+                        checked={localGatewayEnabled}
+                        onChange={setLocalGatewayEnabled}
+                      />
+                      {/* "Off" has a prerequisite: this app's port must reach a
+                          crew saved for it (Set Remote Host…), through the
+                          app-held tunnel or one the user runs. A hand-run tunnel
+                          with no saved crew is refused as a foreign holder
+                          (#3810). The guide's SSH-tunnel section covers it. */}
+                      <a
+                        href={LOCAL_GATEWAY_TUNNEL_GUIDE}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1.5 text-[13px] font-medium text-accent hover:underline py-1"
+                      >
+                        {i18nT('pages.settings.developerPanel.how_to_set_up_an_ssh_tunnel')}
+                        <ExternalLink size={13} className="lucide-inline" />
+                      </a>
+                    </div>
                   </SettingsCard>
                 </SettingsSection>
               )}
-            </>
+            </div>
           )
 
         case 'logs':

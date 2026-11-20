@@ -197,14 +197,20 @@ def _allow_rules(spec: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _permission_refs(spec: dict[str, Any], base: dict[str, Any] | None) -> set[str]:
-    """The ``allowedTools`` refs *spec*'s ``mcp`` allow rules land as on the worker.
+    """The ``allowedTools`` refs *spec*'s ``mcp`` and built-in allow rules land as on the worker.
 
-    The worker merge writes an allow its list can express as that list's own refs
-    (``mate_spec_policy.mcp_allow_refs``), unless the list already grants it
-    (``mate_spec_policy._carry_mcp_allow``). A rule the worker *base* already
-    grants, and a ref the base already lists, are left out the same way.
+    The worker merge writes an allow its list can express as that list's own
+    entries: an ``mcp`` one as its refs (``mate_spec_policy.mcp_allow_refs``), an
+    unscoped built-in one as its tool name (``kas_tool_view.builtin_allow_tool``),
+    unless the list already grants it (``mate_spec_policy._carry_mcp_allow``,
+    ``_carry_builtin_allow``). A rule the worker *base* already grants, and a ref
+    the base already lists, are left out the same way.
     """
-    from kiro_crew.agent_sdk.kas_tool_view import allow_granted_by_spec, permission_allow_derivable
+    from kiro_crew.agent_sdk.kas_tool_view import (
+        allow_granted_by_spec,
+        builtin_allow_tool,
+        permission_allow_derivable,
+    )
     from kiro_crew.mate_spec_policy import mcp_allow_refs
 
     held = base or {}
@@ -213,6 +219,9 @@ def _permission_refs(spec: dict[str, Any], base: dict[str, Any] | None) -> set[s
     refs: set[str] = set()
     for rule in _allow_rules(spec):
         carried = mcp_allow_refs(rule)
+        if carried is None:
+            name = builtin_allow_tool(rule)
+            carried = [name] if name else None
         if carried is None or not permission_allow_derivable(rule):
             continue
         if not allow_granted_by_spec(rule, held):
@@ -252,10 +261,11 @@ def _approval_changes(
     Diffed from the file before and after (the same written result ``apply``
     saves), so the preview cannot list fewer grants than the file will hold. Three
     channels count: an ``allowedTools`` entry, a tool in a server entry's own
-    ``autoApprove``, and an ``mcp`` allow in ``permissions``, which the worker
-    merge writes into the worker's ``allowedTools`` unless the worker *base*
-    already grants it. Each lets the worker run that tool with no prompt, so all
-    three are listed as ``allowedTools`` rows (``@server`` / ``@server/tool``).
+    ``autoApprove``, and an ``mcp`` or unscoped built-in allow in ``permissions``,
+    which the worker merge writes into the worker's ``allowedTools`` unless the
+    worker *base* already grants it. Each lets the worker run that tool with no
+    prompt, so all three are listed as ``allowedTools`` rows (``@server`` /
+    ``@server/tool``, or a built-in tool name such as ``use_subagent``).
     """
 
     return [
@@ -291,9 +301,13 @@ def _runs_unasked(
     counts. A selector on a server the worker *base* declares counts too, against
     the file's approvals and the base's own, since the worker inherits both. So
     does a new ``permissions`` allow that grants with no ``allowedTools`` ref
-    (:func:`_unlisted_allow_added`); ``deny`` and ``ask`` rules never count.
+    (:func:`_unlisted_allow_added`), and a new unscoped built-in allow, whose tool
+    name lands in the worker's list; ``deny`` and ``ask`` rules never count.
     """
     if _unlisted_allow_added(before, after):
+        return True
+    new_grants = _permission_refs(after, base) - _permission_refs(before, base)
+    if any(not ref.startswith("@") for ref in new_grants):
         return True
     existing = set(_kit_of(before)["tools"])
     grants = _approval_refs(after, base)
@@ -355,10 +369,18 @@ def view(member: str) -> dict[str, Any]:
     Purely additive: there is no recorded template and no "additions since" to
     report — a crewmate's file is the sum of everything added to it.
     """
+    from kiro_crew.mate_spec_policy import conditional_denies, unjudged_denies
+
     _, spec = _owned_file(member)
     return {
         "member": member,
         "revision": _digest(spec),
+        # The file's blocked commands nobody can check, as written: the worker
+        # refuses its shell commands that are not read-only while any is left.
+        "unenforced_denies": unjudged_denies(spec),
+        # Those only the gate checks, in a simple command or chain: the worker
+        # refuses any other command that is not read-only while one is left.
+        "conditional_denies": conditional_denies(spec),
     }
 
 
@@ -788,6 +810,8 @@ def preview(member: str, body: Any) -> dict[str, Any]:
     ``changes`` lists each net-new item (``added``) and each item left out
     because the crewmate already has it (``skipped``).
     """
+    from kiro_crew.mate_spec_policy import conditional_denies, unjudged_denies
+
     path, spec, new_spec, template, tkit = _plan(member, body)
     base = _worker_base_or_none()
     current = slot_directions(spec, base, path.stem)
@@ -796,6 +820,9 @@ def preview(member: str, body: Any) -> dict[str, Any]:
         "template": template,
         "revision": _plan_revision(spec, new_spec),
         "runs_unasked": _runs_unasked(spec, new_spec, base),
+        # The blocked commands nobody can check once the add lands, as written.
+        "unenforced_denies": unjudged_denies(new_spec),
+        "conditional_denies": conditional_denies(new_spec),
         # The behaviour directions the add writes ("" when the agent has none),
         # so the preview can show the text it fills the slot with.
         "directions": tkit.get("prompt") or "",

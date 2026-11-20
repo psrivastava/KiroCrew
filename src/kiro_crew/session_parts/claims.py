@@ -53,6 +53,12 @@ _ACQUIRING_TASK: "ContextVar[weakref.ref[asyncio.Task[Any]] | None]" = ContextVa
     "kiro_crew_session_acquiring_task", default=None
 )
 
+#: How long an acquire waits for the Kiro account check before it goes ahead without
+#: it, so a slow store read or a long sweep does not hold up a claim of a live or warm
+#: session. An acquire that then cold-starts still queues for a start permit, and
+#: while the sweep holds every permit it waits for that sweep.
+_IDENTITY_CHECK_BEFORE_ACQUIRE_TIMEOUT_SECS = 30.0
+
 
 def process_shutdown_requested(sessions: SessionManager | None) -> bool:
     if shutdown_event.is_set():
@@ -213,8 +219,10 @@ async def _acquire_after_identity_check(
     (``final_drain_started``: a shutdown or re-exec, when no session outlives
     the process). During an update pause the check still runs, because
     ``try_acquire`` stays open then and must not take a session the check would
-    retire. A check that fails is logged and the acquire goes ahead, as it would
-    have before the check existed.
+    retire. A check that fails, or that has not finished within
+    ``_IDENTITY_CHECK_BEFORE_ACQUIRE_TIMEOUT_SECS``, is logged and the acquire goes
+    ahead, as it would have before the check existed. The installed check runs its
+    sweep in a task of its own, so giving up the wait does not cancel that sweep.
     """
     task = asyncio.current_task()
     acquiring = _ACQUIRING_TASK.get()
@@ -226,7 +234,13 @@ async def _acquire_after_identity_check(
         check = self.identity_check_before_acquire
         if check is not None and not identity_checked and not self.final_drain_started:
             try:
-                await check()
+                async with asyncio.timeout(_IDENTITY_CHECK_BEFORE_ACQUIRE_TIMEOUT_SECS):
+                    await check()
+            except TimeoutError:
+                logger.warning(
+                    "The Kiro account check before an acquire took over %.0fs; acquiring without it",
+                    _IDENTITY_CHECK_BEFORE_ACQUIRE_TIMEOUT_SECS,
+                )
             except Exception:
                 logger.warning("The Kiro account check before an acquire failed", exc_info=True)
         yield
@@ -263,6 +277,7 @@ async def _reacquire_and_validate(
     *,
     wait_if_busy: bool = True,
     reservation: object | None = None,
+    refuse_looser_tier: bool = True,
 ) -> bool:
     """Acquire outside the registry lock, revalidate identity and meet the key's ending fence again."""
     return await self._allocation_boundary()._reacquire_and_validate(
@@ -270,12 +285,29 @@ async def _reacquire_and_validate(
         sess,
         wait_if_busy=wait_if_busy,
         reservation=reservation,
+        refuse_looser_tier=refuse_looser_tier,
     )
 
 
 async def _evict_stale_session(self: SessionManager, key: str, sess: "_Session") -> None:
     """Evict and close the exact stale session."""
     await self._allocation_boundary()._evict_stale_session(key, sess)
+
+
+async def recycle_if_sandbox_tightened(self: SessionManager, key: str) -> bool:
+    """End *key*'s session if ``agent.sandbox`` is now stricter than its spawn tier.
+
+    Every new claim makes this check itself (``_reacquire_and_validate``). A holder
+    that keeps one claim, and its permit, for its whole life calls this at each turn
+    boundary instead, then re-acquires the key. Returns whether the session was ended.
+    """
+    allocation = self._allocation_boundary()
+    folded = self._fold_key(key)
+    session = allocation._sessions.get(folded)
+    if session is None or not allocation._sandbox_tightened(session.provider):
+        return False
+    await allocation._evict_stale_session(folded, session, held_by_caller=True)
+    return True
 
 
 def _get_session_agent(self: SessionManager, session_key: str) -> str:
@@ -342,12 +374,17 @@ async def get_or_create(
     _won_race_retries: int = 0,
     start_priority: StartPriority = StartPriority.BACKGROUND,
     identity_checked: bool = False,
+    focus_resume: bool = False,
     **extra_factory_kwargs: Any,
 ) -> tuple[LLMProvider, bool, bool]:
     """Claim or allocate a session and return its held lease.
 
     ``start_priority`` orders a cold start in the start queues; a caller passes
     FOREGROUND only where a person waits on it (rule: ``kiro_crew.start_priority``).
+
+    ``focus_resume`` marks the dashboard owner's return to a saved chat: the start
+    keeps its BACKGROUND place in the queues and is handed to the provider as one
+    a person is about to wait on (rule: ``acp.mcp_start_wait.person_waits``).
 
     ``identity_checked`` says the caller ran the Kiro account check itself just
     before this call; every other acquire runs it here first
@@ -369,7 +406,7 @@ async def get_or_create(
                 # failed boot start on any other: through the same path the boot
                 # uses, so it keeps its start stamping.
                 await self._ensure_background(start_priority=start_priority)
-        return await self._allocation_boundary().get_or_create(
+        provider, is_new, resumed = await self._allocation_boundary().get_or_create(
             key,
             agent=agent,
             channel_id=channel_id,
@@ -382,8 +419,11 @@ async def get_or_create(
             wait_if_busy=wait_if_busy,
             _won_race_retries=_won_race_retries,
             start_priority=start_priority,
+            focus_resume=focus_resume,
             **extra_factory_kwargs,
         )
+    self.note_session_head(key, provider, is_new=is_new, resumed=resumed)
+    return provider, is_new, resumed
 
 
 @contextmanager
@@ -855,6 +895,11 @@ def approval_revocation(self: SessionManager, key: str) -> int:
 def get_agent(self: SessionManager, key: str) -> str:
     """Return a folded session agent name."""
     return self._allocation_boundary().get_agent(key)
+
+
+def starting_agent(self: SessionManager, key: str) -> str:
+    """The agent a cold start in flight will register *key* as, or ``""``."""
+    return self._allocation_boundary().starting_agent(key)
 
 
 def get_agent_selection(self: SessionManager, key: str) -> tuple[str, str]:

@@ -41,12 +41,43 @@ def _match_identifier(item: str, pattern: str) -> bool:
     return fnmatch.fnmatch(item.strip().casefold(), pattern.strip().casefold())
 
 
+class _Marker(str):
+    """A never-permittable item the evaluator mints, and the reason a refusal of it gives.
+
+    Its text stays the governed item, the one a rule is matched against and an audit
+    names; ``refusal`` is what an allow list's refusal says in its place, so a reader
+    learns why the call could not be checked and what to try.
+    """
+
+    refusal: str
+
+    def __new__(cls, text: str, refusal: str) -> "_Marker":
+        marker = super().__new__(cls, text)
+        marker.refusal = refusal
+        return marker
+
+    def __reduce__(self) -> Tuple[object, ...]:
+        # ``str``'s own reduce passes only the text, which ``__new__`` cannot take.
+        return (type(self), (str(self), self.refusal))
+
+
+class _UnmatchableCommand(_Marker):
+    """A ``commands`` item no pattern matches: a marker the evaluator mints.
+
+    A type of its own, so a real command is always matched on its text, even one
+    that spells the marker's characters.
+    """
+
+
 def _match_command(item: str, pattern: str) -> bool:
     """Case-sensitive fnmatch on a shell command body (deterministic per-OS).
 
     Uses ``fnmatchcase`` (not ``fnmatch``) so the decision does not depend on
     the host's filesystem case-folding — matching ``security``/``admission``.
+    An :class:`_UnmatchableCommand` matches no pattern, ``*`` included.
     """
+    if isinstance(item, _UnmatchableCommand):
+        return False
     return fnmatch.fnmatchcase(item, pattern)
 
 

@@ -9,6 +9,7 @@ before, so its oss output is unchanged.
 
 from __future__ import annotations
 
+import configparser
 import importlib.metadata
 import importlib.util
 import os
@@ -118,7 +119,11 @@ class TestOssReleaseIsUnchanged:
             (tmp_path / name).write_text(
                 (ROOT / name).read_text(encoding="utf-8"), encoding="utf-8"
             )
-        subprocess.run(["bash", "-eo", "pipefail", "-c", rename["run"]], cwd=tmp_path, check=True)
+        # The step runs on Linux with GNU sed. BSD sed (macOS) reads the word after
+        # a bare `-i` as the backup suffix, so `-E` would turn into a suffix and the
+        # pattern into a basic regex; `-i.bak` is the form both seds read the same.
+        script = rename["run"].replace("sed -i ", "sed -i.bak ")
+        subprocess.run(["bash", "-eo", "pipefail", "-c", script], cwd=tmp_path, check=True)
         assert 'name = "kirocrew-lts"' in (tmp_path / "pyproject.toml").read_text(encoding="utf-8")
         cfg = (tmp_path / "setup.cfg").read_text(encoding="utf-8")
         assert "    kirocrew-lts[voice-aws]" in cfg
@@ -156,6 +161,34 @@ class TestLtsReleaseLegs:
         assert 'if ($isLts) { $gatewayEnv["KIROCREW_DESKTOP_GATEWAY"] = "1" }' in win
         for name in ("build-desktop.yml", "build-windows.yml"):
             assert _workflow(name)["env"]["KIROCREW_BUILD_EDITION"] == _EDITION_ENV, name
+
+    @pytest.mark.parametrize(
+        "module",
+        [
+            "test/test_lts_remote_ceiling_outranks_local.py",
+            "test/test_lts_batch1_ceiling_outranks_local.py",
+        ],
+    )
+    def test_the_candidate_tests_run_the_remote_ceiling_proof(self, module: str) -> None:
+        # The tagged commit must pass the end-to-end proofs that no local tier widens
+        # the organisation's remote policy. The step runs the whole suite split by
+        # file, so each module runs as long as its shard is in the matrix and nothing
+        # filters it out.
+        from scripts.ci_file_shards import hash_shard
+
+        assert (ROOT / module).is_file()
+        cfg = configparser.ConfigParser()
+        cfg.read(ROOT / "setup.cfg", encoding="utf-8")
+        assert "test" in cfg["tool:pytest"]["testpaths"].split()
+        job = _workflow("release-lts.yml")["jobs"]["release-candidate-tests"]
+        count = int(job["env"]["SHARD_COUNT"])
+        assert job["strategy"]["matrix"]["group"] == list(range(1, count + 1))
+        run = next(s["run"] for s in job["steps"] if s.get("name") == "Run release candidate tests")
+        args = run[run.index("python -m pytest") + len("python -m pytest") :].split()
+        assert "--file-shards" in args and '"$SHARD_COUNT"' in args
+        for narrowing in ("-k", "-m", "--deselect", "--ignore", "--file-shard-", "--lf", "test"):
+            assert not any(a.startswith(narrowing) for a in args), narrowing
+        assert 1 <= hash_shard(module, count) <= count
 
     def test_no_docker_image_and_no_github_release(self) -> None:
         text = (WORKFLOWS / "release-lts.yml").read_text(encoding="utf-8")

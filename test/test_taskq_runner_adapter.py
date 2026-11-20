@@ -1182,6 +1182,66 @@ def test_l3_ladder_bounds_the_stall_recoveries(clock: Clock) -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_wait_the_store_cannot_record_still_honours_the_retry_instant(
+    store: TaskStore, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adm, sleeps = _admission(store, clock, cap=1)
+    rec = adm.accept(kind=m.KIND_WORKFLOW_AGENT, task_id="workflow:w:agent1")
+    h = await adm.admit(rec.id, kind=m.KIND_WORKFLOW_AGENT)
+    h.running()
+
+    def store_down(*_args, **_kwargs):
+        raise TaskStoreUnavailable("disk I/O error")
+
+    monkeypatch.setattr(store, "enter_wait", store_down)
+    signal = DependencySignal(
+        kind=KIND_RATE_LIMITED, dependency_scope="api", source="test", retry_at=clock.t + 30
+    )
+    assert await adm.yield_dependency(h, signal) is True
+    # The server asked for 30 s; an immediate re-run would just hit the limit again.
+    assert sleeps.calls == [pytest.approx(30.0)]
+    assert adm.lane.running == 1  # slot taken back for the retry
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fence", ["stale_generation", "cancelled_before_the_wait"])
+async def test_a_wait_the_store_refuses_ends_the_step(
+    store: TaskStore, clock: Clock, fence: str
+) -> None:
+    adm, sleeps = _admission(store, clock, cap=1)
+    rec = adm.accept(kind=m.KIND_WORKFLOW_AGENT, task_id="workflow:w:agent1")
+    h = await adm.admit(rec.id, kind=m.KIND_WORKFLOW_AGENT)
+    h.running()
+    if fence == "stale_generation":
+        h.generation += 1
+        want_state = m.RUNNING
+    else:
+        assert store.cancel(rec.id, reason="user_stop") == m.RUNNING
+        want_state = m.CANCELLED
+    row_gen = store.get(rec.id).generation
+    signal = DependencySignal(
+        kind=KIND_RATE_LIMITED, dependency_scope="api", source="test", retry_at=clock.t + 30
+    )
+    assert await adm.yield_dependency(h, signal) is False  # the call is not re-run
+    assert sleeps.calls == []
+    assert adm.lane.running == 1  # the slot is the caller's until it settles
+    assert store.get(rec.id).state == want_state
+    # store.cancel bumps the generation, so both refusals are the generation fence.
+    assert (
+        "stale_result",
+        {
+            "from_generation": h.generation,
+            "current": row_gen,
+            "wanted": m.WAITING_DEPENDENCY,
+        },
+    ) in _events(store, rec.id)
+    # The caller's fenced terminal write cannot touch the row either.
+    assert await h.fail_async("x") is False
+    row = store.get(rec.id)
+    assert row.state == want_state and row.generation == row_gen
+
+
+@pytest.mark.asyncio
 async def test_rate_limit_parks_in_waiting_dependency_and_tick_wakes_it(
     store: TaskStore, clock: Clock
 ) -> None:

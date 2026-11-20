@@ -260,7 +260,8 @@ export default function MyApp() {
 ### Version Source (IMPORTANT)
 
 Read the installed manifest version from `useAppInfo()`. The host mounts external
-apps inside `AppApiProvider` and supplies `{name, version, permissions, active}`;
+apps inside `AppApiProvider` and supplies `{name, version, permissions, active}`,
+plus `session` (`{ sessionKey }`) on a session-bound surface such as a side-panel tab;
 apps are not iframes and do not need to derive absolute data-home paths.
 
 ```javascript
@@ -733,8 +734,8 @@ process — but the contract DIFFERS from builtins (`auto_research` etc.):
   `mv ~/.kiro/crew/apps/<n>/ui ~/.kiro/crew/apps/<n>/ui.bak && ln -s <src>/ui ~/.kiro/crew/apps/<n>/ui`
   followed by `kirocrew app dev <n> --confirm-out-of-install-root`. That
   confirmation is a human security decision; agents must not supply it.
-  On native Windows use a directory junction instead (PowerShell):
-  `Rename-Item "$env:USERPROFILE\.kiro\crew\apps\<n>\ui" ui.bak; New-Item -ItemType Junction -Path "$env:USERPROFILE\.kiro\crew\apps\<n>\ui" -Target "<src>\ui"`
+  On native Windows use a directory junction instead (cmd; no admin needed):
+  `ren "%USERPROFILE%\.kiro\crew\apps\<n>\ui" ui.bak && mklink /J "%USERPROFILE%\.kiro\crew\apps\<n>\ui" "<src>\ui"`
   (`pathlib` resolves junctions the same way, so serving and the watcher work;
   the lifecycle clobber below applies identically — junctions are also never
   preserved by the install/update safe-copy).

@@ -18,8 +18,9 @@ the stdio server itself and relays each message to that url with the recorded
 headers added (:mod:`kiro_crew.kas_http_bridge`).
 
 Standard library only and at the top of the package: the engine starts this once
-per server, so it must not import the ACP stack. The bridge path adds only the
-package's trust bootstrap (:mod:`kiro_crew._ssl_compat`). It prints no env value.
+per server, so it must not import the ACP stack. The bridge path adds the
+package's trust bootstrap (:mod:`kiro_crew._ssl_compat`) and, once a request
+fails, :mod:`kiro_crew.asset_downloader`. It prints no env value.
 """
 
 from __future__ import annotations
@@ -33,6 +34,8 @@ import stat
 import subprocess
 import sys
 from typing import Any, NoReturn
+
+from kiro_crew.bounded_read import bounded_read
 
 #: The crew data-home leaf the snapshots live in.
 SNAPSHOT_LEAF = "kas-mcp-launch"
@@ -59,8 +62,10 @@ def _digest(*parts: str) -> str:
 def snapshot_name(session_key: str, agent: str, server: str, version: str) -> str:
     """The snapshot file name for one write of one session's server.
 
-    *version* is random per write, so two projections never share a file, even
-    for the same session: each one owns, and removes, only what it wrote. Every
+    A Connection bridge's *version* is random per write, so two of its
+    projections never share a file. A stdio launch or a header bridge is shared
+    by every session of its agent (``kas_env_launch.SHARED_SESSION``), and its
+    version is keyed to the file's content, so they all read one file. Every
     part is hashed, so no reference can name a path outside the leaf.
     """
     return (
@@ -110,7 +115,7 @@ def _read_snapshot(path: str, server: str) -> dict[str, Any]:
             _refuse(server, "its launch snapshot is too large")
         with os.fdopen(fd, "rb") as fh:
             fd = -1
-            raw = fh.read(_MAX_SNAPSHOT_BYTES + 1)
+            raw = bounded_read(fh, _MAX_SNAPSHOT_BYTES + 1)
     finally:
         if fd != -1:
             os.close(fd)
@@ -188,6 +193,17 @@ def _stdio_launch(
     return [command, *args], {**environ, **env}
 
 
+def _unstartable(command: str, exc: OSError) -> NoReturn:
+    """End the launch with the one line both platforms print when the command won't start."""
+    reason = exc.strerror or exc
+    print(
+        f"kirocrew: MCP server command {command!r} could not be started: {reason}",
+        file=sys.stderr,
+        flush=True,
+    )
+    raise SystemExit(127) from None
+
+
 def _spawn_child(argv: list[str], env: dict[str, str]) -> NoReturn:
     """Windows has no in-place exec: run the server as a child on this process's stdio.
 
@@ -196,7 +212,10 @@ def _spawn_child(argv: list[str], env: dict[str, str]) -> NoReturn:
     shape ``mcp_gateway.stub_fallback._fallback_spawn_child`` uses.
     """
     resolved = shutil.which(argv[0], path=env.get("PATH")) or argv[0]
-    proc = subprocess.Popen([resolved, *argv[1:]], env=env, stdin=0, stdout=1, stderr=2)
+    try:
+        proc = subprocess.Popen([resolved, *argv[1:]], env=env, stdin=0, stdout=1, stderr=2)
+    except OSError as exc:
+        _unstartable(argv[0], exc)
     try:
         rc = proc.wait()
     except BaseException:
@@ -238,13 +257,7 @@ def main(argv: list[str] | None = None) -> NoReturn:
         # nosemgrep: python.lang.security.audit.dangerous-os-exec-tainted-env-args.dangerous-os-exec-tainted-env-args
         os.execvpe(launch[0], launch, env)
     except OSError as exc:
-        print(
-            f"kirocrew: MCP server command {launch[0]!r} could not be started: "
-            f"{exc.strerror or exc}",
-            file=sys.stderr,
-            flush=True,
-        )
-        raise SystemExit(127) from None
+        _unstartable(launch[0], exc)
     raise SystemExit(1)
 
 

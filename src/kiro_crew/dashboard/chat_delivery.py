@@ -33,11 +33,14 @@ from kiro_crew.dashboard.chat_utils import (
 from kiro_crew.dashboard.slot_queue_repository import (
     ATTACHMENT_META_KEYS,
     RESTORED_QUEUE_KEY,
+    is_held_queue_entry,
     refused_durable_ids,
     warn_if_not_durable,
 )
+from kiro_crew.dashboard.steer_supersedes_approval import reject_approvals_superseded_by_steer
 from kiro_crew.history import HUMAN_TURN_META_KEY
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.shared_crew.contracts import MESSAGE_AUTHOR_META_KEY
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from kiro_crew.dashboard.state import DashboardState, _ChatSlot
@@ -68,6 +71,7 @@ STEER_UNAVAILABLE = "unavailable"
 #              in-flight generation was actually redirected.
 #   requeued -- the turn ended with no consumption echo, so the teardown moved the
 #              message to the queue and it runs as its own turn.
+#   superseded -- that own turn has written its row, so this one is not drawn.
 #
 # A steer can only be injected at a model-inference boundary, so a turn that is
 # streaming text without dispatching a tool may never reach one before it ends
@@ -86,6 +90,9 @@ STEER_STATE_RETRACTED = "retracted"
 # harness can drop a steer its turn has not read -- so the dashboard draws the
 # controls from the row alone.
 STEER_RETRACTABLE_META = "steerRetract"
+# A requeued row whose own turn has since written a fresh row with the same text:
+# the transcript keeps it, the client does not draw it again.
+STEER_STATE_SUPERSEDED = "superseded"
 
 # Upper bound on a client-minted ``meta.sendId`` accepted into the steer path.
 # Client mints are ~17 chars; the bound exists because the value is raw client
@@ -428,6 +435,7 @@ async def steer_into_running_turn(
     nudge_meta: dict | None = None,
     banner: str = "",
     relay_meta: dict | None = None,
+    author: dict | None = None,
 ) -> str:
     """Inject *message* into the slot's RUNNING turn; return a ``STEER_*`` outcome.
 
@@ -514,7 +522,8 @@ async def steer_into_running_turn(
     a restored transcript, and only an id names THIS delivery.
 
     ``nudge_meta`` says the text is AUTOMATION (a monitor loop's work-ledger
-    wake), and is the ``meta.nudge`` (``{"cycle", "loop_id"}``) its row carries.
+    wake), and is the ``meta.nudge`` (``{"cycle", "loop_id"}``) its row carries,
+    plus the loop's ``session_deliver.WAKE_GENERATION``, which no row carries.
     The row's role follows the origin, not the branch that ran: the steer is
     persisted as a ``nudge`` row, the same role the idle fire writes, so it
     draws as the nudge chip rather than a bubble the person typed. It
@@ -587,6 +596,10 @@ async def steer_into_running_turn(
         # prompt and nothing consumes it; the queue path delivers it as
         # the next turn instead.
         logger.info("no prompt in flight for slot %s; queueing instead of steering", slot.key)
+        return STEER_UNAVAILABLE
+    if getattr(slot, "_compact_command_turn", False) is True:
+        # The turn IS a manual /compact: no prompt runs that a steer could join.
+        logger.info("slot %s is compacting; queueing instead of steering", slot.key)
         return STEER_UNAVAILABLE
 
     # Register as pending BEFORE the await: ``steer()`` suspends on
@@ -713,7 +726,16 @@ async def steer_into_running_turn(
         slot._turn_owner_sent = False
     if admission is not None:
         slot._steer_admissions[message] = admission
-    if attachments or quote or knowledge or app_label or app_actor or banner or relay_meta:
+    if (
+        attachments
+        or quote
+        or knowledge
+        or app_label
+        or app_actor
+        or banner
+        or relay_meta
+        or author
+    ):
         # Retained for the REQUEUE with the attachment lists: a steer the turn
         # ended before consuming is drained as a queued row, and that row is
         # rebuilt from this map -- without the quote here it would render its
@@ -733,6 +755,9 @@ async def steer_into_running_turn(
             **quote,
             **knowledge,
             **({"relay": dict(relay_meta)} if relay_meta else {}),
+            # The server-named Shared Crew author, so a requeued steer's drained row
+            # names its person as the delivered row below does.
+            **({MESSAGE_AUTHOR_META_KEY: dict(author)} if author else {}),
             **({"appLabel": app_label} if app_label else {}),
             **({TURN_ACTOR_META_KEY: "app"} if app_actor else {}),
             **({CHAT_BANNER_META_KEY: banner} if banner else {}),
@@ -1084,6 +1109,10 @@ async def steer_into_running_turn(
         # THIS delivery by identity rather than by text. Inert for the client,
         # which reads ``steer``, ``steerState``, ``mid`` and ``sendId``.
         "steer_delivery_id": delivery_id,
+        # The server-named Shared Crew author (``shared_crew.attribution``): a
+        # teammate's steer is their message like any other send, so its row and
+        # its live push name them.
+        **({MESSAGE_AUTHOR_META_KEY: dict(author)} if author else {}),
     }
     if user_origin:
         # A PERSON typed this into the session's own surface, same as an ordinary
@@ -1095,7 +1124,7 @@ async def steer_into_running_turn(
     if decision_strip:
         # The same field the assistant row's strip rides on, read by the same
         # frontend reader. Stamped at APPEND time rather than written afterwards,
-        # for the reason `chat_runner._decisions_strip_meta` states: `append`
+        # for the reason `chat_turn.decisions_hooks._decisions_strip_meta` states: `append`
         # broadcasts the live frame from inside the call, so a later write would
         # persist a receipt the open tab never renders.
         meta["decisions_strip"] = decision_strip
@@ -1202,7 +1231,13 @@ async def steer_into_running_turn(
         # A peer's steer: an open tab draws the row from this frame, so without
         # the sender it would show the raw provenance prefix until a reload.
         push_payload.setdefault("meta", {})["relay"] = dict(relay_meta)
+    if author:
+        push_payload.setdefault("meta", {})[MESSAGE_AUTHOR_META_KEY] = dict(author)
     state.broadcast_ws("steer_push", push_payload)
+    if _state == STEER_STATE_WRITTEN and _shown_as_typed and owner_origin:
+        # Still held, so a card open now is the one it was typed over. Without
+        # this the steer waits behind the card until someone clicks it.
+        reject_approvals_superseded_by_steer(state, slot)
     return STEER_STEERED
 
 
@@ -1447,6 +1482,9 @@ def queue_for_next_turn(
     # that case is logged at WARNING and drawn on the card this frame makes.
     if not warn_if_not_durable(slot._queue, qid, slot.key):
         push.setdefault("meta", {})["durable"] = False
+    from kiro_crew.dashboard import responsive_chat as _rc
+
+    _rc.mark_written_on_push(slot, qid, push)
     state.broadcast_ws("queue_push", push)
     start_queue_persist(state, slot)
     return qid
@@ -1746,11 +1784,21 @@ def queue_entry_view(item: dict[str, Any]) -> dict[str, Any]:
     # continue_slot_turn that checks RESTORED_QUEUE_KEY.
     if item.get(RESTORED_QUEUE_KEY):
         view.setdefault("meta", {})["restored"] = True
+    # Whether the entry waits for a person (``is_held_queue_entry``): restored
+    # provenance alone is not that state, since a restored card the person chose
+    # or the startup drain accepted is sent without another action.
+    if is_held_queue_entry(item):
+        view.setdefault("meta", {})["held"] = True
+    edit_rev = item.get("edit_rev")
+    if isinstance(edit_rev, int) and not isinstance(edit_rev, bool):
+        view["editRev"] = edit_rev
     return view
 
 
 def queue_view(
-    queue: list[dict[str, Any]], refused: set[str] | None = None
+    queue: list[dict[str, Any]],
+    refused: set[str] | None = None,
+    written: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """The slot-detail ``queue[]`` field: :func:`queue_entry_view` per entry, with
     ``meta.durable: false`` on each prompt the durable write will not keep. Judged
@@ -1758,7 +1806,12 @@ def queue_view(
 
     A caller rendering a trimmed copy of the queue passes ``refused``, read off the
     LIVE entries: the writer weighs fields such a copy drops (source channels, the
-    system-entry stamps), so judging the copy would mark the wrong prompts."""
+    system-entry stamps), so judging the copy would mark the wrong prompts.
+
+    ``written`` holds the ids whose user row is already in the transcript
+    (``responsive_chat.row_already_written``, read off the live slot): each gets
+    ``meta.written: true``, because the cancel and edit endpoints refuse such an
+    entry and the card must not offer either."""
     snapshot = list(queue)
     if refused is None:
         refused = refused_durable_ids(snapshot)
@@ -1766,4 +1819,6 @@ def queue_view(
     for view in views:
         if view["id"] in refused:
             view.setdefault("meta", {})["durable"] = False
+        if written and view["id"] in written:
+            view.setdefault("meta", {})["written"] = True
     return views

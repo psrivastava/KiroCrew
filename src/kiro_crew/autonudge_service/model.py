@@ -490,7 +490,8 @@ class NudgeLoop:
     # nobody answered within the window. Set by ``notify_approval_stalled`` and
     # read by ``_timer`` as a HOLD: the loop stays active but fires no cycle, spending
     # neither its cycle cap nor its runtime budget. Set only on proof, never on
-    # prediction. Cleared by ``release_approval_hold`` once a person is back, and on
+    # prediction. Cleared by ``release_approval_hold`` once a person is back or a
+    # new turn starts in the session, and on
     # every revival. Persisted, because the cause usually outlives a restart.
     approval_stalled: bool = False
     # When the current hold began (0 = not held, or a legacy row). On release the
@@ -861,6 +862,24 @@ def unreadable_bound_field(loop: "NudgeLoop") -> str | None:
         if stored_bound(getattr(loop, name, 0)) is None:
             return name
     return None
+
+
+def terminal_wake_line(loop: "NudgeLoop") -> str:
+    """The news an owed final turn opens with, or ``""`` when no such turn is owed.
+
+    The watched subject ended, so this turn is the watch's last: the line says how
+    it ended and that the loop stops after it, so the agent reports instead of
+    waiting for a wake that will not come.
+    """
+    monitor = getattr(loop, "monitor", None)
+    pending = str(getattr(monitor, "terminal_pending", "") or "") if monitor else ""
+    if not pending:
+        return ""
+    note = str(getattr(monitor, "terminal_note", "") or "")
+    if not note:
+        ending = "merged" if pending == "success" else "closed without merging"
+        note = f"{getattr(monitor, 'target', '') or 'The watched subject'} {ending}."
+    return f"[monitor finished] {note} This is the last wake; the loop stops after this turn."
 
 
 def nudge_cycle_header(loop: "NudgeLoop", now: float | None = None) -> str:

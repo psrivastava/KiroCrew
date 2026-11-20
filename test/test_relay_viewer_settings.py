@@ -31,6 +31,19 @@ def test_the_viewer_is_off_and_empty_by_default() -> None:
     assert tunnel.relay_viewer_cps_url == ""
     assert tunnel.relay_viewer_credential == ""
     assert tunnel.relay_viewer_relay_domain == ""
+    assert tunnel.relay_viewer_oidc_scope_prefix == ""
+
+
+@pytest.mark.parametrize("value", ["Bad", "has:colon", "has space", "x" * 64, "dash-ed", "9lead"])
+def test_an_invalid_scope_prefix_is_ignored_with_a_warning(
+    tmp_path, monkeypatch, caplog, value
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        cfg = _load(tmp_path, monkeypatch, {"relay_viewer_oidc_scope_prefix": value})
+    assert cfg.tunnel.relay_viewer_oidc_scope_prefix == ""
+    assert any(
+        "tunnel.relay_viewer_oidc_scope_prefix ignored" in r.getMessage() for r in caplog.records
+    )
 
 
 def test_the_viewer_settings_round_trip(tmp_path, monkeypatch) -> None:
@@ -39,6 +52,7 @@ def test_the_viewer_settings_round_trip(tmp_path, monkeypatch) -> None:
         "relay_viewer_cps_url": "https://control.example.com/",
         "relay_viewer_credential": "secret://viewer-test",
         "relay_viewer_relay_domain": "us-east-1.relay.example.invalid",
+        "relay_viewer_oidc_scope_prefix": "test_prefix",
     }
     cfg = _load(tmp_path, monkeypatch, stored)
     tunnel = cfg.to_dict()["tunnel"]
@@ -77,10 +91,12 @@ def test_an_https_or_loopback_url_is_kept(tmp_path, monkeypatch, url) -> None:
         "not a url",
     ],
 )
-def test_an_unsafe_url_is_ignored_with_a_warning(tmp_path, monkeypatch, caplog, url) -> None:
+def test_an_unsafe_url_is_kept_with_a_warning(tmp_path, monkeypatch, caplog, url) -> None:
+    # Kept as set, so the viewer refuses it as not set up instead of reading it as
+    # empty (which means the built-in control plane). Every reader checks it again.
     with caplog.at_level(logging.WARNING):
         cfg = _load(tmp_path, monkeypatch, {"relay_viewer_cps_url": url})
-    assert cfg.tunnel.relay_viewer_cps_url == ""
+    assert cfg.tunnel.relay_viewer_cps_url == url
     assert any("tunnel.relay_viewer_cps_url ignored" in r.getMessage() for r in caplog.records)
 
 

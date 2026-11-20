@@ -14,6 +14,7 @@ alone so only the coloured ghost body shifts. Alpha is preserved.
 
 Usage:  .venv/bin/python scripts/ccrew-tint-icons.py <in.png> <out.png>
 """
+
 import colorsys
 import sys
 

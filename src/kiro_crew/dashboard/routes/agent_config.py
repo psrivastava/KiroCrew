@@ -78,6 +78,7 @@ def register(app: web.Application) -> None:
     # MCP servers
     app.router.add_get("/api/mcp", handlers.api_mcp_servers)
     app.router.add_get("/api/mcp/scopes", handlers.api_mcp_global_scopes)
+    app.router.add_get("/api/mcp/unreadable", handlers.api_mcp_unreadable_files)
     app.router.add_get("/api/mcp/active", handlers.api_mcp_active)
     # Multi-provider MCP discovery (official registry + optional edition capability provider)
     app.router.add_get("/api/mcp/discover", api_mcp_discover)
@@ -89,6 +90,7 @@ def register(app: web.Application) -> None:
     app.router.add_put("/api/mcp/custom/{name}", api_mcp_custom_update)
     app.router.add_post("/api/mcp/probe", handlers.api_mcp_probe)
     app.router.add_get("/api/mcp/probe", handlers.api_mcp_probe_cached)
+    app.router.add_post("/api/mcp/probe/{name}", handlers.api_mcp_probe_one)
     app.router.add_post("/api/mcp/quarantine/clear", handlers.api_mcp_quarantine_clear)
     app.router.add_post("/api/mcp/measure", handlers.api_mcp_measure_start)
     app.router.add_get("/api/mcp/measure", handlers.api_mcp_measure_progress)

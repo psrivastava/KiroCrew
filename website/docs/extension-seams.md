@@ -433,7 +433,8 @@ theme, including the first render for the initially-active theme, because the
 "previous theme" ref starts empty. Keep it idempotent and cheap. `shell/branding.ts`
 wraps the call in a `try`/`catch` so an edition-owned effect that throws cannot take
 down the shell, but it still logs. `favicon` is handled the same generic way: the
-core has no per-theme favicon and falls back to `/logo.png`.
+core has no per-theme favicon and falls back to a tile of `dashboard.instance_label`'s
+initial on the theme accent when that label is set, else to `/logo.png`.
 
 **Readout-capsule segments.** `registerCapsuleSegment([{ id, order?, component, hideOnMobile? }])`
 mounts a status segment INSIDE the header's readout capsule, sharing its border,
@@ -452,6 +453,14 @@ Widgets render in insertion order, take no props (each reads its own state or
 queries), and are each `ErrorBoundary`-isolated. The same rule as for capsule
 segments applies: a widget's size must not depend on the collapse classes or
 level.
+
+**A widget that owns the desktop update flow.** A widget that offers and arms
+the desktop app's update itself (through `window.updateAPI`) also needs the
+core's two update prompts to stay closed, or they open over it. That is not a
+frontend registration: the edition sets `"updatePrompts": "edition"` in the
+`EXTERNALLY-MANAGED` marker it bakes into the app, and every update push then
+carries the flag the prompts read
+([desktop-app.md → Externally-managed installs](../../docs/build/desktop-app.md#externally-managed-installs-repackagers)).
 
 **Theme centre decoration is a backdrop, not a cell.** Under the three-track grid
 `branding.topBar` renders as a full-header background layer, not as a sized flow
@@ -634,7 +643,7 @@ unoffered method draws nothing.
 
 **Remote-instance provisioner forms.**
 `registerRemoteProvisionerRenderer({ kind, component })` supplies the launch form
-that Settings → Remote Crew → "Set up a new one" draws for one provisioner
+that Settings → Remote Crew → Add Crew → "Set up a new Crew" draws for one provisioner
 the backend offers. It keys on `kind`, not `id`, for the same reason as the seam
 above: `id` is what `POST /api/cloud/launch` names in `provider_id` (an id the
 server does not offer is refused with `unknown_provisioner`), while `kind` exists
@@ -777,7 +786,9 @@ composition benefit.
 So `api/apiTransport.ts` **exports** the blessed `apiTransport`, the same
 `get`/`post`/`put`/`del`/`patch` plus `j`/`jNullable` the core methods use
 (`client.ts` defines them and installs them via `installApiTransport` at its
-module load). An edition builds its OWN fully-typed API module on it:
+module load), and `getWithSignal`, the same `get` aborted by an `AbortSignal`
+for a read its caller bounds with `lib/withDeadline`. An edition builds its OWN
+fully-typed API module on it:
 
 ```ts
 import { apiTransport as t } from '../api/apiTransport'
@@ -792,7 +803,7 @@ static types on the edition side and no new *registry* contract. It never forks
 `client.ts` and never writes raw `fetch`, which would silently drop the session
 key.
 
-`ApiTransport` (the five request helpers plus the `j`/`jNullable` semantics) **is**
+`ApiTransport` (the six request helpers plus the `j`/`jNullable` semantics) **is**
 a small, intentionally frozen downstream contract, because a separately built
 edition compiles against it. There is no version guard on this seam, and the stock
 build stays green whatever you do to it (the seam is inert), so breakage surfaces

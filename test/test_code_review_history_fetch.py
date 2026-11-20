@@ -114,6 +114,11 @@ class _Origin:
         )
         # Stripping GIT_* drops the suite's maintenance entries and global file.
         self.env.update(git_maintenance_off_entries(self.env))
+        # HOME is replaced, so a version-manager shim first on PATH would read its
+        # tools from the fake HOME and fail; the running interpreter's dir goes first.
+        self.env["PATH"] = os.pathsep.join(
+            (os.path.dirname(sys.executable), self.env.get("PATH", ""))
+        )
         self.git("init", "-q", "-b", "main", str(self.path), cwd=tmp)
         for key in ("uploadpack.allowFilter", "uploadpack.allowAnySHA1InWant"):
             self.git("config", key, "true")
@@ -273,7 +278,6 @@ READS = (
     ("diff", "MB..HEAD", "--unified=0", "--diff-filter=ACMR", "--", ":(exclude)README.md"),
     ("diff", "MB", "HEAD"),
     ("diff", "--name-only", "--no-renames", "MB", "HEAD"),
-    ("rev-list", "--count", "BASE..HEAD"),
     ("ls-tree", "--name-only", "BASE", "--", ".github/scripts/code-review-history.sh"),
     ("ls-tree", "--name-only", "BASE", "--", ".github/scripts/absent_check.py"),
     ("show", "BASE:.github/scripts/code-review-history.sh"),
@@ -300,26 +304,10 @@ def test_every_read_matches_a_full_clone_with_no_further_fetch(world, job: str) 
             assert got == o.git(*args, cwd=full), (case["name"], read)
 
 
-def test_the_commit_range_and_the_rule_greps_run_on_the_fetched_history(world) -> None:
+def test_the_rule_greps_run_on_the_fetched_history(world) -> None:
     o, cases, _ = world
     by_name = {c["name"]: c for c in cases}
-    steps = {s.get("name"): s for s in _steps("pr-hygiene") + _steps("autosde-rules")}
-    for name, count in (("normal", 1), ("three-commits", 3), ("base-moved", 1), ("fork", 1)):
-        work, res, _ = _diff_base(o, by_name[name], "pr-hygiene")
-        assert res.returncode == 0, res.stderr
-        env = {
-            "BASE": by_name[name]["base_tip"],
-            "HEAD": by_name[name]["head"],
-            "BASE_REF": "main",
-            "MAX_COMMITS": "2",
-        }
-        enforced = _run(
-            o, work, steps["Enforce commit count"]["run"], {**env, "GIT_NO_LAZY_FETCH": "1"}
-        )
-        assert (enforced.returncode == 0) is (count <= 2), (name, enforced.stdout)
-        assert (
-            f"({count} of at most" in enforced.stdout or f"(has {count})" in enforced.stdout
-        ), enforced.stdout
+    steps = {s.get("name"): s for s in _steps("autosde-rules")}
     work, res, sha = _diff_base(o, by_name["normal"], "autosde-rules")
     assert res.returncode == 0, res.stderr
     # The rule step runs on a Linux runner with GNU `grep -P`; a host whose

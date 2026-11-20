@@ -36,8 +36,19 @@ The **Bots** row sits in the left rail, under Sessions, and opens
 | Avatar | A ghost face with chosen traits, or an uploaded picture | a face derived from its name |
 | Session color | Tints the sessions it starts | no color of its own |
 
-A per-session pick always wins over the Bot's model and reasoning effort,
-and the Bot's values win over the global defaults.
+A per-session pick wins over the Bot's model and reasoning effort, and the
+Bot's values win over the global defaults. In the Bot's own chat your latest
+choice wins: saving the Bot's model clears the model that chat picked for
+itself (with `/model`, for example), and saving its reasoning effort clears
+the chat's own effort, so the chat's next reply uses the Bot's values. This
+happens on every save from the Bot's editor, which always sends both fields,
+so renaming the Bot or saving it unchanged resets them too. A change made
+outside the dashboard, with `kirocrew agent update --model` or by editing
+`config.json`, does not reset the chat's own model or effort yet
+([#36614](https://github.com/kirodotdev/KiroCrew/issues/36614)); save the Bot
+in its editor to bring the chat back onto it. A `/model` typed in the chat
+after the save wins again until the next save.
+Other chats and the sessions the Bot starts keep their own picks.
 
 ## The roster
 
@@ -214,8 +225,10 @@ added to this Bot, and **Remove** takes one out. A new Bot starts with
 nothing added. To add more, pick an agent under **Add abilities** on the same
 page: it shows at once which connections, skills and auto-approvals would be
 added and which the Bot already has, then **Add** writes them and says so.
-Only what is missing is added and nothing already there is replaced. If the
-agent has its own instructions, they become the Bot's **behavior
+Only what is missing is added and nothing already there is replaced. The
+agent's hooks and permission rules come too, and the worker runs them on KAS;
+an agent's allow for sub-agents or skills becomes the worker's auto-approval
+for them. If the agent has its own instructions, they become the Bot's **behavior
 directions**, which its worker follows after its built-in instructions. A Bot
 has one set: adding another agent that has directions replaces them (the
 preview says **Replaces current**), and **Remove** clears them. Later edits to that agent do not reach the
@@ -235,6 +248,11 @@ A Bot's **Goals** tab (Profile card) holds what it works toward:
   remove its text. The Bot is
   encouraged to keep the list short and to suggest merging goals that overlap;
   you decide.
+- **Credits used.** The credits reported by the sessions doing the Bot's
+  tasks, each session counted once. The Bot's own chat turns are not in the
+  number. It reads **Not reported** when no session reported a charge,
+  **At least** when part of the count was dropped, and **Still counting**
+  while the count is being read.
 - **Milestones.** Key results that show how far it is from its goals, one
   shared set, each showing the numbers of the goals it serves. The Bot
   works them out, links each to its goals, and proposes them on one card
@@ -281,11 +299,14 @@ card's goal as its goal; its description stays empty until it or you write one.
 What the Bot is working on right now is its task list on the Crew board,
 not part of the goal.
 
-Creating a Bot allocates its memory store for it. That store cannot later
+Creating a Bot allocates its memory store for it, unless it takes over a
+deleted Bot's kept memory (below). That store cannot later
 be pointed somewhere else or shared with another Bot — `kirocrew agent
 update --memory-store` refuses it — because a Bot's memory is its identity.
 Deleting a Bot removes it, along with its picture and its goal check-ins. Its
-workspace, its memory and its past chats are kept.
+workspace, its memory and its past chats are kept. A new Bot can take that
+memory over: pick it under **Memory** in the New Bot dialog's **Advanced
+settings**, and the new Bot owns that store and its past chats.
 
 ## Memory
 
@@ -318,7 +339,15 @@ anywhere else (from the agent picker in chat or on the welcome screen, as a chat
 folder's default agent, or in a channel bound to it, such as a Slack channel)
 runs on its memory and workspace but has no worker and no sub-agents, so the bot
 does that work in the chat itself. Abilities added to the bot are not available
-there, because they reach only its worker. A scheduled turn runs on its worker.
+there, because they reach only its worker. A scheduled turn runs on its worker,
+so it cannot message other sessions; its result comes back to the bot's thread
+as a worker report. To hand work to another session at a set time, have the
+scheduled turn report back, and send the message from the bot's thread when
+that report arrives.
+
+From a Discord DM, `!bot` connects the conversation to the bot's own thread
+instead of opening a new chat, so the bot keeps its worker there
+([discord-integration.md](discord-integration.md)).
 
 Slack is the exception worth knowing. Its per-thread `!ta <name>` (`!ta off`
 clears it) resolves the name against the agent spec files in `~/.kiro/agents/`,

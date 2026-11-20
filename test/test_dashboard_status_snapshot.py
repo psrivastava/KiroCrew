@@ -135,6 +135,20 @@ class TestStatusSnapshot:
         snap = state.status_snapshot()
         assert snap["release_channel"] in ("nightly", "insider", "stable")
 
+    @pytest.mark.parametrize(
+        ("stamp", "expected"),
+        [("docker", "docker exec kirocrew kirocrew token"), ("wheel", ""), ("dmg", ""), ("", "")],
+    )
+    def test_names_the_container_sign_in_command_only_on_a_container(
+        self, state: DashboardState, monkeypatch, stamp: str, expected: str
+    ) -> None:
+        """A container's dashboard sends the person on the host through
+        ``docker exec``; every other install keeps the catalog's ``kirocrew token``.
+        Read from the baked stamp, so the environment variable cannot set it."""
+        monkeypatch.setattr("kiro_crew.beacon._BAKED_DISTRIBUTION", stamp)
+        monkeypatch.setenv("KIROCREW_DISTRIBUTION", "docker")
+        assert state.status_snapshot().get("sign_in_command") == expected
+
     def test_cached_overrides_skip_expensive_calls(self, state: DashboardState) -> None:
         """Caller-supplied cron_jobs/lessons pass straight through and never
         touch list_jobs()/load_all() — the counts are always caller-supplied."""
@@ -189,6 +203,7 @@ class TestAllStatusSnapshotCallersPassTheUpdateFields:
             "update_latest_version",
             "update_latest_version_display",
             "update_channel",
+            "update_upcoming",
             "update_channel_move_pending",
             "update_managed_by",
             "update_policy_file",
@@ -198,6 +213,12 @@ class TestAllStatusSnapshotCallersPassTheUpdateFields:
             "update_auto_effect",
             "update_auto_manual_only",
             "update_bundled_by_app",
+            "update_restart_ready",
+            "update_restart_ready_version",
+            "update_restart_ready_reason",
+            "update_armed_version",
+            "update_armed_at",
+            "pending_apply_error",
             "update_last_checked_at",
             "update_check_interval_secs",
             "update_required",
@@ -327,7 +348,7 @@ class TestAllStatusSnapshotCallersPassTheUpdateFields:
         sentinel = {key: f"S:{key}" for key in status_update_fields()}
         monkeypatch.setattr(
             "kiro_crew.dashboard.handlers.updates.status_update_fields",
-            lambda: dict(sentinel),
+            lambda *_next_start: dict(sentinel),
         )
 
         async def _run():

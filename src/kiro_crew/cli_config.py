@@ -6,25 +6,29 @@ import argparse
 import base64
 import errno
 import json
+import math
 import os
 import re
+import shutil
+import signal
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from kiro_crew import beacon
-from kiro_crew.config import KiroCrewConfig
+from kiro_crew.config import KiroCrewConfig, loader, loosening_provenance
 from kiro_crew.config.loader import (
     ConfigReadError,
     ConfigWriteRefused,
     ResourceLimitsConfig,
-    config_local_path,
-    config_path,
     read_config_text,
     read_endorsed_config_text,
     update_config_locked,
     workspace_dir_from_entry,
 )
+from kiro_crew.config.paths import config_dir
 from kiro_crew.config.resolution import (
     _SECTION_KEYS_EMITTED_ELSEWHERE,
     drop_extra_section_keys,
@@ -51,11 +55,28 @@ from kiro_crew.config.superseded_defaults import (
 from kiro_crew.config.write_provenance import record_path
 from kiro_crew.hooks import safe_read_file
 from kiro_crew.sel import sel
+from kiro_crew.user_json import strict_json_equal, strip_utf8_bom
 
 if TYPE_CHECKING:
     from kiro_crew.config.schema import ConfigEntry
 
 _MISSING = object()
+
+
+def config_path() -> Path:
+    """The base ``config.json``, looked up on the loader at call time.
+
+    A name bound by ``from loader import config_path`` keeps whatever object the loader
+    held at this module's first import, so a substitute in force then (a test's
+    monkeypatch) would outlive its own undo and redirect every later save.
+    """
+    return loader.config_path()
+
+
+def config_local_path() -> Path:
+    """The ``config.local.json`` overlay, looked up on the loader at call time."""
+    return loader.config_local_path()
+
 
 #: How the OS sandbox refuses a write to a sealed config file: Seatbelt answers
 #: ``EPERM``, and a Linux read-only file bind answers ``EROFS`` for an in-place write
@@ -69,7 +90,7 @@ def _names_sealed_config(exc: OSError) -> bool:
     The publishing ``os.replace(tmp, path)`` reports the temp as ``filename`` and the
     destination as ``filename2``; an in-place ``open(path, "w")`` reports only
     ``filename``. Either way the sealed file is one of the two. A failure that names
-    neither -- ``config edit``'s ``execvp`` of an editor, a temp the data home itself
+    neither -- ``config edit``'s launch of an editor, a temp the data home itself
     refused -- is the caller's to report as what it is.
     """
     # Before it publishes, the config writer stores the endorsed copy and the publication
@@ -149,6 +170,22 @@ def _ack_explicit_config_write(key: str, value: object) -> None:
             _ack_explicit_config_write(f"{key}.{child}", child_value)
 
 
+def _ack_edited_values(prefix: str, old: object, new: object) -> None:
+    """Ack each value of *new* that differs from *old*, as ``config set`` acks what it writes.
+
+    Values the edit left as they were are not acked: they are not a choice made now.
+    """
+    if isinstance(old, dict) and isinstance(new, dict):
+        for child, child_value in new.items():
+            key = f"{prefix}.{child}" if prefix else child
+            if child in old:
+                _ack_edited_values(key, old[child], child_value)
+            else:
+                _ack_explicit_config_write(key, child_value)
+    elif not strict_json_equal(old, new):
+        _ack_explicit_config_write(prefix, new)
+
+
 def _warn_if_bot_name_altered(key: str, parsed: object) -> None:
     """Warn when a stored ``agent.bot_name`` will load differently from the typed value.
 
@@ -181,6 +218,34 @@ def _warn_if_bot_name_altered(key: str, parsed: object) -> None:
 
 
 _ADDRESS_SPACE_KEY = "resource_limits.max_address_space_mb"
+
+
+def _non_finite_paths(key: str, parsed: object) -> list[str]:
+    """Each dotted path under *key* whose value is a NaN or infinite float."""
+    if isinstance(parsed, float) and not math.isfinite(parsed):
+        return [key]
+    if isinstance(parsed, dict):
+        return [p for k, v in parsed.items() for p in _non_finite_paths(f"{key}.{k}", v)]
+    if isinstance(parsed, list):
+        return [p for i, v in enumerate(parsed) for p in _non_finite_paths(f"{key}[{i}]", v)]
+    return []
+
+
+def _warn_if_not_finite(key: str, parsed: object) -> None:
+    """Warn when a write stores ``NaN`` or ``Infinity``, which the setting never uses.
+
+    ``nan``, ``inf`` and an overflowing ``1e999`` parse as floats, pass the declared
+    number type, and are written as the non-standard JSON tokens ``NaN`` and
+    ``Infinity``. The loader's number reader (``config.fields._safe_float`` / ``_safe_int``) then
+    replaces a non-finite value with the key's default, so the ``✅`` line names a
+    value that never takes effect. Advice only: the write itself already succeeded.
+    """
+    for path in _non_finite_paths(key, parsed):
+        print(
+            f"⚠️  {path} is not a finite number: it is saved, but a number setting "
+            "loads it as its default, so it will not take effect.",
+            file=sys.stderr,
+        )
 
 
 def _warn_if_address_space_capped(key: str, parsed: object) -> None:
@@ -230,7 +295,7 @@ def _warn_unapproved_share_names(key: str, parsed: object) -> None:
     for name in unapproved_share_names(parsed):
         print(
             f"⚠️  {name} has no approved launch, so the gateway will not share it until "
-            "you approve it in Customize → Connections → MCP Servers.",
+            "you approve it in MCP Servers.",
             file=sys.stderr,
         )
 
@@ -281,7 +346,18 @@ def _run_config_cmd(args: argparse.Namespace) -> None:
         if encoded is not None and file_path:
             print("❌ --value-base64 cannot be combined with --file", file=sys.stderr)
             sys.exit(1)
+        if file_path and args.key is not None:
+            # ``--file`` replaces the whole document, so a positional key/value
+            # alongside it has nothing well-defined to apply to. Keep the
+            # ``--file`` write (the behaviour today) and say the key/value was
+            # ignored, rather than silently dropping it.
+            print(
+                f"⚠️  ignoring the key/value ({args.key}) given with --file: "
+                "--file replaces the whole document",
+                file=sys.stderr,
+            )
         if file_path:
+            use_local = getattr(args, "local", False)
             fp = Path(file_path).expanduser().resolve()
 
             try:
@@ -303,18 +379,63 @@ def _run_config_cmd(args: argparse.Namespace) -> None:
                 )
                 sys.exit(1)
 
+            local_warnings: list[str] = []
+
             def _mutate_from_file(cur: dict) -> dict:
-                _refuse_missing_workspace_dirs(data, cur)
+                local_warnings.clear()
+                # Every new or changed workspace dir must exist, as on a base write.
+                # The overlay wins over config.json, so for ``--local`` an entry is
+                # "unchanged" against what is in force now: the base with this
+                # overlay over it. An overlay entry with no ``dir`` keeps the base dir.
+                if not use_local:
+                    _refuse_missing_workspace_dirs(data, cur)
+                else:
+                    try:
+                        base = json.loads(read_endorsed_config_text(config_path()))
+                    except (OSError, ValueError):
+                        base = {}
+                    if not isinstance(base, dict):
+                        base = {}
+                    base_ws = base.get("workspaces")
+                    over_ws = cur.get("workspaces")
+                    current = {
+                        "workspaces": {
+                            **(base_ws if isinstance(base_ws, dict) else {}),
+                            **(over_ws if isinstance(over_ws, dict) else {}),
+                        }
+                    }
+                    # Per workspace: an entry the base already binds to this dir
+                    # passes the base-only check, so save it and warn rather than refuse.
+                    workspaces = data.get("workspaces")
+                    entries = workspaces.items() if isinstance(workspaces, dict) else ()
+                    for name, entry in entries:
+                        one = {"workspaces": {name: entry}}
+                        try:
+                            _refuse_missing_workspace_dirs(one, current)
+                        except ConfigWriteRefused as e:
+                            _refuse_missing_workspace_dirs(one, base)
+                            local_warnings.append(str(e))
                 for key, value in data.items():
                     _ack_explicit_config_write(key, value)
                 return data
 
+            # ``--local`` writes the overlay (config.local.json), whose values win
+            # over config.json, instead of replacing the base. The overlay is a
+            # partial document and is not meta-stamped, the same as the keyed
+            # ``config set --local`` path above.
+            target = config_local_path() if use_local else config_path()
             try:
                 update_config_locked(
-                    config_path(),
+                    target,
                     mutate=_mutate_from_file,
                     on_corrupt="reset",
+                    stamp_meta=not use_local,
                 )
+            except ConfigReadError as e:
+                # The file cannot be read, so its bytes cannot be kept before the
+                # reset replaces them: nothing was written.
+                print(f"Error: {fp}: {e}", file=sys.stderr)
+                sys.exit(1)
             except ConfigWriteRefused as e:
                 # Third writer behind the publish floor, same report as the keyed
                 # paths: nothing was written. The message names an env-var key
@@ -324,12 +445,18 @@ def _run_config_cmd(args: argparse.Namespace) -> None:
                 sys.exit(1)
             sel().log_api_access(
                 caller="cli",
-                operation="config_set_file",
+                operation="config_set_local_file" if use_local else "config_set_file",
                 outcome="allowed",
                 source="cli",
                 resources=str(fp),
             )
-            print(f"✅ Config loaded from {file_path}")
+            dest = "config.local.json" if use_local else file_path
+            if use_local:
+                print(f"✅ Overlay loaded from {file_path} (saved to {dest})")
+                for warning in local_warnings:
+                    print(f"⚠  {warning}", file=sys.stderr)
+            else:
+                print(f"✅ Config loaded from {file_path}")
             gateway_section = data.get("mcp_gateway")
             if isinstance(gateway_section, dict):
                 _warn_unapproved_share_names(_SHARE_LIST_KEY, gateway_section.get("stub_servers"))
@@ -488,6 +615,11 @@ def _run_config_cmd(args: argparse.Namespace) -> None:
                     update_config_locked(
                         p, mutate=_mutate_local_overlay, stamp_meta=False, on_corrupt="reset"
                     )
+                except ConfigReadError as e:
+                    # The overlay cannot be read, so its bytes cannot be kept before
+                    # the reset replaces them: nothing was written.
+                    print(f"Error: {key}: {e}", file=sys.stderr)
+                    sys.exit(1)
                 except ConfigWriteRefused as e:
                     # The publish floor refused the document before writing it; the
                     # message names the offending env-var key and never its value.
@@ -507,6 +639,7 @@ def _run_config_cmd(args: argparse.Namespace) -> None:
                 _warn_if_bot_name_altered(key, parsed)
                 _warn_if_address_space_capped(key, parsed)
                 _warn_unapproved_share_names(key, parsed)
+                _warn_if_not_finite(key, parsed)
             else:
 
                 def _mutate_base(existing: dict) -> dict:
@@ -553,6 +686,7 @@ def _run_config_cmd(args: argparse.Namespace) -> None:
                     _warn_if_bot_name_altered(key, parsed)
                 _warn_if_address_space_capped(key, parsed)
                 _warn_unapproved_share_names(key, parsed)
+                _warn_if_not_finite(key, parsed)
     elif action == "edit":
 
         p = config_path()
@@ -567,13 +701,121 @@ def _run_config_cmd(args: argparse.Namespace) -> None:
             source="cli",
             resources=str(p),
         )
-        editor = os.environ.get("EDITOR", "vi")
-        os.execvp(editor, [editor, str(p)])
+        _edit_config_endorsed(os.environ.get("EDITOR", "vi"))
     elif action == "defaults":
         _defaults_cmd(args)
+    elif action == "pending":
+        from kiro_crew.cli_config_pending import pending_cmd
+
+        pending_cmd(args)
     else:
-        print("Usage: kirocrew config {get,set,edit,defaults}", file=sys.stderr)
+        print("Usage: kirocrew config {get,set,edit,defaults,pending}", file=sys.stderr)
         sys.exit(1)
+
+
+def _run_editor(editor: str, path: Path) -> int:
+    """Run *editor* on *path*, wait for it, and return its exit status.
+
+    Ctrl-C is the editor's to handle, but the terminal also sends it to this process
+    while the editor runs a shell command, so SIGINT is ignored here until it exits.
+    """
+    with subprocess.Popen([editor, str(path)]) as proc:
+        previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            return proc.wait()
+        finally:
+            signal.signal(signal.SIGINT, previous)
+
+
+def _edit_config_endorsed(editor: str) -> None:
+    """Edit a copy of ``config.json`` in *editor* and publish it as Kiro Crew's own write.
+
+    The copy is staged inside the sealed ``config-provenance`` directory, which no
+    sandboxed process can write, so what is published is what the editor saved.
+    Publishing goes through ``update_config_locked``, which endorses the bytes it
+    writes, so the edit takes effect at once instead of waiting as an outside change.
+    """
+    loosening_provenance.refuse_save_if_pending(loosening_provenance.LEAF_CONFIG)
+    try:
+        # As the loader reads it, so bytes swapped onto the file are never what is edited.
+        original_text = read_endorsed_config_text(config_path())
+    except UnicodeDecodeError as e:
+        print(
+            f"❌ {config_path()} is not UTF-8 text, so it cannot be edited here: {e}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    original = original_text.encode("utf-8")
+    # A corrupt original (the repair path) counts as empty: every edited value is new.
+    try:
+        original_raw: object = json.loads(strip_utf8_bom(original_text))
+    except json.JSONDecodeError:
+        original_raw = {}
+    original_doc: dict = original_raw if isinstance(original_raw, dict) else {}
+    parent = config_dir() / loosening_provenance.RECORD_DIR_LEAF
+    parent.mkdir(mode=0o700, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix="edit-", dir=parent))
+    staged = staging / "config.json"
+    keep = False
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+        fd = os.open(staged, flags, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(original)
+        status = _run_editor(editor, staged)
+        edited = staged.read_bytes()
+        keep = edited != original
+        kept = f"; the edited copy is kept at {staged}" if keep else ""
+        if status != 0:
+            print(
+                f"❌ The editor exited with status {status}; nothing was written{kept}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if not keep:
+            # A GUI launcher (EDITOR=code) returns at once, before anything is saved.
+            print(
+                "No changes to config.json, so nothing was written. If you did save a "
+                "change, the editor returned before you saved it: set EDITOR to an "
+                "editor that waits until the file is closed."
+            )
+            return
+        try:
+            data = json.loads(strip_utf8_bom(edited.decode("utf-8")))
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            print(f"❌ Invalid JSON: {e}{kept}", file=sys.stderr)
+            sys.exit(1)
+        if not isinstance(data, dict):
+            print(
+                f"❌ Not a config object: the edit holds a JSON "
+                f"{type(data).__name__}, expected an object{kept}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        def _mutate(_cur: dict) -> dict:
+            try:
+                current: str | None = read_endorsed_config_text(config_path())
+            except (FileNotFoundError, UnicodeDecodeError):
+                current = None
+            if current != original_text:
+                raise ConfigWriteRefused(
+                    "config.json changed while the editor was open, so this edit was not saved"
+                )
+            # Under the lock and before the write, so the next load keeps the choice.
+            _ack_edited_values("", original_doc, data)
+            return data
+
+        try:
+            update_config_locked(config_path(), mutate=_mutate, on_corrupt="reset")
+        except (ConfigReadError, ConfigWriteRefused) as e:
+            print(f"❌ {e}{kept}", file=sys.stderr)
+            sys.exit(1)
+        keep = False
+        print(f"✅ Saved {config_path()}")
+    finally:
+        if not keep:
+            shutil.rmtree(staging, ignore_errors=True)
 
 
 def _defaults_cmd(args: argparse.Namespace) -> None:
@@ -663,7 +905,8 @@ def _defaults_cmd(args: argparse.Namespace) -> None:
         for centry, stored in coerced:
             print(
                 f"⚠️  {centry.dotted_key} ({stored!r}) cannot be kept — "
-                f"the loader replaces it. Use --adopt to drop it."
+                f"the loader replaces it. Use --adopt to drop it.",
+                file=sys.stderr if wanted else sys.stdout,
             )
         coerced = []
         if not drifted:

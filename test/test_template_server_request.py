@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -962,6 +963,34 @@ def test_the_owner_step_refuses_a_malformed_write(env, tmp_path):
     assert additions.read_additions("kirocrew-conductor") == {}
 
 
+@pytest.mark.parametrize("server", [{}, [], 5, None], ids=["dict", "list", "int", "null"])
+def test_a_masked_write_with_a_non_string_server_is_refused_like_the_unmasked_one(
+    env, tmp_path, monkeypatch, server
+):
+    """The same 400 ``server_invalid`` either path gives, and no config lookup."""
+    from kiro_crew.dashboard.handlers import member_capability_catalog as catalog
+    from kiro_crew.dashboard.handlers.member_capability_catalog import SETTING_MASK
+
+    def lookup(*_a, **_k):
+        raise AssertionError("a non-string server must not reach the config lookup")
+
+    monkeypatch.setattr(catalog, "gateway_entry_behind", lookup)
+    store = CardStore(tmp_path / "c.json")
+    masked = {**GATEWAY_ENTRY, "env": {"API_KEY": SETTING_MASK}}
+
+    async def go(c):
+        out = []
+        for entry in (masked, GATEWAY_ENTRY):
+            r = await c.post(ADD, json={"server": server, "entry": entry}, headers=OWNER_WITH_CARD)
+            out.append((r.status, await r.json()))
+        return out
+
+    for status, body in _bare(store, go):
+        assert (status, body["code"]) == (400, "addition_refused")
+        assert "server_invalid" in json.dumps(body)
+    assert additions.read_additions("kirocrew-conductor") == {}
+
+
 def test_an_unwritable_record_is_a_503_on_both_steps(env, tmp_path, monkeypatch):
     store = CardStore(tmp_path / "c.json")
 
@@ -1145,3 +1174,113 @@ def test_a_cardless_write_other_than_the_settings_one_needs_a_card(env, tmp_path
 
     assert _bare(store, go) == (403, "card_required")
     assert additions.list_additions() == {}
+
+
+# ── a gateway server with env or headers: masked on the card, filled in at Apply ──
+
+_REAL_RESOLVE = capability_catalog.resolve_server
+
+#: The gateway's own entry for "files" when it carries settings. Only Apply reads its values.
+SETTINGS_ENTRY = {
+    **GATEWAY_ENTRY,
+    "env": {"FEATURE_X_ROLLOUT": "rollout-42", "API_KEY": "sk-live-123"},
+    "headers": {"X-Trace": ""},
+    "autoApprove": ["read_file"],
+    "disabledTools": ["list_dir"],
+}
+
+
+@pytest.fixture
+def gateway(env, monkeypatch):
+    """The real ``resolve_server`` over a gateway whose ``files`` entry the test sets."""
+    live: dict[str, Any] = {"entry": json.loads(json.dumps(SETTINGS_ENTRY)), "status": "enabled"}
+    monkeypatch.setattr(capability_catalog, "resolve_server", _REAL_RESOLVE)
+    monkeypatch.setattr(
+        "kiro_crew.dashboard.handlers.mcp._find_server_spec_anywhere",
+        lambda name: json.loads(json.dumps(live["entry"])) if name == "files" else None,
+    )
+    monkeypatch.setattr(
+        "kiro_crew.mcp_discovery.list_servers",
+        lambda: [SimpleNamespace(name="files", status=live["status"])],
+    )
+    return live
+
+
+def test_a_gateway_server_s_settings_are_masked_on_the_card_and_filled_in_at_apply(
+    gateway, tmp_path
+):
+    store = CardStore(tmp_path / "c.json")
+
+    async def go(c):
+        status, card = await _request(c)
+        assert status == 200, card
+        step = card["plan"]["apply"][0]
+        applied = await c.post(step["path"], json=step["body"], headers=_card_headers(card))
+        assert applied.status == 200, await applied.text()
+        return card, store.public(store.get(card["id"])), store.get(card["id"])
+
+    card, after, record = _run(store, go)
+    # The card, and so the agent, sees which settings the server takes, never a value.
+    assert card["params"]["entry"]["env"] == {
+        "FEATURE_X_ROLLOUT": "[REDACTED]",
+        "API_KEY": "[REDACTED]",
+    }
+    assert card["params"]["entry"]["headers"] == {"X-Trace": ""}
+    for value in ("rollout-42", "sk-live-123"):
+        assert value not in json.dumps(card) and value not in json.dumps(record)
+    # Apply records the gateway's own values, without its approval switches.
+    recorded = dict(additions.read_additions("kirocrew-conductor")["files"].entry)
+    assert recorded == {**GATEWAY_ENTRY, "env": SETTINGS_ENTRY["env"], "headers": {"X-Trace": ""}}
+    assert after["status"] == "applied" and after["plan"]["undo"]
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"args": ["-y", "@modelcontextprotocol/server-filesystem", "/"]},
+        {"env": {"FEATURE_X_ROLLOUT": "rollout-42"}},
+        {"env": {**SETTINGS_ENTRY["env"], "EXTRA": "x"}},
+        {"status": "disabled"},
+    ],
+    ids=["args", "key_removed", "key_added", "switched_off"],
+)
+def test_apply_refuses_a_gateway_entry_that_changed_since_the_card(gateway, tmp_path, change):
+    store = CardStore(tmp_path / "c.json")
+
+    async def go(c):
+        _status, card = await _request(c)
+        if "status" in change:
+            gateway["status"] = change["status"]
+        else:
+            gateway["entry"] = {**gateway["entry"], **change}
+        step = card["plan"]["apply"][0]
+        return await _code(
+            await c.post(step["path"], json=step["body"], headers=_card_headers(card))
+        )
+
+    assert _run(store, go) == (409, "entry_changed")
+    assert additions.read_additions("kirocrew-conductor") == {}
+
+
+def test_a_setting_value_repeated_in_an_argument_is_not_copied(gateway, tmp_path):
+    """An argument would show what the masked env hides, so the server is refused."""
+    gateway["entry"] = {
+        "command": "npx",
+        "args": ["srv", "--header", "X-Api: sk-live-123"],
+        "env": {"API_KEY": "sk-live-123"},
+    }
+    store = CardStore(tmp_path / "c.json")
+    status, body = _run(store, lambda c: _request(c))
+    assert (status, body["code"]) == (400, "carries_settings")
+    assert "sk-live-123" not in json.dumps(body)
+
+
+def test_a_setting_value_no_record_can_hold_raises_no_card(gateway, tmp_path):
+    """Judged on the gateway's real value, not the short mask the card would show."""
+    long_value = "k" * 4097
+    gateway["entry"] = {**GATEWAY_ENTRY, "headers": {"Authorization": long_value}}
+    store = CardStore(tmp_path / "c.json")
+    status, body = _run(store, lambda c: _request(c))
+    assert (status, body["code"]) == (400, "entry_not_recordable")
+    assert store.pending(SLOT) == []
+    assert long_value not in json.dumps(body)

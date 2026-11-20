@@ -9,6 +9,7 @@ import json
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any
 
+from kiro_crew.dashboard.channel_prompt import PROMPT_ON_CHANNEL_META_KEY, batch_prompt_on_channel
 from kiro_crew.dashboard.chat_delivery import (
     BACKGROUND_START_TASKS,
     START_BACKGROUND_META_KEY,
@@ -38,7 +39,10 @@ from kiro_crew.dashboard.chat_utils import (
 )
 from kiro_crew.dashboard.chat_utils_injected_rows import (
     AUTOMATION_STEER_META,
-    WORKFLOW_FOLLOWUP_KIND,
+    GATEWAY_PROMPT_INJECT_KINDS,
+    REQUEUED_STEER_ROW_MID_META,
+    RESOURCE_WAKE_KIND,
+    resource_inject_row,
 )
 from kiro_crew.dashboard.chat_utils_slots import dashboard_slot_key
 from kiro_crew.dashboard.queue_edit_hold import edit_hold_blocks_user_turn
@@ -50,6 +54,7 @@ from kiro_crew.dashboard.session_directive_apply import (
 from kiro_crew.dashboard.slot_queue_repository import (
     RESTORED_QUEUE_KEY,
     RESTORED_SEND_CHOSEN_KEY,
+    run_now_chosen_id,
     source_channels_of,
 )
 from kiro_crew.dashboard.state import CRON_NOTIFY_RE, SUBAGENT_COMPLETION_PREFIXES
@@ -92,6 +97,12 @@ if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_turn.steer_queue import (
         _actor_for_queue_items,
         _drop_stale_admissions,
+        _drop_stale_resource_wakes,
+    )
+    from kiro_crew.dashboard.chat_turn.superseded_steer import (
+        _carry_superseded_steer_meta,
+        _requeued_steer_row,
+        _retire_superseded_steer_row,
     )
     from kiro_crew.dashboard.chat_turn.turn_marker import _gateway_shutdown_requested
 
@@ -359,6 +370,10 @@ _RESTORED_DRAIN_IDS: ContextVar[dict[str, frozenset[str]]] = ContextVar(
     "restored_drain_ids", default={}
 )
 
+# An idle delivery collects the ids of the entries its drain started here, so it
+# can tell its own entry starting from a sweep dropping it while another starts.
+_STARTED_QUEUE_IDS: ContextVar[list[str] | None] = ContextVar("started_queue_ids", default=None)
+
 
 async def _drain_parked_queues(state: DashboardState, slot_keys: list[str]) -> None:
     """Start the next queued turn on each parked slot that is still idle.
@@ -462,9 +477,9 @@ def _is_own_recovery(items: "list[dict]", predecessor_actor: str, predecessor_tu
 _REPLAYS_COMPLETION_KEY = "_replays_completion"
 
 #: Process-local key on a synthetic-recovery queue entry that a loop's own cycle
-#: queued for itself: that loop's ``(id, config generation)``, so the recovery's
-#: fault is charged to the loop like the cycle it retries. Never persisted: a kinded
-#: entry is not durable.
+#: queued for itself, or on a requeued automation steer (a loop's steered wake):
+#: that loop's ``(id, config generation)``, so the turn's fault is charged to the
+#: loop like the cycle it carries. Never persisted: it is not a durable queue key.
 _RECOVERED_WAKE_KEY = "_recovered_wake"
 
 
@@ -536,15 +551,11 @@ def _record_queued_crew_steers(state: DashboardState, consumed: list[dict]) -> N
         if not isinstance(text, str) or not text:
             continue
         try:
-            from kiro_crew.dashboard.handlers import crew_workers
+            from kiro_crew.dashboard.chat_handlers import record_crew_steer_later
 
-            task = asyncio.get_running_loop().create_task(
-                crew_workers.person_steer(state, root, worker, text)
-            )
-            tasks = getattr(state, "_background_tasks", None)
-            if isinstance(tasks, set):
-                tasks.add(task)
-                task.add_done_callback(tasks.discard)
+            # The one ordered path every steer record takes, so this one lands
+            # after the worker's earlier steers and a failure reaches the composer.
+            record_crew_steer_later(state, root, worker, text)
         except Exception:
             logger.warning("crew steer: a queued steer was not recorded", exc_info=True)
 
@@ -583,7 +594,7 @@ async def _start_next_queued_turn(
     if _gateway_shutdown_requested(state):
         return False
 
-    # An Ultra Mode "Pause all" holds the root and every member it stopped: the
+    # A conductor mode "Pause all" holds the root and every member it stopped: the
     # queue stays as it is until Resume all (or the member's own Continue) lets it go.
     # Imported here: this module's functions run on the composing module's globals.
     from kiro_crew import crew_pause
@@ -633,6 +644,7 @@ async def _start_next_queued_turn(
     # Everything below — the note flush peeking at queue[0], the user-intervention
     # purge, the dequeue itself — must see only entries that may still deliver.
     _drop_stale_admissions(state, slot, selected_id=required_queue_id)
+    _drop_stale_resource_wakes(state, slot)
     # The sweep may have dropped that recovery, leaving a new turn at the head.
     if (
         predecessor_actor
@@ -715,6 +727,12 @@ async def _start_next_queued_turn(
     if await _drop_revoked_replays(state, slot):
         return False
 
+    # A subscription removal or pause can commit during any await since the first
+    # sweep, so this last synchronous point before the dequeue checks the wakes again.
+    _drop_stale_resource_wakes(state, slot)
+    if not slot._queue:
+        return False
+
     # Asked again after the parked-work probes above: a Pause all published
     # during them holds this drain too, with the queue left as it is.
     if slot._queue and crew_pause.holds_slot(slot):
@@ -755,6 +773,15 @@ async def _start_next_queued_turn(
     if auto_priority:
         required_queue_id = priority_id
         allow_user_during_subagents = True
+    elif (
+        not required_queue_id
+        and not teardown_held
+        and not edit_held
+        and (chosen := run_now_chosen_id(slot))
+    ):
+        # A ``session_run_queued`` choice runs next, as its idle path would run it.
+        # Held like the promotion above: the mark stays and runs once the hold lifts.
+        required_queue_id, allow_user_during_subagents = chosen, True
 
     # A completion counts as a child until it has run: while it is still being
     # handed to this tab, or waits in the queue behind another system entry, a
@@ -874,6 +901,11 @@ async def _start_next_queued_turn(
         )
     if next_msg is None:
         return False
+    started_queue_ids = _STARTED_QUEUE_IDS.get()
+    if started_queue_ids is not None:
+        started_queue_ids.extend(item["id"] for item in consumed)
+        # The turn spawned below copies this context, and its own drains report to nobody.
+        _STARTED_QUEUE_IDS.set(None)
     _record_queued_crew_steers(state, consumed)
 
     # A successor turn is now certain to dispatch (every no-successor path above
@@ -955,7 +987,7 @@ async def _start_next_queued_turn(
     # and the restore drops the actor stamp, so the text is all that is left and
     # it cannot name an event.
     _not_an_event = (
-        _actor_for_queue_items(consumed) == "app"
+        _actor_for_queue_items(consumed) in ("app", "resource")
         or any(item.get(RESTORED_QUEUE_KEY) for item in consumed)
         or any(responsive_chat.priority_entry(item) for item in consumed)
     )
@@ -970,16 +1002,28 @@ async def _start_next_queued_turn(
     # message never merges (it is a system-injection kind, so the merge stops
     # at it), so `consumed` holds it alone.
     is_app_message = any(item.get("kind") == MCP_APP_MESSAGE_KIND for item in consumed)
+    # A queued MCP resource-subscription wake: the same structural rule as the app
+    # message above, for the same reason (its URI is server-written).
+    is_resource_wake = any(item.get("kind") == RESOURCE_WAKE_KIND for item in consumed)
     # A re-routed automation refusal (``session_directive_apply``): structural
     # kind, like the app message above, so it drains as an ``inject`` row the
     # crewmate's turn carries rather than a ``user`` row shown as the person's
     # own bubble. Never merges (a system-injection kind), so ``consumed`` holds
     # it alone.
     is_automation_notice = any(item.get("kind") == AUTOMATION_NOTICE_KIND for item in consumed)
-    # The gateway's follow-up prompt after a workflow result: structural kind
-    # again, so it drains as the same `inject` row its idle twin writes
-    # (`_ChatSlot.enqueue_or_run_prompt`). Never merges (a system-injection kind).
-    is_workflow_followup = any(item.get("kind") == WORKFLOW_FOLLOWUP_KIND for item in consumed)
+    # A gateway prompt (the follow-up after a workflow result, a heartbeat
+    # prompt): structural kind again, so it drains as the same `inject` row its
+    # idle twin writes (`_ChatSlot.enqueue_or_run_prompt`). Never merges (a
+    # system-injection kind), so `consumed` holds it alone.
+    gateway_inject_kind = next(
+        (
+            GATEWAY_PROMPT_INJECT_KINDS[item["kind"]]
+            for item in consumed
+            if item.get("kind") in GATEWAY_PROMPT_INJECT_KINDS
+        ),
+        None,
+    )
+    is_gateway_prompt = gateway_inject_kind is not None
     # A requeued automation steer (a work-ledger wake the turn never took): its
     # entry names the `meta.nudge` its row carries, so it drains as the same
     # nudge row it was steered as, never as the person's `user` row. Never
@@ -993,15 +1037,36 @@ async def _start_next_queued_turn(
         None,
     )
     is_automation_steer = automation_nudge is not None
-    if not (
+    # A steer the RPC accepted already has its transcript row; the turn that was
+    # meant to take it ended first, so the requeue marked that row `requeued` and
+    # named it on the entry. This turn still writes its own row below, AFTER the
+    # stop card, so turn grouping and the interrupted/stopped tail walks see the
+    # same shape as any other queued send. The old row is retired once that row
+    # lands, so the text shows once. Only when the entry drains ALONE and the old
+    # row still holds exactly the text this turn runs: an edited card, a merge
+    # with later sends, or a redaction that changed the text keep both rows,
+    # because then the old row holds different text from what runs. And only when
+    # this drain writes a row of the old row's own role: a `user` row for the
+    # person's or a peer's steer, a `nudge` row for an automation steer (a
+    # work-ledger wake). Typed text that opens with a cron or sub-agent prefix
+    # drains as an event row, and hiding the old row would leave no copy drawn as
+    # the person's own words.
+    _drains_as_user = not (
         is_cron
         or is_subagent
         or is_recovery
         or is_app_message
+        or is_resource_wake
         or is_automation_notice
         or is_automation_steer
-        or is_workflow_followup
-    ):
+        or is_gateway_prompt
+    )
+    superseded_steer_row = (
+        _requeued_steer_row(slot, consumed, next_msg, "nudge" if is_automation_steer else "user")
+        if _drains_as_user or is_automation_steer
+        else None
+    )
+    if _drains_as_user:
         # A user message after the last completion takes over from the armed
         # synthesis and ends its batch, so its count starts over. Only the
         # caller that read the fire gate as `clear` with the floor held says so
@@ -1047,9 +1112,10 @@ async def _start_next_queued_turn(
             or is_subagent
             or is_recovery
             or is_app_message
+            or is_resource_wake
             or is_automation_notice
             or is_automation_steer
-            or is_workflow_followup
+            or is_gateway_prompt
             or responsive_chat.reusable_row(slot, consumed, next_msg) is not None,
         }
         # The client rebuilds the drained entry as a user row from this frame
@@ -1066,6 +1132,15 @@ async def _start_next_queued_turn(
         _pop_send_id = normalize_send_id((item.get("meta") or {}).get("sendId"))
         if _pop_send_id:
             _pop_meta["sendId"] = _pop_send_id
+        # The entry's server-stamped Shared Crew author, so the rebuilt row
+        # names its sender as the stored row and a `chat_message` echo do.
+        # Without it a teammate's queued send shows no byline on an open tab
+        # until a reload.
+        from kiro_crew.shared_crew.attribution import message_author
+        from kiro_crew.shared_crew.contracts import MESSAGE_AUTHOR_META_KEY
+
+        if isinstance((item.get("meta") or {}).get(MESSAGE_AUTHOR_META_KEY), dict):
+            _pop_meta[MESSAGE_AUTHOR_META_KEY] = message_author(item["meta"]).to_public_dict()
         # A peer's queued ``session_send`` names its sender (``meta.relay``, set
         # only by the gateway's delivery path; an edit drops it). The rebuilt row
         # is that one entry's text, so its own sender rides its own pop, and the
@@ -1081,6 +1156,9 @@ async def _start_next_queued_turn(
             )
             if _pop_relay_record is not None:
                 _pop_meta["relay"] = _pop_relay_record
+        if superseded_steer_row is not None:
+            # The rebuilt row must carry these before the drain hides the old row.
+            _carry_superseded_steer_meta(superseded_steer_row, _pop_meta)
         if _pop_meta:
             _pop["meta"] = _pop_meta
         state.broadcast_ws("queue_pop", _pop)
@@ -1107,7 +1185,14 @@ async def _start_next_queued_turn(
         row_role = "nudge"
     elif is_subagent:
         row_role = "subagent"
-    elif is_cron or is_recovery or is_app_message or is_automation_notice or is_workflow_followup:
+    elif (
+        is_cron
+        or is_recovery
+        or is_app_message
+        or is_resource_wake
+        or is_automation_notice
+        or is_gateway_prompt
+    ):
         row_role = "inject"
     else:
         row_role = "user"
@@ -1123,7 +1208,9 @@ async def _start_next_queued_turn(
         # `_prepare_messages` replace the stored meta on HTTP rebuild,
         # dropping `injectKind` and the row's collapse/fold exemptions.
         row_cls = app_inject_row(app_label or "app")[1]
-    elif is_recovery or is_automation_notice or is_workflow_followup:
+    elif is_resource_wake:
+        row_cls = resource_inject_row("", "")[1]
+    elif is_recovery or is_automation_notice or is_gateway_prompt:
         row_cls = "msg msg-inject"
     else:
         row_cls = "msg msg-u"
@@ -1160,6 +1247,7 @@ async def _start_next_queued_turn(
         CHANNEL_RECIPIENT_META_KEY,
         QUEUED_CONTAINMENT_META_KEY,
         SEND_ORIGIN_META_KEY,
+        SESSION_SEND_QUEUED_META,
         audit_queued_allow,
     )
 
@@ -1259,6 +1347,12 @@ async def _start_next_queued_turn(
     # Read off the consumed entries (``_batch_recovery_echo_owed``); the merged
     # row's union says nothing about each entry, so it does not ride along.
     _drained_meta.pop(MIRROR_ECHO_OWED_META_KEY, None)
+    # Read off the consumed entries too (``batch_prompt_on_channel``).
+    _drained_meta.pop(PROMPT_ON_CHANNEL_META_KEY, None)
+    # Queue plumbing: read above to pick the row, never part of a row's meta.
+    _drained_meta.pop(REQUEUED_STEER_ROW_MID_META, None)
+    # Queue plumbing for ``session_queue``'s ownership read; never row meta.
+    _drained_meta.pop(SESSION_SEND_QUEUED_META, None)
     # Queue plumbing like the steer mark above, read the way the channel origin is:
     # ANY consumed entry a channel hand-off stamped keeps the merged text content,
     # so a batch cannot smuggle a channel's "/clear" into a command by sitting
@@ -1277,6 +1371,10 @@ async def _start_next_queued_turn(
         _drained_meta.update(
             quote_meta({"quote": _drained_meta.pop("quote")}, user_origin=deliver_as_typed)
         )
+    if superseded_steer_row is not None:
+        # The old row is about to be hidden, so the row that stays drawn takes its
+        # carried meta. The quote is already in its stored form for this text.
+        _carry_superseded_steer_meta(superseded_steer_row, _drained_meta)
     if _drained_ids:
         _drained_meta.pop("steer_delivery_id", None)
         _drained_meta["steer_delivery_ids"] = _drained_ids
@@ -1317,10 +1415,12 @@ async def _start_next_queued_turn(
             # payload (that is what suppresses the channel mirror), but its
             # inject identity is its own, matching the direct-dispatch twin.
             _inject_kind = "mcp_app"
+        elif is_resource_wake:
+            _inject_kind = "resource"
         elif is_automation_notice:
             _inject_kind = "automation_notice"
-        elif is_workflow_followup:
-            _inject_kind = "workflow"
+        elif gateway_inject_kind is not None:
+            _inject_kind = gateway_inject_kind
         elif synthetic_payload:
             _inject_kind = "recovery"
         else:
@@ -1330,6 +1430,20 @@ async def _start_next_queued_turn(
             _inject_meta["cronLabel"] = cron_label
         elif is_app_message:
             _inject_meta["appLabel"] = app_label or "app"
+        elif is_resource_wake:
+            # The identity the producer stamped on the entry: the keys
+            # `resource_inject_row` gives a resource wake's row.
+            _resource_meta = next(
+                (
+                    item.get("meta") or {}
+                    for item in consumed
+                    if item.get("kind") == RESOURCE_WAKE_KIND
+                ),
+                {},
+            )
+            for _field in ("resourceServer", "resourceSubscription"):
+                if isinstance(_resource_meta.get(_field), str):
+                    _inject_meta[_field] = _resource_meta[_field]
         _drained_meta.update(_inject_meta)
     elif row_role == "user" and directive_user_origin:
         # The direct-send path stamps HUMAN_TURN_META_KEY on a user row whenever
@@ -1361,6 +1475,8 @@ async def _start_next_queued_turn(
                 row_cls,
                 meta=_drained_meta or None,
             )
+    if superseded_steer_row is not None and superseded_steer_row is not current_row:
+        _retire_superseded_steer_row(state, slot, superseded_steer_row, current_row)
 
     # Per-turn consumption cell for a drained sub-agent completion (see
     # _arm_queued_delivery_settlement): owned by THIS turn, so a successor turn
@@ -1428,6 +1544,9 @@ async def _start_next_queued_turn(
     # set only when every consumed entry carries the stamp, so it is echoed once.
     if _batch_recovery_echo_owed(consumed):
         _run_kwargs["_recovery_echo_owed"] = True
+    # A channel challenge link's prompt is already in the thread it came from.
+    if batch_prompt_on_channel(consumed):
+        _run_kwargs["_prompt_on_channel"] = True
     # A recovery of a Dashboard card's reply is still that card's words. ANY consumed
     # entry carrying the mark makes the whole drained turn untrusted (it can only
     # add prompts, never remove one), and it survives a restart because a stamp
@@ -1485,7 +1604,10 @@ async def _start_next_queued_turn(
         _run_kwargs["_synthetic_recovery_turn"] = True
         if len(consumed) == 1 and consumed[0].get(_REPLAYS_COMPLETION_KEY) is True:
             _run_kwargs["_replays_completion"] = True
-        if len(consumed) == 1 and consumed[0].get(_RECOVERED_WAKE_KEY):
+    # Read only while the entry is still the recovery or the wake: a person's edit
+    # takes the automation origin off a requeued wake, and its words charge no loop.
+    if (is_recovery or is_automation_steer) and len(consumed) == 1:
+        if consumed[0].get(_RECOVERED_WAKE_KEY):
             _run_kwargs["_recovered_wake"] = consumed[0][_RECOVERED_WAKE_KEY]
     if _possibly_delivered_steer:
         _run_kwargs["_steer_possibly_delivered"] = True
@@ -1520,13 +1642,32 @@ async def _start_next_queued_turn(
     # this turn's own call, so it ends with this dispatch (``turn_entry`` adopts
     # it only for a user-sent opener).
     _run_kwargs["_directive_owner_origin"] = directive_owner_origin
-    with independent_turn(), initiated_by(queued_initiator(consumed)), queued_work(consumed):
+    from kiro_crew.tracing import steps as trace_steps
+    from kiro_crew.tracing import subagents as trace_subagents
+    from kiro_crew.tracing import workflows as trace_workflows
+
+    # The sub-agent results, or the workflow run, these entries deliver: the
+    # turn's trace joins that run's. Their queue wait and senders ride its turn span.
+    with (
+        independent_turn(),
+        initiated_by(queued_initiator(consumed)),
+        queued_work(consumed),
+        trace_subagents.delivered(item.get("id") for item in consumed),
+        trace_workflows.delivering(trace_workflows.run_of(consumed)),
+        trace_steps.drained(consumed),
+    ):
         task = spawn_guarded_turn(
             state,
             slot,
             _run_chat(state, slot, next_msg, **_run_kwargs),
         )
+    # A retry the ending turn queued for itself (``_is_own_recovery``) is that
+    # turn again under a new generation: it keeps the turn's first generation.
+    lineage = slot._turn_lineage_generation()
+    own_retry = _is_own_recovery(consumed, predecessor_actor, predecessor_turn_id)
     slot.task = task
+    if own_retry:
+        slot._turn_lineage = (slot._turn_generation, lineage)
     if _run_kwargs.get("_turn_start_background"):
         BACKGROUND_START_TASKS.add(task)
     # A recovery replay of a Regenerate's message takes over its target now
@@ -1542,4 +1683,11 @@ async def _start_next_queued_turn(
         # row's CONTENT, which is what a pre-consumption retry re-queues: its
         # queue-entry id is freshly minted and would match no debt.
         _arm_queued_delivery_settlement(state, slot, task, _settleable, _consumed)
+    # The slot now reads running. A turn started on an IDLE slot has no other
+    # push until its own end (``_finish_queue_cycle``), so the Sessions list
+    # would show it idle for the whole turn. Coalesced per window, so
+    # a caller that also pushes adds no extra broadcast. The suspend block logs
+    # a failing flush instead of raising it: the turn has already started.
+    with state.suspend_slots_push():
+        state.push_slots_update()
     return True

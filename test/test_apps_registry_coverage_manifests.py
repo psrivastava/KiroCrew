@@ -5,6 +5,7 @@ merging and enriching a manifest with its install status and trust fields.
 
 from __future__ import annotations
 
+import codecs
 import json
 import os
 import time
@@ -346,10 +347,13 @@ def _tmp_clone_dir(monkeypatch, tmp_path, name: str = "clone") -> Path:
 
 class TestFetchAppManifest:
     @pytest.mark.asyncio
-    async def test_local_checkout_is_used_when_origin_and_branch_match(self, monkeypatch, tmp_path):
+    @pytest.mark.parametrize("mark", [b"", codecs.BOM_UTF8], ids=["plain", "bom"])
+    async def test_local_checkout_is_used_when_origin_and_branch_match(
+        self, monkeypatch, tmp_path, mark
+    ):
         src = tmp_path / "app-sources" / "demo"
         src.mkdir(parents=True)
-        (src / "app.json").write_text(json.dumps({"name": "demo"}), encoding="utf-8")
+        (src / "app.json").write_bytes(mark + json.dumps({"name": "demo"}).encode("utf-8"))
         monkeypatch.setattr(registry, "app_source_dir", lambda n: src)
 
         async def _origin_matches(dest, git_url):
@@ -361,8 +365,13 @@ class TestFetchAppManifest:
         monkeypatch.setattr(registry, "_clone_origin_matches", _origin_matches)
         monkeypatch.setattr(registry, "_clone_branch_matches", _branch_matches)
 
+        # No remote: a local read that fails returns None instead of cloning.
         got = await registry._fetch_app_manifest(
-            "o/demo", "main", app_name="demo", git_url="https://github.com/o/demo.git"
+            "o/demo",
+            "main",
+            app_name="demo",
+            git_url="https://github.com/o/demo.git",
+            allow_remote=False,
         )
         assert got == {"name": "demo"}
 
@@ -419,11 +428,12 @@ class TestFetchAppManifest:
         assert got is None
 
     @pytest.mark.asyncio
-    async def test_successful_clone_reads_the_manifest(self, monkeypatch, tmp_path):
+    @pytest.mark.parametrize("mark", [b"", codecs.BOM_UTF8], ids=["plain", "bom"])
+    async def test_successful_clone_reads_the_manifest(self, monkeypatch, tmp_path, mark):
         monkeypatch.setattr(registry, "is_clone_host_trusted", lambda url: True)
         clone = _tmp_clone_dir(monkeypatch, tmp_path)
-        (clone / "app.json").write_text(
-            json.dumps({"name": "demo", "version": "2.0.0"}), encoding="utf-8"
+        (clone / "app.json").write_bytes(
+            mark + json.dumps({"name": "demo", "version": "2.0.0"}).encode("utf-8")
         )
         _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
         got = await registry._fetch_app_manifest(
@@ -506,9 +516,13 @@ class TestFetchAppManifest:
             owner_designated=True,
         )
         assert got == {"name": "demo"}
-        # Exactly the builder's env plus the network entries the git spawn may add.
+        # Exactly the builder's env plus the network entries the git spawn may add,
+        # with the English locale the private-repo classifier reads git's output in.
         assert seen_env == [
-            registry._git_network_env({"SENTINEL": "owner"}, "https://github.com/o/demo.git")
+            {
+                **registry._git_network_env({"SENTINEL": "owner"}, "https://github.com/o/demo.git"),
+                "LC_ALL": registry._GIT_CLONE_LOCALE,
+            }
         ]
         assert grants == ["fetch_app_manifest"]
 
@@ -537,9 +551,13 @@ class TestFetchAppManifest:
         await registry._fetch_app_manifest(
             "o/demo", "main", git_url="https://github.com/o/demo.git"
         )
-        # Exactly the builder's env plus the network entries the git spawn may add.
+        # Exactly the builder's env plus the network entries the git spawn may add,
+        # with the English locale the private-repo classifier reads git's output in.
         assert seen_env == [
-            registry._git_network_env({"SENTINEL": "anon"}, "https://github.com/o/demo.git")
+            {
+                **registry._git_network_env({"SENTINEL": "anon"}, "https://github.com/o/demo.git"),
+                "LC_ALL": registry._GIT_CLONE_LOCALE,
+            }
         ]
         assert modes == ["strict"]
 
@@ -834,6 +852,93 @@ class TestManifestNegativeCache:
         assert started == [self._ROW["gitUrl"]]
 
 
+class _RefusedClone(_FakeProc):
+    """A clone that exits 128 with *stderr*."""
+
+    def __init__(self, stderr: bytes) -> None:
+        super().__init__(returncode=128)
+        self._stderr = stderr
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        return b"", self._stderr
+
+
+class TestSshSignInRefusal:
+    """ssh refuses a sign-in before it names a repository, so a listing asks a
+    refusing ssh destination once instead of cloning every app there."""
+
+    @staticmethod
+    def _rows(*urls: str) -> list[dict[str, str]]:
+        return [{"name": f"app{i}", "gitUrl": url} for i, url in enumerate(urls)]
+
+    async def _list(self, monkeypatch, tmp_path, stderr: bytes, rows) -> list[str]:
+        """Resolve *rows* in turn over clones that fail with *stderr*; the cloned URLs."""
+        monkeypatch.setattr(registry, "is_clone_host_trusted", lambda url: True)
+        _tmp_clone_dir(monkeypatch, tmp_path)
+        spawned = _fake_sandbox(monkeypatch, [_RefusedClone(stderr) for _ in rows])
+        for row in rows:
+            assert await registry._resolve_manifest(dict(row)) == row
+        return [argv[-2] for argv in spawned]
+
+    @pytest.mark.asyncio
+    async def test_rows_at_a_destination_that_refused_the_sign_in_clone_once(
+        self, cache_dir, monkeypatch, tmp_path
+    ):
+        refusal = (
+            b"git@git.example.com: Permission denied (publickey).\r\n"
+            b"fatal: Could not read from remote repository.\n"
+        )
+        rows = self._rows(
+            *(f"git@git.example.com:acme/app{i}.git" for i in range(4)),
+            "other@git.example.com:acme/app4.git",
+        )
+        cloned = await self._list(monkeypatch, tmp_path, refusal, rows)
+        # The other user at the same host signs in on its own.
+        assert cloned == [rows[0]["gitUrl"], rows[4]["gitUrl"]]
+        assert all(registry._read_manifest_negative_cache(row) for row in rows)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("branch", "echo"),
+        [
+            pytest.param(
+                "main",
+                b"fatal: 'acme/git@git.example.com: Permission denied (publickey).' "
+                b"does not appear to be a git repository\n",
+                id="path",
+            ),
+            pytest.param(
+                "missing\u2028Permission denied (publickey).\u2028missing",
+                "fatal: Remote branch missing\u2028Permission denied (publickey).\u2028"
+                "missing not found in upstream origin\n".encode(),
+                id="branch-with-line-separators",
+            ),
+            pytest.param(
+                "missing\nPermission denied (publickey).\nmissing",
+                b"fatal: Remote branch missing\nPermission denied (publickey).\n"
+                b"missing not found in upstream origin\n",
+                id="branch-spanning-lines",
+            ),
+        ],
+    )
+    async def test_index_text_git_echoes_that_spells_the_refusal_is_not_one(
+        self, cache_dir, monkeypatch, tmp_path, branch, echo
+    ):
+        # git echoes the index-chosen path and branch in its own errors; only ssh's
+        # whole line counts.
+        rows = self._rows(*(f"git@git.example.com:acme/app{i}.git" for i in range(2)))
+        rows[0]["branch"] = branch
+        assert await self._list(monkeypatch, tmp_path, echo, rows) == [r["gitUrl"] for r in rows]
+
+    @pytest.mark.asyncio
+    async def test_refresh_asks_a_refusing_destination_again(self, monkeypatch):
+        monkeypatch.setitem(registry._SSH_SIGN_IN_REFUSED, "git@git.example.com", time.monotonic())
+        monkeypatch.setattr(registry, "_effective_registries", lambda: [])
+        monkeypatch.setattr(registry, "list_registry", AsyncMock(return_value=[]))
+        await registry.refresh_registries()
+        assert registry._SSH_SIGN_IN_REFUSED == {}
+
+
 class TestMergeManifest:
     def test_display_fields_come_from_the_manifest(self):
         merged = registry._merge_manifest(
@@ -875,6 +980,11 @@ class TestMergeManifest:
         )
         assert merged["manifest"]["setup"] == {"onInstall": "echo hi"}
         assert merged["manifest"]["openCommand"] == "open"
+
+    def test_the_desktop_declaration_reaches_the_trust_prompt(self):
+        desktop = {"windows": [{"id": "pet", "entry": "pet.mjs", "kind": "background"}]}
+        merged = registry._merge_manifest({"name": "demo", "repo": "o/demo"}, {"desktop": desktop})
+        assert merged["manifest"]["desktop"] == desktop
 
     def test_no_manifest_key_means_no_manifest_block(self):
         merged = registry._merge_manifest({"name": "demo", "repo": "o/demo"}, {})

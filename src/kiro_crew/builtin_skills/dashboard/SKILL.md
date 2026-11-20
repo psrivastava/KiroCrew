@@ -94,15 +94,10 @@ page named for you) you never replace it unasked. When a Kiro Crew note in your
 turn says you can offer your own page, call `offer_dashboard_page` once: it
 raises one card asking whether to build a page around your goal in place of
 that template, and writes nothing. If the user says yes you are woken to write,
-save and apply it, with no second question, and post the same one message; a
-locked layout refuses the apply, and you say so once and stop. If they say no,
+save and apply it, with no second question, and post the same one message. If they say no,
 or the card expires, nothing changes and you are not asked again. A page the
 user asks for in chat needs no card: write it then.
 
-**Layout lock.** The person's **Lock dashboard layout** switch on Profile
-holds the current page. A `[DASHBOARD]` block marked LOCKED means apply and
-rollback answer `dashboard_locked`. The person can unlock it; you can explain
-that path and wait. Field writes and template previews remain available.
 Only the owner writes its page or values. A worker reports through
 `work_report`, whose record feeds the owner's folds.
 
@@ -369,7 +364,10 @@ The frame supplies `--bg`, `--bg-elevated`, `--card`, `--card-fg`, `--text`,
 `--text-strong`, `--muted`, `--border`, `--accent`, `--accent-subtle`, `--ok`,
 `--warn`, `--danger` and other host theme variables. Your CSS and `theme.tokens`
 can define custom properties too. An undefined variable uses its fallback;
-a defined custom variable is a normal design tool.
+a defined custom variable is a normal design tool. The frame marks its scheme
+on the body as `data-mode="light"` or `data-mode="dark"`; a Tailwind `dark:`
+utility and a `[data-mode=dark]` selector read it. No host element carries a
+class, so every class name is the page's own, `light` and `dark` included.
 
 Pair surface and text colours, either through host variables or your own
 scheme-aware definitions. Fixed colours can also form a readable self-contained
@@ -399,3 +397,55 @@ markup reads; the controller pushes only that list.
 
 Search documentation with `search_docs` and locate controls with `find_ui`
 when a fold, field or setting needs clarification.
+
+## 8. Phone widgets
+
+A page can also carry `widgets`: up to four home-screen widgets for the Kiro
+Mobile app, saved with the page by passing `widgets` to `dashboard_save`.
+Leave it out and the stored widgets stay as they are; `[]` removes them.
+Every Bot also gets a built-in `status` widget, so that id is taken. In this
+version only the Bot's owner sees widgets.
+
+A widget is layout, never values or HTML. Each block names one field of your
+`model.types`, and the gateway fills it from the same source the page reads.
+A block cannot show a field the model does not declare, nor one read from a
+tree-keyed fold such as `worktree`. The phone draws every string as plain
+text, so markup in a value shows as typed.
+
+```json
+{
+  "model": {"types": {
+    "pipeline_state": {"type": "enum", "choices": ["green", "amber", "red"], "source": {"agentic": true}},
+    "open_prs":       {"type": "number", "source": {"agentic": true}},
+    "waiting_items":  {"type": "array", "source": {"fold": "waiting", "path": "items"}}
+  }},
+  "widgets": [{
+    "id": "build-health",
+    "title": "Build health",
+    "sizes": ["small", "medium", "large"],
+    "blocks": [
+      {"type": "status", "label": "Pipeline", "field": "pipeline_state",
+       "tones": {"green": "ok", "amber": "warn", "red": "bad"}},
+      {"type": "metric", "label": "Open PRs", "field": "open_prs", "warn_at": 10, "bad_at": 20},
+      {"type": "list", "label": "Waiting on you", "field": "waiting_items", "item_text": "text", "max_items": 3}
+    ],
+    "tap": {"open": "bot"}
+  }]
+}
+```
+
+| Block `type` | Keys (required first) | Field type |
+|---|---|---|
+| `title` | `text` or `field`, exactly one | text, enum |
+| `metric` | `label`, `field`; `format` (`integer`, `decimal`, `percent`, `duration_s`, `text`), `unit`, `warn_at`, `bad_at`, `higher_is_worse` (default true) | number, text |
+| `list` | `label`, `field`, `item_text`; `item_detail`, `max_items` (1 to 5) | array |
+| `progress` | `label`, `field`, and `total` or `total_field` | number |
+| `sparkline` | `label`, `field`; `point`, `max_points` (2 to 48) | array |
+| `status` | `label`, `field`; `tones` (value to `ok`, `warn`, `bad`, `idle`, at most 8) | enum, bool, text |
+
+Limits: 1 to 6 blocks a widget; `id` of lowercase letters, digits and `-`, at
+most 32 characters and unique; `title` and `label` 1 to 40 characters, `unit`
+at most 8; `sizes` a subset of `small`, `medium`, `large`; `tap.open` is
+`bot` only; the stored `widgets` at most 16 KiB. A small widget draws the first
+2 blocks, a medium one 4, a large one all 6, so put the most important first.
+A refusal names the key path and the reason: fix that one and save again.

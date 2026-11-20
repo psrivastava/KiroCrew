@@ -8,7 +8,24 @@ browser-visible status/watch/plan surface.
 
 `defaultEnabled: false` and `platform.requiresDesktopApp: true` — it appears in
 the App Store, is opt-in, and its window surfaces need the Electron shell.
-`permissions`: `api`, `storage`, `events`, `cron`, `spawn`.
+`permissions`: `api`, `storage`, `events`, `cron`, `spawn`, and `desktopCapabilities`
+(`screenCapture`, `localFiles`, `gatewayChoice`): the shell features its windows use
+today (the snip surface, reveal-file and open-image, the instance switcher), declared so
+they are disclosed and approved like any app's (app-kit-platform §35). Its own
+main-process windows do not read that grant; they are the §9 exception until Mochi moves
+onto the window host. The reveal-file and open-image handlers run the shell's shared
+`website/electron/app-local-files.js`.
+
+Its global shortcuts (toggle the panel, hide all, screen capture; defaults
+`CommandOrControl+Shift+M/H/X` on macOS, `Alt+Shift+M/H/X` elsewhere, rebindable in
+Settings > Shortcuts) and the crew the pet shows live in the shell's
+`mochi-machine.json` (`machineStore.js`). At every start `mochi/hostHandOff.js` copies the crew and
+the rebinds into the host's gateway choice and bindings for `mochi`, never over a choice
+the user made through the host; an adopted Mochi declares the defaults above as each
+shortcut's `platformAccelerators` (app-kit-platform §35, "What still runs in the shell").
+`shortcuts.js` reserves the configured chords as a plain shell owner, so the host refuses
+them to any app, an adopted Mochi included, until the built-in steps aside for it
+(#37454) and can hand them over with `{ app: true }`.
 
 The desktop pet keeps polling the gateway while disabled so enabling Mochi in
 the App Store takes effect without restarting the shell. Probe diagnostics are
@@ -27,6 +44,30 @@ pointer to `self`. The pet overlay is a full-display window pinned at the
 machine with nothing to dismiss: a main-frame `did-fail-load` (gateway
 unreachable) and any `>=400` navigation both hide and latch the overlay, and
 the reconcile tick re-arms it once a target answers.
+
+**The pet stands down for a record the window host serves.** The host probe has a
+fourth, definite answer, `hosted`: this computer's Mochi record declares a manifest
+`desktop` block (`hostOwnsAppWindows`, app-kit-platform §35), so the desktop window
+host serves Mochi here, from whichever crew it chose. The reconcile then takes the
+full teardown whatever the pet shows, a remote's pet included, and backs off like the
+settled disabled state. The probe's answer is `instanceGate.localMochiState`. A
+remote whose Mochi record declares one reads as a definite
+`disabled` for the built-in pet (`instanceGate.parseMochiEnabled`), so the pet shows
+this computer's Mochi. The built-in record declares no block, so neither answer occurs
+until a record that declares one replaces it.
+
+## Adoption
+
+The wheel pins Mochi for adoption (`apps/adoption-pins.json`; app-kit-platform §35,
+"Mochi is adopted onto its own repository"): at a restart a host whose record is
+builtin-owned moves onto `KiroCrewCaptain/kirocrew-app-mochi`, keeping `data/`, the
+approved grants and `enabled`. The adopted record declares no `desktop` block, so on
+every desktop shell `localMochiState` answers `enabled` or `disabled` as for the built-in
+record, and the shell code in `website/electron/mochi/` keeps drawing the pet, the panel
+and the shortcuts from the window pages under `website/src/apps/mochi/`, over the
+adopted copy's routes (the wheel copy's table, served by the gateway's route registry).
+Both stay in this tree until the windows move onto the window host. A fix to Mochi lands
+in the app repository first; a change here needs its `App repo:` line (PR Hygiene).
 
 ## Layout
 

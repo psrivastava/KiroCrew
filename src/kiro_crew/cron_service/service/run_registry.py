@@ -9,8 +9,8 @@ patch of the member on the class or on an instance reaches every caller. A name
 tests patch on :mod:`kiro_crew.cron`, or one that module defines, is read through
 it on each call (``seams``).
 
-Instance fields written: ``_active_session_keys``, ``_finished_session_keys``, ``_push_refresh``,
-``_timeout_alert``.
+Instance fields written: ``_active_session_keys``, ``_finished_session_keys``,
+``_interrupt_alert``, ``_push_refresh``, ``_timeout_alert``.
 
 Instance fields read: ``_active_session_lock``, ``_history``, ``_runs``.
 """
@@ -180,6 +180,12 @@ def running_since(self: CronService, job_id: str) -> float | None:
     return self._runs.running_since(job_id)
 
 
+def run_trigger(self: CronService, job_id: str) -> str | None:
+    """How a job's running run was started (``"manual"`` or ``"scheduled"``), or None."""
+    claim = self._runs.claims.get(job_id)
+    return claim.trigger if claim is not None else None
+
+
 def set_refresh_callback(self: CronService, cb: Any) -> None:
     """Set the dashboard refresh callback."""
     self._push_refresh = cb
@@ -193,6 +199,17 @@ def set_timeout_alert(self: CronService, cb: Any) -> None:
     timeout reaches the history and the log and no one is told.
     """
     self._timeout_alert = cb
+
+
+def set_interrupt_alert(self: CronService, cb: Any) -> None:
+    """Set the coroutine function ``cb(job, detail)`` that tells the user a run was stopped.
+
+    The gateway sets its interrupted-run notice here. ``stop()`` cancels every run
+    with no cancel or reap flag, so a run that recorded no outcome of its own
+    leaves a ``cancelled`` history row and nothing retries it;
+    without this, that row is the only trace and no one is told.
+    """
+    self._interrupt_alert = cb
 
 
 def trigger_run(self: CronService, job_id: str, *, expected_owner: str | None = None) -> bool:

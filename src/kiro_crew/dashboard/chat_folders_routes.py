@@ -72,6 +72,7 @@ from kiro_crew.dashboard.mate_folders import (
     mate_home_id,
     refuses_write_into,
 )
+from kiro_crew.dashboard.mate_subfolder_delete import delete_empty_bot_subfolder, is_person_browser
 from kiro_crew.dashboard.snapshot_commit import (
     VocabularyDeleteCancellations,
     slots_with_a_close_in_flight,
@@ -80,7 +81,7 @@ from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.dashboard.token_auth import MEMBER_CHAT_PRINCIPAL_KEY
 from kiro_crew.dashboard.token_auth import effective_request_app as _effective_request_app
 from kiro_crew.dashboard.token_auth import folder_principal
-from kiro_crew.executors import subprocess_executor
+from kiro_crew.executors import discovery_executor
 from kiro_crew.instances.crew_ref import clean_crew_ref
 from kiro_crew.sel import sel
 
@@ -111,12 +112,13 @@ async def api_chat_folders(request: web.Request) -> web.Response:
     state: DashboardState = request.app["state"]
     # _folders_with_history_counts walks the on-disk session list (a synchronous
     # filesystem scan) that is user-triggered (every GET) and scales with the
-    # archived-session count. Offload it to keep the event loop responsive, using
-    # subprocess_executor (the pool for potentially-slow work) rather than
-    # maintenance_executor, whose fast periodic sweeps — the orphan reaper — must
-    # stay responsive and could otherwise be starved by frequent polling.
+    # archived-session count. Offload it to keep the event loop responsive, on
+    # discovery_executor, the pool for the dashboard's read-only filesystem scans:
+    # process-tree walks can hold every subprocess_executor worker past their
+    # callers' timeouts, and maintenance_executor's sweeps (the orphan reaper)
+    # must stay responsive.
     loop = asyncio.get_running_loop()
-    folders = await loop.run_in_executor(subprocess_executor(), _folders_with_history_counts, state)
+    folders = await loop.run_in_executor(discovery_executor(), _folders_with_history_counts, state)
     member_principal = str(request.get(MEMBER_CHAT_PRINCIPAL_KEY) or "")
     if member_principal.startswith("member:"):
         # The member also sees the folder its own session is filed in, and that
@@ -171,7 +173,7 @@ async def api_chat_folder_create(request: web.Request) -> web.Response:
     try:
         body = await request.json()
     except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
     if not isinstance(body, dict):
         # ``[]``, ``"s"``, ``5``, ``true`` and ``null`` are all valid JSON, so
         # the parse above succeeds and the ``body.get()`` below would raise
@@ -338,7 +340,7 @@ async def api_chat_folder_update(request: web.Request) -> web.Response:
     try:
         body = await request.json()
     except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
     if not isinstance(body, dict):
         # ``[]``, ``"s"``, ``5``, ``true`` and ``null`` are all valid JSON, so
         # the parse above succeeds and the ``body.get()`` below would raise
@@ -370,7 +372,9 @@ async def api_chat_folder_update(request: web.Request) -> web.Response:
     # stamped once at create from the authenticated caller and is not a field a
     # request can hand over, take, or clear.
     changes: dict[str, object] = {}
-    if "name" in body:
+    # Test the VALUE, like the MCP twin: ``str(None)`` would rename the folder
+    # to "None", so an explicit null leaves the name as it is.
+    if body.get("name") is not None:
         new_name = str(body["name"]).strip()[:100]
         if not new_name:
             return web.json_response({"error": "name required"}, status=400)
@@ -1259,8 +1263,15 @@ async def api_chat_folder_delete(request: web.Request) -> web.Response:
     if target is None:
         return web.json_response({"error": "not found"}, status=404)
     principal = folder_principal(state, request)
-    if is_mate_home(target) or refuses_write_into(state._folders, fid, principal):
+    if is_mate_home(target):
         return _mate_home_locked()
+    if refuses_write_into(state._folders, fid, principal):
+        # Inside a Bot's home: only the person's browser may delete it, and
+        # only empty. An internal request is an agent tool call, even one
+        # running in the person's own session.
+        if not is_person_browser(principal, request):
+            return _mate_home_locked()
+        return await delete_empty_bot_subfolder(state, request, fid)
     request_app = _effective_request_app(state, request)
     # Answered before a single slot is unfiled, so the common refusal costs no
     # rollback. Sound pre-lock because ``owner_app`` is stamped at create and no
@@ -1340,7 +1351,7 @@ async def api_chat_folder_delete(request: web.Request) -> web.Response:
         archived = (
             {}
             if not_yours
-            else await loop.run_in_executor(subprocess_executor(), _folder_history_counts, state)
+            else await loop.run_in_executor(discovery_executor(), _folder_history_counts, state)
         )
         if archived.get(fid, 0):
             return web.json_response(

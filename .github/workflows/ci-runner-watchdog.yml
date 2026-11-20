@@ -97,8 +97,10 @@ name: CI Runner Watchdog
 # and a watchdog that cancelled and re-ran itself would never finish a tick. For
 # each run older than 15 minutes it reads its jobs. A run is ORPHANED when a job
 # is still `queued`, carries a `codebuild-` label, and has waited more than 15
-# minutes (CodeBuild's measured queue-to-start here is under a minute). Oldest
-# first across every watched workflow, at most 5 per tick as one global cap, the
+# minutes (CodeBuild's measured queue-to-start here is under a minute). Push runs
+# first (their group is not cancelled by a later push) with one slot kept for
+# the oldest other run, oldest first within each event, across every watched
+# workflow, at most 5 per tick as one global cap, the
 # script cancels the run, waits for the cancellation to land, and re-runs it. The
 # re-run is a new attempt: every routed job asks for a label with the new attempt
 # suffix and GitHub emits fresh `workflow_job.queued` webhooks, so CodeBuild
@@ -114,8 +116,12 @@ name: CI Runner Watchdog
 # names. That outcome is a FAILURE and the tick exits nonzero whatever it managed
 # to classify first, because the same abort skips the cancelled-orphan recovery
 # pass and a cancelled run in the last tick-interval of its 90-minute window ages
-# out before any later tick reaches it. Every other status (401, 404, 5xx) and
-# every malformed payload still raises.
+# out before any later tick reaches it. The exception is a refusal whose
+# `X-RateLimit-Remaining` header is `0`: the shared installation quota is drained,
+# so a red tick would name no run to act on. It ends `aborted-quota-exhausted`, a
+# `::warning::` naming the remaining quota and reset time, not a failure; a run it
+# classified first keeps its own outcome, so a stuck orphan still reds the tick.
+# Every other status (401, 404, 5xx) and every malformed payload still raises.
 #
 # Slow is not dead. A `codebuild-` job queued past the threshold is also what
 # CodeBuild account-concurrency saturation looks like, and re-running saturated

@@ -27,7 +27,7 @@ from kiro_crew.mcp_gateway.backend import (
     BackendGone,
     has_recyclable_in_flight,
 )
-from kiro_crew.mcp_gateway.daemon import logger
+from kiro_crew.mcp_gateway.daemon import logger, session_describe
 from kiro_crew.mcp_gateway.daemon.admission_protocol import (
     _LEGACY_SPAWN_WAIT_SECS,
     _await_answering_pings,
@@ -51,7 +51,7 @@ from kiro_crew.mcp_gateway.daemon.identity import (
     _resolve_register_identity,
     _StubConn,
 )
-from kiro_crew.mcp_gateway.daemon.launch import TargetResolver
+from kiro_crew.mcp_gateway.daemon.launch import TargetResolver, bound_to_owner_port
 from kiro_crew.mcp_gateway.daemon.replacement import _ReplacementRefused
 from kiro_crew.mcp_gateway.daemon.wire import (
     _jsonrpc_error,
@@ -64,6 +64,7 @@ from kiro_crew.mcp_gateway.daemon.wire import (
 )
 from kiro_crew.mcp_gateway.pool import BackendPool, PoolKey
 from kiro_crew.mcp_gateway.prewarm import HotKeyStore
+from kiro_crew.start_priority import priority_from_wire
 
 if TYPE_CHECKING:
     from kiro_crew.mcp_gateway import gatewayd as facade
@@ -193,6 +194,10 @@ async def _handle_connection(
     # It arrives over the uid socket from the stub the rewriter wrote, which is
     # what makes it an answer the governed agent cannot author.
     stub_agent = str(register.get("agent_name") or "")
+    # Where this stub's spawn waits in the gate's queue: the priority its
+    # session start has (``kiro_crew.start_priority``). Not a pool dimension. A
+    # frame without the field, as an older stub sends, is background.
+    start_priority = priority_from_wire(register.get("start_priority"))
     # Absent ``poolable`` means this connection gets its own backend. Absence is
     # the safe default in both directions: an overlay written before the flag
     # existed never silently starts sharing, and a malformed frame cannot widen
@@ -382,6 +387,9 @@ async def _handle_connection(
     # below drains it and it cannot run while a wait is being served.
     pending: deque[bytes] = deque()
     try:
+        # Inside the ``try``: whatever tracking raises, the teardown below
+        # still clears the claim index and the keepalive probe table.
+        session_describe.track_live_conn(conn, register, private_backend=bool(exclusive_stub_uuid))
         while True:
             try:
                 line = pending.popleft() if pending else await reader.readuntil(b"\n")
@@ -487,6 +495,7 @@ async def _handle_connection(
                                 admission=admission,
                                 wait_deadline=deadline,
                                 on_queued=_on_queued if queue_aware else None,
+                                priority=start_priority,
                             ),
                             stub_uuid=stub_uuid,
                         )
@@ -546,6 +555,7 @@ async def _handle_connection(
                                 if admission is None
                                 else time.monotonic() + _LEGACY_SPAWN_WAIT_SECS
                             ),
+                            priority=start_priority,
                         ),
                         stub_uuid=stub_uuid,
                     )
@@ -573,14 +583,27 @@ async def _handle_connection(
             # a fresh backend without kiro-cli re-sending initialize.
             if msg.get("method") == "initialize":
                 captured_init = dict(msg)
-
-            # ``caller`` itself stays tokenless for the life of the connection:
-            # the token is attached to a per-forward copy, decided against the
-            # backend that receives THIS frame. A respawn hands the tokenless
-            # base on and re-decides for the replacement.
-            forward_caller = _caller_for_backend(backend, caller, conn)
+                session_describe.track_initialize(conn, captured_init)
 
             try:
+                if not bound_to_owner_port(backend):
+                    # The owner announced a new port after this connection
+                    # attached (``control._apply_owner_port``). The pool hands
+                    # this backend to no one else, but this connection still
+                    # holds it, and it dials the old port. Replaced through the
+                    # respawn below BEFORE the forward, so neither this frame
+                    # nor the caller block it would carry reaches a process
+                    # bound to a port that another process can now bind.
+                    raise BackendGone(
+                        f"bound to owner port {backend.owner_port}, "
+                        f"which is now {facade._OWNER_PORT}"
+                    )
+                # ``caller`` itself stays tokenless for the life of the
+                # connection: the token is attached to a per-forward copy,
+                # decided against the backend that receives THIS frame. A
+                # respawn hands the tokenless base on and re-decides for the
+                # replacement.
+                forward_caller = _caller_for_backend(backend, caller, conn)
                 await backend.forward_from_stub(
                     stub_uuid, msg, caller=forward_caller, tenant_nonce=conn.tenant_nonce
                 )
@@ -663,6 +686,7 @@ async def _teardown_connection(
     writer stops last.
     """
     _conn_index_discard(conn)
+    session_describe.forget_live_conn(conn)
     if probe is not None:
         _stub_probe_discard(probe)
     if backend is not None:

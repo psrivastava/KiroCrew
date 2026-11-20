@@ -19,7 +19,7 @@ import { disintegrate } from '../../lib/disintegrate'
 import type { Notification } from '../../types'
 import {
   parseTs, dateGroup, KIND_META, DEFAULT_META, fmtTime, stripMd, notePriority, noteText, safeInternalUrl,
-  MAC_ACTION_BTN_CLASS, decisionFailedCopy, decidedClearFailedCopy,
+  MAC_ACTION_BTN_CLASS, decisionFailedCopy, decidedClearFailedCopy, noteActionLabel,
 } from './notifMeta'
 import NotificationPermissionHint from './NotificationPermissionHint'
 import NotificationCard, { CARD_RADIUS, type NotificationCardAction } from './NotificationCard'
@@ -663,7 +663,7 @@ export default function NotificationFeed({ selectedTs, onSelect, variant = 'pane
                 // (a non-string label would crash React).
                 const urlActions = (Array.isArray(n.actions) ? n.actions : [])
                   .filter(a => typeof a?.id === 'string' && typeof a?.label === 'string' && typeof a?.url === 'string')
-                  .map(a => ({ ...a, safeUrl: safeInternalUrl(a.url) }))
+                  .map(a => ({ ...a, label: noteActionLabel(n, a), safeUrl: safeInternalUrl(a.url) }))
                   .filter(a => a.safeUrl)
                 const approveLabel = i18nT('components.notifications.notificationFeed.approve')
                 const rejectLabel = i18nT('components.notifications.notificationFeed.reject')
@@ -695,9 +695,9 @@ export default function NotificationFeed({ selectedTs, onSelect, variant = 'pane
                 ) : undefined
                 // Outside the row's Clickable in both variants: that control is
                 // role="button", whose descendants are presentational, so a
-                // notice inside it would never reach a screen reader. A refused
-                // decide or a failed decision renders an error, on the row it
-                // failed for. Below the row's
+                // notice inside it would never reach a screen reader. A failed
+                // decide renders an error and a gone one a status, on the row
+                // it was pressed on. Below the row's
                 // controls, as in the detail panel and the chat card, so a
                 // retry finds Approve/Reject where they were. No hand-off on
                 // any of the row's notices: the feed also renders in the topbar
@@ -720,15 +720,15 @@ export default function NotificationFeed({ selectedTs, onSelect, variant = 'pane
                       variant="inline"
                       className="mt-1"
                       testId="notif-approval-notice"
-                      message={decideReason !== null ? decisionFailedCopy(decideReason.reason, { targeted: !!n.approval_instance })
+                      message={decideReason !== null ? decisionFailedCopy(decideReason.reason)
                         : endedFailure !== null ? decisionFailedCopy(endedFailure, { ended: true }) : null}
                     />
-                    {/* A decide this tab sent was refused as no longer pending: that request
-                        failed, so it renders through the shared ErrorNotice.
-                        The open row's detail panel already says it, so the
-                        row does not repeat it. */}
-                    <ErrorNotice
-                      variant="inline"
+                    {/* A decide this tab sent found the approval gone: status,
+                        not an error, since nothing the user did failed. The
+                        open row's detail panel already says it, so the row
+                        does not repeat it. */}
+                    <StatusNotice
+                      tone="info"
                       className="mt-1"
                       testId="notif-approval-retired"
                       message={retired && !active ? i18nT('components.approvalCard.approval_no_longer_pending') : null}
@@ -744,11 +744,10 @@ export default function NotificationFeed({ selectedTs, onSelect, variant = 'pane
                       testId="notif-decision-recorded"
                       message={rowDecided ? i18nT('components.notifications.notificationFeed.decision_recorded') : null}
                     />
-                    {/* Boxed beside the boxed StatusNotice above it, so the
-                        two read as one pair; under a retired row's inline
-                        notice it stays inline. */}
+                    {/* Boxed beside the boxed StatusNotice above it (decision
+                        recorded, or no longer pending), so the two read as one
+                        pair. */}
                     <ErrorNotice
-                      variant={rowDecided ? 'block' : 'inline'}
                       className="mt-1"
                       testId="notif-dismiss-failed"
                       message={rowDismissFailed ? decidedClearFailedCopy() : null}

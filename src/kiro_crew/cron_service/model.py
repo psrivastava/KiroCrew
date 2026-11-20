@@ -38,6 +38,37 @@ _NEVER_PAUSE_BACKOFF_MAX_SECS = 3600
 # Default consecutive failures before a failure alert leaves the dashboard bell
 # for the job's channel or the owner's DM: 1 alerts on the first failure.
 _ALERT_AFTER_DEFAULT = 1
+# What the job's own ``cron-<id>`` tab shows when a run re-creates it after the
+# person closed it: its history (``resume``) or none of it (``fresh``).
+ON_TAB_CLOSE_VALUES = ("resume", "fresh")
+
+
+def validate_on_tab_close(value: object) -> str:
+    """Return *value* when it is one of :data:`ON_TAB_CLOSE_VALUES`, else raise ``ValueError``."""
+    if value not in ON_TAB_CLOSE_VALUES:
+        raise ValueError(f"on_tab_close must be 'resume' or 'fresh', got {value!r}")
+    return str(value)
+
+
+def parked_by_its_run(
+    kind: object, user_paused: object, user_pause_requested: object, last_run_ts: object
+) -> bool:
+    """Whether a paused job is a one-shot its own run parked, not a pause the user made.
+
+    A fired ``at`` job that keeps its row is stored as ``enabled`` False and
+    ``user_paused`` True, the same flags a user pause writes
+    (:func:`~kiro_crew.cron_service.execution.run_parks_one_shot`). A user pause
+    also sets ``user_pause_requested``; a park does not. A paused one-shot without
+    it that has run (``last_run_ts``) was parked by that run, so health readers
+    count it and a failed one-shot is not hidden as a user pause.
+
+    shortcut: a pause saved before ``user_pause_requested`` existed carries no
+    marker, so an ``at`` job paused that way after a run reads as parked until the
+    user pauses or resumes it again. Drop this note once such stores are gone.
+    """
+    if kind != "at" or user_paused is not True or user_pause_requested is True:
+        return False
+    return not isinstance(last_run_ts, bool) and isinstance(last_run_ts, (int, float))
 
 
 def _lifts_default_pause(limit: object) -> bool:
@@ -119,6 +150,11 @@ class CronJob:
     # repeated request whose booleans already have that value. A pending run
     # record uses it to keep a newer user choice while merging runtime fields.
     user_pause_generation: int = 0
+    # True while ``user_paused`` is the person's own pause request (a pause, a job
+    # created paused, an import held for review); a resume clears it. A run's park
+    # of a fired one-shot writes ``user_paused`` but never this, which is how the
+    # health readers tell the two apart (:func:`parked_by_its_run`).
+    user_pause_requested: bool = False
     auto_paused: bool = (
         False  # True when paused by execution after repeated failures; cleared on re-enable/success
     )
@@ -159,6 +195,10 @@ class CronJob:
     # tick, which woke no one), so the run writes no history row. Reset at the
     # start of every run.
     quiet_run: bool = False
+    # Runtime-only (never serialized): set by the gateway when THIS run was a
+    # script's Skip(), so its history row is marked idle and the Logs tab can
+    # hide it. Reset at the start of every run.
+    idle_run: bool = False
     last_result: str | None = None
     # Epoch at which ``last_result`` was produced, written by
     # :meth:`set_run_result` and PERSISTED. Carries the run's identity for
@@ -279,6 +319,10 @@ class CronJob:
     # one run alone. The store refuses it with ``persistent_session=True``, whose
     # one tab already holds every run. ``hide_in_chat`` still wins.
     new_chat_per_run: bool = False
+    # ``fresh`` → the first run after the person closed the job's tab reopens it
+    # empty: the rows stay in ``cron:<id>`` below the tab's display floor
+    # (``cron_inject.start_fresh_cron_tab``). ``resume`` shows them again.
+    on_tab_close: str = "resume"
     # Cron folder grouping; "" = unfiled. CONTRACT for all consumers
     # (Schedule UI, calendar, CLI, MCP): an id that does not match a folder
     # in cron_folders.json MUST be treated as ungrouped — folder deletion
@@ -354,6 +398,14 @@ class CronJob:
     secret_env_pending: dict[str, str] = field(default_factory=dict)
     secret_env_pending_pin: str = ""
     secret_env_pending_ts: float = 0.0
+    # The pending pin of the last re-approval request the SCHEDULER filed for
+    # a stale active grant (see cron_service.grant_resurface). It lets the
+    # scheduler raise that request once per code revision: an operator who
+    # denies it is not asked again on every refused run, while a further code
+    # change mints a different pin and asks again. Agent-writable like every
+    # stored field, which costs nothing: it only ever suppresses or permits a
+    # REQUEST, and nothing is granted without the operator's approval.
+    secret_env_resurfaced_pin: str = ""
 
     def set_run_result(self, value: str) -> None:
         """Record a result produced by the CURRENT run.
@@ -412,7 +464,12 @@ class CronJob:
         auditable per the security-controls guideline. Best-effort — an audit
         write failure must never mask the failure/success bookkeeping that drives
         the pause itself; the tool-invocation error paths already log the run
-        outcome separately."""
+        outcome separately.
+
+        The user-facing auto-pause notice does NOT ride this audit: it fires
+        on the stored pause's rising edge, at the save (``store_sync._save``),
+        so every writer shares one owner and the notice never outruns the
+        disk."""
         from kiro_crew import cron as seams  # the facade holds the patched names; it imports us
 
         try:
@@ -550,6 +607,10 @@ class CronJob:
         default threshold, the backoff in :meth:`failure_backoff_until`, so a job
         that stays signed out keeps a bounded retry rate. A later failure of
         another kind pauses the job as usual once the streak is at its limit.
+
+        The notice for the pause this lands fires at the SAVE that persists
+        it (``store_sync._save``'s rising edge), never here: this runs on the
+        claim's copy, and the stored limit decides the pause at the merge.
         """
         counted = self.count_failure()
         self.failure_auth_expiry = auth_expiry

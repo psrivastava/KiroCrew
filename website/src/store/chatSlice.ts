@@ -24,14 +24,15 @@ import { isChatPageSurface } from '../utils/channelOrigin'
 import { isNoteRow } from '../lib/noteContract'
 import { isUntitledSession } from '../utils/sessionDisplayTitle'
 import type { RootState } from './index'
-import type { ChatMessage, SideSnapshot, TurnIdentityFields } from '../types'
+import type { ChatMessage, ChatSlot, SideSnapshot, TurnIdentityFields } from '../types'
 import { SOFT_STOP_DEBOUNCE_MS } from '../pages/chat/types'
 import { mergePreservedPastes } from '../utils/pasteTokens'
+import { forgetSlotUploadFailure } from '../utils/slotUploadFailures'
 import { initialState, type ChatState } from './chat/state'
 import type { AgentSwitchNotice } from '../utils/agentSwitchFeedback'
 import { filterMessages, isUnsafeKey, safeKey } from './chat/wire'
 import { ensureMsgId, finalizeTrailingStreaming, floorForGen, isRedeliveredMessage, mintMsgId, reconcileOptimisticEcho } from './chat/transcript'
-import { OLDER_PAGE_LIMIT, OLDER_WALK_PAGE_LIMIT, claimOlderFetchAbort, isSupersededPagingRejection, releaseOlderFetchAbort } from './chat/paging'
+import { OLDER_PAGE_LIMIT, OLDER_WALK_PAGE_LIMIT, abortActiveOlderFetch, claimOlderFetchAbort, isSupersededPagingRejection, releaseOlderFetchAbort } from './chat/paging'
 import { reinsertThinkingOrphans } from './chat/thinking'
 import { isPendingCoordinatorApproval } from './chat/coordinatorApprovals'
 import { pruneDeliveredAttempts } from './chat/sendAttempts'
@@ -52,7 +53,7 @@ import { composerCardReducers } from './chat/composerCards'
 import { messageReducers } from './chat/messages'
 import { queueReducers } from './chat/queue'
 import { activityReducers } from './chat/activity'
-import { subagentReducers } from './chat/subagents'
+import { markParentStopped, subagentReducers } from './chat/subagents'
 import { automationReducers } from './chat/automations'
 import { sideReducers } from './chat/side'
 import { workflowReducers } from './chat/workflows'
@@ -175,6 +176,16 @@ export const batchedTextAboveFloor = (parts: BatchedChunkPart[], floor: number |
 /** One `chat_message` frame as the WebSocket hook hands it to `sseChatMessage`. */
 type ChatFrame = TurnIdentityFields & { slot: string; role: string; content: string; ts?: string; seq?: number; gen?: string; cls?: string; meta?: Record<string, unknown>; kind?: string; batched?: boolean; parts?: BatchedChunkPart[] }
 
+/** A Stop card that settled as stopped ended the parent turn, which leaves
+ *  any still-running subagent without its parent. `stop_failed_reset` ends it
+ *  too: the cooperative cancel timed out and the slot was hard-reset. A
+ *  declined Stop (`stop_declined_compacting`) and the in-flight `stopping`
+ *  card leave the parent as it was. */
+function stopCardStoppedTurn(meta: ChatFrame['meta']): boolean {
+  const s = meta?.state
+  return s === 'stopped' || s === 'force_stopped' || s === 'stop_failed_reset'
+}
+
 /**
  * Path B (native session grid): apply a WS chat frame for a NON-active slot
  * into the per-slot store so a pane rendering that slot streams live. The
@@ -200,6 +211,7 @@ function applyNonActiveFrame(
     const msg: ChatMessage = ensureMsgId({ role, content, cls: cls || '', ts, meta: { ...meta, kind: 'stop_event' }, kind: 'stop_event' })
     if (idx >= 0) msgs[idx] = msg
     else msgs.push(msg)
+    if (stopCardStoppedTurn(meta)) markParentStopped(state, slot)
     return
   }
   if (role === '_segment') {
@@ -326,6 +338,8 @@ function applyNonActiveFrame(
     return
   }
   if (role === 'assistant') {
+    // An unwatched slot gets no chunk after a compaction; its result notice ends it.
+    if (effectiveKind === 'compaction' && !meta?.notice && run.state === 'compacting') { setRunState(run, 'streaming'); syncOriginRun(state, slot, 'streaming') }
     for (let i = msgs.length - 1; i >= 0; i--) {
       if (msgs[i].role === 'streaming') {
         msgs[i].role = 'assistant'; msgs[i].content = content; msgs[i].rawText = content; if (ts) msgs[i].ts = ts
@@ -394,6 +408,7 @@ function applyActiveFrame(state: ChatState, p: ChatFrame): void {
     countLiveFrame(state)
     const msg: ChatMessage = ensureMsgId({ role, content, cls: cls || '', ts, meta: { ...meta, kind: 'stop_event' }, kind: 'stop_event' })
     if (idx >= 0) { state.messages[idx] = msg } else { state.messages.push(msg) }
+    if (stopCardStoppedTurn(meta)) markParentStopped(state, slot)
     return
   }
   // WS segment — finalize streaming into assistant without resetting sequence or slot state
@@ -424,6 +439,10 @@ function applyActiveFrame(state: ChatState, p: ChatFrame): void {
     }
     if (state.slotState === 'idle') bumpRunEpoch(state, slot)
     state.slotState = 'streaming'
+    // A live frame proves a turn is running, even one started elsewhere
+    // (Slack, cron) before any `slots` running frame lands. Without it
+    // `selectContinuable` offers Resume beside Stop (#34409).
+    state.slotRunning = true
     state._wsChunkedDuringFetch = true
     countLiveFrame(state)
     // Drop only the empty "Thinking…" placeholder; keep content-bearing
@@ -529,6 +548,8 @@ function applyActiveFrame(state: ChatState, p: ChatFrame): void {
   if (role === 'tool') {
     if (state.slotState === 'idle') bumpRunEpoch(state, slot)
     state.slotState = 'tool_running'
+    // Same as `chunk`: the turn is running (#34409).
+    state.slotRunning = true
     // Insert tool before any trailing streaming message so
     // chat_segment can still find and finalize it with redacted text.
     let insertIdx = state.messages.length
@@ -666,10 +687,12 @@ export const deleteSlot = createAsyncThunk<
     if (root.chat.activeSlot === key) {
       // A Crew Mode worker is its conductor's, never where a close lands: not by
       // the sidebar's displayed order (where it may sit right under its root) and
-      // not by recency. Both sets leave it out.
-      const sameSurface = new Set(root.dashboard.slots.filter(s => !crewRootOf(s) && slotSurfaceKey(s) === deletedSurface).map(s => s.key))
+      // not by recency. Both sets leave it out, and a conversation the Slack list
+      // setting leaves out (`slack_list_hidden`) too, as `autoOpenRows` does.
+      const landable = (s: ChatSlot) => !crewRootOf(s) && !s.slack_list_hidden
+      const sameSurface = new Set(root.dashboard.slots.filter(s => landable(s) && slotSurfaceKey(s) === deletedSurface).map(s => s.key))
       const sidebarSurface = isChatPageSurface(deletedSurface)
-        ? new Set(root.dashboard.slots.filter(s => !crewRootOf(s) && isChatPageSurface(slotSurfaceKey(s))).map(s => s.key))
+        ? new Set(root.dashboard.slots.filter(s => landable(s) && isChatPageSurface(slotSurfaceKey(s))).map(s => s.key))
         : sameSurface
       // Land on the sidebar row below the closed one (above at the bottom): the
       // tab-strip landing rule, applied to the sidebar's displayed order. The
@@ -683,6 +706,8 @@ export const deleteSlot = createAsyncThunk<
       const prev = !discard && ((landing !== key ? landing : null)
         || root.chat.slotHistory.filter(k => k !== key && sameSurface.has(k)).pop()
         || root.dashboard.slots.filter(s => s.key !== key && sameSurface.has(s.key)).map(s => s.key)[0])
+      // Supersede an older page in flight, as a switch does: it would clear the next chat's loading flag.
+      abortActiveOlderFetch()
       // Closing a chat is not choosing the landing: the page picks it. Both
       // moves count as automatic, so a create or fork still pending from
       // before the close opens its new session when it resolves, while a
@@ -785,6 +810,9 @@ export const deleteSlot = createAsyncThunk<
       // the error being propagated.
       await navigation
     }
+    // A closed chat is never shown again, so a failure held for it never would
+    // be. A 404 closed nothing here: the close that did may still restore it.
+    if (!alreadyGone) forgetSlotUploadFailure(key)
     return fulfillWithValue(key, { alreadyGone })
   },
 )
@@ -887,9 +915,12 @@ type StopReply = { ok?: boolean; info?: string; already_stopping?: boolean; erro
  *  the reason, so the host can say it in plain words (#20398). */
 export type StopFailure = { error: string; status?: number; code?: string; authRequired?: boolean; edgeChallenge?: boolean } | null
 
-export const requestStop = createAsyncThunk<StopFailure, { slotId: string; force: boolean }>(
+/** `rejectPending` (the composer's Stop) rejects the stopped turn's approval
+ *  cards once the stop has landed. A failed stop leaves the turn running, so
+ *  its cards must keep their buttons. */
+export const requestStop = createAsyncThunk<StopFailure, { slotId: string; force: boolean; rejectPending?: boolean }>(
   'chat/requestStop',
-  async ({ slotId, force }, { getState, dispatch }) => {
+  async ({ slotId, force, rejectPending }, { getState, dispatch }) => {
     const state = (getState() as { chat: ChatState }).chat
     if (!force) {
       const lastPress = state.stopPressedAt[slotId] ?? 0
@@ -923,6 +954,12 @@ export const requestStop = createAsyncThunk<StopFailure, { slotId: string; force
     // no-op (a cancel already in flight) and changes nothing here.
     if (reply?.info === 'not running' && !reply.already_stopping) {
       dispatch(chatSlice.actions.settleStopNotRunning({ slot: slotId, epoch }))
+    }
+    // Only the cards on screen for the turn this press was about: a switch
+    // to another chat, or a newer turn on this one, keeps its cards.
+    const now = (getState() as { chat: ChatState }).chat
+    if (rejectPending && now.activeSlot === slotId && (now.runEpoch?.[safeKey(slotId)] ?? 0) === epoch) {
+      dispatch(chatSlice.actions.clearPendingPermissions())
     }
     return null
   },
@@ -992,8 +1029,15 @@ const chatSlice = createSlice({
       const p = action.payload
       state.agentSwitchNotice = p === null ? null : typeof p === 'string' ? { message: p } : { ...p }
     },
-    setVoicePlaying(state, action: PayloadAction<boolean>) { state.voicePlaying = action.payload },
-    setVoicePreparing(state, action: PayloadAction<boolean>) { state.voicePreparing = action.payload },
+    setVoicePlaying(state, action: PayloadAction<boolean>) {
+      state.voicePlaying = action.payload
+      if (!state.voicePlaying && !state.voicePreparing) state.voicePaused = false
+    },
+    setVoicePreparing(state, action: PayloadAction<boolean>) {
+      state.voicePreparing = action.payload
+      if (!state.voicePlaying && !state.voicePreparing) state.voicePaused = false
+    },
+    setVoicePaused(state, action: PayloadAction<boolean>) { state.voicePaused = action.payload },
     setVoiceAudio(state, action: PayloadAction<string | null>) { state.voiceAudio = action.payload },
     /** Ask the sidebar to reveal a session row (expand collapsed ancestor
      *  folders, scroll it into view, flash it). Consumed and cleared by
@@ -1102,9 +1146,11 @@ const chatSlice = createSlice({
         if (slot === state.activeSlot) return
         if ((state.slotPaneNextBefore?.[k] ?? 0) !== before) return
         const cur = state.slotMessages[k] ?? []
+        // The backend never stores `meta.pastes`, so re-collapse this page's sent pastes first.
+        const restored = mergePreservedPastes(cur, messages)
         // Identity is meta.mid only, as for the active walk: an overlapping
         // page must not reach the list as a duplicate row key.
-        const fresh = messages.filter(m => !isRedeliveredMessage(cur, m.meta))
+        const fresh = restored.filter(m => !isRedeliveredMessage(cur, m.meta))
         const merged = [...fresh, ...cur]
         // Paging older is exactly when a parked block's anchor becomes loaded,
         // as on the active walk; without this a split pane showed the restored
@@ -1147,9 +1193,9 @@ const chatSlice = createSlice({
 export const {
   setCloseRefused,
   setActiveSlot, dropActiveSlot, forkOpenStarted, forkOpenSettled, clearSlotState, setPendingInput, stagePendingSend, stageToMainComposer, setAgentSwitchNotice, clearUnresumableResume, clearUndeletableHistory, setQuestionCard, clearQuestionCard, setQuestionDraft, setQuestionNotice, setQuestionRequestInFlight, markQuestionSettled, resolveQuestionCard, setFollowupCard, clearFollowupCard, dismissFollowupItem, setFolderSuggestion, clearFolderSuggestion, ageFolderSuggestion, appendMessage, appendSlotMessage, updateStreamingMessage, finalizeAssistant,
-  removeThinking, confirmOptimisticSend, markSendUnconfirmed, dropUnconfirmedRow, recordSendAttempt, resolveOptimisticSteer, removeByApprovalId, retireSwappedRows, resolveByApprovalId, clearPendingPermissions, setSlotRunning, setSlotStopping, settleStopNotRunning, startLocalTurn, startServerTurn, endLocalTurn, syncSlotRunningFromServer, setSlotState, setSlotStatusDetail, setStopPressedAt, clearMessages, clearSlotCache, truncateAfterIndex, replaceMessages, hydrateSlotMessages, clearSlotHydrated, holdHydratedSlotPane, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages,
-  sseContextUsage, setVoicePlaying, setVoicePreparing, setVoiceAudio,
-  toggleActivity, openActivityToTab, openActivityPanel, closeActivityPanel, setSidePanelAlwaysOpen, openActivityToTool, clearFocusToolCallId, requestSlotReveal, requestSlotFolderOpen, clearSlotReveal, requestFolderReveal, clearSubagentsForSnapshot, subagentReplayDone, sseSubagentPending, markSubagentApproving, markSubagentApprovalGone, reconcileSubagentApprovalGone, sseSubagentSpawn, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentQueued, reconcileSubagentQueuedFromSlots,
+  removeThinking, confirmOptimisticSend, markSendUnconfirmed, dropUnconfirmedRow, recordSendAttempt, resolveOptimisticSteer, removeByApprovalId, retireSwappedRows, resolveApprovalRow, resolveShownApprovalRow, resolveNativeApprovalRows, resolveElicitationRow, clearSlotHydrated, holdHydratedSlotPane, clearPendingPermissions, setSlotRunning, setSlotStopping, settleStopNotRunning, startLocalTurn, startServerTurn, endLocalTurn, syncSlotRunningFromServer, setSlotState, setSlotStatusDetail, setStopPressedAt, clearMessages, clearSlotCache, truncateAfterIndex, replaceMessages, hydrateSlotMessages, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages,
+  sseContextUsage, setVoicePlaying, setVoicePreparing, setVoicePaused, setVoiceAudio,
+  toggleActivity, openActivityToTab, openActivityPanel, closeActivityPanel, setSidePanelAlwaysOpen, openActivityToTool, clearFocusToolCallId, requestSlotReveal, requestSlotFolderOpen, clearSlotReveal, requestFolderReveal, clearSubagentsForSnapshot, subagentReplayDone, sseSubagentPending, setSubagentApprovalTarget, markSubagentApproving, markSubagentApprovalGone, reconcileSubagentApprovalGone, sseSubagentSpawn, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentQueued, reconcileSubagentQueuedFromSlots,
   sseSubagentBatchUpdate, sseSubagentBatchChunks, selectSubagent, clearTerminalSubagents,
   setAutomations, sseAutomation, removeAutomation,
   sseSubagentSnapshot, sseToolActivity, sseToolResult, markToolReturned, sseActivityEvent,
@@ -1332,6 +1378,7 @@ export {
   abortActiveOlderFetch, type CoverageRow,
 } from './chat/paging'
 export type { ChatState, FollowupItem, SideMessage, SideQueueEntry, SideSendStatus, SideStandingNotice, SideState, SlotState, SlotStatusDetail, WorkflowRunProgress } from './chat/state'
+export { hasSavedActivityOpen } from './chat/state'
 export { FOLDER_SUGGESTION_MAX_TURNS, capturePendingAskId, isAnsweredQuestionEnding, pendingQuestionFor, shouldResolveAskOnSend } from './chat/composerCards'
 export { mcpAppKey } from './chat/mcpApps'
 export {
@@ -1343,8 +1390,8 @@ export { selectAutomationForSlot, selectSidebarAutomationRunningKeys } from './c
 export { beginSideQueueEdit, finishSideQueueEdit, forgetSideSteerSubmittedText, noteSideQueueCancelWaiting, noteSideQueueDroppedByClose, queueEditBroadcastAt, readSideSteerSubmittedText, recordSideSteerSubmittedText, setSideQueueEditDraft, takeSideQueueDroppedByClose, takeSideQueueDroppedByResyncThenClose, takeSideSteerDroppedByClose, takeSideQueueEditForClose } from './chat/side'
 export {
   selectActiveSlotProject, selectComposerBusy, selectContinuable, selectProjectChipLocked, selectSendAccepted, selectSendAttempts, selectSendConfirmed, selectSlotMessages,
-  selectSlotPendingApproval, selectSlotRunEpoch, selectSlotStreamState, selectSlotToolLog, selectTrailingSendUnconfirmed,
-  selectSlotTurnFromWake, selectTurnInterrupted,
+  selectPendingTurn, selectSlotPendingApproval, selectSlotRunEpoch, selectSlotStreamState, selectSlotToolLog, selectTrailingSendUnconfirmed,
+  selectResumeInterrupted, selectSlotTurnFromWake, selectTurnInterrupted,
   QUIET_END_SERVER, QUIET_END_TOOL,
 } from './chat/selectors'
 export { clearSwitchSlotGone, setSwitchSlotGone, switchSlot, switchSlotNoticeCopy, type SwitchSlotArg } from './chat/slotSwitch'

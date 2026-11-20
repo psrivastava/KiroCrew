@@ -47,9 +47,14 @@ from kiro_crew.history_cache import (
     _TranscriptIndexBase,
     _TranscriptRowIndexEntry,
 )
+from kiro_crew.history_metadata_line import (  # noqa: F401 - facade surface
+    METADATA_LINE_CORRUPT,
+    METADATA_LINE_READABLE,
+    METADATA_LINE_TRANSIENT,
+    parse_metadata_line,
+)
 from kiro_crew.history_projection_contract import (
     _HISTORY_LOGGER,
-    METADATA_LINE_CORRUPT,
     TranscriptRevisionChanged,
     _history_facade,
 )
@@ -82,7 +87,11 @@ def _split_transcript_head(data: bytes) -> tuple[list[str], bool]:
     except UnicodeDecodeError:
         first = None
     text = (first or "") + rest.decode("utf-8")
-    lines = text.replace("\r\n", "\n").replace("\r", "\n").splitlines(keepends=True)
+    del data, head, rest
+    if "\r" in text:
+        # Two whole-file copies, so only for a file that has a ``\r`` at all.
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.splitlines(keepends=True)
     if first is None:
         # A placeholder the caller's JSON parse rejects, so it takes the
         # corrupt-line rewrite and replaces it with a real metadata line.
@@ -209,6 +218,17 @@ class SessionMetadataProjection:
                         "delete_session: search index present but unreadable, so a "
                         "copy of this session's text may remain; not deleting "
                         "key=%s (remove the index to proceed)",
+                        key,
+                    )
+                    return False
+                # The chunk store holds data derived from this text under the
+                # same contract: drop() succeeds when no store file exists and
+                # fails when one exists and cannot be opened or erased.
+                vector_store = self._log._catalog_projection.vector_store
+                if existed and not vector_store.drop(identities):
+                    _HISTORY_LOGGER.warning(
+                        "delete_session: could not remove the session's chunk rows, "
+                        "not deleting key=%s",
                         key,
                     )
                     return False
@@ -698,8 +718,6 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _TRANSCRIPT_PAGE_READ_ATTEMPTS,
         _TRANSCRIPT_READ_CHUNK,
         DISPLAY_ONLY_ROLES,
-        METADATA_LINE_READABLE,
-        METADATA_LINE_TRANSIENT,
         ChainRevision,
         TranscriptPage,
         _facade_flock_acquire_timeout,

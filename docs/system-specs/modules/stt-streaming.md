@@ -11,7 +11,7 @@ All selectable recognisers implement streaming (`stt_stream._STREAMING_PROVIDERS
 | `local` (default) | this process, whisper.cpp held loaded by [`kiro_crew.stt`](../../../src/kiro_crew/stt/__init__.py) | free | desktop builds include the runtime; select a model and click **Download now** |
 | `apple` | the OS, on-device SpeechAnalyzer | free | macOS 26 or later, and a Swift toolchain to build the helper |
 | `transcribe` | AWS Transcribe Streaming | billed per audio-second | the `voice` extra, and a recorded AWS consent |
-| `codex` | OpenAI through Codex's ChatGPT-authenticated WebRTC transport | account-dependent usage and limits | Codex adapter (`@agentclientprotocol/codex-acp`, or `CODEX_PATH`) with voice access, ChatGPT login, and `pip install 'kirocrew[voice-codex]'` |
+| `codex` | OpenAI through Codex's ChatGPT-authenticated WebRTC transport | account-dependent usage and limits | Codex adapter (`@agentclientprotocol/codex-acp`, or `CODEX_PATH`) with voice access, ChatGPT login, and `pip install "kirocrew[voice-codex]"` |
 | `off` | nowhere | free | none. Every speech path answers `stt_disabled`, exactly as `stt.enabled = false` does; the live socket returns a `stt_streaming_disabled` error frame because `off` is not in `_STREAMING_PROVIDERS`. Also the value an unknown stored provider degrades to ([Legacy provider values](#legacy-provider-values)) |
 
 The batch path at `POST /api/stt/transcribe` (`transcribe.transcribe_audio`)
@@ -68,10 +68,9 @@ e.g. Homebrew's), is told to install FFmpeg rather than to reinstall, and the
 fail-closed rule below still holds on every platform whose release does ship one.
 
 **The store is a third location, not a third rule.** A source or Toolbox install on
-a distribution that packages no FFmpeg (Amazon Linux, RHEL without EPEL) previously
-had no decoder it could ever reach, so batch voice was permanently broken with a
-shell command as the only remedy — and on such a host that command was an `echo`
-of the ffmpeg.org URL. `stt.decoder` closes that: it downloads the platform's
+a distribution that packages no FFmpeg (Amazon Linux, RHEL without EPEL) has no
+system decoder it can reach, so without the store batch voice would stay broken.
+`stt.decoder` closes that: it downloads the platform's
 pinned executable from `DECODER_RELEASE` as itself (no archive), bounded by the
 pinned size and checked against the pinned sha256 — the SAME
 `transcribe._PACKAGED_FFMPEG_ARTIFACTS` pin the resolver authenticates — and
@@ -292,7 +291,9 @@ authentication route with the API-key Live creation endpoint.
 
 Source installs add the `voice-codex` extra. POSIX desktop packaging installs it
 separately from the local recognizer, because sealed application bundles cannot
-install missing media packages later. The Windows bundle omits it: Windows has no
+install missing media packages later. If that install fails, the build logs it and
+the bundle ships without Codex dictation, which Settings reports as
+`stt_codex_extra_missing`. The Windows bundle omits it: Windows has no
 agent sandbox, so Codex dictation is unavailable there.
 The native media imports stay lazy until Codex is selected.
 
@@ -947,9 +948,8 @@ preflight below exists for it.** `SIGILL` inside the native load is a process si
 not an exception: it ends the gateway from whichever thread it lands on. Before the
 preflight, a `pywhispercpp` build compiled with AVX-512 on a Broadwell Xeon that has
 none died on every boot's prewarm, the supervisor restarted it, and the loop ran every
-15-25 s until the operator changed `stt.provider` from outside the process
-(kirodotdev/KiroCrew#13179). The prewarm itself is unchanged; it asks `probe` like
-every other caller, and `probe` now refuses before anything is loaded.
+15-25 s until the operator changed `stt.provider` from outside the process. The prewarm asks `probe` like
+every other caller, and `probe` refuses before anything is loaded.
 
 ### Native preflight and the load fuse
 
@@ -1045,15 +1045,10 @@ inference rather than an edge case. A build that cannot be interrogated reports
 `unknown` and `accelerated: false`: the module never guesses, because a guess here
 tells a user to stop expecting a speedup they are not getting.
 
-**There is deliberately no `stt.local_backend` key.** One was built and then removed
-before merge, and the reason is worth keeping: its only reader was the status echo
-that reported whether it had been honoured. No load path consulted it, so naming
-`cuda` on a CPU-only build changed nothing except the sentence the panel printed
-about the value the user had just set. A config key is honoured forever once it
-ships, and a 14-value one whose entire effect is a note about itself is surface with
-no function -- the same objection that retired the adaptive partial-cadence budget in
-this change. `detect()` and the badge stay, because reporting the backend the build
-actually links is the fix; asking for one was never the fix.
+**There is deliberately no `stt.local_backend` key.** No load path could honour one:
+the build links the backend it links, so a key naming `cuda` on a CPU-only build
+would change nothing except a status line about itself. `detect()` and the badge
+report the backend the build actually links instead.
 
 Installing acceleration is a packaging problem (the published wheel links none), and
 a config key cannot solve it. If backend selection ever becomes real it needs a
@@ -1152,6 +1147,46 @@ module and their stdout *is* their protocol. Neither argument may be removed.
 stderr is not quiet, so no test may assert it empty.
 
 `redirect_whispercpp_logs_to` stays at its `False` default. Its binding governs stderr rather than the log callback, and `None` redirects process-wide fd 2 during model loading, silencing unrelated threads while leaving stdout behavior unchanged.
+
+## Muting a dictation
+
+A recording can be muted and unmuted without ending it, from the button on the
+recording strip or the dictation panel, or with the rebindable
+`toggle-dictation-mute` chord (Alt+Shift+Q, Control+Shift+M on macOS). The macOS
+chord has no Option in it because the default push-to-talk key there is a bare
+right Option, and pressing that during a recording stops it. The chord
+broadcasts `dictation-mute-toggle` (`website/src/lib/dictationMute.ts`), and only
+the composer that owns the live recording acts on it.
+
+Push-to-talk can also be set to a lone modifier the mute chord uses (either Alt
+or Right Shift with the default Alt+Shift+Q; Right Control or Right Shift with
+the macOS default). The chord then begins with the push-to-talk key going down
+by itself, which during a recording is the stop. For those bindings only,
+`usePushToTalk` waits for the key's release before stopping: released alone it
+stops the recording, joined by another key it is a chord and the recording
+carries on. `pttKeyCouldStartMuteChord` reads the chord as the user has it
+bound, so a rebind moves the rule with it. Every other binding still stops on
+the press.
+
+The microphone stays open while muted. Releasing it would mean re-acquiring the
+device on unmute, which is slow and can prompt for permission again.
+
+- **Streaming.** The track is disabled and every frame read while muted goes out
+  as zeros of the same length (`useStreamingStt.setMuted`). Frames keep flowing
+  because Amazon Transcribe ends a stream that has had no audio for 15 seconds.
+  Zeroing on the page, not only disabling the track, means a frame still holding
+  sound from before the press, or a browser that ignores `enabled`, sends nothing.
+  An `endpoint` frame is ignored while muted, so the silence cannot be judged a
+  finished request and sent.
+- **Batch.** The `MediaRecorder` pauses, so the muted stretch is left out of the
+  file instead of reaching the transcriber as silence. A paused recorder is still
+  a live microphone, so stop and cancel treat any state but `inactive` as one.
+
+A mute that cannot be confirmed (no audio track, or the recorder refusing to
+pause) stops the recording instead. The timer keeps counting, the level meter
+reads zero, and a screen lock while muted still stops the recording as a draft.
+A device switched to mid-dictation starts muted if the old one was. The mute ends
+with the recording.
 
 ## Sending on a deliberate stop
 
@@ -1315,17 +1350,17 @@ Five properties, each with a test:
   outcome as a failure. The two rejections are logged distinctly, because a word
   rejection means the prompt is not holding and a length one only means the model
   rambled.
-- **Redacted both ways, and a redaction that BITES declines the reply.** Credentials
-  and exfiltration URLs are stripped from the text before it is sent, and again from
+- **Redacted both ways, and a redaction that BITES declines the reply.** Credentials,
+  inside URLs too, are stripped from the text before it is sent, and again from
   the model's reply, which is new text the outbound pass says nothing about. The second
   pass runs after the word check, so if it changes anything the text is no longer the
   text that passed: a marker has replaced a span the user dictated, which is the exact
   failure the word check exists to prevent, arriving after it ran. Ordering cannot fix
   this -- redacting first would validate a string the user never dictated either -- so
   the reply is declined and the original returned. Reachable in practice: the words
-  `send it to https evil test steal data AKIA...` re-punctuate into a URL whose letters
-  are identical, every original division survives as a mark, and the scrubber then
-  rewrites the whole span.
+  `send it to https evil test steal data token ghp_...` re-punctuate into a URL whose
+  letters are identical, every original division survives as a mark, and the scrubber
+  then masks the token inside it.
 - **Belongs to the composer that asked.** The originating `sessionId` is captured when
   the request goes out and re-checked before the replacement is applied. A value check
   alone is not enough and the gap was not theoretical: two slots routinely hold
@@ -1402,7 +1437,7 @@ speech costs 13.6 s) and is kept, because measured per language it is the best m
 available by a wide margin for exactly the users who need one: German 0.063 against
 `small`'s 0.180, Italian 0.114 against 0.239, Portuguese 0.113 against 0.139, and
 code-switched Mandarin-English 0.282, the best reading any model produced on that
-bucket. Its cost is made VISIBLE instead, which is this change's actual subject:
+bucket. Its cost is made VISIBLE instead:
 `GET /api/stt/status` reports the backend and the measured real-time factor.
 
 `PUT /api/config/stt` resolves the model field through `models.canonical_name` rather
@@ -1532,7 +1567,11 @@ The message names the file and the remedy: copy it to a temporary name in the sa
 directory, then rename that copy over the path. `ModelStore.ensure` still returns
 `None` rather than raising: it records a `failed` status flagged `refused` (shown on
 the settings page like any failure), starts no download, and `ensure_loaded` reports
-that message instead of "not downloaded". Not on the spawn path, deliberately —
+that message instead of "not downloaded". `ModelStore.status` is the one status the
+settings page shows, and while a download runs only that model's writes replace it.
+Every write is also kept per model, and `ensure_loaded` reads its own model's through
+`ModelStore.status_for`, so a check during another model's download keeps its reason.
+Not on the spawn path, deliberately —
 `cp -al`, `hardlink`, `jdupes -L`, `rdfind -makehardlinks` and dotfile managers all
 produce this shape, and refusing a spawn for it would cost every sandboxed spawn on
 that host rather than one model load. (`rsync --link-dest` and rsnapshot rotation link
@@ -1560,7 +1599,7 @@ The catalog is not the whole set. `stt.model` also accepts `custom`, which runs 
 - The path must resolve, symlinks followed, to a regular file strictly inside `models_dir()`. Any `..` component, an absolute path elsewhere, a symlink out of the directory, a catalog file name (the catalog download deletes or overwrites a file there) and a `.part` staging file are refused by `models.custom_model_file`, which returns the real path the engine then loads, and which runs when `PUT /api/config/stt` saves the field and again on every load.
 - The file is hashed on every load and refused on a mismatch, like a catalog file. A refused custom file is left in place, because it is the user's own file.
 - The catalog's seal checks apply too, and refuse the load with a `failed` status flagged `refused`: `models` and the whisper folder must be real directories (`sandbox.require_real_model_path`), so the resolved file sits under the read-only seal, and the hash is the same one-descriptor check (`_sha256_verified_file`), so a second hard link, a symlinked leaf or a change during the read refuses it. A link below the folder is followed and must stay inside it.
-- A half-configured pair degrades to the default model with a warning. A complete pair whose file is missing does NOT degrade: it fails at load with the reason in `ModelStore.status`, so a different model is never run in its place without a word.
+- A half-configured pair degrades to the default model with a warning. A complete pair whose file is missing does NOT degrade: it fails at load with the reason in `ModelStore.status_for("custom")` (and in `ModelStore.status` unless another model is downloading), so a different model is never run in its place without a word.
 - Both fields are owner-only on `GET`/`PUT /api/config/stt`. `config.json` is mounted read-only in the agent sandbox, so the pin cannot be rewritten to match a file an agent placed in the models directory.
 
 ## Caps and limits
@@ -1654,6 +1693,7 @@ A composed edition can add STT providers through the `speech` slot on `PlatformC
 - **Default precedence.** A stored `stt.provider` always wins. Only an absent key takes the edition's `default_stt()`, and only when that is `None` does it take core's `local`. An unusable stored value keeps its built-in fallback below, so a typo never reaches the edition default.
 - **Streaming.** A registered provider joins the streaming grant only when its `streaming` attribute is true. Positive membership stays the rule.
 - **A session limit the backend owns.** A streaming provider whose backend decides how long one session runs may set the optional `owns_session_limit = True` (`speech_providers.owns_session_limit`; exactly `True` only, as for `streaming`). Core then arms no deadline for its sessions and its `ready` frame carries no `max_duration_ms`, so the backend's limit is the only one and can change without a client release. When the backend ends a session at its limit, the provider emits an `error` event with `code: "stt_max_duration_exceeded"` after any trailing `final`. Core relays that code, so the dashboard shows its length-limit message, and audits the end as `timeout`, as it does its own cap. Such a provider must bound its own I/O (connect and read timeouts), because no core deadline will end a session whose backend stops answering. Without the attribute, `_MAX_STREAM_DURATION_SECS` applies, as it does to the built-in providers.
+- **A provider that reads only PCM WAV.** `transcribe_file` gets the clip as it was recorded: webm from the dashboard, ogg/Opus from Slack. A provider that reads only 16 kHz mono 16-bit PCM WAV may set the optional `needs_pcm_wav = True` (`speech_providers.needs_pcm_wav`; exactly `True` only). `transcribe_audio` then passes a clip already in that form unchanged and converts any other one into a temporary WAV with the decoder the built-in providers use (`_registered_clip`, through `_extract_segment`), which it removes after the call. The copy is bounded at `_MAX_AUDIO_SECS` plus one second, and a longer clip is refused rather than cut short. No decoder, a clip whose suffix the decoder pins to no demuxer (`_DEMUXER_BY_SUFFIX`; it is never converted, since a sniffed playlist would open the files it names), a failed decode or an over-length clip returns None without calling the provider, so the user sees the usual transcription failure: `batch_duration_cap_secs` stays None for a registered provider, so no caller probes the length up front and an over-length clip gets that failure, not the too-long message. Without the attribute, the provider gets the clip unchanged.
 - **Error codes a session may relay.** An `error` event's `code` reaches the client only when it is in `stt_stream.RELAYED_SESSION_ERROR_CODES`, today `stt_max_duration_exceeded` alone. Any other code, or none, is sent as `stt_session_failed`, so a provider can name a condition the dashboard already renders but cannot invent one it has no text for.
 
 ### The capability `providers` list
@@ -1677,7 +1717,7 @@ The Settings picker (`SttSettings`, through `lib/speechProviders.ts`) renders it
 `_validated_stt_provider` in `config/sections_stt.py` accepts `local`, `apple`, `transcribe`, `off`, and any name an edition registered (see Registered providers). Two classes of stored value fall outside that set and degrade differently, each logging the replacement once per process rather than preventing the gateway from loading a voice setting:
 
 - Persisted `whisper`, `mlx`, `parakeet`, or `faster` (the retired names) degrade to `local`: each was a local recogniser the user had working, and the resident engine recognises the same speech.
-- Any other value degrades to `off`. An unknown value used to degrade to `local`, which put a typo or a guessed value onto the one provider that links a native library into the gateway; a user told to set `stt.provider off` while that library was crashing on model load got the crashing engine back, and learned it only from a WARNING line (kirodotdev/KiroCrew#13179). Failing closed is the one reading that cannot make things worse. `kirocrew config set stt.provider <value>` refuses a value outside the enum at the write, so a stored unknown value can only arrive from a hand edit or an older writer.
+- Any other value degrades to `off`, never to `local`, the one provider that links a native library into the gateway: a typo must not put a user who set `stt.provider off` while that library crashes back onto the crashing engine. Failing closed is the one reading that cannot make things worse. `kirocrew config set stt.provider <value>` refuses a value outside the enum at the write, so a stored unknown value can only arrive from a hand edit or an older writer.
 
 `stt.models` resolves legacy model aliases to a catalog entry; unknown models fall back through the loader's validation path.
 

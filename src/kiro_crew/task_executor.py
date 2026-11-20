@@ -27,6 +27,7 @@ from kiro_crew.agent_sdk.drivers.acp_vocab import (
     STOP_CLASS_STALLED,
     STOP_RECOVERY_MAX_RETRIES,
     classify_stop_reason,
+    continue_timed_out_calls,
 )
 from kiro_crew.agent_sdk.mcp_problems import (
     UNATTENDED_MCP_WAIT_SECS,
@@ -62,6 +63,7 @@ from kiro_crew.messaging.dispatch import (
     rearm_reinjection,
     rollback_skill_bodies,
 )
+from kiro_crew.messaging.driver import strip_steering_markers
 from kiro_crew.messaging.link import telemetry_channel_of
 from kiro_crew.parent_turns import note_turn_landed
 from kiro_crew.providers.base import (
@@ -95,6 +97,7 @@ from kiro_crew.task_models import (
 )
 from kiro_crew.task_planner import group_parallel_tasks
 from kiro_crew.task_status_file import fail_on_declared_failure
+from kiro_crew.tracing import surfaces as trace_surfaces
 
 if TYPE_CHECKING:
     from kiro_crew.name_grant import Refusal as NameRefusal
@@ -329,7 +332,7 @@ async def _check_error_loop(
         return True
     if consecutive >= 1:
         await on_notify(
-            "⚠️ Possible loop",
+            "Warning: Possible loop",
             f"Same error {consecutive + 1}x: {task.error[:100]}",
             run=run,
         )
@@ -377,15 +380,19 @@ async def execute_single_task(
     # Approval gate
     if task.requires_approval or task.force_approval:
         run.last_task_time = _time.time()
-        label = "🚧 GATE" if task.force_approval else "⏸️"
+        label = "GATE: " if task.force_approval else ""
         safe_title, _ = redact_exfiltration_urls(task.title or "")
         safe_title, _ = redact_credentials(safe_title)
         await on_notify(
-            f"{label} Task {task.index} requires approval",
+            f"{label}Task {task.index} requires approval",
             safe_title,
             run=run,
         )
         if on_approval:
+            # The callback keeps its one-argument contract; the task names
+            # its run, so a gate can say WHICH run's task it holds (up to three
+            # runs execute at once and their task indexes overlap).
+            task.run_task_id = run.task_id
             approved = await on_approval(task)
             if approved and task.force_approval:
                 sel().log_api_access(
@@ -423,7 +430,7 @@ async def execute_single_task(
                 run.status = "paused"
                 run.error = f"Task {task.index} approval denied — paused for editing"
                 await on_notify(
-                    f"⏸️ Task {task.index} denied",
+                    f"Task {task.index} denied",
                     "Paused for editing. Modify the task and Resume.",
                     run=run,
                 )
@@ -448,7 +455,7 @@ async def execute_single_task(
             run.status = "failed"
             run.error = f"Task {task.index} denied: {task.error}"
             await on_notify(
-                f"❌ Task {task.index} failed",
+                f"Error: Task {task.index} failed",
                 "No approval handler configured for force_approval gate",
                 run=run,
             )
@@ -495,7 +502,7 @@ async def execute_single_task(
             task.status = TaskStatus.FAILED
             success = False
             await on_notify(
-                f"❌ Task {task.index}/{len(run.tasks)} failed",
+                f"Error: Task {task.index}/{len(run.tasks)} failed",
                 f"{task.title}\n{task.error}",
                 run=run,
             )
@@ -531,13 +538,13 @@ async def execute_single_task(
             log_task_fn(history_key, run, task)
             result_preview = (task.result or "")[:500]
             await on_notify(
-                f"✅ Task {task.index}/{len(run.tasks)}",
+                f"Done: Task {task.index}/{len(run.tasks)}",
                 f"{task.title}\n\n{result_preview}" if result_preview else task.title,
                 run=run,
             )
     else:
         await on_notify(
-            f"❌ Task {task.index}/{len(run.tasks)} failed",
+            f"Error: Task {task.index}/{len(run.tasks)} failed",
             f"{task.title}\n{task.error}",
             run=run,
         )
@@ -668,6 +675,8 @@ def _step_permission_policy(
             event.title,
             session_key=session_key,
             agent=agent,
+            # The ladder's SpecHooks floor fired the PreToolUse hooks first.
+            pre_tool_hooks_fire=True,
             **hook_gate_kwargs(event),
         )
         return verdict
@@ -708,6 +717,7 @@ def _step_permission_policy(
     )
 
 
+@trace_surfaces.rooted(trace_surfaces.TRIGGER_TASK)
 async def execute_task(
     run: Project,
     task: Task,
@@ -754,6 +764,12 @@ async def execute_task(
     previous_error = ""
     consecutive_same_error = 0
     result_prefix = ""
+    # No session applier reads a step's turn, so a person-only directive it
+    # calls is refused and audited; every attempt's refusals lead the result.
+    from kiro_crew.dashboard.session_directive_apply import person_only_directive_refuser
+
+    refusals: list[str] = []
+    _refuse_person_only = person_only_directive_refuser(session_key, refusals)
 
     # Operator answers applied to this step's prompt. They are marked consumed
     # (``input_consumed``) only once the step has durably COMPLETED: a crash
@@ -909,7 +925,7 @@ async def execute_task(
                 spec_keys_noticed = True
                 try:
                     await on_notify(
-                        f"\u2139\ufe0f Task {task.index}: agent settings not applied",
+                        f"Note: Task {task.index}: agent settings not applied",
                         spec_keys_notice(_spec_agent, list(_spec.lost)),
                         run=run,
                     )
@@ -938,7 +954,11 @@ async def execute_task(
             # build and episodic-query embed above are turn setup, not the turn,
             # and this loop re-runs per attempt so each row measures its own turn.
             _turn_t0 = _time.monotonic()
-            async for event in client.stream(full_prompt):
+            # A call whose own silence timer ends the prompt is handed back to the
+            # model on this session (``acp.timed_out_continuation``), so the step
+            # goes on with what it already did instead of re-running from the top.
+            async for event in continue_timed_out_calls(client.stream, full_prompt):
+                await _refuse_person_only(event)
                 if event.kind == EVENT_TEXT_CHUNK:
                     _attempt_emitted = True
                     result_text += event.text
@@ -951,7 +971,9 @@ async def execute_task(
                     run.tokens_used += max(1, len(event.text) // 4)
                 elif event.kind == EVENT_PERMISSION_REQUEST:
                     settled = await tool_permission.settle(
-                        tool_permission.Ask(event, tool_permission.AcpWire(client), session_key),
+                        tool_permission.Ask(
+                            event, tool_permission.AcpWire(client), session_key, agent
+                        ),
                         _policy,
                     )
                     if settled.outcome == "bailed":
@@ -999,7 +1021,9 @@ async def execute_task(
                     _complete_event = event
                     break
 
-            final_result = result_prefix + result_text
+            # kiro-cli's [STEERING steer-…] ack is protocol, not the step's result.
+            result_text = strip_steering_markers(result_text)
+            final_result = "\n\n".join([*refusals, result_prefix + result_text])
             task.result = redact_credentials(redact_exfiltration_urls(final_result)[0])[0]
             # A stream that ended without any EVENT_COMPLETE proves nothing: the
             # provider never said the turn finished, so it is not a PASSED step
@@ -1139,7 +1163,7 @@ async def execute_task(
                     f"{partial[:500]}\n\nContinue from where you left off."
                 )
             await on_notify(
-                f"💀 Task {task.index}: process died",
+                f"Error: Task {task.index}: process died",
                 f"Recovering ({_death_attempts}/{MAX_RECOVERIES})…",
                 run=run,
             )
@@ -1161,7 +1185,7 @@ async def execute_task(
                 task.error = f"Context overflow {compactions} times — giving up"
                 return False
             result_prefix += (
-                f"⚠️ Context window {pct:.0f}% full — compressing conversation history. "
+                f"Warning: Context window {pct:.0f}% full — compressing conversation history. "
                 "Accuracy may degrade due to summarized context.\n\n"
             )
             unsupported = compact_unsupported_backend(client)
@@ -1194,7 +1218,7 @@ async def execute_task(
                     logger.debug("Mid-stream compaction failed, resetting", exc_info=True)
                     await sessions.reset(session_key)
             await on_notify(
-                f"🗜️ Task {task.index}: context compressed",
+                f"Task {task.index}: context compressed",
                 f"Context was {pct:.0f}% full — compacted to continue.",
                 run=run,
             )
@@ -1264,7 +1288,7 @@ async def execute_task(
                         "the durable recovering write did not commit, so no re-run was started",
                     )
                 await on_notify(
-                    f"\u267b\ufe0f Task {task.index}: turn {tnc.stop_class}",
+                    f"Task {task.index}: turn {tnc.stop_class}",
                     f"{tnc.stop_reason} — re-running in {delay:.0f}s (recovery {stop_recoveries})",
                     run=run,
                 )
@@ -1367,7 +1391,7 @@ async def execute_task(
                     )
                     return False
                 await on_notify(
-                    f"\u23f3 Task {task.index}: waiting on {signal.dependency_scope}",
+                    f"Task {task.index}: waiting on {signal.dependency_scope}",
                     f"{signal.kind}: {signal.detail or exc}",
                     run=run,
                 )
@@ -1440,7 +1464,7 @@ async def execute_task(
                 )
                 try:
                     await on_notify(
-                        f"\u26a0\ufe0f Task {task.index}: MCP servers unusable",
+                        f"Warning: Task {task.index}: MCP servers unusable",
                         f"MCP servers unusable in this step: {mcp_problems}",
                         run=run,
                     )
@@ -1537,6 +1561,7 @@ async def build_task_prompt(run: Project, task: Task, attempt: int, work_dir: Pa
             if git_ctx:
                 parts.append(git_ctx + "\n")
         except Exception:
+            # The prompt is built without git context when it cannot be read.
             pass
 
     memory_text = run.memory.summary()
@@ -1556,11 +1581,11 @@ async def build_task_prompt(run: Project, task: Task, attempt: int, work_dir: Pa
         parts.append(label)
         for t in group:
             if t.status == TaskStatus.PASSED:
-                icon = "✅"
+                icon = "[done]"
             elif t.index == task.index:
-                icon = "🔄"
+                icon = "[now]"
             else:
-                icon = "⬜"
+                icon = "[todo]"
             dep_str = (
                 f" (depends on: {', '.join(str(d) for d in t.depends_on)})" if t.depends_on else ""
             )
@@ -1639,6 +1664,7 @@ async def check_context(session_key: str, sessions: "SessionManager") -> None:
         logger.debug("Context check failed", exc_info=True)
 
 
+@trace_surfaces.rooted(trace_surfaces.TRIGGER_TASK)
 async def self_review(
     run: Project,
     task: Task,
@@ -1707,7 +1733,13 @@ async def self_review(
         # reports no duration, so this local measurement is the fallback. Bracket
         # ONLY the model stream, not open_task_session / diff fetch / prompt build.
         _review_t0 = _time.monotonic()
-        result = await stream_and_collect_json(client, prompt)
+        # Not a person's turn: a person-only directive is refused and audited;
+        # the JSON text is left as it is, so the refusal lives in its SEL row.
+        from kiro_crew.dashboard.session_directive_apply import person_only_directive_refuser
+
+        result = await stream_and_collect_json(
+            client, prompt, on_event=person_only_directive_refuser(review_key, [])
+        )
 
         # ── Per-turn usage row: self-review is a separate model turn. ──
         try:
@@ -1791,6 +1823,7 @@ async def _reap_process_group(proc: asyncio.subprocess.Process) -> None:
         await asyncio.wait_for(proc.wait(), timeout=_TEST_KILL_GRACE)
         return
     except Exception:
+        # The wait timed out or failed: escalate to SIGKILL below.
         pass
     try:
         await platform_compat.kill_process_tree_async(pid, platform_compat.SIGKILL)
@@ -1799,6 +1832,7 @@ async def _reap_process_group(proc: asyncio.subprocess.Process) -> None:
     try:
         await asyncio.wait_for(proc.wait(), timeout=_TEST_KILL_GRACE)
     except Exception:
+        # The tree is already SIGKILLed; there is nothing more to do here.
         pass
 
 

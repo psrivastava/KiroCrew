@@ -30,7 +30,7 @@ with the theme CSS custom properties or Tailwind classes mapped to them,
 <div className="bg-[var(--card)] text-[var(--card-fg)]" />
 ```
 
-The 60 CSS variables are the single source of truth for color. They are the
+The 61 CSS variables are the single source of truth for color. They are the
 customization surface a theme (built-in, custom, or installed) can set.
 
 **Fills are flat.** The brand system is flat: a new decorative gradient fill
@@ -42,7 +42,7 @@ bands under every social platform's re-encode. Functional gradients are not
 fills and are fine: `mask-image` scroll-edge fades, loading shimmer, and the
 streaming glow. So are the shipped gradient mechanisms — the appstore gradient
 art in `components/appstore/gradient.ts` (which reads as content, not chrome)
-and the session `'gradient'` color mode. So is the **crew gradient** (`.crew-grad`, `--aim` to `--info`) on Ultra Mode's own surfaces -- the ULTRA MODE session row, the Ultra Mode filter chip, the composer chip, the Crew panel's crew cards -- which the maintainer decision `docs/decisions/2026-10-28-the-crew-gradient-marks-crew-mode-surfaces.md` admits as the one mark of a chat run by a crew; it is not a style for anything else. The UX review lane
+and the session `'gradient'` color mode. So is the **crew gradient** (`.crew-grad`, `--aim` to `--info`) on conductor mode's own surfaces -- the CONDUCTOR MODE session row, the conductor mode filter chip, the composer chip, the Crew panel's crew cards -- which the maintainer decision `docs/decisions/2026-10-28-the-crew-gradient-marks-crew-mode-surfaces.md` admits as the one mark of a chat run by a crew; it is not a style for anything else. The UX review lane
 (`.github/workflows/ux-review.yml` and its fork variant) applies this rule.
 Theme blocks in `src/styles/design-tokens.css` and `src/styles/theme-palettes.css` also set a few non-color properties that are
 deliberately NOT on the allowlist: the font tokens (`--font-body`, `--mono`)
@@ -90,7 +90,8 @@ the page is not a hover at all in this theme; hover states use `bg-bg-hover`.
 **Polarity-fixed variables are not roles.** A few `src/styles/liquid-glass.css` variables are read
 from `data-mode` (the polarity `useTheme` paints), not from the theme, and a pack
 cannot override them: `--glass-tint`, `--glass-band` (and its plain base
-`--glass-band-plain`),
+`--glass-band-plain`, the one glass token a pack MAY set in `variables.json`: its
+default stays polarity-fixed, and every other glass token stays pack-proof),
 `--glass-edge` and `--glass-hairline` — the fill, the top/bottom light bands, the
 side-line / in-pane-divider hairline, and the half-pixel dark sliver outside each
 lit band (none has a focus form: a pane looks the same whether or not a control
@@ -133,6 +134,9 @@ parity (a parity test guards drift), then define it in **every** built-in theme:
 - Frontend: `ALLOWED_CSS_VARS` in `src/hooks/themeCss.ts`
 - Backend: `_THEME_CSS_VARS_SET` (built from `_THEME_CSS_VARS`) in
   `src/kiro_crew/dashboard/theme_validate.py`
+
+`--glass-band-plain` is allowlisted but its default comes from `liquid-glass.css`'s
+two polarity lines, not from per-theme blocks.
 
 Never introduce a one-off literal instead of a variable.
 
@@ -202,7 +206,7 @@ about MCP apps. Do not copy the three-dep spelling into a new site.
 
 **Where each wash comes from is not symmetric, and follows the dashboard.**
 `--ok-subtle`, `--warn-subtle` and `--danger-subtle` are stored per theme and are
-read directly. `--info` has no stored companion in the 60 — `bg-info-subtle` is
+read directly. `--info` has no stored companion in the 61 — `bg-info-subtle` is
 derived in `src/tailwind-theme.css` as
 `color-mix(in srgb, var(--info) 12%, transparent)` — so `COLOR_TOKEN_MAP` derives
 `--color-background-info` the same way, from `INFO_WASH` of the resolved
@@ -219,7 +223,7 @@ cannot shrink.
 
 | Tier | Surface |
 |---|---|
-| **L0 Color** | the 60 CSS vars (dark + light) |
+| **L0 Color** | the 61 CSS vars (dark + light) |
 | **L1 Brand** | logo, favicon, welcome image, desktop splash art, wordmark, botName, fonts, code scheme, scoped `overrides.css` |
 | **L2 Experience** | sandboxed overlays, topbar, audio, persona |
 

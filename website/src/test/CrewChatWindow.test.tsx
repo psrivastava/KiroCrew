@@ -65,12 +65,16 @@ vi.mock('../api/client', async () => ({
 
 import CrewChatWindow from '../pages/chat/crew-window/CrewChatWindow'
 import { createCrewWindowRenderers, PEER_SAFE_ROWS } from '../pages/chat/crew-window/crewWindowRenderers'
+import { mergeRenderers, resolveRenderer } from '../app-sdk/messageRenderers'
+import type { ChatMessage } from '../types'
 import { createTranscriptRenderers } from '../pages/chat/transcriptRenderers'
 import {
   openCrewWindow, closeCrewWindow, useCrewWindow, reloadCrewWindowForTest, writeCrewDraft,
   capsRetryInterval,
 } from '../pages/chat/crew-window/crewWindowStore'
-import { crewModePreviewOn } from './crewModePreview'
+import { crewWindowSlot } from '../pages/chat/crew-window/crewWindowRenderers'
+import { DICTATION_NOTE, _resetDictationProvenance, isDictated, markDictated } from '../chat-core/composer/dictationProvenance'
+import { queryClient as globalQueryClient } from '../api/queryClient'
 
 class FakeEventSource {
   static all: FakeEventSource[] = []
@@ -107,21 +111,16 @@ function renderWindow() {
 
 const posted = () => mocks.crewPeerPost.mock.calls.map(c => [c[1], c[2]])
 
-/** The user bubble's More menu (Quote holds the row seat, as locally). */
-async function openMore(row = 0) {
-  await waitFor(() => expect(screen.getAllByTestId('user-more-actions').length).toBeGreaterThan(row), PEER_ROW_WAIT)
-  fireEvent.pointerDown(screen.getAllByTestId('user-more-actions')[row], { button: 0, ctrlKey: false, pointerType: 'mouse' })
-}
+/** Edit & Resend follows Copy on the user row while the row can be edited. */
+const editButtons = () => screen.queryAllByRole('button', { name: 'Edit & Resend' })
 async function openEdit(row = 0) {
-  await openMore(row)
-  fireEvent.click(await screen.findByRole('menuitem', { name: 'Edit & Resend' }))
+  await waitFor(() => expect(editButtons().length).toBeGreaterThan(row), PEER_ROW_WAIT)
+  fireEvent.click(editButtons()[row])
 }
 /** Whether the first user row offers Edit & Resend. */
 async function editOffered() {
-  await openMore()
-  const offered = !!screen.queryByRole('menuitem', { name: 'Edit & Resend' })
-  fireEvent.keyDown(document.activeElement || document.body, { key: 'Escape' })
-  return offered
+  await waitFor(() => expect(screen.getAllByLabelText('Copy').length).toBeGreaterThan(0), PEER_ROW_WAIT)
+  return editButtons().length > 0
 }
 
 /** Edit & Resend on the user bubble, the way the local chat rewinds: the
@@ -220,6 +219,7 @@ describe('CrewChatWindow', () => {
     for (const el of chrome) expect(el.className).not.toMatch(/(^|\s)(liquid-glass|border-t|p[ytb]?-\S+)(?=\s|$)/)
     const notices = screen.getByTestId('crew-window-notices')
     expect(notices).toHaveClass('empty:hidden')
+    expect(notices).toHaveAttribute('data-guide-keep-clear')
     await waitFor(() => expect(notices.childElementCount).toBe(0))
   })
 
@@ -236,6 +236,94 @@ describe('CrewChatWindow', () => {
     renderWindow()
     await screen.findByRole('textbox', PEER_ROW_WAIT)
     expect(screen.getByTestId('crew-window-dock').style.right).toBe('6px')
+  })
+
+  // The local chat opens at the newest message and follows new rows unless the
+  // reader scrolled up; the crew window reads the same way.
+  describe('transcript scroll position', () => {
+    // happy-dom lays nothing out: give the scroller a 400px viewport over
+    // `contentHeight` of rows, and keep the scrollTop it is given.
+    let contentHeight = 2000
+    const scroller = () => screen.getByTestId('crew-window-dock').previousElementSibling as HTMLElement
+    beforeEach(() => {
+      contentHeight = 2000
+      const isScroller = (el: Element) => el.nextElementSibling?.getAttribute('data-testid') === 'crew-window-dock'
+      const scrollHeight = vi.spyOn(HTMLElement.prototype, 'scrollHeight', 'get').mockImplementation(function (this: HTMLElement) { return isScroller(this) ? contentHeight : 0 })
+      const clientHeight = vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockImplementation(function (this: HTMLElement) { return isScroller(this) ? 400 : 0 })
+      onTestFinished(() => { scrollHeight.mockRestore(); clientHeight.mockRestore() })
+    })
+    const landReply = async (text: string) => {
+      detail = { ...detail, messages: [...(detail.messages as object[]), { role: 'assistant', content: text, ts: text }] }
+      FakeEventSource.all[FakeEventSource.all.length - 1].emit('chat_message', { slot: 'k1' })
+      await screen.findByText(text, {}, PEER_ROW_WAIT)
+    }
+
+    it('opens at the newest message, not the first', async () => {
+      renderWindow()
+      await screen.findByText('hello', {}, PEER_ROW_WAIT)
+      expect(scroller().scrollTop).toBe(2000)
+    })
+
+    it('follows asynchronous content growth without new messages unless the reader scrolled up', async () => {
+      const observers = new Set<FakeResizeObserver>()
+      class FakeResizeObserver implements ResizeObserver {
+        targets = new Set<Element>()
+        constructor(public cb: ResizeObserverCallback) { observers.add(this) }
+        observe(el: Element) { this.targets.add(el) }
+        unobserve(el: Element) { this.targets.delete(el) }
+        disconnect() { observers.delete(this) }
+      }
+      vi.stubGlobal('ResizeObserver', FakeResizeObserver)
+      const { unmount } = renderWindow()
+      await screen.findByText('hello', {}, PEER_ROW_WAIT)
+      expect(scroller().scrollTop).toBe(2000)
+      const content = scroller().firstElementChild as HTMLElement
+      const growContent = (height: number) => {
+        contentHeight = height
+        // Only notify observers of the transcript content, not the viewport
+        // or composer. No peer frame or React render drives this growth.
+        act(() => {
+          for (const ro of observers) {
+            if (ro.targets.has(content)) ro.cb([{ target: content } as ResizeObserverEntry], ro)
+          }
+        })
+      }
+
+      growContent(2600)
+      expect(scroller().scrollTop).toBe(2600)
+      expect([...observers].filter(ro => ro.targets.has(content))).toHaveLength(1)
+      // A browser clamps the programmatic pin to the bottom, then emits scroll.
+      scroller().scrollTop = contentHeight - scroller().clientHeight
+      fireEvent.scroll(scroller())
+      growContent(3200)
+      expect(scroller().scrollTop).toBe(3200)
+
+      scroller().scrollTop = 300
+      fireEvent.scroll(scroller())
+      growContent(3800)
+      expect(scroller().scrollTop).toBe(300)
+
+      // Returning to the bottom re-enables following later image/diagram growth.
+      scroller().scrollTop = contentHeight - scroller().clientHeight
+      fireEvent.scroll(scroller())
+      growContent(4400)
+      expect(scroller().scrollTop).toBe(4400)
+      unmount()
+      expect([...observers].filter(ro => ro.targets.has(content))).toHaveLength(0)
+    })
+
+    it('follows a new reply at the bottom, and keeps the place of a reader who scrolled up', async () => {
+      renderWindow()
+      await screen.findByText('hello', {}, PEER_ROW_WAIT)
+      contentHeight = 2600
+      await landReply('second reply')
+      expect(scroller().scrollTop).toBe(2600)
+      scroller().scrollTop = 300
+      fireEvent.scroll(scroller())
+      contentHeight = 3200
+      await landReply('third reply')
+      expect(scroller().scrollTop).toBe(300)
+    })
   })
 
   // A frameless line stands on the notices' glass chip, never bare over the
@@ -375,6 +463,21 @@ describe('CrewChatWindow', () => {
     const box = await screen.findByRole('textbox')
     fireEvent.change(box, { target: { value: 'half a thought' } })
     await waitFor(() => expect(sessionStorage.getItem('kirocrew.crewDrafts') ?? '').toContain('half a thought'))
+  })
+
+  // The peer's send reports no delivery receipt, so the prompt stash (which
+  // keeps a restored draft until delivery is confirmed) is off here: Ctrl+S
+  // leaves the draft in the composer and writes no stash entry.
+  it('does not offer the prompt stash, whose restored drafts it could not consume', async () => {
+    renderWindow()
+    const box = await screen.findByRole('textbox')
+    fireEvent.change(box, { target: { value: 'not for the stash' } })
+    fireEvent.keyDown(box, { key: 's', ctrlKey: true })
+    expect(box).toHaveValue('not for the stash')
+    const stashKeys = Array.from({ length: localStorage.length }, (_, i) => localStorage.key(i) ?? '')
+      .filter(key => key.startsWith('mc-prompt-stash'))
+    expect(stashKeys).toEqual([])
+    expect(screen.queryByTestId('prompt-stash-status-line')).toBeNull()
   })
 
   it('offers no card for an approval it cannot tie to one peer row', async () => {
@@ -581,6 +684,56 @@ describe('CrewChatWindow', () => {
     fireEvent.change(box, { target: { value: 'steer me' } })
     fireEvent.keyDown(box, { key: 'Enter' })
     await waitFor(() => expect(box).toHaveValue('steer me'))
+  })
+
+  // `stt.dictation_note` is this machine's setting, as the dictation is; the
+  // note rides the text the peer receives. The Voice atom's own marking is
+  // pinned in useComposerVoiceDictationNote.test; `markDictated` stands in.
+  it('ends a dictated message with the dictation note, and hands a refused one back without it', async () => {
+    _resetDictationProvenance()
+    globalQueryClient.setQueryData(['sttConfig'], { enabled: true, dictation_note: true })
+    try {
+      mocks.crewPeerPost.mockRejectedValueOnce(new Error('peer refused'))
+      renderWindow()
+      const box = await screen.findByRole('textbox', { name: 'Message the agent on devbox…' })
+      await waitFor(() => expect(box).not.toBeDisabled())
+      fireEvent.change(box, { target: { value: 'book the room' } })
+      markDictated(crewWindowSlot('cd-1', 'k1'))
+      fireEvent.keyDown(box, { key: 'Enter' })
+      await waitFor(() => expect(posted()).toContainEqual(['api/chat?ws=1', { message: `book the room\n\n${DICTATION_NOTE}`, slot: 'k1' }]))
+      await waitFor(() => expect(box).toHaveValue('book the room'))
+      fireEvent.keyDown(box, { key: 'Enter' })
+      await waitFor(() => expect(posted().filter(p => p[0] === 'api/chat?ws=1')).toHaveLength(2))
+      expect(posted().filter(p => p[0] === 'api/chat?ws=1')[1]).toEqual(['api/chat?ws=1', { message: `book the room\n\n${DICTATION_NOTE}`, slot: 'k1' }])
+      // The next message, typed by hand, carries nothing.
+      fireEvent.change(box, { target: { value: 'typed after' } })
+      fireEvent.keyDown(box, { key: 'Enter' })
+      await waitFor(() => expect(posted()).toContainEqual(['api/chat?ws=1', { message: 'typed after', slot: 'k1' }]))
+    } finally {
+      globalQueryClient.removeQueries({ queryKey: ['sttConfig'] })
+      _resetDictationProvenance()
+    }
+  })
+
+  it('emptying the composer forgets the dictation, so a fresh typed message gets no note', async () => {
+    _resetDictationProvenance()
+    globalQueryClient.setQueryData(['sttConfig'], { enabled: true, dictation_note: true })
+    try {
+      renderWindow()
+      const box = await screen.findByRole('textbox', { name: 'Message the agent on devbox…' })
+      await waitFor(() => expect(box).not.toBeDisabled())
+      markDictated(crewWindowSlot('cd-1', 'k1'))
+      fireEvent.change(box, { target: { value: 'spoken then deleted' } })
+      fireEvent.change(box, { target: { value: '' } })
+      expect(isDictated(crewWindowSlot('cd-1', 'k1'))).toBe(false)
+
+      fireEvent.change(box, { target: { value: 'typed instead' } })
+      fireEvent.keyDown(box, { key: 'Enter' })
+      await waitFor(() => expect(posted()).toContainEqual(['api/chat?ws=1', { message: 'typed instead', slot: 'k1' }]))
+    } finally {
+      globalQueryClient.removeQueries({ queryKey: ['sttConfig'] })
+      _resetDictationProvenance()
+    }
   })
 
   it('shows the peer\'s stop in flight and its compaction, not a live Stop', async () => {
@@ -1037,6 +1190,18 @@ describe('CrewChatWindow', () => {
     expect(await screen.findByTestId('crew-window-approval-hint', undefined, PEER_ROW_WAIT)).toHaveTextContent('Approve runs this one command.')
   })
 
+  it("draws a peer's project-hooks notice read-only, with no link that writes this hub's choice", () => {
+    const row = {
+      role: 'notice',
+      content: 'ℹ Project hooks are off for this folder.',
+      meta: { kind: 'spec_hooks', project_hooks: 'off', project_hooks_folder: '/work/repo' },
+    } as unknown as ChatMessage
+    const crew = createCrewWindowRenderers({ instanceId: 'cd-1', key: 'k1', name: 'devbox', canRewind: () => false, onRewind: () => {}, rewindDisabled: false })
+    const picked = resolveRenderer(row, mergeRenderers(crew))
+    expect(picked?.id).toBe('project_hooks')
+    expect(crew).toContain(picked)
+  })
+
   it('lets in only shared rows decided safe for a peer (a new row falls back)', () => {
     // A new shared row must be added to PEER_SAFE_ROWS on purpose, or it draws
     // through the store-free default instead of reading this hub's own state.
@@ -1047,13 +1212,16 @@ describe('CrewChatWindow', () => {
     // The outgoing session-message card names the recipient (and opens it) from
     // THIS hub's session roster, where a peer's session keys mean nothing: a
     // peer's window draws that row through the store-free default too.
-    const decided = new Set([...PEER_SAFE_ROWS, 'workflow_run_tool', 'subagent_run_tool', 'file', 'conversation_card', 'elicitation', 'session_send_tool'])
+    // A restart's Trust reset row picks a mode through THIS hub's route, never the peer's.
+    // The sign-in notice links to THIS hub's MCP Servers page, where a peer's servers are not listed.
+    const decided = new Set([...PEER_SAFE_ROWS, 'workflow_run_tool', 'subagent_run_tool', 'file', 'conversation_card', 'elicitation', 'session_send_tool', 'trust_reset_notice', 'mcp_sign_in_needed'])
     expect(ids.filter(id => !decided.has(id))).toEqual([])
     const crew = createCrewWindowRenderers({ instanceId: 'cd-1', key: 'k1', name: 'devbox', canRewind: () => false, onRewind: () => {}, rewindDisabled: false }).map(r => r.id)
     expect(crew).not.toContain('workflow_run_tool')
     expect(crew).not.toContain('subagent_run_tool')
     expect(crew).not.toContain('conversation_card')
     expect(crew).not.toContain('elicitation')
+    expect(crew).not.toContain('trust_reset_notice')
   })
 
   it('draws a peer code fence copy-only, with no Run into this machine', async () => {
@@ -1447,6 +1615,3 @@ describe('CrewChatWindow', () => {
     expect(FakeEventSource.all[0].close).toHaveBeenCalled()
   })
 })
-
-// Last, after the file's own hooks that clear localStorage: Crew Mode is a feature preview.
-crewModePreviewOn()

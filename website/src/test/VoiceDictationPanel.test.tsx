@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent } from '@testing-library/react'
+import { render, screen, fireEvent, act } from '@testing-library/react'
 import VoiceDictationPanel from '../components/VoiceDictationPanel'
 import { createAudioSample } from '../hooks/mic'
 
@@ -19,6 +19,24 @@ describe('VoiceDictationPanel', () => {
     render(<VoiceDictationPanel sampleRef={sampleRef} value="" deviceLabel="MacBook Pro Microphone" />)
     expect(screen.getByText('Listening')).toBeTruthy()
     expect(screen.getByText('MacBook Pro Microphone')).toBeTruthy()
+  })
+
+  it('shows how long the recording has run, and holds it once capture has ended', () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'performance'] })
+    try {
+      const { rerender } = render(<VoiceDictationPanel sampleRef={sampleRef} value="" />)
+      const reading = () => screen.getByTestId('voice-recording-elapsed').textContent
+      expect(reading()).toBe('0:00')
+      act(() => { vi.advanceTimersByTime(9_000) })
+      expect(reading()).toBe('0:09')
+      // The panel outlives the release for the streaming drain. The mic is
+      // closed by then, so the reading must not keep climbing.
+      rerender(<VoiceDictationPanel sampleRef={sampleRef} value="" captureEnded />)
+      act(() => { vi.advanceTimersByTime(20_000) })
+      expect(reading()).toBe('0:09')
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('omits the device row entirely when no label is known', () => {
@@ -331,5 +349,24 @@ describe('transcript auto-scroll', () => {
       delete (HTMLDivElement.prototype as unknown as Record<string, unknown>).clientHeight
       restore()
     }
+  })
+})
+
+describe('VoiceDictationPanel mute', () => {
+  it('says Muted and offers unmute while muted', () => {
+    const onToggleMute = vi.fn()
+    render(<VoiceDictationPanel sampleRef={sampleRef} value="" muted onToggleMute={onToggleMute} onSelectDevice={() => {}} />)
+    expect(screen.getByText('Muted')).toBeTruthy()
+    expect(screen.queryByText('Listening')).toBeNull()
+    const btn = screen.getByTestId('voice-mute-toggle')
+    expect(btn.getAttribute('aria-label')).toBe('Unmute microphone')
+    expect(btn.hasAttribute('aria-pressed')).toBe(false)
+    fireEvent.click(btn)
+    expect(onToggleMute).toHaveBeenCalledTimes(1)
+  })
+
+  it('drops the control once capture has ended', () => {
+    render(<VoiceDictationPanel sampleRef={sampleRef} value="" onToggleMute={() => {}} captureEnded onSelectDevice={() => {}} />)
+    expect(screen.queryByTestId('voice-mute-toggle')).toBeNull()
   })
 })

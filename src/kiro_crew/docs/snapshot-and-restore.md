@@ -16,9 +16,9 @@ kirocrew snapshot ~/my-snapshots --keep 3             # custom dir, prune to 3
 kirocrew snapshot --components memory                 # just memory, ~20 MB
 kirocrew snapshot --list                              # list existing snapshots
 kirocrew snapshot --strict                            # exit 3 if the bundle is incomplete
-kirocrew restore snapshot.tar.gz                      # auto-detects replace vs merge
-kirocrew restore snapshot.tar.gz --components memory,crons
-kirocrew restore snapshot.tar.gz --dry-run            # preview, write nothing
+kirocrew restore snapshot.tar.gz --mode merge         # keep what is here, add the rest
+kirocrew restore snapshot.tar.gz --mode replace --components memory,crons
+kirocrew restore snapshot.tar.gz --mode merge --dry-run   # preview, write nothing
 kirocrew restore --list-components                    # show component names
 ```
 
@@ -225,14 +225,15 @@ live state is this module's job, and it needs the gateway stopped (below).
 
 ### Replace vs merge
 
-| Mode | Chosen when | Behavior |
-|------|-------------|----------|
-| `replace` | No existing `memory.db` | Overwrite the target with the snapshot, backing up any existing state first |
-| `merge` | An existing `memory.db` is found | Import new data without overwriting what is already there |
+| Mode | Behavior |
+|------|----------|
+| `replace` | Overwrite the target with the snapshot, backing up any existing state first, except `session_map.json` and `workspace_dir`: they name folders on the machine that made the snapshot, so this install's copy stays (see below) |
+| `merge` | Import new data without overwriting what is already there |
 
-The mode is auto-detected from whether `~/.kiro/crew/memory.db` exists, so a
-restore onto a fresh machine replaces and a restore onto a machine you are
-already using merges. Override with `--mode replace` or `--mode merge`.
+There is no default mode. Name one with `--mode replace` or `--mode merge`.
+Without `--mode`, a restore on a terminal asks which to use and accepts only
+`merge` or `replace`; any other answer stops it with nothing changed. Off a
+terminal it refuses before it reads the archive.
 
 In `replace` mode the state being overwritten is saved first. Named stores go
 into `memory_stores/.member-backups/pre-restore-<timestamp>/` inside the data home,
@@ -260,7 +261,12 @@ component was being replaced.
   way is named (`↩️  config.json: kept the existing file; the bundle's copy was
   NOT merged into it ...`) and `✅ config` is printed only when no setting was
   left behind. Host state in the same component (`session_map.json`,
-  `project_dir`, `workspace_dir`) keeps this machine's copy silently. A bundle
+  `workspace_dir`) keeps this machine's copy silently in a merge. Neither mode
+  installs `session_map.json` or `workspace_dir` from the bundle, even where this
+  install has none, so a restore on the same machine does not bring back the
+  bundle's session resume bindings; a restore also never installs the archive's
+  `project_dir`. A replace says `↩  <file>: not restored` and keeps this install's
+  copy of each. A bundle
   `ui-prefs.json` or `notification_settings.json` that its own store would read
   as empty, or refuse, stops the restore before anything is installed. A replace
   always checks it; a merge checks it only where the destination lacks that file,
@@ -294,10 +300,36 @@ outranks `config.json`. The result names every settings file it kept, so a Merge
 that brought none of your settings back says so. To restore the archive's
 settings over this install's, choose Replace in the mode menu and import again:
 Replace installs all four files, saving the ones it replaces to
-`pre-restore-<timestamp>/` first. A settings file in the archive that is not
+`pre-restore-<timestamp>/` first. Replace also leaves `session_map.json` alone,
+and installs the archive's `workspace_dir` only when it is a plain folder under
+this home (not the home itself, the data home or a folder holding it, or a
+protected folder); otherwise this install's copy stays and the result names it.
+A settings file in the archive that is not
 usable is named in the result and never installed, in either mode.
 Memory, crons, workspace files and skills follow the never-overwrite rules
 above in both tools.
+
+The dashboard export also carries your chat folders (`folders.json`). The
+import adds every folder this install does not have, matched by its id, and
+leaves the ones it has as they are, in Merge and Replace alike, so imported
+chats sit in their folders again. A folder's project is not carried: it names
+a folder on the old computer, so the folder's chats open in the default
+workspace until you set its project again. An imported folder keeps what you
+can set when you create one (name, parent, colour, icon, default agent, crew
+and prompt). Its tags, steering folders, and any app, crew member or channel
+it belonged to stay behind. A folder is not added where its parent already
+holds one of the same name, and one that would land inside a crew member's
+home goes to the top level. At most 500 folders are kept, and the import warns
+with how many folders it did not add. Installed apps and their data are not
+carried yet.
+
+The dashboard export leaves out folders that tools rebuild inside your
+workspace folder (`node_modules`, `.venv`, `venv` and tool caches such as
+`.pytest_cache`), and the import skips them in an older archive. A backup that
+unpacks to more than 2 GiB is accepted when no single file is over 2 GiB, the
+total stays under 64 GiB and at most 100 times the archive's own size, and the
+disk has room for it twice plus 1 GiB. When one is refused, the message names
+its biggest folders.
 
 #### Known limitation: the knowledge database is not row-merged
 
@@ -376,7 +408,7 @@ as they are and prints a line saying so, while the rest of `memory` is replaced.
 
 | Flag | Description |
 |------|-------------|
-| `--mode replace\|merge` | Force the mode instead of auto-detecting |
+| `--mode replace\|merge` | The restore mode. Without it a terminal is asked and a non-terminal is refused |
 | `--components X,Y` | Restore only these components |
 | `--dry-run` | List what would be restored and write nothing |
 | `--list-components` | Show the component names and what each covers |

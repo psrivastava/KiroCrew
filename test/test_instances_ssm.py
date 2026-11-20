@@ -6,7 +6,10 @@ import asyncio
 import os
 
 import pytest
+from closed_peer_helpers import refused_peer_connects  # noqa: F401
 from instances_helpers import _FakeTunnel, _patch_port_probe
+
+pytestmark = pytest.mark.usefixtures("refused_peer_connects")
 
 
 class TestSsmValidation:
@@ -766,8 +769,11 @@ class TestSsmTunnelProcessGroup:
         assert seen["creationflags"] == 0x200
 
     @pytest.mark.asyncio
-    async def test_ssh_spawn_gets_no_process_group(self, monkeypatch):
-        """Regression guard: the SSH transport's spawn is unchanged."""
+    async def test_ssh_spawn_gets_a_process_group_on_posix_only(self, monkeypatch):
+        """POSIX gives ssh its own group, so a teardown also reaps its ProxyCommand.
+
+        Windows keeps the SSH spawn unchanged: no setsid and no creation flag.
+        """
         import kiro_crew.instances.ssh_tunnel_manager as mod
 
         seen = {}
@@ -778,6 +784,12 @@ class TestSsmTunnelProcessGroup:
 
         monkeypatch.setattr(mod.asyncio, "create_subprocess_exec", fake_exec)
         monkeypatch.setattr(mod.platform_compat, "IS_POSIX", True)
+        await self._tunnel("ssh").start()
+        assert seen["start_new_session"] is True
+        assert seen["creationflags"] == 0
+
+        seen.clear()
+        monkeypatch.setattr(mod.platform_compat, "IS_POSIX", False)
         await self._tunnel("ssh").start()
         assert seen["start_new_session"] is False
         assert seen["creationflags"] == 0
@@ -849,6 +861,34 @@ class TestSsmTunnelProcessGroup:
         child_path = seen["env"]["PATH"].split(os.pathsep)
         assert child_path.index(str(inherited)) < child_path.index(str(install_dir))
 
+    @pytest.mark.asyncio
+    async def test_ssm_child_gets_no_python_interpreter_settings(self, monkeypatch):
+        """aws-cli v1 is Python: the gateway's PYTHONPATH/PYTHONHOME must not reach it.
+
+        Everything else ``tool_spawn_env`` builds, the widened PATH included, still does.
+        """
+        import kiro_crew.instances.ssh_tunnel_manager as mod
+
+        seen = {}
+
+        async def fake_exec(*argv, **kw):
+            seen.update(kw)
+            raise OSError("stop here — we only care about the spawn kwargs")
+
+        spawn_env = {
+            "PATH": "<widened>",
+            "PYTHONPATH": "<gw>",
+            "PYTHONHOME": "<gw>",
+            "AWS_PROFILE": "k",
+        }
+        monkeypatch.setattr(mod, "tool_spawn_env", lambda head: dict(spawn_env))
+        monkeypatch.setattr(mod.asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(mod.platform_compat, "IS_POSIX", True)
+
+        await self._tunnel("ssm").start()
+
+        assert seen["env"] == {"PATH": "<widened>", "AWS_PROFILE": "k"}
+
     def test_teardown_routes_through_the_platform_shim(self, monkeypatch):
         """Not raw os.killpg — that leaves the plugin alive on Windows."""
         import kiro_crew.instances.ssh_tunnel_manager as mod
@@ -903,6 +943,7 @@ class TestSsmTransportSelection:
             ttl="20h",
             remote_port=None,
             embed_parent_port=None,
+            embed_forward_port=None,
             timeout_secs=None,
         ):
             return "SSH_TOKEN"
@@ -1014,6 +1055,7 @@ class TestSsmTransportSelection:
             ttl="20h",
             remote_port=None,
             embed_parent_port=None,
+            embed_forward_port=None,
             timeout_secs=None,
         ):
             seen["timeout_secs"] = timeout_secs
@@ -1130,6 +1172,9 @@ class TestSsmTransportSelection:
         st = await mgr.connect("ec2")
         assert st.state == TunnelState.ERROR
         assert "session-manager-plugin" in st.error
+        # The dashboard shows this (Connect in Settings, Retry in the crew panel), not a CLI.
+        assert "then connect again:" in st.error
+        assert "kirocrew cloud connect" not in st.error
         # No tunnel was spawned for a missing prerequisite.
         assert mgr.status("ec2") is None
         await mgr.shutdown()
@@ -1305,6 +1350,58 @@ class TestSsmMintOutputRedaction:
         assert ("instances.mint_timeout_secs" in msg) is names_setting
         assert ("already at its maximum" in msg) is not names_setting
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "stderr, exit_code, lead",
+        [
+            (
+                "sudo: unknown user ubuntu\nsudo: error initializing audit plugin",
+                1,
+                "User ubuntu doesn't exist on this instance.",
+            ),
+            (
+                "kirocrew binary not found in any of: ...",
+                127,
+                "Kiro Crew isn't installed for user ubuntu on this instance.",
+            ),
+            ("Traceback (most recent call last): ...", 1, "remote token mint on"),
+            (
+                "/home/ubuntu/.local/bin/kirocrew: line 2: python3: command not found",
+                127,
+                "remote token mint on",
+            ),
+        ],
+    )
+    async def test_failed_ssm_mint_leads_with_the_cause_and_its_setting(
+        self, monkeypatch, stderr, exit_code, lead
+    ):
+        """A mint whose output names its cause says so first, as Diagnose would.
+
+        The raw status and tail still follow, and an unrecognised failure keeps
+        today's message unchanged.
+        """
+        from kiro_crew.cloud import ssm as cloud_ssm
+        from kiro_crew.instances import ssm_token_mint as sm
+
+        def fake_run_command(target, command, profile, region, **kwargs):
+            return cloud_ssm.CommandResult(
+                status="Failed", stdout="", stderr=stderr, exit_code=exit_code
+            )
+
+        monkeypatch.setattr(cloud_ssm, "run_command", fake_run_command)
+        with pytest.raises(sm.TokenMintError) as excinfo:
+            await sm.mint_remote_token_ssm("i-0123456789abcdef0", ssm_run_as="ubuntu")
+        msg = str(excinfo.value)
+        assert msg.startswith(lead)
+        assert f"exited status=Failed code={exit_code}" in msg
+
+    def test_connect_and_diagnose_word_the_mint_causes_alike(self):
+        import kiro_crew.instances.diagnostics as diag
+        from kiro_crew.instances import ssm_token_mint as sm
+
+        assert diag._SSM_REASONS[diag.SSM_USER_UNKNOWN] == sm.USER_UNKNOWN_REASON
+        assert diag._SSM_REASONS[diag.REMOTE_NOT_INSTALLED] == sm.NOT_INSTALLED_REASON
+
 
 class TestSsmDiagnostics:
     """The SSM diagnosis ladder reports the first broken link, SSM-worded."""
@@ -1408,6 +1505,24 @@ class TestSsmDiagnostics:
         assert await diag._probe_ssm_managed("i-0123456789abcdef0") == diag._NODE_UNREACHABLE
 
     @pytest.mark.asyncio
+    async def test_local_sandbox_refusal_is_not_blamed_on_ssm(self, monkeypatch):
+        """A hub whose own sandbox refuses ``aws`` gets that reason, not SSM/IAM advice."""
+        import kiro_crew.instances.diagnostics as diag
+        from kiro_crew.cloud import aws
+        from kiro_crew.sandbox import SandboxUnavailableError
+
+        msg = "Sandbox backend unavailable and allow_unsandboxed_exec is not set."
+
+        def refuse(*a, **k):
+            raise SandboxUnavailableError(msg, "no_backend", "unshare failed")
+
+        monkeypatch.setattr(aws, "run_aws", refuse)
+        res = await diag.diagnose_instance_ssm("i-0123456789abcdef0", 7777, 7777)
+        assert res.code == diag.UNKNOWN
+        assert res.reason == msg
+        assert res.probes == [{"name": "ssm_managed_node", "ok": False}]
+
+    @pytest.mark.asyncio
     async def test_remote_down_then_not_connected_then_ok(self, monkeypatch):
         import kiro_crew.instances.diagnostics as diag
 
@@ -1417,14 +1532,14 @@ class TestSsmDiagnostics:
         monkeypatch.setattr(diag, "_probe_ssm_managed", node_ok)
 
         async def dash_down(*a, **k):
-            return False
+            return diag.REMOTE_DOWN, diag._SSM_REASONS[diag.REMOTE_DOWN]
 
         monkeypatch.setattr(diag, "_probe_remote_dashboard_ssm", dash_down)
         res = await diag.diagnose_instance_ssm("i-0123456789abcdef0", 7777, 7777)
         assert res.code == diag.REMOTE_DOWN
 
         async def dash_ok(*a, **k):
-            return True
+            return diag.OK, ""
 
         monkeypatch.setattr(diag, "_probe_remote_dashboard_ssm", dash_ok)
         # local_port == 0 -> never connected (not a broken tunnel)
@@ -1443,6 +1558,12 @@ class TestSsmDiagnostics:
         import kiro_crew.instances.diagnostics as diag
 
         res = await diag.diagnose_instance_ssm("-oProxyCommand=evil", 7777, 7777)
+        assert res.code == diag.UNKNOWN
+        assert res.probes == []
+        # remote_bin reaches the remote shell, so it is validated before any dispatch too.
+        res = await diag.diagnose_instance_ssm(
+            "i-0123456789abcdef0", 7777, 7777, remote_bin="$(id)"
+        )
         assert res.code == diag.UNKNOWN
         assert res.probes == []
 

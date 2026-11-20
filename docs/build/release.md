@@ -27,6 +27,14 @@ mapping to get wrong. `test_publish_feed_contract.py` pins the channel set
 against `publish-cli.yml`, and `cli.sh` rejects anything outside it before
 touching the CDN.
 
+Nightly builds also run Kiro Crew's own KAS engine by default: `nightly.yml`
+passes `build_channel: nightly` to `build-wheel.yml`, `build-desktop.yml` and
+`build-windows.yml`, `scripts/stamp-distribution.sh` bakes it into
+`_build_info.BUILD_CHANNEL`, and an unset `agent.kas_bundle` reads that stamp
+(`config.loader_document.kas_bundle_build_default`). `release.yml` passes no
+lane, so insider and stable builds keep the default off. Pinned by
+`test_kas_bundle_nightly_default.py`.
+
 Channel is derived from the tag, and nothing else. `release.yml`'s `version` job
 treats **any** prerelease label as insider and maps it to a PEP 440 `rcN` wheel
 using the label's trailing number. Cutting the branch, numbering the RCs,
@@ -183,8 +191,12 @@ mechanism:
   `publish-cli.yml` run signs a second manifest for insider and, as its last
   step and only when the same guard advances, stages the same wheel under
   `cli/insider/<version>/` and writes that manifest to
-  `feed/insider/latest-cli.json`. The insider PEP 503 index and the `:insider`
-  image tag do not catch up yet (#32646).
+  `feed/insider/latest-cli.json`. The same run also lists the stable wheel in
+  the insider PEP 503 index, with no guard: an index only adds a version and
+  pip installs the newest one listed, so an insider line already ahead still
+  resolves to its own build. `publish-docker.yml` moves `:insider` to a stable
+  release's digest as its last alias write, behind the same guard run against
+  the repo's tags, which are pushed before any run publishes them.
 
 ### Runbook: promoting an RC to stable
 
@@ -310,24 +322,25 @@ code.
 
 ## Workflows in the release path
 
-Every one of these exists on `main`. Two trigger workflows call the same set of
+Every one of these exists on `main`. Two trigger workflows (plus `release-lts.yml`,
+see "LTS edition releases") call the same set of
 reusable ones, which hold all of the build, sign, and publish logic so the
 recipe exists exactly once; the triggers carry only their trigger, their
 concurrency group, and their version derivation.
 
 | Workflow | Kind | Role |
 |---|---|---|
-| `nightly.yml` | trigger (schedule + dispatch) | Derives the date stamp, then calls everything below. `concurrency: nightly-build` with `cancel-in-progress: true`. |
+| `nightly.yml` | trigger (schedule + dispatch) | Derives the date stamp, then calls everything below. `concurrency: nightly-build`; only a scheduled run cancels the run in progress (`cancel-in-progress: ${{ github.event_name == 'schedule' }}`), so a manual dispatch waits behind the scheduled nightly instead of cancelling it. |
 | `release.yml` | trigger (`push` on `v*` tags) | Derives version + channel + wheel version from the tag. A prerelease tag builds, publishes to insider, and records the immutable promotion bundle. A bare tag verifies the same-commit successful prerelease run, then rebuilds under the bare version by default; `STABLE_PROMOTE_BYTES` opts one base into exact-byte reuse. Then it creates the GitHub Release. `concurrency: release-publish` with `cancel-in-progress: false` (queued). |
-| `dependency-vulnerability.yml` | reusable gate | `scripts/check_npm_audit.py`. On a release every build job needs it; on a nightly every **publish** job needs it and no build job does, so a slow registry delays publication rather than failing the build. |
+| `dependency-vulnerability.yml` | reusable gate | `scripts/check_npm_audit.py`. On a release every build job needs it; on a nightly every **publish** job needs it and no build job does, so a slow registry delays publication rather than failing the build. Its own daily `schedule:` run at 22:00 UTC gates nothing: it is the early warning that files a `scheduled-failure` issue eight hours before the nightly. |
 | `build-wheel.yml` | reusable build | Stamps the PEP 440 version into `pyproject.toml` and `__init__.py`, stamps the distribution channel, builds the frontend and stages it into the package, then `python -m build`. Uploads artifact `cli-wheel` (wheel + sdist). Credential-free. |
 | `build-desktop.yml` | reusable build | Matrix `macos-15` (universal macOS app) and `ubuntu-22.04` / `ubuntu-22.04-arm` (AppImage + deb + rpm) via `packaging/build-desktop.sh`, then a `smoke-linux-packages` job that installs the deb and rpm in Ubuntu 24.04 and Amazon Linux 2023 containers. Deliberately credential-free (`contents: read` only, pinned by `test_workflow_permissions.py`), so it builds **unsigned** and hands the `.app` downstream. `nightly.yml` passes `soft_fail_arm64: true`, which marks the arm64 leg alone `continue-on-error` so a failed arm64 build cannot skip the x64 publishers; the smoke never carries it, so a package that will not install still holds both arches. A second macOS job, `build-desktop-mac-single-arch`, builds arm64-only and x86_64-only DMGs behind the `mac_single_arch` input (`nightly.yml` and `release.yml` both pass true). It is `continue-on-error` only under `soft_fail_mac_single_arch: true`, which `nightly.yml` passes and `release.yml` does not: on release both DMGs are required promotion-bundle roles, so a failed single-arch build fails the aggregate before any publisher writes an immutable key. Each DMG is then signed and fed by its own `sign-and-notarize.yml` call (`mac_variant`), and the universal call excludes both artifact names when flattening, so the universal DMG stays the only mac bytes the universal leg signs and feeds. |
 | `build-windows.yml` | reusable build | `kirocrew-windows-4-core` on this repository and `windows-latest` on a fork, an NSIS `Setup.exe`. Separate from `build-desktop.yml` because Authenticode signing has to happen *inside* the build (the installer compresses its own already-signed executable), so this job holds an AWS Signer identity and `build-desktop.yml` can stay credential-free. Callers pass `soft_fail: true`, so a Windows failure cannot skip the mac/Linux lanes. |
 | `publish-windows.yml` | reusable publish | Publishes the signed x64 installer and blockmap, then `feed/<channel>/latest.yml` and the `latest/` installer alias. It probes the soft-failed build artifact and skips when none exists; stable uses the fresh build by default or the optional candidate pair in byte-reuse mode. |
-| `publish-cli.yml` | reusable publish | Wheel + `SHA256SUMS` + KMS-signed `cli-manifest.json` to `cli/<channel>/<version>/`, the same signed manifest to `feed/<channel>/latest-cli.json`, and a PEP 503 index under `feed/<channel>/simple/`. A stable release repeats the first two for insider with an insider-signed manifest when the insider guard advances. |
+| `publish-cli.yml` | reusable publish | Wheel + `SHA256SUMS` + KMS-signed `cli-manifest.json` to `cli/<channel>/<version>/`, the same signed manifest to `feed/<channel>/latest-cli.json`, and a PEP 503 index under `feed/<channel>/simple/`. A stable release repeats the first two for insider with an insider-signed manifest when the insider guard advances, and always adds its wheel to the insider index. |
 | `publish-linux.yml` | reusable publish | One Linux artifact to `desktop/<channel>/<version>/`, its channel file under `<feed prefix>/latest-linux[-arm64].yml`, then the `latest/` alias. Invoked ONCE PER (ARCH, FORMAT) PAIR — `arch: x64\|arm64` × `format: appimage\|deb\|rpm`, six callers — each with its own keys and feed, so no two ever share one. |
-| `sign-and-notarize.yml` | reusable publish | Three chained jobs (`sign`, `notarize`, `publish`) covering the whole macOS trust chain and the mac feed write. Called THREE TIMES by each trigger: once for the universal DMG (`feed/<channel>/latest-mac.yml`) and once per single-arch DMG with `mac_variant: arm64 \| x64` + `mac_artifact`, which suffixes every shared key, artifact and in-artifact zip name with the arch and writes `feed/<channel>/<arch>/latest-mac.yml`. All three are required lanes on `release.yml`, and the promotion bundle carries all three zip/DMG pairs (`mac_zip[_<arch>]` / `dmg[_<arch>]` roles). |
-| `publish-docker.yml` | reusable publish | Multi-arch (`linux/amd64,linux/arm64`) image built from the same wheel, pushed to `ghcr.io/<owner>/kirocrew`. |
+| `sign-and-notarize.yml` | reusable publish | Four chained jobs (`sign`, `notarize`, `blockmap`, `publish`) covering the whole macOS trust chain and the mac feed write. `blockmap` holds no credentials and builds the differential-update blockmap from the notarized zip with the pinned electron-builder; `publish` writes it beside the zip before the feed, only when it was built from the bytes the CDN serves, and goes on without it when it is missing (that version's updates are then full downloads). Called THREE TIMES by each trigger: once for the universal DMG (`feed/<channel>/latest-mac.yml`) and once per single-arch DMG with `mac_variant: arm64 \| x64` + `mac_artifact`, which suffixes every shared key, artifact and in-artifact zip name with the arch and writes `feed/<channel>/<arch>/latest-mac.yml`. All three are required lanes on `release.yml`, and the promotion bundle carries all three zip/DMG pairs (`mac_zip[_<arch>]` / `dmg[_<arch>]` roles). |
+| `publish-docker.yml` | reusable publish | Multi-arch (`linux/amd64,linux/arm64`) image built from the same wheel, pushed to `ghcr.io/<owner>/kirocrew`. A stable release also moves `:insider` when the insider guard advances. |
 | `publish-installer.yml` | independent publish | Publishes `cli.sh` to the distribution bucket root. Triggered by a push to `main` touching `cli.sh` (path-filtered), plus manual dispatch. **Not** part of a channel release. |
 
 Release-adjacent, deliberately outside the release path:
@@ -365,6 +378,7 @@ cli/<channel>/<version>/cli-manifest.json                    immutable
 desktop/<channel>/<version>/KiroCrew.zip                     immutable
 desktop/<channel>/<version>/KiroCrew.dmg                     immutable (universal)
 desktop/<channel>/<version>/KiroCrew-{arm64,x64}.{zip,dmg}   immutable (single-arch)
+desktop/<channel>/<version>/KiroCrew[-{arm64,x64}].zip.blockmap immutable (optional)
 desktop/<channel>/<version>/KiroCrew-x86_64.AppImage         immutable
 desktop/<channel>/<version>/KiroCrew-aarch64.AppImage        immutable
 desktop/<channel>/<version>/KiroCrew-x86_64.deb              immutable
@@ -406,9 +420,9 @@ one with no exact kernel version (a non-`.0` macOS 11+ floor).
 
 Every channel file, on every platform, also carries `releaseNotes`: the version's
 `CHANGELOG.md` section, which the desktop app shows for a pending update before the
-user installs it. `scripts/feed_release_notes.py` picks the section the way
-Settings > Releases does (`0.4.0-insider.14` reads `## [0.4.0]`) and prints it as one
-JSON string, which is also a YAML double-quoted scalar, so no changelog text can
+user installs it. `scripts/feed_release_notes.py` picks the section the way the release
+notes in Settings > About do (`0.4.0-insider.14` reads `## [0.4.0]`) and prints it as
+one JSON string, which is also a YAML double-quoted scalar, so no changelog text can
 break the file. A version with no section, in practice a nightly, gets `""`.
 
 Every public URL is exactly one of two classes, and the class decides the cache
@@ -592,6 +606,21 @@ different key). The project page is merged with the live one so prior versions
 stay installable, and a non-200/non-404 fetch aborts the step rather than
 truncating the version history.
 
+Every link carries `data-requires-python`, so pip on an older interpreter refuses
+with "Requires-Python >=3.12" instead of falling back to a release from before the
+floor was raised. A new link takes the wheel's own `Requires-Python`; the merge
+keeps each link's attributes, and stamps any link published before the attribute
+existed with `>=3.12`. That stamp is deliberate even where a pre-0.6 wheel's
+METADATA says `>=3.10`: this index serves only the supported 3.12+ line
+([decision](../decisions/2026-11-09-pip-older-than-3-12-is-refused-not-given-a-pre-0-6-release.md)).
+`pip install --ignore-requires-python` is the escape hatch.
+
+Every branch that can tag a release must merge the page the same way, because a
+tag runs the workflow from its own commit. A release branch whose merge still keeps
+only bare links would publish a page holding just its own link and drop the
+channel's whole version history. So a release branch cut before links carried
+attributes takes the attribute-keeping merge pattern before its next tag.
+
 ## The macOS trust chain
 
 `sign-and-notarize.yml`, three jobs, called with `write_feed: true` by both
@@ -631,7 +660,8 @@ with the matching `*-mac.zip`.
    unsigned app is removed and replaced with the stapled app before the image
    is shrunk and recompressed. This preserves the Finder background and icon
    positions while ensuring no unsigned app survives. The resulting DMG is
-   signed by a second CDSigner task with a `type: dmg` manifest, notarized,
+   signed by a second CDSigner task with a `type: "app"` manifest that names the
+   DMG as its output, notarized,
    stapled, and held to the same `spctl` gate. The DMG signature is load-bearing
    twice over: an `hdiutil` DMG carries an adhoc signature that the Apple notary
    accepts but Gatekeeper treats as "no usable signature" ("app is damaged" on
@@ -671,7 +701,8 @@ byte-for-byte would otherwise leave the old object published while the feed
 described the new one, and every client would refuse to install.
 
 Ordering **across** runs has two layers: the trigger workflows' `concurrency`
-groups (nightly cancels an in-flight older run, release queues), plus
+groups (a scheduled nightly cancels an in-flight older run, a manual nightly
+and a release queue), plus
 `scripts/check_feed_advance.py` before each mutable pointer write. The guard
 compares the candidate with both the live CDN feed and repository tags; older
 runs still publish immutable versioned assets but do not move feeds or aliases.
@@ -831,6 +862,15 @@ bucket is private and a manifest must never advertise a raw S3 URL.
 so a retried job produces a byte-identical manifest and the immutable write
 still succeeds.
 
+**The optional advance notice, `announce.json`.** Beside `latest-cli.json` the
+feed may carry `feed/<channel>/announce.json`, which the gateway reads to draw
+the About page's "Upcoming update" block (field schema and failure rules:
+[learn-cron-dashboard](../system-specs/modules/learn-cron-dashboard.md), "Upcoming
+update notice"). It is unsigned display text. Nothing writes it yet: a follow-up
+adds a step to `publish-cli.yml`, next to the manifest write, that publishes it
+from the release's changelog section ahead of the release and removes or
+replaces it once the release ships.
+
 Key provisioning, the `kms:GetPublicKey` + `kms:Sign` grant, and the rotation
 procedure (dual-trust, never an in-place swap, because schema v1 pins exactly
 one key) are in [../../packaging/signing/README.md](../../packaging/signing/README.md).
@@ -941,9 +981,15 @@ the installed source rather than a mock. It fails, rather than passing vacuously
 when `CI` is set and the library is not installed, and is skipped elsewhere. If
 that test fails after a bump, it is not flaky and it is not the test's problem: the library rewrapped the error, and
 the attribution scheme in `runtime/update/feed-lane.js` and the check lifecycle it reads from `runtime/update/freshness-gate.js` — not one line of it —
-needs re-reading before the bump lands. The version range stays a caret on purpose: `npm ci` builds
+needs re-reading before the bump lands. The same file pins the premise the Download
+click rests on: `downloadUpdate()` fetches only what `doCheckForUpdates()`, the
+event-emitting check, stored in `this.updateInfoAndProvider`, and
+`getUpdateInfoAndProvider()`, the read that emits nothing, never sets it. That is why
+the click's freshness gate in `runtime/update/feed-lane.js` runs a real
+`checkForUpdates()` rather than a read; when that test fails, re-read that gate before
+the bump lands. The version range stays a caret on purpose: `npm ci` builds
 from `package-lock.json`, so resolution is already exact in CI, and the canary is
-the general guard for the premise rather than a frozen version number.
+the general guard for both premises rather than a frozen version number.
 
 It runs in packaged macOS, Linux and Windows builds: `SUPPORTED_PLATFORMS` is
 exactly `{darwin, linux, win32}`.
@@ -954,7 +1000,7 @@ path. On Linux the install shape decides: an AppImage is replaced in place (so
 the directory holding it must be writable, which `bundle-location.js`'s
 `canUpdateLinuxInstall` gates on), while a deb or rpm is handed to
 `dpkg`/`rpm` behind an elevation prompt by electron-updater's `DebUpdater` /
-`RpmUpdater`. `resolveLinuxInstall()` picks the shape from three positive
+`RpmUpdater`. `classifyLinuxInstall()` picks the shape from three positive
 signals — `resources/package-type`, `$APPIMAGE`, and an `/opt` install path —
 and a package whose FORMAT cannot be named is refused rather than pointed at
 another format's feed. On Windows `NsisUpdater` reads
@@ -974,11 +1020,14 @@ Two Windows details do not generalise from the other platforms:
   it also has to contend with `Provider.findFile()` disambiguating entries by
   matching `process.arch` against the URL path.
 - **Windows updates are visible but non-interactive.** `quitAndInstall` passes
-  `isSilent=false` and `isForceRunAfter=true`. The assisted installer
+  `isSilent=false` and `isForceRunAfter=false` (see "Updates install on the
+  user's quit" below), so the installer does not start the app again; the one
+  exception is a Restart now the user asked for. The assisted installer
   (`nsis.oneClick: false`) uses update-only hooks in `installer.nsh` to skip the
   Welcome, install-mode, and Finish decisions, leaving only the native
-  extraction page and its real progress visible. At completion it runs the
-  locked electron-builder `StartApp` contract and exits successfully. The same
+  extraction page and its real progress visible. At completion it exits
+  successfully, running the locked electron-builder `StartApp` contract only
+  when the update was started with `--force-run`. The same
   hooks call `SetSilent normal` for `/S --updated`, so a client released before
   this behavior change also gets visible progress on its first upgrade into it.
   The downloaded installer owns this UI contract: a downgrade or channel
@@ -1067,11 +1116,30 @@ platform — on macOS that flag stages eagerly, which arms ShipIt to swap the
 bundle on ANY exit (including exits that skip the gateway teardown) and cannot
 be un-armed, so it would also defeat release retraction.
 
+**Updates install on the user's quit, never while the app runs.** The Install
+click ARMS the staged build (`install()` on the lane, `updateAPI.install()` in
+the renderer): it does not stop the gateway, does not call `quitAndInstall` and
+quits nothing, and the renderer is told with `armed: true` on the `downloaded`
+state. The renderer reads that as finished, not as an install still in flight:
+`useInstallDispatch` releases its latch, the modal and the About card say the
+update installs when the user quits, and a Restart now action calls
+`updateAPI.relaunch()`. An armed stage installs even when the auto-download preference is off,
+because the user chose it. The install itself runs only from the `before-quit`
+handler, after the gateway has fully stopped, and that handler calls
+`quitAndInstall(false, false)`: the app is not relaunched by it. Squirrel.Mac
+brings the app back after its swap whatever that argument says; that is the
+platform's behavior. `updateAPI.relaunch()` (Restart now) is a plain quit and
+relaunch: with an armed stage the quit's install runs and then relaunches
+(`quitAndInstall(false, true)`), otherwise it is `app.relaunch()`. The maintainer's
+rulings are
+the 2026-11-10 decision "updates never restart a running gateway".
+The managed lane follows the same rule with its own commands; see
+[desktop-app.md → Externally-managed installs](desktop-app.md#externally-managed-installs-repackagers).
+
 **A stage is re-verified against the feed before it installs, so an install
 always applies the NEWEST build.** A download can sit staged for hours while
 newer releases publish, and installing it then applies a superseded build the
-user must immediately update again. Both install paths — the About panel's
-explicit install and the deferred install on quit — therefore call
+user must immediately update again. The quit-time install therefore calls
 `verifyStageIsLatest` (`website/electron/runtime/update/freshness-gate.js`, composed by `feed-lane.js`) first.
 It drives an ordinary `checkForUpdates`, or waits for the one already in flight,
 and reads the verdict back out of the existing handlers, so the direction gate

@@ -46,7 +46,10 @@ export interface CronJob {
    * default resolved by the server. Read this, never `timezone`, to place a run. */
   effective_tz?: string | null
   skip_dates?: string[] | null
-  script?: string | null; command?: string | null; last_result?: string | null; last_error?: string | null
+  script?: string | null; command?: string | null
+  /** The list (`api.crons()`) carries only the opening of a long result or
+   *  error; `api.cron(id)` carries both whole. */
+  last_result?: string | null; last_error?: string | null
   /** Epoch seconds at which `last_result` was produced; absent on an older gateway. */
   last_result_ts?: number | null
   is_running?: boolean; running_since?: number | null
@@ -55,8 +58,12 @@ export interface CronJob {
    * supplies, so it cannot be used to claim another app's jobs. Absent on an
    * older gateway. */
   app?: string | null
-  /** True only when the USER paused the job; execution never sets it. */
+  /** True when the USER paused the job, and also on a one-shot its own run
+   * parked (the store writes the same flags); `parked_after_run` tells them apart. */
   user_paused?: boolean
+  /** True when the pause is a fired one-shot's park, not the user's. Absent on an
+   * older gateway. */
+  parked_after_run?: boolean
   /** Operator-granted vault secrets injected into a script/command job's env at
    * fire time: env-var name -> vault secret NAME (values never leave the vault).
    * Absent/null when the job holds no grant. */
@@ -74,8 +81,12 @@ export interface CronJob {
    *  Schedule page — the two are never read off each other. */
   chat_folder_id?: string
   /** False for a job that runs on a fresh session every fire. The form does not
-   *  edit it; it only reads it to disable the chat-folder picker. */
+   *  edit it; it reads it to disable the chat-folder picker and to offer
+   *  `new_chat_per_run`. */
   persistent_session?: boolean
+  /** True when each run of this stateless agent job opens its own chat tab on
+   *  its own session. Absent on an older gateway. */
+  new_chat_per_run?: boolean
   /** Consecutive failed runs that auto-pause this job (0..10000). 0 never
    *  pauses; a job at 0 or above 5 backs off from its 5th failure instead.
    *  Absent on an older gateway. */

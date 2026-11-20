@@ -44,6 +44,7 @@ import sys
 import tempfile  # noqa: F401
 import textwrap  # noqa: F401
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from types import ModuleType
@@ -88,6 +89,7 @@ from kiro_crew.acp.types import ACP_BACKEND_KAS
 from kiro_crew.agent import AGENT_FILENAME, agent_spec_path
 from kiro_crew.agent_discovery import (
     _read_agent_spec,
+    plain_markdown_document,
     project_agent_files,
     project_agent_name,
 )
@@ -99,6 +101,8 @@ from kiro_crew.agent_spec_format import (  # noqa: F401
     SKILL_VIEW_PROJECTION_CEILING,
     count_authored_agent_files,
     is_agent_spec_name,
+    is_markdown_spec,
+    iter_agent_spec_files_strict,
     shadowed_markdown_specs,
     skill_view_ceiling,
 )
@@ -179,6 +183,7 @@ from kiro_crew.cron import (  # noqa: F401
 )
 from kiro_crew.dashboard.crash_dump_store import (  # noqa: F401
     dump_age_seconds,
+    dump_fired_at,
     dump_first_stack_lines,
     dump_superseded,
     dumps_with_stacks,
@@ -414,6 +419,26 @@ _NO_BLANKET_ALLOW_MCPS = frozenset({CU_MCP_SERVER, "kirocrew-guide", "kirocrew-m
 _OOM_KILLER_UNITS = ("systemd-oomd", "earlyoom")
 
 
+def _model_url_failure_text(exc: BaseException, url: str) -> str:
+    """Why the model url probe failed, never quoting a secret-bearing url.
+
+    urllib quotes pieces of a malformed url in its error text (only the tail
+    after the host's last ``:``), so masking the secret by value can miss part
+    of it. A url with a password, query or fragment gets a fixed line instead.
+    """
+    from kiro_crew.asset_downloader import network_failure_cause
+
+    cause = network_failure_cause(exc)
+    if cause:
+        return cause
+    try:
+        parts = urllib.parse.urlsplit(url)
+        carries_secret = bool(parts.password or parts.query or parts.fragment)
+    except ValueError:
+        carries_secret = True
+    return "the model url could not be opened" if carries_secret else str(exc)
+
+
 def _doctor_model_url_reachable(issues: list[str]) -> None:
     """Light HTTPS-reachability probe of the resolved embedding-model URL.
 
@@ -439,7 +464,8 @@ def _doctor_model_url_reachable(issues: list[str]) -> None:
         print("               Fix: set KIROCREW_EMBED_MODEL_URL (or memory.embed_model_url)")
         print("               to a mirror hosting the GGUF; the sha256 pin still verifies it.")
     except Exception as exc:
-        print(f"  model url:   ❌ unreachable ({exc}) {safe}")
+        why = _model_url_failure_text(exc, url)
+        print(f"  model url:   ❌ unreachable ({why}) {safe}")
         print("               Check network connectivity; the background download will")
         print("               keep retrying with backoff on every gateway boot.")
 
@@ -503,6 +529,17 @@ def _selected_roles_run_claude(cfg: KiroCrewConfig) -> bool:
     return ACP_BACKEND_CLAUDE in (cfg.agent.acp_backend, cfg.agent.member_acp_backend)
 
 
+def _selected_roles_run_codex(cfg: KiroCrewConfig) -> bool:
+    """Whether the main or the crewmate backend selects the Codex harness.
+
+    The positive test of ``_selected_roles_run_claude``, for ``ACP_BACKEND_CODEX``,
+    and imported locally for the same reason.
+    """
+    from kiro_crew.acp_backends import ACP_BACKEND_CODEX
+
+    return ACP_BACKEND_CODEX in (cfg.agent.acp_backend, cfg.agent.member_acp_backend)
+
+
 _KIRO_VERSION_TIMEOUT_SECS = 5
 
 
@@ -543,7 +580,46 @@ def _kiro_cli_version_row(kiro: str, issues: list[str], *, required: bool) -> st
     return "  kiro-cli:    ⚠  exits with error (optional backend)"
 
 
-def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False) -> None:
+def _reconcile_memory() -> None:
+    """``doctor --reconcile-memory``: the full metadata pass a start skips.
+
+    An explicit repair, the one write ``doctor`` makes besides ``--bundle``'s zip.
+    """
+    from kiro_crew import memory_record_metadata, memory_stores, sqlite_wal
+    from kiro_crew._sqlite_compat import sqlite3
+
+    path = memory_stores.resolve_store_path(memory_stores.DEFAULT_MEMORY_STORE)
+    if not path.is_file():
+        print(f"  ⏭ no memory database at {path}")
+        return
+    try:
+        db = sqlite3.connect(str(path), timeout=30)
+        # The gateway may be writing through this -wal: this close must not delete it.
+        kept = sqlite_wal.keep_wal_on_close(db)
+        try:
+            with db:
+                # One transaction with the pass, as a store's own open does it: a
+                # database from before the metadata tables gets them first.
+                db.execute("BEGIN IMMEDIATE")
+                if not memory_record_metadata.schema_is_current(db):
+                    memory_record_metadata.ensure_schema(db)
+                changed = memory_record_metadata.reconcile(db, full=True)
+        finally:
+            if kept:
+                db.close()
+            else:
+                sqlite_wal.close_keeping_wal(db)
+    except sqlite3.Error as exc:
+        print(f"  ❌ memory reconcile failed: {exc}")
+        sys.exit(1)
+    print(f"  ✅ memory reconcile: every row checked, {changed} journaled")
+
+
+def _doctor(
+    platform_boot_error: "Exception | None" = None,
+    bundle: bool = False,
+    reconcile_memory: bool = False,
+) -> None:
     """Verify KiroCrew setup — check dependencies, config, credentials, connectivity.
 
     ``platform_boot_error`` carries a :class:`PlatformCompositionError` from
@@ -555,11 +631,16 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     The order of the sections below IS the report: each section prints as it runs
     and appends to one ``issues`` list, and the closing line and exit status are
     decided from that list alone. The families are imported here, once the
-    ``--bundle`` mode has had its turn, so the ``kiro_crew.cli`` import every command
-    pays never loads them.
+    ``--bundle`` mode has had its turn (it loads ``services``, with the ``render``
+    helpers it imports, for the gateway version its ``versions.txt`` records), so
+    the ``kiro_crew.cli`` import every command pays never loads them.
     """
     print("Kiro Crew Doctor 👻\n")
     issues: list[str] = []
+
+    if reconcile_memory:
+        _reconcile_memory()
+        return
 
     # ── Diagnostics bundle (--bundle) ──
     # Short-circuit: collect logs + crash reports into a redacted zip and print
@@ -570,13 +651,16 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     # scans printed output.
     if bundle:
         print("Collecting diagnostics bundle (secrets are redacted)...\n")
+        from kiro_crew.doctor_checks import services  # the one family a bundle reads
+
+        alignment = services._bundle_version_alignment()
         # The collector touches the filesystem in several places that can fail for
         # ordinary reasons — an unwritable data home, a plain FILE sitting where
         # `diagnostics/` should be, a full disk. Letting OSError escape prints a
         # traceback at the one moment the user is already trying to report a
         # failure, so fail with a readable message and a nonzero status instead.
         try:
-            result = diagnostics.collect_bundle()
+            result = diagnostics.collect_bundle(version_alignment=alignment)
         except OSError as exc:
             print(f"  ❌ could not write the diagnostics bundle: {exc}")
             print("     Check that ~/.kiro/crew is writable and has free space.")
@@ -664,9 +748,9 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     # ── Dependencies ──
     print("Dependencies")
     # kiro-cli is the DEFAULT agent backend and the floor every deployment keeps.
-    # Claude Code is selectable too (``BASELINE_SELECTABLE_BACKENDS``), so it is
-    # reported as a real optional backend -- present or absent -- rather than only
-    # when it happens to be installed. The verdict comes from the same owner the
+    # Claude Code and Codex are selectable too (``BASELINE_SELECTABLE_BACKENDS``), so
+    # each is reported as a real optional backend -- present or absent -- rather than
+    # only when it happens to be installed. The verdict comes from the same owner the
     # dashboard asks, so doctor and the panel cannot disagree.
     # Resolved the way the gateway resolves it -- KIROCREW_KIRO_BIN, then the
     # desktop app's bundled copy, then the known install dirs, then PATH -- so
@@ -698,6 +782,7 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
         print("               Install kiro-cli per its docs, then: kiro-cli login")
 
     agents._doctor_claude_backend(issues, required=_selected_roles_run_claude(cfg))
+    agents._doctor_codex_backend(issues, required=_selected_roles_run_codex(cfg))
     # After the install rows, and per harness rather than per provider: sign-in is a
     # different question from install with a different remedy, and every harness's
     # answer now comes from one declaration instead of a block written per backend.
@@ -723,7 +808,16 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
             installed_engine = None
         if installed_engine is not None:
             bundle_node_version = installed_engine.node_version or None
-    _report_node(issues, bundle_route=bundle_route, bundle_node_version=bundle_node_version)
+    # The node row treats PATH's Node as unused only when EVERY selected role runs
+    # on the bundle: a Bot role on another harness (Claude's adapter, say) spawns
+    # on the Node from PATH, so its floor still fails the run.
+    # shortcut: reads the two role fields as the other role checks here do, not a
+    # bot's own agents.<name>.acp_backend pin; widen if doctor learns those.
+    roles_on_bundle = bundle_route and all(
+        backend == ACP_BACKEND_KAS
+        for backend in (cfg.agent.acp_backend, cfg.agent.member_acp_backend)
+    )
+    _report_node(issues, bundle_route=roles_on_bundle, bundle_node_version=bundle_node_version)
 
     # venv detection — used by the runtime section below. Windows venvs put the
     # interpreter under .venv\Scripts\python.exe, not .venv/bin/python3, so a
@@ -809,6 +903,7 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     mcp._doctor_mcp_gateway_daemon(issues)
     mcp._doctor_mcp_share_refused(cfg, issues)
     mcp._doctor_unresolved_mcp_refs()
+    mcp._doctor_authored_agent_mcp_refs(cfg)
     mcp._doctor_template_mcp_additions()
     mcp._doctor_backend_ability_cards(cfg)
     mcp._doctor_selected_backend_projection(cfg)
@@ -967,11 +1062,22 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     # ── Speech-to-Text (optional) ──
     features._doctor_speech_to_text(cfg, issues)
 
+    # ── Saved prompts (only when a built-in command shadows one) ──
+    features._doctor_saved_prompts()
+
     # ── Slack (optional) ──
-    channels._doctor_slack(cfg, dashboard.creds, dashboard.has_slack, issues)
+    channels._doctor_slack(
+        cfg,
+        dashboard.creds,
+        dashboard.has_slack,
+        issues,
+        creds_unreadable=dashboard.creds_unreadable,
+    )
 
     # ── Discord (optional) ──
-    channels._doctor_discord(cfg, dashboard.creds, dashboard.port, issues)
+    channels._doctor_discord(
+        cfg, dashboard.creds, dashboard.port, issues, creds_unreadable=dashboard.creds_unreadable
+    )
 
     # ── WhatsApp (optional) ──
     # Its own section rather than a line in the Slack one: WhatsApp's
@@ -980,10 +1086,15 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     channels._doctor_whatsapp(cfg, issues)
 
     # ── Every other channel (optional) ──
-    channels._doctor_other_channels(cfg, dashboard.creds, issues)
+    channels._doctor_other_channels(
+        cfg, dashboard.creds, issues, creds_unreadable=dashboard.creds_unreadable
+    )
 
     # ── Loop-stall crash dumps ──
     workload._doctor_crash_dumps(issues)
+
+    # ── Session tree checkpoint ──
+    workload._doctor_session_tree_checkpoint(issues)
 
     # ── Connectivity ──
     print("\nConnectivity")
