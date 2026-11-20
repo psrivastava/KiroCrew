@@ -473,3 +473,52 @@ parity and logo-glyph tests, and record the entry below.
   passed. Electron host-config + CCrew identity tests 118 passed / 2 skipped.
 - **Not run:** full test suite (CI), `mypy --platform linux`, desktop `.app`
   build (must run from a terminal, §8).
+
+---
+
+## 10. CI on the fork
+
+Upstream's workflows assume resources the fork does not have. The workflows
+below are **disabled in the fork's Actions settings** (`gh workflow disable`).
+Nothing in the repo was edited to skip them, so a sync never conflicts on
+`.github/workflows/`. Their results on a sync PR are expected to be absent, not
+red.
+
+| Workflow | Why it cannot pass on the fork |
+|---|---|
+| Docker Smoke Test, Build, macOS Tests (on demand) | `runs-on` a self-hosted runner group `kirocrew-runners` that does not exist; jobs fail with "runner group not found" or queue forever |
+| Build ffmpeg decoder | Its macOS job uses the same runner group (Windows and Linux jobs do pass) |
+| Opus 5.5 Review, GPT 6.1 Review, UX Review, Design Review, First Principles Review | Need model credentials held as upstream secrets |
+| Security Scope Review | Needs the same credentials; also fails closed on diffs over 1 MB, which every sync exceeds |
+| Internal Content Scan, Internal Content Scan Gate | Need `KIRO_RELEASE_GATE_ROLE_ARN` / `KIRO_RELEASE_GATE_BUCKET` |
+
+**Left enabled:** the `Fork …` variants (Fork UX Review, Fork Security Scope Review, Fork Opus 5.5 Review, …), which are upstream's fork-aware counterparts, plus the checks below that run on GitHub-hosted runners: CI, Fast Gate, PR Policy,
+PR Hygiene, Dependency License Gate, Crew Image Build, Denial Differential,
+Python Client Tests.
+
+**Known red on a sync PR even with the above:**
+- *Fast Gate → Flake Pattern Ratchet* times out (>300 s) on the hosted runner,
+  where the user-namespace probe fails with EPERM. Environmental; re-run once,
+  then treat as accepted.
+- *PR Hygiene* needs a `## Backwards compatibility` section with
+  `Reader: <path>:<symbol> -- <chat|cron|subagent|app|crew page|release> -- <why it still works | test name>`
+  lines for every removed public def. "Removes nothing:" is not accepted
+  (`docs/system-specs/common/take-away-changes.md`).
+- *PR Policy* wants screenshot evidence when the PR touches `website/src/pages/**`,
+  and flags absolute POSIX paths / `/` joins in upstream-added lines (Cross-Platform
+  Portability); both come from upstream code, not the fork.
+
+**One-time repo setting:** enable the dependency graph (Settings → Advanced
+Security), otherwise Dependency License Gate fails with HTTP 403.
+
+**Restore / re-disable:**
+
+```bash
+R=psrivastava/KiroCrew
+gh -R $R workflow list --all                 # ids and states
+gh -R $R workflow enable  <id>               # turn one back on
+gh -R $R workflow disable <id>               # turn one off
+```
+
+Disabling stops future runs only; check results already attached to an open PR
+stay until the PR's head changes.
