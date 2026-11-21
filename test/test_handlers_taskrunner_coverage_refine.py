@@ -21,6 +21,7 @@ from handlers_taskrunner_coverage_helpers import (  # noqa: F401 -- the autouse 
     _request,
     _stub_sel,
 )
+from taskrunner_switch_helpers import turn_task_runner_off
 
 from kiro_crew.acp.types import (
     EVENT_COMPLETE,
@@ -70,6 +71,27 @@ class TestRefineStart:
         resp = await api_taskrunner_refine(_request(_refine_state(), json_body={"input": "  "}))
         assert resp.status == 400
         assert _body(resp)["error"] == "input is required"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", [5, ["a"], {"a": 1}, True, None], ids=repr)
+    async def test_non_string_input_is_400(self, value: Any) -> None:
+        state = _refine_state()
+        resp = await api_taskrunner_refine(_request(state, json_body={"input": value}))
+        assert resp.status == 400
+        assert _body(resp) == {"error": "input must be a string", "code": "invalid_field_type"}
+        assert state._background_tasks == set()
+
+    @pytest.mark.asyncio
+    async def test_task_runner_turned_off_refuses_refine(self) -> None:
+        # A refine is a model session Task Runner, turned off, must not start.
+        state = _refine_state()
+        turn_task_runner_off()
+        resp = await api_taskrunner_refine(_request(state, json_body={"input": "build it"}))
+        assert resp.status == 409
+        assert _body(resp)["code"] == "app_disabled"
+        assert state._refine_task is None
+        assert state._background_tasks == set()
+        assert state._refine_status == "idle"
 
     @pytest.mark.asyncio
     async def test_starts_background_task_and_cancels_previous(self) -> None:
@@ -159,6 +181,15 @@ class TestRefineAnswer:
         )
         assert resp.status == 400
         assert _body(resp)["error"] == "answer required"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", [5, ["a"], {"a": 1}, True, None], ids=repr)
+    async def test_non_string_answer_is_400(self, value: Any) -> None:
+        resp = await api_taskrunner_refine_answer(
+            _request(_refine_state(), json_body={"answer": value})
+        )
+        assert resp.status == 400
+        assert _body(resp) == {"error": "answer must be a string", "code": "invalid_field_type"}
 
     @pytest.mark.asyncio
     async def test_no_pending_question_is_409(self) -> None:

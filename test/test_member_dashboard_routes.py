@@ -1,10 +1,8 @@
 """The crewmate dynamic dashboard HTTP routes (CONTRACT-v3 parts 4, 7 and "adopt").
 
-The property worth guarding hardest is the one the sibling member routes already guard
-and this surface adds a write to: WHICH crewmate's dashboard a request reaches is
-decided from the slug plus the exact crew name, and a slug two crews share reaches
-nobody's. An instance is one directory per slug, so serving a shared slug -- with an
-editor -- would let two crewmates overwrite each other's dashboard.
+The crewmate a request reaches is decided from the slug plus the exact crew name, and a
+slug two crews share reaches nobody's: an instance is one directory per slug, so serving
+a shared slug would let two crewmates overwrite each other's dashboard.
 """
 
 from __future__ import annotations
@@ -12,8 +10,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import random
-import re
 import string
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -21,11 +17,13 @@ from types import SimpleNamespace
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from redaction_structured_cases import github_classic
 
 from kiro_crew import members as members_mod
 from kiro_crew.dashboard.handlers import member_dashboard as routes
 from kiro_crew.dashboard_templates import catalog, instance
 from kiro_crew.platform.context import redact_via_context
+from kiro_crew.testing.synthetic_credentials import SAMPLE_AWS_SECRET
 
 #: The REAL resolvers, bound at import time.
 #:
@@ -67,14 +65,9 @@ def _manifest(**over):
 def _env(tmp_path, _floor_monkeypatch):
     """One fixture template, an isolated home, and the member checks stubbed.
 
-    The member-identity checks are the SIBLING routes' and are tested there; what is
-    stubbed is config loading, not the checks themselves -- ``_member_names_for_slug``
-    still runs, so the shared-slug refusal below is the real code path.
-
-    Patches through ``_floor_monkeypatch`` rather than the shared ``monkeypatch``
-    (D11): an isolation patch on the test-owned undo stack is lifted by any test body
-    that calls ``monkeypatch.undo()``, which would hand the rest of that test the real
-    config loader and the real owner gate.
+    Only config loading is stubbed; ``_member_names_for_slug`` still runs. Uses
+    ``_floor_monkeypatch`` (D11) so a test calling ``monkeypatch.undo()`` cannot lift
+    the isolation and reach the real config loader and owner gate.
     """
     _floor_monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
     builtin = tmp_path / "builtin" / "fixture-board"
@@ -107,16 +100,10 @@ async def _none(*_a, **_k):
 async def _client(state=None):
     """A started client that always closes.
 
-    An ``async with`` helper rather than an ``@pytest.fixture``, by this repo's
-    convention (see ``agent_panel_routes_helpers._client``): the pinned pytest-asyncio
-    does not collect async-generator fixtures declared with plain ``@pytest.fixture``.
-
-    Closing is not tidiness. A ``TestClient`` owns an aiohttp session AND a listening
-    socket, so a returned-but-never-closed client leaks two descriptors per test and,
-    on a loaded runner, fails UNRELATED tests with EMFILE.
-
-    *state* stands in for the gateway's ``DashboardState`` where a case needs one;
-    without it the app carries none, as every other case here reads it.
+    An ``async with`` helper because the pinned pytest-asyncio does not collect
+    async-generator fixtures. An unclosed client leaks a session and a socket, and on a
+    loaded runner fails unrelated tests with EMFILE. *state* stands in for
+    ``DashboardState`` where a case needs one.
     """
     app = web.Application()
     if state is not None:
@@ -137,9 +124,7 @@ def _q(path: str, **extra) -> str:
     return f"/api/members/{SLUG}/dashboard{path}?{query}"
 
 
-# --------------------------------------------------------------------------
 # the read the frame does
-# --------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -158,13 +143,9 @@ async def test_a_crewmate_with_no_dashboard_answers_the_empty_state_not_a_404():
 async def test_an_empty_record_with_no_default_is_not_composed(caplog):
     """Nothing to compose, so nothing is attempted -- and nothing is logged.
 
-    This fixture registers one built-in and it is not ``DEFAULT_TEMPLATE_ID``, so
-    ``default_instance`` answers None: the ordinary state of a build whose registry
-    carries the loader and no default page. An empty record carries ``manifest={}``,
-    which ``parse_manifest`` refuses, so composing it logged a warning WITH a
-    traceback for a crewmate that has simply adopted nothing -- on every poll and
-    every projection frame. The frame's own empty state is the answer here and it
-    needs no html.
+    The fixture's one built-in is not ``DEFAULT_TEMPLATE_ID``, so ``default_instance`` is
+    None. Composing the empty ``manifest={}`` would log a traceback on every poll for a
+    crewmate that adopted nothing.
     """
     import logging
 
@@ -320,9 +301,7 @@ async def test_a_preview_read_the_store_refuses_answers_in_the_stores_words(monk
         assert (await resp.json())["code"] == "dashboard_failed"
 
 
-# --------------------------------------------------------------------------
 # adopt, edit, rollback
-# --------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -387,15 +366,9 @@ async def test_a_live_dashboard_comes_back_with_its_values_filled_in(monkeypatch
 def test_no_worker_session_key_survives_the_render_mask():
     """The page is served by a route with NO owner check.
 
-    The conductor ledger's rule is that no reader but the conductor sees a session
-    key, and a template decides for itself which fold reaches its page and how deep
-    it walks into it -- so the mask is recursive and keyed on the FIELD NAME rather
-    than on one fold's item shape. A mask written against the shape that exists today
-    covers the template adopted today and not the one adopted tomorrow.
-
-    A ``bind`` event's whole text IS the key, so emptying the item field alone leaves
-    it on the page inside the event log while a per-row check passes. The line stays,
-    because its ``kind`` and ``ts`` are when dispatch happened.
+    Only the conductor may see a session key, and a template picks which folds it walks,
+    so the mask is recursive and keyed on the field name. A ``bind`` event's text IS the
+    key, so it is emptied too; the line stays for its ``kind`` and ``ts``.
     """
     key = "chat-9-worker"
     value = {
@@ -422,20 +395,114 @@ def test_no_worker_session_key_survives_the_render_mask():
     assert item["id"] == "it_1"
 
 
+class _Slots:
+    """A slot table with one running and one idle worker; any other key is gone."""
+
+    def __init__(self) -> None:
+        self.slots = {
+            "chat-run": SimpleNamespace(running=True),
+            "chat-idle": SimpleNamespace(running=False),
+        }
+
+    def get_slot(self, key):
+        return self.slots.get(key)
+
+    def slot_exists(self, key):
+        return key in self.slots
+
+
+def test_work_items_get_worker_facts_and_the_key_still_never_reaches_the_page():
+    """The goal-board tells working from waiting by whether the worker is mid-turn.
+
+    That fact needs the session key, which the page may not have, so it is derived
+    before the mask and only the words travel. A remote item and a value that is not
+    a work item list are left as they are.
+    """
+    long_ago = "2020-01-01T00:00:00+00:00"
+
+    def it(item_id, key, **over):
+        base = {"item_id": item_id, "state": "open", "status": "progress"}
+        base["worker_session_key"] = key
+        return {**base, "last_report_at": long_ago, "created_at": long_ago, **over}
+
+    value = [
+        it("a", "chat-run"),
+        it("b", "chat-idle", last_report_at="2999-01-01T00:00:00+00:00"),
+        it("c", "chat-idle"),
+        it("d", "chat-gone"),
+        it("e", None),
+        it("f", "chat-gone", state="accepted", status="done"),
+        it("g", "peer-key", worker_instance_id="peer-1"),
+    ]
+    out = routes.page_safe_for(_Slots())(value)
+    assert "chat-" not in json.dumps(out) and "peer-key" not in json.dumps(out)
+    facts = {row["item_id"]: (row.get("worker"), row.get("stale")) for row in out}
+    assert facts == {
+        "a": ("running", False),
+        "b": ("idle", False),
+        "c": ("idle", True),
+        "d": ("closed", True),
+        "e": ("closed", True),
+        "f": ("closed", False),
+        "g": (None, None),
+    }
+    # Not a work-item list: untouched apart from the mask, as before.
+    assert routes.page_safe_for(_Slots())({"worker_session_key": "chat-run", "x": 1}) == {"x": 1}
+    # No gateway state (the agent's own read): the plain mask.
+    assert routes.page_safe_for(None)(value) == routes._page_safe(value)
+    # No conductor slot named: no `orphaned` stamp, so the page keeps its old rule.
+    assert all("orphaned" not in row for row in out)
+
+
+def test_work_items_say_orphaned_when_the_board_main_chat_is_closed():
+    """The Crew panel calls an open item stuck when its conductor's chat is closed.
+
+    The goal-board gets the same ``orphaned`` fact, read from the board's own slot,
+    for every open local item, and a closed item is never orphaned. A remote item
+    gets none: it has no ``worker`` here, so stuck would hide a running remote
+    worker. An open main chat orphans nothing.
+    """
+
+    def it(item_id, key, **over):
+        base = {"item_id": item_id, "state": "open", "status": "progress"}
+        return {**base, "worker_session_key": key, **over}
+
+    value = [
+        it("a", "chat-idle"),
+        it("f", "chat-gone", state="accepted", status="done"),
+        it("g", "peer-key", worker_instance_id="peer-1"),
+    ]
+    gone = routes.page_safe_for(_Slots(), "chat-conductor")(value)
+    assert {row["item_id"]: row.get("orphaned") for row in gone} == {
+        "a": True,
+        "f": False,
+        "g": None,
+    }
+    assert "chat-" not in json.dumps(gone) and "peer-key" not in json.dumps(gone)
+
+    slots = _Slots()
+    slots.slots["chat-conductor"] = SimpleNamespace(running=False)
+    open_ = routes.page_safe_for(slots, "chat-conductor")(value)
+    assert {row["item_id"]: row.get("orphaned") for row in open_} == {
+        "a": False,
+        "f": False,
+        "g": None,
+    }
+    # The worker facts are the same either way.
+    assert [(r.get("worker"), r.get("stale")) for r in gone] == [
+        (r.get("worker"), r.get("stale")) for r in open_
+    ]
+
+
 def test_a_credential_in_a_fold_value_is_redacted_before_it_reaches_the_page():
     """Every string here is AGENT-AUTHORED and nothing before this read inspects it.
 
-    A fold value is whatever a conductor wrote into the crew log, so a
-    `session_ledger_record(goal=...)` carrying a pasted key is rendered by any template
-    binding that fold. Dropping the one field known to be a secret says nothing about
-    prose that happens to contain one.
-
-    Mapping KEYS too: an artifact name is a free string the agent chose and reaches the
-    browser the same way its value does.
+    A `session_ledger_record(goal=...)` carrying a pasted key reaches any template
+    binding that fold. Mapping keys are scrubbed too: an artifact name is agent-chosen.
     """
     # ASSEMBLED at runtime, never written out whole. The internal-content scan reads
-    # this change's own diff, so a credential-shaped literal added here is a finding
-    # against the PR whatever the surrounding code is for -- and a test that proves
+    # each PR's own diff, so a credential-shaped literal added here is a finding
+    # against that PR whatever the surrounding code is for -- and a test that proves
     # secrets are redacted is a poor place to put one in plain text. The runtime value
     # is a real key header and a real token shape, which is what the redactor has to
     # recognise; only the source spelling is split. Do not join these back up.
@@ -446,7 +513,7 @@ def test_a_credential_in_a_fold_value_is_redacted_before_it_reaches_the_page():
         "MIIEowIBAAKCAQEA3Zx8kUoTBqQw0hXvPj9mKpLq2yTnVr7dFcBg6WsEnJaHtYuZ\n"
         f"{_dashes}END {_kind}{_dashes}"
     )
-    token = "ghp" + "_" + "ZXAMPLEzxampleZXAMPLEzxampleZXAMPLE12"
+    token = github_classic(seed=64)
     value = {
         "goal": f"ship the thing; key is {pem}",
         "items": [{"summary": f"used {token} to fetch it"}],
@@ -454,7 +521,7 @@ def test_a_credential_in_a_fold_value_is_redacted_before_it_reaches_the_page():
     }
     out = routes._page_safe(value)
     blob = json.dumps(out)
-    assert f"BEGIN {_kind}" not in blob, f"a key block reaches the page: {blob[:300]}"
+    assert "MIIEowIBAAKCAQEA3Zx8" not in blob, f"a key body reaches the page: {blob[:300]}"
     assert token not in blob, f"a token reaches the page: {blob[:300]}"
     # Still a page, not a blank: the prose around the secret survives.
     assert "ship the thing" in out["goal"]
@@ -530,9 +597,7 @@ async def test_a_page_whose_values_cannot_be_read_still_answers_without_them(mon
     assert resp.status == 200 and body["state"] == "live" and "rendered_html" not in body
 
 
-# --------------------------------------------------------------------------
 # the boundaries, asserted structurally
-# --------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -576,12 +641,24 @@ async def test_every_route_denies_an_app_caller_and_gates_the_values_it_serves()
             assert "_resolve" in called, f"{name} does not resolve the member"
         if name in _VALUE_SERVING_READS:
             assert "_owner_only" in called, f"{name} is not owner-gated"
+    reader_gate = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_teammate_reader"
+    )
+    reader_calls = {
+        n.func.id
+        for n in ast.walk(reader_gate)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+    }
+    assert "_teammate_admitted" in reader_calls
 
 
 #: Reads that serve this crewmate's FOLD VALUES, which are work-ledger and crew-log
 #: data: task titles, summaries, PR links. ``work_ledger_board`` answers a non-owner
 #: ``owner_only`` for exactly those, so this one cannot answer 200 to the same caller
-#: just because its copy arrives as rendered html.
+#: just because its copy arrives as rendered html. The one non-owner a crewmate's page
+#: admits is a relay teammate on a Bot in their roster (``_teammate_reader``).
 #:
 #: A SET rather than a check inside the loop, so adding a route that serves values is a
 #: one-line change HERE and a visible one in review.
@@ -626,12 +703,8 @@ async def test_a_non_owner_cannot_read_a_crewmates_values():
 async def test_the_gateway_registers_exactly_these_paths_without_importing_us():
     """The boot path binds these routes DEFERRED, so the paths are written twice.
 
-    The same property ``test_agent_panel_routes_allocation`` pins, for the same reason: the boot
-    path may not import an optional subsystem before the socket binds, so it restates
-    each path against ``server._deferred`` -- and a restated path can drift. A route
-    renamed here and not there would 404 in the gateway while every test above passed.
-
-    Compares the two SETS, so a route added to either side has to be added to both.
+    Boot may not import this subsystem before the socket binds, so it restates each path
+    against ``server._deferred``. Comparing the two sets catches drift on either side.
     """
     import inspect
 
@@ -676,12 +749,9 @@ _REAL_WRITE_SESSION = routes._write_session
 def test_the_history_session_is_the_newest_by_SUCCESSION_not_by_the_clock(monkeypatch):
     """A change's history entry belongs to the LIVE session, chosen causally.
 
-    A unit's ``createdAt`` is stamped once and never rewritten, so a clock that steps
-    backward between two units of one slot lists the retired unit last. Reading the
-    newest off that listing would attribute every later change to a session that is
-    already over. Driven through the succession helper, which returns the chain order,
-    and asserted against the opposite clock order so a fallthrough to the header
-    listing fails this case rather than passing it.
+    A clock that steps backward lists the retired unit last by ``createdAt``. The clock
+    order here is the opposite of the chain order, so a fallthrough to the header
+    listing fails this case.
     """
     from kiro_crew.crew_log import projection as crew_log
 
@@ -781,25 +851,20 @@ class TestTheSlugChecks:
 def test_a_credential_in_a_page_is_redacted_before_it_reaches_the_reader():
     """The page goes through the same scrub as the values filled into it.
 
-    Only a template that shipped with the product can become a page, and that is a
-    claim about the repository rather than about the bytes on this disk: a hand-edited
-    template directory, or an instance record written under an older gateway, arrives
-    here having passed a parity check, which says nothing about a credential pasted
-    into a heading. `_page_safe` covers only the resolved values, never the page around
-    them.
+    A hand-edited template directory or an older instance record can carry a credential
+    in a heading; `_page_safe` covers only the resolved values, not the page around them.
     """
     # ASSEMBLED at runtime for the reason the fold-value case above gives: a
     # credential-shaped literal in the diff is a finding against the PR whatever the
     # code around it is for. Do not join these back up.
-    token = "AKIA" + "IOSFODNN7" + "EXAMPLE"
+    token = github_classic(seed=65)
     page = f'<p>key {token}</p><b data-dashboard-field="credits"></b>'
     assert token not in routes._template_text_safe(page), "a page kept its credential"
     assert "credits" in routes._template_text_safe(page), "the redaction ate the bindings"
 
 
 #: 62 letters and digits, then 18 marks: the 80-character palette a pixel-art page indexes
-#: into. Any 40-character window of it holds forty distinct characters, which is what the
-#: bare-secret pass reads as a key.
+#: into. Any 40-character window of it holds forty distinct characters and no label.
 _PALETTE = string.ascii_lowercase + string.ascii_uppercase + string.digits + "#$%&*+-=?@^_~:;<>!"
 
 
@@ -809,13 +874,9 @@ def _bare_key() -> str:
 
 
 def test_a_script_is_served_as_its_author_wrote_it():
-    """The bare-secret pass reads an alphabet as a key, and the page ran on the marker.
-
-    The script loaded, nothing reported an error, and every lookup into the alphabet
-    answered the wrong index.
-    """
+    """An alphabet is no credential: a marker in it would leave the script loading with
+    nothing reported and every lookup into the alphabet answering the wrong index."""
     page = f'<canvas id="c"></canvas><script>var ART_CHARS = "{_PALETTE}";</script>'
-    assert redact_via_context(page) != page, "the premise: the whole-page pass rewrites it"
     assert routes._template_text_safe(page) == page
 
 
@@ -829,278 +890,48 @@ def test_a_script_is_served_as_its_author_wrote_it():
     ],
 )
 def test_a_long_base64_data_uri_in_a_stylesheet_or_script_is_served_as_written(template):
-    """A font or an image inlined into the page's code is binary, so the bare-secret
-    pass reads windows of it as keys and the browser then decodes the marker."""
+    """A font or an image inlined into the page's code is binary, not a credential: a
+    marker in it would leave the browser decoding the marker."""
     blob = base64.b64encode(
         b"".join(hashlib.sha256(bytes([n])).digest() for n in range(12))
     ).decode()
     page = template.format(blob=blob)
-    assert redact_via_context(page) != page, "the premise: the whole-page pass rewrites it"
     assert routes._template_text_safe(page) == page
-
-
-def test_the_same_run_outside_a_script_or_stylesheet_is_still_masked():
-    run = _PALETTE[:62]
-    for page in (
-        f"<p>{run}</p>",
-        f'<p title="{run}">x</p>',
-        f'<a href="#" onclick="draw(\'{run}\')">x</a>',
-        f'<script src="/lib.js" data-key="{run}"></script>',
-    ):
-        assert run not in routes._template_text_safe(page), page
-
-
-def test_a_label_less_key_in_visible_text_is_masked_beside_a_script_that_keeps_its_literal():
-    page = f"<script>var A = '{_PALETTE}';</script><p>key {_bare_key()}</p>"
-    out = routes._template_text_safe(page)
-    assert f"var A = '{_PALETTE}';" in out
-    assert _bare_key() not in out
 
 
 def test_a_credential_written_into_a_script_or_stylesheet_is_still_masked():
     # ASSEMBLED at runtime for the reason the page case above gives.
     dashes = "-" * 5
     kind = "RSA PRIVATE KEY"
-    secrets = [
-        "AKIA" + "IOSFODNN7" + "EXAMPLE",
-        "ghp" + "_" + "ZXAMPLEzxampleZXAMPLEzxampleZXAMPLE12",
+    pem = (
         f"{dashes}BEGIN {kind}{dashes}\nMIIEowIBAAKCAQEA3Zx8kUoTBqQw0hXvPj9mKpLq2yTnVr7\n"
-        f"{dashes}END {kind}{dashes}",
+        f"{dashes}END {kind}{dashes}"
+    )
+    token = github_classic(seed=66)
+    # (as written, the value that must not be served): a bare 40-character run is no
+    # credential by itself, so the AWS secret is a member under its label.
+    secrets = [
+        (f'{{"aws_secret_access_key": "{SAMPLE_AWS_SECRET}"}}', SAMPLE_AWS_SECRET),
+        (token, token),
+        (pem, pem),
     ]
-    for secret in secrets:
+    for written, secret in secrets:
         for page in (
-            f"<script>var k = `{secret}`; draw(k);</script>",
-            f"<style>/* {secret} */ .a {{ color: red }}</style>",
+            f"<script>var k = `{written}`; draw(k);</script>",
+            f"<style>/* {written} */ .a {{ color: red }}</style>",
         ):
             out = routes._template_text_safe(page)
             assert secret not in out, page
             assert out.startswith(page[:8]) and out.endswith(page[-9:]), "the tags were eaten"
 
 
-@pytest.mark.parametrize("keep_first", [True, False])
-@pytest.mark.parametrize("length", [30, 36, 39])
-def test_a_key_id_glued_to_a_partial_key_is_masked_as_one_run_beside_a_style(keep_first, length):
-    """The full pass reads the two as one run; rewriting the id first leaves a tail under 40."""
-    key_id = "AKIA" + "IOSFODNN7" + "EXAMPLE"
-    tail = _bare_key()[:length]
-    run = key_id + tail if keep_first else tail + key_id
-    page = f"<p>{run}</p><style>a {{ color: red }}</style>"
-    out = routes._template_text_safe(page)
-    assert out == redact_via_context(page)
-    assert tail not in out
-
-
 def test_a_script_holding_a_masked_credential_still_keeps_its_literal():
-    """The page changes under the scrub here, so the result is read again before it is served."""
-    key_id = "AKIA" + "IOSFODNN7" + "EXAMPLE"
-    page = f"<script>var A = '{_PALETTE}'; var k = '{key_id}';</script><p>{_bare_key()}</p>"
+    """Only the credential's value changes: the script's other literal is served as written."""
+    token = github_classic(seed=67)
+    page = f"<script>var A = '{_PALETTE}'; var k = '{token}';</script>"
     out = routes._template_text_safe(page)
     assert f"var A = '{_PALETTE}';" in out
-    assert key_id not in out
-    assert _bare_key() not in out
-
-
-@pytest.mark.parametrize(
-    "template",
-    [
-        # A PEM block wraps a nested script opener, so the first end tag after it closes the script.
-        "<script>\n{pem}\n// </script><p>{key}</p>\n</script>",
-        # A labelled value runs through the start tag that follows its label, or the end tag.
-        "aws_secret_access_key=<script>{key}</script>",
-        "aws_secret_access_key=<script/c>{key}</script>",
-        "<script/aws_secret_access_key=>{key}</script>",
-    ],
-)
-def test_a_rule_that_rewrites_the_markup_around_a_script_cannot_turn_its_text_into_prose(template):
-    """A rule that takes tags with it must not leave the text it spared to be read as prose.
-
-    The browser reads the page the rules leave, so the script text is chosen from that page and
-    not from the page before the rules ran.
-    """
-    dashes = "-" * 5
-    pem = (
-        f"{dashes}BEGIN PRIVATE KEY{dashes}\nMIIEowIBAAKCAQEA3Zx8kUoTBqQw0hXvPj9mKpLq2yTnVr7\n"
-        f"<!--<script>\n{dashes}END PRIVATE KEY{dashes}"
-    )
-    page = template.format(pem=pem, key=_bare_key())
-    assert _bare_key() not in routes._template_text_safe(page)
-
-
-def _page_vocabulary():
-    """Tags, comment and script openers, the rules that reach across them, keys, and glued runs."""
-    dashes = "-" * 5
-    keys = [
-        k
-        for k in (
-            base64.b64encode(hashlib.sha256(b"kc-bare-%d" % n).digest()).decode()[:40]
-            for n in range(40)
-        )
-        if k not in redact_via_context(f"<p>{k}</p>")
-    ]
-    assert len(keys) >= 10, "the premise: the full pass masks a key standing alone"
-    key_id = "AKIA" + "IOSFODNN7" + "EXAMPLE"
-    tails = [k[:36] for k in keys[:6]]
-    structure = [
-        "<script>", "</script>", "<style>", "</style>", "<!--", "-->", "<!--<script>", "<p>",
-        "</p>", '<script src="', '">', ">", "<", "\n", " ", "//", "<script ", "<scr", "ipt>",
-        "<noscript>", "<template>", "<textarea>", "</textarea>", "var s = '", "'", ";",
-    ]  # fmt: skip
-    rules = [
-        f"{dashes}BEGIN PRIVATE KEY{dashes}", f"{dashes}END PRIVATE KEY{dashes}",
-        "aws_secret_access_key=", "aws_secret_access_key = ", "password=", "token=",
-        "api_key=", "const password =\n    ", "headers['X-Api-Key'] = '", key_id,
-    ]  # fmt: skip
-    glued = [key_id + t for t in tails] + [t + key_id for t in tails]
-    return structure, rules, glued, keys, tails
-
-
-def test_a_page_without_an_alphabet_or_a_data_uri_is_scrubbed_exactly_as_the_full_pass_does():
-    """Whatever the markup, the scrub differs from the full pass only by the two shapes it keeps.
-
-    The pages are seeded mixes of tags, comment and script openers, the rules that reach across
-    them (a PEM block, a labelled value), keys and keys glued to a key id. None holds an
-    alphabet or a data URI, so every page must come out as the full pass makes it.
-    """
-    structure, rules, glued, keys, _tails = _page_vocabulary()
-    rng = random.Random(20815)
-    differing = []
-    for _ in range(3000):
-        pieces = []
-        for _ in range(rng.randint(3, 16)):
-            pick = rng.random()
-            pieces.append(
-                rng.choice(structure)
-                if pick < 0.4
-                else (
-                    rng.choice(rules)
-                    if pick < 0.65
-                    else rng.choice(glued) if pick < 0.75 else rng.choice(keys)
-                )
-            )
-        page = "".join(pieces)
-        if routes._template_text_safe(page) != redact_via_context(page):
-            differing.append(page)
-    assert not differing, differing[:3]
-
-
-def _in_a_data_uri_payload(page: str, secret: str) -> bool:
-    """Whether every run of *page* that holds *secret* is a payload behind a data URI header."""
-    runs = [m for m in re.finditer(r"[A-Za-z0-9+/]{40,}", page) if secret in m.group()]
-    return bool(runs) and all(
-        len(m.group()) >= 64
-        and re.search(r"data:[^,;]+/[^,;]+(?:;[^,;]+)*;base64,\Z", page[: m.start()], re.I)
-        for m in runs
-    )
-
-
-def test_an_alphabet_and_a_data_uri_survive_and_nothing_else_the_full_pass_masks_does():
-    """The two shapes the scope keeps are kept; every key beside them is masked all the same.
-
-    The one place a key the full pass masks may be served is the stated limit: inside a run of
-    64 characters or more directly behind a ``data:`` header. The test finds that run itself.
-    """
-    structure, rules, glued, keys, tails = _page_vocabulary()
-    shapes = [_PALETTE, "data:image/png;base64," + "QUJD" * 40]
-    rng = random.Random(20816)
-    kept = limit = 0
-    for _ in range(3000):
-        pieces = []
-        for _ in range(rng.randint(3, 16)):
-            pick = rng.random()
-            pieces.append(
-                rng.choice(structure)
-                if pick < 0.35
-                else (
-                    rng.choice(rules)
-                    if pick < 0.55
-                    else (
-                        rng.choice(glued)
-                        if pick < 0.65
-                        else rng.choice(keys) if pick < 0.8 else rng.choice(shapes)
-                    )
-                )
-            )
-        page = "".join(pieces)
-        served = routes._template_text_safe(page)
-        masked_by_main = redact_via_context(page)
-        for secret in (*keys, *tails):
-            if (secret in served) == (secret in masked_by_main):
-                continue
-            assert secret in served and _in_a_data_uri_payload(page, secret), (page, served)
-            limit += 1
-        kept += sum(shape in served for shape in shapes)
-    assert kept > 0, "no alphabet or data URI was ever kept, so this proves nothing"
-    assert limit > 0, "the stated limit never came up, so its test proves nothing"
-
-
-@pytest.mark.parametrize(
-    "template",
-    [
-        "<!-- old <script> tag removed --><p>{key}</p>",
-        '<p title="<style>">{key}</p>',
-        "<textarea><script></textarea><p>{key}</p>",
-        "<title><style></title><p>{key}</p>",
-        "<script data-note='>'>var a = 1;</script><p data-q='<style>'>{key}</p>",
-        "<script>var a = 1;<p>{key}</p>",
-        "<svg><script/></svg><p>{key}</p><script>var a = 1;</script>",
-        "<svg><script><p>{key}</p></script></svg>",
-        "<math><style><p>{key}</p></style></math>",
-        '<p a=x"b="c>d" e<textarea x><script>{key}</script></textarea>',
-        "<math></svg><style><mtext>{key}</mtext></style></math>",
-        '<svg><foreignObject><div></svg></div></foreignObject><script><a title="{key}">x</a></script>',
-        "<select><style></select><p>{key}</p></style>",
-        "<noscript><textarea></noscript><script>{key}</script></textarea></noscript>",
-        "<template><col><style></template><p>{key}</p></style>",
-        "<script\u00a0>var a = 1;</script\u00a0><p>{key}</p>",
-        "<\u017fcript>var a = 1;</\u017fcript><p>{key}</p><style>a{{}}</style>",
-    ],
-)
-def test_prose_a_browser_reads_as_prose_keeps_every_pass_whatever_markup_surrounds_it(template):
-    """A tag the HTML tokenizer would not open must not turn the text after it into code.
-
-    Each page puts a key-shaped run in a paragraph. Reading the page the way a browser does
-    leaves the paragraph as prose, and where the scan cannot tell it reads nothing as code.
-    """
-    key = _bare_key()
-    assert key not in routes._template_text_safe(template.format(key=key))
-
-
-def test_a_real_script_beside_markup_that_only_looks_like_one_keeps_its_literal():
-    page = (
-        f"<!-- <script> --><svg><circle/></svg><select><option>a</option></select>"
-        f"<script>var A = '{_PALETTE}';</script>"
-        f'<p title="<style>">{_bare_key()}</p>'
-    )
-    out = routes._template_text_safe(page)
-    assert f"var A = '{_PALETTE}';" in out
-    assert _bare_key() not in out
-
-
-def test_past_the_bound_a_scripts_text_gets_every_pass_not_fewer():
-    """Handing text to the code function is a relaxation, so a page cannot earn it by length.
-
-    Only the first MAX_CODE_PIECES non-empty elements are handed over. Every element after
-    them goes back to the full pass, and empty elements neither spend the bound nor change
-    what is masked. So adding elements can only move text from the relaxed pass to the strict one.
-    """
-    from kiro_crew import dashboard_frame
-
-    bound = dashboard_frame.MAX_CODE_PIECES
-    key_id = "AKIA" + "IOSFODNN7" + "EXAMPLE"
-    first = f"<script>var FIRST = '{_PALETTE}';</script>"
-    spent = "<script></script><script>var a = 1;</script>" * (bound - 1)
-    past = "<script>var a = 1;</script>" * 4
-    last = f"<script>var LAST = '{_PALETTE}'; var k = '{key_id}'; var b = '{_bare_key()}';</script>"
-    page = first + spent + past + last
-    assert len(dashboard_frame.code_spans(page)) > bound, "the premise: elements past the bound"
-
-    out = routes._template_text_safe(page)
-
-    assert f"var FIRST = '{_PALETTE}';" in out, "the first element lost its literal"
-    assert key_id not in out, "a credential in the last element was served"
-    assert _bare_key() not in out, "the last element kept a key-shaped run the full pass masks"
-    assert f"var LAST = '{_PALETTE}'" not in out, "the last element kept its literal"
-    assert out.count("<script>") == page.count("<script>"), "a tag was eaten"
+    assert token not in out
 
 
 def test_a_page_with_no_script_or_stylesheet_is_scrubbed_as_it_always_was():
@@ -1121,7 +952,7 @@ def test_a_credential_in_a_manifest_string_is_redacted():
     ``^[a-z][a-z0-9_]{0,63}$``, a grammar no credential survives, and rewriting a key
     would break the page's own bindings.
     """
-    token = "AKIA" + "IOSFODNN7" + "EXAMPLE"
+    token = github_classic(seed=69)
     scrubbed = routes._manifest_text_safe(
         {"title": f"board {token}", "fields": {"credits": {"type": "number"}}}
     )
@@ -1131,7 +962,7 @@ def test_a_credential_in_a_manifest_string_is_redacted():
 
 def test_the_raw_body_is_scrubbed_beside_the_composed_page():
     """Scrubbing only the rendered half leaves the same credential one key away."""
-    token = "AKIA" + "IOSFODNN7" + "EXAMPLE"
+    token = github_classic(seed=70)
     body = routes._safe_body(
         {
             "html": f"<p>{token}</p>",
@@ -1147,24 +978,12 @@ def test_the_raw_body_is_scrubbed_beside_the_composed_page():
 
 
 class TestOneCrewmateResolvesToOneSlug:
-    """THE POD BUG on a freshly created crewmate whose roster key carries case.
+    """A crewmate whose roster key carries case (``Atlas``) resolves to one slug.
 
-    A crewmate was created as ``Atlas``. Its own session's ``dashboard_write``
-    returned success and recorded no mistake, yet the instance stayed at version 0
-    and the tab rendered "Nothing needs you, and nothing has been spent" over a
-    session that had spent 0.63 credits. Opening the tab as ``?member=atlas``
-    answered "not on the roster".
-
-    One cause, two symptoms. The roster is keyed by the display name somebody typed,
-    and every per-member path comes off that key's ``member_id``. A caller holding
-    ``atlas`` missed the key, read no ``member_id``, and fell through to
-    ``slug_for_name("atlas")`` -- so the write (resolved from the session, which
-    carries ``Atlas``) and the read (resolved from the query string) addressed two
-    different directories. Both succeeded. Neither saw the other.
-
-    These run against the REAL ``members`` helpers, not the module fixture's stubs:
-    the fixture replaces ``member_slug`` with a constant, which is precisely the
-    function that was wrong.
+    The roster is keyed by the typed display name; a caller holding ``atlas`` that missed
+    the key would fall through to ``slug_for_name("atlas")``, so the write and the read
+    would address two directories. Runs the REAL ``members`` helpers, since the module
+    fixture stubs ``member_slug``.
     """
 
     @staticmethod
@@ -1251,15 +1070,9 @@ class TestOneCrewmateResolvesToOneSlug:
 class TestTheExecutedPageComesFromTheCatalog:
     """The record is WRITABLE, so it cannot be the thing that vouches for itself.
 
-    `members/<slug>/dashboard/instance.json` holds the page AND the `source` label.
-    Gating the render on that label asked the file to vouch for its own contents:
-    anything that could append a `<script>` to the stored page could leave
-    `"source": "builtin"` sitting beside it, and this is the step that hands the
-    crewmate's task titles, summaries and costs to whatever runs.
-
-    So the record's `template_id` is read and the BYTES are read from the catalog --
-    a directory in this repository. The stored copy stays on disk, because a rollback
-    reads it and it is what the crewmate copied; nothing executes it.
+    Anything that could append a `<script>` to `instance.json` could also leave
+    `"source": "builtin"` beside it. So only `template_id` is read from the record and the
+    bytes come from the catalog; the stored copy stays for rollback and never executes.
     """
 
     # The module's own `_env` fixture already builds `fixture-board` into a scratch
@@ -1385,25 +1198,11 @@ class TestAStoredPageCannotBeEdited:
 
 
 class TestAStagedPageReachesOnlyItsOwnersPreview:
-    """WHERE A STAGED PAGE CAN BE SEEN, enumerated from the source rather than claimed.
+    """A staged page, which carries real fold values, is served only to its owner.
 
-    A staged page is bytes nobody has applied. It carries this crewmate's fold values
-    exactly as the applied page does, and it is written beside the record without moving
-    the version -- so the question that matters is not whether staging is safe but
-    whether a staged page can be SERVED anywhere except to the one person entitled to
-    look at it and say yes.
-
-    Three facts answer it, and each is read off the modules rather than restated:
-
-    1. there is exactly ONE place staged bytes are turned into a record to render, and
-       it sits behind the same owner gate as the applied read;
-    2. every route that emits a page is owner-gated, so there is no second door;
-    3. the link handed back by the staging call is that same owner-gated read, not a
-       route of its own and not a capability token.
-
-    Source-level on purpose. A behavioural test proves one request was refused; what is
-    worth guarding here is that no OTHER caller exists, which is a property of the call
-    graph and is exactly what a later edit breaks silently.
+    Read off the source: ONE place renders staged bytes, behind the owner gate; every
+    page route is owner-gated; the staging link is that same read. Source-level because
+    the property is that no other caller exists in the call graph.
     """
 
     def _source(self, module) -> str:
@@ -1467,6 +1266,14 @@ class TestAStagedPageReachesOnlyItsOwnersPreview:
             # Returned on refusal, not merely computed: a gate whose answer is dropped
             # is not a gate.
             assert "return owner_denied" in source, handler.__name__
+        # A relay teammate skips the crewmate read's owner gate only off the staged page.
+        gate = self._source(member_dashboard._teammate_reader)
+        preview_guard = 'if request.query.get("preview") == "1":\n        return False'
+        assert preview_guard in gate
+        assert gate.index(preview_guard) < gate.index("_teammate_admitted(")
+        assert "_teammate_reader(" not in self._source(
+            member_dashboard.api_member_dashboard_refetch
+        ), "the refetch answers owner pushes; a teammate gets none"
         # `_serve` is reached only from those two page routes.
         module_source = self._source(member_dashboard)
         assert module_source.count("await _serve(request") == 2
@@ -1495,13 +1302,10 @@ class TestAStagedPageReachesOnlyItsOwnersPreview:
         assert "_preview_record" not in source
 
     def test_the_preview_link_is_the_owner_gated_read(self) -> None:
-        """Not a route of its own and not a capability token: a second door would be a
-        second place to get the gate right, and a token would be a second credential
-        for data its holder can already read.
+        """The preview link is the owner-gated read, not a new route or capability token.
 
-        The link is the PAGE with this crewmate open and its Dashboard tab on the
-        staged read, named by the exact crew name -- slugification is lossy, so the
-        page and the read it makes both refuse a slug alone.
+        It names the exact crew name, because slugification is lossy and both the page
+        and its read refuse a slug alone.
         """
         from urllib.parse import parse_qs, urlparse
 
@@ -1533,13 +1337,10 @@ class TestAStagedPageReachesOnlyItsOwnersPreview:
         assert "render_package_page" not in source
 
     def test_the_preview_branch_is_reached_before_any_binding_is_resolved(self) -> None:
-        """THE CONVERSE, and the half that is easy to lose: a preview must reach the
-        staged page rather than some other page.
+        """A preview must reach the staged page, so its branch runs before any binding.
 
-        The tab's preview link carries no `dashboard=`, so a binding resolved before
-        this branch would serve the live PACKAGE page to a person deciding whether to
-        apply a staged one. Pinned as an ORDER, because an order is what a later edit
-        undoes without changing any single line's meaning.
+        The preview link carries no `dashboard=`, so resolving a binding first would serve
+        the live package page. Pinned as a source order.
         """
         from kiro_crew.dashboard.handlers import member_dashboard
 
@@ -1579,9 +1380,7 @@ class TestAStagedPageReachesOnlyItsOwnersPreview:
         assert emitters == {"dashboard/handlers/member_dashboard.py": 3}, emitters
 
 
-# --------------------------------------------------------------------------
 # the STAGED composed page: read back for a look, and nothing installed
-# --------------------------------------------------------------------------
 
 
 def _package(**over) -> dict:
@@ -1650,9 +1449,7 @@ class TestTheStagedComposedPage:
         assert "manifest" in body
 
 
-# --------------------------------------------------------------------------
 # when the person last spoke in the page's chat
-# --------------------------------------------------------------------------
 
 #: One instant: the person's reply. Every case states it in UTC and writes it the way
 #: a chat row or the stored stamp carries it.

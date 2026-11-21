@@ -36,6 +36,7 @@ import asyncio
 import contextlib
 
 import pytest
+from closed_peer_helpers import refused_peer_connects  # noqa: F401
 from remote_crew_chaining_helpers import (
     VIA_ID,
     _FakeMintSession,
@@ -46,6 +47,9 @@ from remote_crew_chaining_helpers import (
 )
 
 from kiro_crew.instances.ssh_tunnel_manager import _Mint
+from kiro_crew.testing.wait import await_until
+
+pytestmark = pytest.mark.usefixtures("refused_peer_connects")
 
 
 class TestHopRetiredDetection:
@@ -73,8 +77,10 @@ class TestHopRetiredDetection:
         async def run():
             out = await mgr._refresh_token_once("c")
             if mgr._retirements:
-                # flake-ok: pre-existing unbounded await on the retirement tasks the manager scheduled; each ends in-process, moved verbatim
-                await asyncio.gather(*list(mgr._retirements))
+                await await_until(
+                    asyncio.gather(*list(mgr._retirements)),
+                    what="the retirement the refresh scheduled",
+                )
             return out
 
         return asyncio.run(run())
@@ -423,16 +429,13 @@ class TestChainedRepairPaths:
         # credential already held survives -- a stale token yields a 403 the client
         # recovers from, where a delivered one is a disclosure that is not undone.
         #
-        # It ALSO asks for the forward to go, which this case originally asserted it
-        # must not. That was wrong, and the mechanism is the one GPT named: the parent
-        # moved this crew to a new port and can hand the old one to ANOTHER crew, so the
-        # forward still dialling the old number reaches that crew, and the token already
-        # in `_tokens` keeps travelling over it. Discarding the new mint corrected
-        # neither, and each refresh cycle re-discarded and retried, so the stale pair
-        # survived for as long as the crew was connected. The reason the original
-        # assertion gave -- that a forward being BUILT also names a hop it does not yet
-        # dial -- is real, and it is what `binds_forward` is for; it is not a reason to
-        # leave this case alone.
+        # It ALSO asks for the forward to go: the parent moved this crew to a new port
+        # and can hand the old one to ANOTHER crew, so a forward still dialling the old
+        # number reaches that crew, and the token already in `_tokens` keeps travelling
+        # over it. Discarding the new mint fixes neither, and each refresh cycle would
+        # re-discard and retry, so the stale pair survives for as long as the crew is
+        # connected. A forward being BUILT also names a hop it does not yet dial; that
+        # case is what `binds_forward` is for.
         asked: list[str] = []
         monkeypatch.setattr(
             mgr, "_schedule_chained_retirement", lambda _id, reason: asked.append(reason)
@@ -450,7 +453,7 @@ class TestChainedRepairPaths:
         # And NOT while this store is the one defining the pairing: a forward being
         # built names a hop it does not dial yet, and retiring there would tear down
         # the tunnel being set up. The mint is still DISCARDED -- only the retirement
-        # is gated, which is the whole of this change.
+        # is gated.
         asked.clear()
         assert (
             mgr._store_token(
@@ -486,7 +489,7 @@ class TestChainedRepairPaths:
                 pathlib.Path(__file__).resolve().parents[1]
                 / "src/kiro_crew/instances"
                 / f"{name.rpartition('.')[2]}.py"
-            ).read_text()
+            ).read_text(encoding="utf-8")
             for name in (mod.__name__, *mod._OWNERS)
         )
         tree = ast.parse(src)
@@ -659,8 +662,10 @@ class TestChainedRepairPaths:
             # park forever. Drained here so the assertion is deterministic rather
             # than a race with the loop closing.
             if mgr._retirements:
-                # flake-ok: pre-existing unbounded await on the retirement tasks the manager scheduled; each ends in-process, moved verbatim
-                await asyncio.gather(*list(mgr._retirements))
+                await await_until(
+                    asyncio.gather(*list(mgr._retirements)),
+                    what="the retirement the refresh scheduled",
+                )
             return refreshed
 
         assert (
@@ -712,8 +717,10 @@ class TestChainedRepairPaths:
                 binds_forward=False,
             )
             if mgr._retirements:
-                # flake-ok: pre-existing unbounded await on the retirement tasks the manager scheduled; each ends in-process, moved verbatim
-                await asyncio.gather(*list(mgr._retirements))
+                await await_until(
+                    asyncio.gather(*list(mgr._retirements)),
+                    what="the retirement the stale store scheduled",
+                )
             return stored
 
         assert asyncio.run(store_stale()) is False, "stored a credential for a dead generation"
@@ -765,6 +772,8 @@ class TestChainedRepairPaths:
         monkeypatch.setattr(mgr, "_peer_cookie_header", _no_cookie_header)
 
         base = {"token": "T", "port": 4242, "ttl": "2h", "hop_id": "c-2", "hop_gen": 3}
+        # The reply is a class attribute other tests read; monkeypatch puts it back.
+        monkeypatch.setattr(_FakeMintSession, "reply", dict(base))
         for missing in ("hop_id", "hop_gen"):
             bad = dict(base)
             del bad[missing]
@@ -912,27 +921,32 @@ class TestTheRefreshScheduleFollowsTheLifetimeItStored:
     def _intervals(mgr, monkeypatch, *, cycles: int, on_cycle=None) -> list[float]:
         """Run the REAL loop and return the interval it asked to sleep each cycle.
 
-        Sleeps are recorded and skipped rather than waited out, and the loop is
-        stopped by cancelling it once it has asked ``cycles`` times — the same way
-        disconnect stops it in production.
+        The loop sleeps whatever ``_refresh_delay`` answers, so that answer is what is
+        recorded. It is then replaced by 0, so the loop re-mints at once instead of
+        waiting the hours out, and it still asks for the next interval after every
+        re-mint, which is what these cases measure. The loop is stopped by cancelling
+        it as it asks for its ``cycles``-th interval, the same way disconnect stops it
+        in production.
         """
         seen: list[float] = []
-        real_sleep = asyncio.sleep
+        real_delay = mgr._refresh_delay
 
-        async def record(delay, *args, **kwargs):
-            seen.append(delay)
+        def record_then_skip(instance_id):
+            seen.append(real_delay(instance_id))
             if len(seen) >= cycles:
-                raise asyncio.CancelledError
-            if on_cycle is not None:
+                asyncio.current_task().cancel()
+            elif on_cycle is not None:
                 on_cycle(len(seen))
-            await real_sleep(0)
+            return 0.0
 
-        # flake-ok: pre-existing worker-wide asyncio.sleep rebind that records each interval the refresh loop asks for, scoped by monkeypatch, moved verbatim
-        monkeypatch.setattr(asyncio, "sleep", record)
+        monkeypatch.setattr(mgr, "_refresh_delay", record_then_skip)
 
         async def run():
+            refresh_loop = asyncio.ensure_future(mgr._token_refresh_loop("c"))
             with contextlib.suppress(asyncio.CancelledError):
-                await mgr._token_refresh_loop("c")
+                await await_until(
+                    refresh_loop, what=f"the refresh loop asking for interval {cycles}"
+                )
 
         asyncio.run(run())
         return seen

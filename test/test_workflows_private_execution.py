@@ -37,6 +37,9 @@ async def workflow(ctx):
 
 
 class Model:
+    # ``LLMProvider``'s default: no spawn tier to compare.
+    sandbox_mode = None
+
     def __init__(self, key):
         self.key = key
         self._private_memory = bool(private_memory_store_for_session(key))
@@ -55,6 +58,9 @@ class Model:
 
     def is_process_alive(self):
         return self.alive
+
+    def set_delete_delay(self, seconds):
+        return None
 
     def context_usage_pct(self):
         return 0.0

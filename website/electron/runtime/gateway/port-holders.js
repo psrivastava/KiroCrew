@@ -1,7 +1,7 @@
 "use strict";
 
 const { findKirocrewBin } = require("../../find-bin");
-const { forceStopPort, isKirocrewCommand } = require("../../gateway-stop");
+const { confirmedFree, forceStopPort, isKirocrewCommand } = require("../../gateway-stop");
 const {
   canonicalWindowsPath,
   windowsGatewayExecutablePaths,
@@ -16,8 +16,31 @@ const {
   snapshotPortPids,
   incumbentSnapshotBlocksRespawn,
 } = require("../../gateway-recovery");
+const { LOCAL_GATEWAY_WAIT_MS } = require("../../gateway-wait");
 
 const LSOF_CANDIDATES = ["/usr/sbin/lsof", "/usr/bin/lsof"];
+
+// The address the gateway binds unless its operator widens it. The check stays
+// on loopback: a listener on a non-loopback address makes Windows Firewall ask
+// the user to allow the app, and on Windows a wildcard holder does not block a
+// loopback bind, so loopback answers the question the respawn will ask.
+const GATEWAY_BIND_HOST = "127.0.0.1";
+
+/**
+ * Whether a listener could bind `port` on the gateway's loopback address right
+ * now. The probe listener is closed at once. Any bind error counts as "held".
+ *
+ * @param {number} port
+ * @param {{ net?: typeof import("node:net") }} [deps]
+ * @returns {Promise<boolean>}
+ */
+function portBindable(port, { net = require("node:net") } = {}) {
+  return new Promise((resolve) => {
+    const server = net.createServer();
+    server.once("error", () => resolve(false));
+    server.listen({ port, host: GATEWAY_BIND_HOST, exclusive: true }, () => server.close(() => resolve(true)));
+  });
+}
 
 /**
  * Every descendant of `rootPid`, deepest first, from a `ps -A -o pid=,ppid=`
@@ -72,6 +95,11 @@ function descendantPids(rootPid, psTable) {
  * @param {object} deps
  * @param {() => string[]} deps.getSpawnedExecutablePaths  executables the
  *        CURRENT child was spawned from, read at call time.
+ * @param {(port:number) => Promise<boolean>} [deps.isPortBindable]  force-stop's
+ *        bind check for an empty netstat answer on Windows, and for an lsof
+ *        probe that could not run on macOS and Linux.
+ * @param {(ms:number) => Promise<void>} [deps.sleep]  the wait between bind
+ *        checks while that answer stays refused.
  */
 function createPortHolders({
   fs,
@@ -83,6 +111,8 @@ function createPortHolders({
   isWindows: IS_WIN,
   log: glog,
   getSpawnedExecutablePaths,
+  isPortBindable = portBindable,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 }) {
   const windowsRealpath = (candidate) => fs.realpathSync.native(candidate);
 
@@ -138,8 +168,11 @@ function createPortHolders({
 
   // Port free is not lock free. Wait for captured incumbent PIDs to die so the
   // kernel has released gateway.lock before attempting the replacement spawn.
-  async function waitForIncumbentExit(pids, label) {
+  // `options` ({ isServing, timeoutMs, pollMs }) lets a caller also stop on a
+  // holder that starts answering; see waitForProcessExit.
+  async function waitForIncumbentExit(pids, label, options = {}) {
     const verdict = await waitForProcessExit({
+      ...options,
       pids,
       isAlive: pidAlive,
       sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
@@ -167,9 +200,11 @@ function createPortHolders({
         ["-nP", `-iTCP:${probePort}`, "-sTCP:LISTEN", "-t"],
         { timeout: 5000 },
         (error, stdout) => {
-          // lsof exits non-zero with empty output for no match. Only an EXECUTE
-          // failure is unknown; treating it as a free port permits blind kills.
-          if (error && (error.code === "ENOENT" || error.code === "EACCES")) {
+          // lsof exits non-zero with empty output for no match. An EXECUTE
+          // failure, or a run killed at the timeout, is unknown: reading it as
+          // a free port would report a held port free and permit blind kills.
+          if (error && (error.code === "ENOENT" || error.code === "EACCES" ||
+              error.killed || error.signal)) {
             reject(error);
             return;
           }
@@ -210,8 +245,9 @@ function createPortHolders({
     });
   }
 
-  // PPID 1 distinguishes service-managed gateways (and conservative orphans)
-  // which must never be evicted into a launchd/systemd respawn race.
+  // PPID 1 marks a gateway a service manager may own, which must never be
+  // evicted into a launchd/systemd respawn race. An orphan has that parent too;
+  // on macOS isLaunchdJob tells the two apart.
   function psPpid(pid) {
     return new Promise((resolve) => {
       execFile(
@@ -221,6 +257,39 @@ function createPortHolders({
         (_error, stdout) => resolve(String(stdout || "")),
       );
     });
+  }
+
+  // macOS only: the pids launchd runs as jobs in this user's gui and user
+  // domains and in the system domain. PPID 1 alone cannot tell a LaunchAgent
+  // gateway from an orphan the previous app left behind (both are children of
+  // launchd), but only the agent is a job. Resolves null when any domain cannot
+  // be read or lists no services, so the caller keeps its fail-closed verdict.
+  function launchdJobPids() {
+    let uid;
+    try {
+      uid = typeof processObj.getuid === "function" ? processObj.getuid() : os.userInfo().uid;
+    } catch {
+      return Promise.resolve(null);
+    }
+    if (!Number.isInteger(uid)) return Promise.resolve(null);
+    const readDomain = (domain) => new Promise((resolve) => {
+      execFile(
+        "/bin/launchctl",
+        ["print", domain],
+        { timeout: 5000, maxBuffer: 8 * 1024 * 1024 },
+        (error, stdout) => resolve(error ? null : launchdServicePids(stdout)),
+      );
+    });
+    return Promise.all([`gui/${uid}`, `user/${uid}`, "system"].map(readDomain)).then((sets) => {
+      if (sets.some((set) => set === null)) return null;
+      return new Set(sets.flatMap((set) => [...set]));
+    });
+  }
+
+  // macOS only: whether launchd runs `pid` as a job. null when the job list
+  // cannot be read, which the service-managed check reads as a service.
+  function isLaunchdJob(pid) {
+    return launchdJobPids().then((jobs) => (jobs ? jobs.has(Number(pid)) : null));
   }
 
   // Every live descendant of `pid`, deepest first. Empty when ps cannot run
@@ -243,7 +312,14 @@ function createPortHolders({
     });
   }
 
-  function forceStopGatewayPort(probePort) {
+  /**
+   * @param {number} probePort
+   * @param {{ onBindWait?: () => void, isAborted?: () => boolean }} [o]
+   *        `onBindWait` is called once when a port with no known owner refuses
+   *        a bind and recovery starts waiting for it to free; `isAborted` ends
+   *        that wait.
+   */
+  async function forceStopGatewayPort(probePort, { onBindWait = null, isAborted = null } = {}) {
     if (IS_WIN) {
       return forceStopPort(probePort, {
         // Recovery fails closed on a probe error, so one slow netstat spawn
@@ -254,20 +330,48 @@ function createPortHolders({
         kill: (pid) => windowsTaskkill(pid, {
           isTrustedCommand: isTrustedWindowsGatewayCommand,
         }),
-        sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+        sleep,
         isKirocrew: isTrustedWindowsGatewayCommand,
         failClosedOnProbeError: true,
+        // netstat can leave a held port out of its table, so "no owner" is
+        // checked with a real bind before recovery respawns into the port. A
+        // netstat that fails every attempt is settled by the same bind. A
+        // gateway that served connections leaves the port refusing binds for a
+        // while after it exits, so a refusal is waited out for as long as the
+        // splash already allows a Windows gateway to start.
+        confirmFree: (p) => isPortBindable(p),
+        confirmFreeWaitMs: LOCAL_GATEWAY_WAIT_MS,
+        onConfirmFreeWait: onBindWait,
+        isAborted,
         log: glog,
       });
     }
-    return forceStopPort(probePort, {
+    const result = await forceStopPort(probePort, {
       getListenPids: lsofListenPids,
       getCommand: psCommand,
       getPpid: psPpid,
+      // An orphan nothing restarts is evicted like any wedged holder.
+      isLaunchdJob: processObj.platform === "darwin" ? isLaunchdJob : null,
       kill: (pid, signal) => processObj.kill(pid, signal),
       sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+      failClosedOnProbeError: true,
       log: glog,
     });
+    if (!result.probeFailed) return result;
+    // lsof can be missing for good, so a failed probe is settled with a real
+    // bind: a port that opens within the wait the splash already allows is
+    // free, and one that never does goes to the restart-required dialog.
+    const bindable = await confirmedFree(probePort, {
+      confirmFree: (p) => isPortBindable(p),
+      waitMs: LOCAL_GATEWAY_WAIT_MS,
+      sleep,
+      onWait: onBindWait,
+      isAborted,
+      log: glog,
+    });
+    if (!bindable) return result;
+    const { probeFailed: _probeFailed, ...probed } = result;
+    return { ...probed, freed: true };
   }
 
   return {
@@ -279,6 +383,8 @@ function createPortHolders({
     lsofHoldsFile,
     psCommand,
     psPpid,
+    launchdJobPids,
+    isLaunchdJob,
     snapshotGatewayPortPids,
     unverifiedIncumbent,
     waitForIncumbentExit,
@@ -286,4 +392,31 @@ function createPortHolders({
   };
 }
 
-module.exports = { createPortHolders, descendantPids };
+/**
+ * The running job pids in one `launchctl print <domain>` listing: the rows of
+ * its `services = { ... }` block, each `<pid> <status> <label>`, where a job
+ * that is not running shows pid 0. Returns null when the block is missing or
+ * has no rows, because a listing with no services is not one this parser
+ * understands, and the caller must then fail closed.
+ *
+ * @param {string} stdout
+ * @returns {Set<number>|null}
+ */
+function launchdServicePids(stdout) {
+  const lines = String(stdout || "").split("\n");
+  const start = lines.findIndex((line) => /^\s*services = \{\s*$/.test(line));
+  if (start < 0) return null;
+  const pids = new Set();
+  let rows = 0;
+  for (const line of lines.slice(start + 1)) {
+    if (/^\s*\}\s*$/.test(line)) break;
+    const match = /^\s*(-?\d+)\s+\S+\s+\S/.exec(line);
+    if (!match) continue;
+    rows += 1;
+    const pid = parseInt(match[1], 10);
+    if (pid > 0) pids.add(pid);
+  }
+  return rows ? pids : null;
+}
+
+module.exports = { createPortHolders, descendantPids, launchdServicePids };

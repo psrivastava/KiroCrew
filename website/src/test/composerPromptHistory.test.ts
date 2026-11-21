@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest'
 import {
   livePromptHistoryCursor,
   promptHistoryFromMessages,
+  promptHistoryKeyEngages,
+  promptHistoryWithAttempts,
   samePromptHistory,
   stepPromptHistory,
   type PromptHistoryCursor,
@@ -37,6 +39,21 @@ function hist(...texts: string[]): PromptHistoryItem[] {
 function sameId(id: string, ...texts: string[]): PromptHistoryItem[] {
   return texts.map(text => ({ text, id }))
 }
+
+describe('promptHistoryKeyEngages', () => {
+  it('lets ↑ recall only from an empty composer while not browsing', () => {
+    expect(promptHistoryKeyEngages('older', '', 0, false)).toBe(true)
+    // A draft, with the caret at its very start or on its first line, keeps ↑.
+    expect(promptHistoryKeyEngages('older', 'draft', 0, false)).toBe(false)
+    expect(promptHistoryKeyEngages('older', 'line 1\nline 2', 3, false)).toBe(false)
+    expect(promptHistoryKeyEngages('older', '[ Paste #1 · 4 lines ]', 0, false)).toBe(false)
+  })
+
+  it('keeps walking older from the first line of a recalled prompt', () => {
+    expect(promptHistoryKeyEngages('older', 'line 1\nline 2', 3, true)).toBe(true)
+    expect(promptHistoryKeyEngages('older', 'line 1\nline 2', 9, true)).toBe(false)
+  })
+})
 
 describe('stepPromptHistory', () => {
   const sent = hist('first', 'second', 'third')
@@ -157,6 +174,15 @@ describe('stepPromptHistory', () => {
     const down2 = stepPromptHistory(grown, down1.cursor, 'newer', down1.text)!
     expect(down2).toEqual({ cursor: null, text: 'my draft' })
   })
+
+  it('hands the saved draft back with its paste blocks past the newest', () => {
+    // The keyboard now starts browsing only from an empty composer, so this
+    // restore path is reached here, not from a ↑ over a non-empty draft.
+    const block = { id: 'paste-1', seq: 1, lines: 4, content: 'a\nb\nc\nd' }
+    const up = stepPromptHistory(sent, null, 'older', 'draft', [block])!
+    const down = stepPromptHistory(sent, up.cursor, 'newer', up.text)!
+    expect(down).toEqual({ cursor: null, text: 'draft', pastes: [block] })
+  })
 })
 
 describe('livePromptHistoryCursor', () => {
@@ -250,5 +276,53 @@ describe('samePromptHistory', () => {
     expect(samePromptHistory([{ text: 'a', id: '1' }], [{ text: 'a', id: '2' }])).toBe(false)
     expect(samePromptHistory(hist('a'), [{ text: 'a' }])).toBe(true)
     expect(samePromptHistory(hist('a'), hist('a', 'b'))).toBe(false)
+  })
+})
+
+describe('promptHistoryWithAttempts', () => {
+  const attempt = (text: string, sendId: string) => ({ text, sendId })
+
+  it('adds a submitted prompt no row carries at the newest end, so the first ↑ returns it', () => {
+    const items = promptHistoryWithAttempts([user('earlier', { mid: 'm1' })], [attempt('lost', 's-lost')])
+    expect(items).toEqual([{ text: 'earlier', id: 'm1' }, { text: 'lost', id: 's-lost' }])
+    expect(walk(items, '', ['older', 'older']).shown).toEqual(['lost', 'earlier'])
+  })
+
+  it('skips a prompt whose sendId is on a row, even when the row is spelled differently', () => {
+    const rows = [user('expanded [attached_file 1] /tmp/a.png', { sendId: 's1', mid: 'm1' }), user('later', { mid: 'm2' })]
+    expect(promptHistoryWithAttempts(rows, [attempt('typed', 's1')])).toEqual([
+      { text: 'expanded [attached_file 1] /tmp/a.png', id: 's1' }, { text: 'later', id: 'm2' },
+    ])
+  })
+
+  it('counts a queued row carrying the sendId as present', () => {
+    const rows: ChatMessage[] = [{ role: 'queued', content: 'waiting', cls: 'msg msg-queued', meta: { queueId: 'q1', sendId: 's1' } }]
+    expect(promptHistoryWithAttempts(rows, [attempt('waiting', 's1')])).toEqual([])
+  })
+
+  it('collapses a lost prompt equal to the newest entry', () => {
+    expect(promptHistoryWithAttempts([user('same', { mid: 'm1' })], [attempt('same', 's1')])).toEqual([{ text: 'same', id: 'm1' }])
+    expect(promptHistoryWithAttempts([], [attempt('a', 's1'), attempt('a', 's2'), attempt('b', 's3')]))
+      .toEqual([{ text: 'a', id: 's1' }, { text: 'b', id: 's3' }])
+  })
+
+  it('drops a lost prompt once a later send is on a row, so ↑ returns the last prompt', () => {
+    // A was lost; the user then sent B (or recalled and resent A), which landed.
+    const rows = [user('earlier', { mid: 'm1' }), user('B', { sendId: 's-b' })]
+    const items = promptHistoryWithAttempts(rows, [attempt('A', 's-a'), attempt('B', 's-b')])
+    expect(items).toEqual([{ text: 'earlier', id: 'm1' }, { text: 'B', id: 's-b' }])
+    expect(walk(items, '', ['older']).shown).toEqual(['B'])
+  })
+
+  it('does not bring back a delivered prompt whose row is above the loaded window', () => {
+    // Only the newest send's row is loaded; the two older ones paged out.
+    const rows = [user('third', { sendId: 's3' })]
+    expect(promptHistoryWithAttempts(rows, [attempt('first', 's1'), attempt('second', 's2'), attempt('third', 's3')]))
+      .toEqual([{ text: 'third', id: 's3' }])
+  })
+
+  it('returns the transcript list unchanged with no attempts', () => {
+    const rows = [user('a', { mid: 'm1' })]
+    expect(promptHistoryWithAttempts(rows, [])).toEqual(promptHistoryFromMessages(rows))
   })
 })

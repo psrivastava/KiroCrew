@@ -11,6 +11,7 @@ import { useRowDisclosure } from './rowDisclosure'
 import { Glass } from '../../components/Glass'
 
 import { i18nT } from '../../i18n/t'
+import { fmtNumber } from '../../i18n/format'
 import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 /** Rows rendered before the list scrolls internally — bounds DOM on long plans. */
 const MAX_VISIBLE_ROWS = 12
@@ -42,6 +43,8 @@ function tickFailureDetail(e: unknown): string | null {
       return i18nT('pages.chat.taskProgressBar.fail_session_gone')
     case 'relay_archive_read_only':
       return i18nT('pages.chat.taskProgressBar.fail_remote')
+    case 'todo_read_only':
+      return i18nT('pages.chat.taskProgressBar.agent_kept_hint')
     default:
       return null
   }
@@ -64,7 +67,9 @@ function tickFailureDetail(e: unknown): string | null {
  * tick the rows it shows. A click writes the dashboard's copy through
  * `PATCH /api/chat/slots/{slot}/todo`; the gateway echoes the same
  * `todo_update` delta the tool result does, so the store repaints and the next
- * fresh agent session rebuilds its list from this copy.
+ * fresh agent session rebuilds its list from this copy. The rows are status
+ * marks, not toggles, on a relay archive and on a list the harness keeps itself
+ * (`read_only`, Claude Code's checklist), which no click can reach.
  */
 const TaskProgressBar = memo(function TaskProgressBar({ slot, disclosureKey }: { slot: string | null; disclosureKey?: string }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
@@ -76,9 +81,12 @@ const TaskProgressBar = memo(function TaskProgressBar({ slot, disclosureKey }: {
   ) as TodoList | null
   // An `executor: 'remote'` slot is a read-only relay archive: the local slot
   // holds no list to write, so the PATCH would 404. Rows stay read-only there.
-  const editable = useAppSelector(s =>
-    (s.dashboard.slots ?? []).find(x => x.key === slot)?.executor !== 'remote'
+  const remote = useAppSelector(s =>
+    (s.dashboard.slots ?? []).find(x => x.key === slot)?.executor === 'remote'
   )
+  // A `read_only` list is one the harness keeps itself (an ACP `plan`): a click
+  // could never reach the agent, so it takes the same read-only rows.
+  const editable = !remote && todo?.read_only !== true
 
   const tasks = useMemo(() => todo?.tasks ?? [], [todo])
   const toggle = useCallback(() => setExpanded(v => !v), [setExpanded])
@@ -233,7 +241,7 @@ const TaskProgressBar = memo(function TaskProgressBar({ slot, disclosureKey }: {
             className={`shrink-0 tabular-nums font-medium ${allDone ? 'text-ok' : 'text-text-strong'}`}
             data-testid="todo-count"
           >
-            {done} {i18nT('pages.chat.taskProgressBar.of')} {total}
+            {i18nT('pages.chat.taskProgressBar.done_of_total', { done: fmtNumber(done), total: fmtNumber(total) })}
           </span>
           <span
             className={`truncate text-left text-muted ${expanded ? 'min-w-0 flex-1' : 'min-w-0 max-w-[42ch]'}`}
@@ -272,7 +280,9 @@ const TaskProgressBar = memo(function TaskProgressBar({ slot, disclosureKey }: {
             <li className="text-[11px] text-muted/70 font-mono pb-1" data-testid="todo-hint">
               {editable
                 ? i18nT('pages.chat.taskProgressBar.click_to_toggle_hint')
-                : i18nT('pages.chat.taskProgressBar.read_only_hint')}
+                : remote
+                  ? i18nT('pages.chat.taskProgressBar.read_only_hint')
+                  : i18nT('pages.chat.taskProgressBar.agent_kept_hint')}
             </li>
             {tasks.slice(0, MAX_VISIBLE_ROWS).map((t, i) => {
               const id = t.id || String(i + 1)
@@ -295,7 +305,7 @@ const TaskProgressBar = memo(function TaskProgressBar({ slot, disclosureKey }: {
                     {t.completed
                       ? <CheckCircle2 size={12} className="mt-[3px] shrink-0 text-ok" aria-hidden="true" />
                       : <Circle size={12} className="mt-[3px] shrink-0 text-muted/50" aria-hidden="true" />}
-                    <span className={t.completed ? 'text-muted/60 line-through' : 'text-text'}>{text}</span>
+                    <span className={t.completed ? 'text-muted line-through' : 'text-text'}>{text}</span>
                   </li>
                 )
               }
@@ -324,7 +334,7 @@ const TaskProgressBar = memo(function TaskProgressBar({ slot, disclosureKey }: {
                       : t.completed
                         ? <CheckSquare2 size={13} className="mt-[2px] shrink-0 text-ok" aria-hidden="true" />
                         : <Square size={13} className="mt-[2px] shrink-0 text-accent/70" aria-hidden="true" />}
-                    <span className={t.completed ? 'text-muted/60 line-through' : 'text-text'}>
+                    <span className={t.completed ? 'text-muted line-through' : 'text-text'}>
                       {text}
                     </span>
                     {/* Visible, not just announced: the dimmed row alone read
@@ -335,8 +345,8 @@ const TaskProgressBar = memo(function TaskProgressBar({ slot, disclosureKey }: {
               )
             })}
             {tasks.length > MAX_VISIBLE_ROWS && (
-              <li className="text-[11px] text-muted/60 font-mono pl-[18px]">
-                + {tasks.length - MAX_VISIBLE_ROWS} {i18nT('pages.chat.taskProgressBar.more')}
+              <li className="text-[11px] text-muted font-mono pl-[18px]">
+                {i18nT('pages.chat.taskProgressBar.more_count', { count: tasks.length - MAX_VISIBLE_ROWS, n: fmtNumber(tasks.length - MAX_VISIBLE_ROWS) })}
               </li>
             )}
           </ul>

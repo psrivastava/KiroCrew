@@ -1,21 +1,25 @@
 """The agents Kiro Crew's own services drive: lite, guest, knowledge and research.
 
 ``kirocrew-lite`` is the cheap background helper; ``kirocrew-guest`` is the tool-less
-agent a non-operator channel sender talks to, a trust boundary that mounts nothing;
+agent a non-operator channel sender talks to, a trust boundary that mounts nothing
+and is rewritten before a turn it would refuse (:func:`repair_guest_agent_spec`);
 ``kirocrew-knowledge`` runs the Knowledge Library's extraction; ``kirocrew-research``
 is the Research Lab's per-cycle worker, derived from the default template so it
-inherits the governance ceiling. Each is rewritten on every rebuild, and the
-knowledge spec also before each knowledge worker spawn when the file on disk is not
-its template (:func:`repair_knowledge_agent_spec`).
+inherits the governance ceiling. Each is rewritten on every rebuild. The knowledge
+spec is also rewritten before each knowledge worker spawn when the file on disk is not
+its template (:func:`repair_knowledge_agent_spec`), and the lite spec before a
+background turn its helper would otherwise refuse (:func:`repair_lite_agent_spec`).
 """
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
 from kiro_crew import agent as agent_mod
-from kiro_crew import agent_discovery, agent_state
+from kiro_crew import agent_discovery, agent_spec_injections, agent_state
 from kiro_crew.agent_files import (
     DASHBOARD_MANAGER_AGENT_FILENAME as _DASHBOARD_MANAGER_AGENT_FILENAME,
 )
@@ -26,17 +30,20 @@ from kiro_crew.agent_files import MATE_CONDUCTOR_AGENT_FILENAME as _MATE_CONDUCT
 from kiro_crew.agent_files import MATE_WORKER_AGENT_FILENAME as _MATE_WORKER_AGENT_FILENAME
 from kiro_crew.agent_files import RESEARCH_AGENT_FILENAME as _RESEARCH_AGENT_FILENAME
 from kiro_crew.agent_files import TEAM_LEAD_AGENT_FILENAME as _TEAM_LEAD_AGENT_FILENAME
-from kiro_crew.agent_materialization import auto_approve, managed_mcp, skill_resources
+from kiro_crew.agent_materialization import (
+    auto_approve,
+    conductor_agents,
+    managed_mcp,
+    skill_resources,
+)
 from kiro_crew.user_json import strict_json_equal
 
 
-def _install_guest_agent() -> None:
-    """Write the tool-less ``kirocrew-guest`` config a non-operator sender talks to.
+def _guest_agent_config() -> dict[str, Any]:
+    """The ``kirocrew-guest`` spec as its installer and its repair build it, before the tail.
 
-    Separate from ``kirocrew-lite`` on purpose: the lite agent is the background
-    helper (titles, extraction) and may one day need a tool; this one is a trust
-    boundary and never may. Same model as the operator's chat so an admitted
-    sender gets an ordinary answer, never a background worker's minimal default.
+    Same model as the operator's chat so an admitted sender gets an ordinary answer,
+    never a background worker's minimal default.
     """
     from kiro_crew.config.loader import KiroCrewConfig
 
@@ -44,8 +51,7 @@ def _install_guest_agent() -> None:
         model = KiroCrewConfig.load().agent.model or "auto"
     except Exception:
         model = "auto"
-    guest_path = agent_mod.kiro_agents_dir_path() / _GUEST_AGENT_FILENAME
-    guest_config = {
+    return {
         "name": "kirocrew-guest",
         "model": model,
         "tools": [],
@@ -55,9 +61,113 @@ def _install_guest_agent() -> None:
         "includeMcpJson": False,
         "prompt": agent_mod.GUEST_AGENT_PROMPT,
     }
+
+
+def _install_guest_agent() -> None:
+    """Write the tool-less ``kirocrew-guest`` config a non-operator sender talks to.
+
+    Separate from ``kirocrew-lite`` on purpose: the lite agent is the background
+    helper (titles, extraction) and may one day need a tool; this one is a trust
+    boundary and never may.
+    """
+    guest_path = agent_mod.kiro_agents_dir_path() / _GUEST_AGENT_FILENAME
     auto_approve.write_governed_spec(
-        guest_path, guest_config, source="_install_guest_agent", kas_policy="none"
+        guest_path, _guest_agent_config(), source="_install_guest_agent", kas_policy="none"
     )
+
+
+def repair_guest_agent_spec() -> bool:
+    """Rewrite an existing ``kirocrew-guest.json`` from its template unless it already is it.
+
+    A ``deny_all_tools`` channel turn is refused before its spawn when this spec mounts
+    anything, and only a rebuild re-derives the file, so a tool that writes its own MCP
+    server into every spec in the agents directory leaves every non-operator turn
+    refused until then. The channel pipeline calls this when it would refuse
+    (``messaging.dispatch_tools._repair_toolless_spec``), then reads the spec again,
+    and the second read still decides whether the turn runs.
+
+    Compared and rewritten as :func:`repair_knowledge_agent_spec` does, with a WARNING
+    naming the top-level keys that differed and never their values. A missing file is
+    not created: another spec may claim the name, and one more claimant would leave
+    the harness a choice. Returns True when it rewrote the file. Never raises.
+    Blocking.
+    """
+    return _repair_spec_from_template(
+        _GUEST_AGENT_FILENAME,
+        _guest_agent_config,
+        source="repair_guest_agent_spec",
+        operation="guest_spec_repair",
+        label="guest agent spec",
+    )
+
+
+def _repair_spec_from_template(
+    filename: str,
+    build: Callable[[], dict[str, Any]],
+    *,
+    source: str,
+    operation: str,
+    label: str,
+) -> bool:
+    """Rewrite the existing spec *filename* from the template *build* returns, if it differs.
+
+    The one body of :func:`repair_guest_agent_spec` and :func:`repair_lite_agent_spec`;
+    *label* names the spec in its log lines. A missing file is not created. Returns
+    True when it rewrote the file. Never raises. Blocking.
+    """
+    path = agent_mod.kiro_agents_dir_path() / filename
+    try:
+        config = build()
+        auto_approve.govern_spec(config, agent_filename=filename, source=source, kas_policy="none")
+        drift, _on_disk = _spec_drift(path, config, operation=operation)
+        if drift is None or drift == "missing":
+            return False
+        auto_approve.write_governed_spec(path, config, source=source, kas_policy="none")
+    except agent_mod.SharedAgentHomeRefused:
+        agent_mod.logger.debug("%s repair declined: %s", label, path, exc_info=True)
+        return False
+    except Exception:
+        agent_mod.logger.warning(
+            "Could not rewrite the %s %s from its template", label, path, exc_info=True
+        )
+        return False
+    agent_mod.logger.warning(
+        "%s %s was not the spec Kiro Crew writes (%s); rewrote it from the template",
+        label[:1].upper() + label[1:],
+        path,
+        drift,
+    )
+    return True
+
+
+#: How long a spec repair waits for one session's reset. Every turn on the repaired
+#: spec is refused until the repair finishes, so one hung teardown must not hold them all.
+_SPEC_REPAIR_RESET_TIMEOUT_SECS = 30.0
+
+
+async def reset_after_spec_repair(
+    sessions: Any, keys: Iterable[str], failed: dict[str, Any]
+) -> None:
+    """Reset each session in *keys* after its agent spec was rewritten from the template.
+
+    Each reset is bounded (:data:`_SPEC_REPAIR_RESET_TIMEOUT_SECS`). A provider whose
+    reset raises or times out stays in *failed*, keyed by its session, so the clean
+    file does not vouch for it; only a reset that returns forgets it, and a successor
+    recorded meanwhile is kept.
+    """
+    for key in keys:
+        provider = sessions.get_provider(key)
+        if provider is not None:
+            failed[key] = provider
+        try:
+            await asyncio.wait_for(sessions.reset(key), _SPEC_REPAIR_RESET_TIMEOUT_SECS)
+        except Exception:
+            agent_mod.logger.warning(
+                "Could not reset session %s after its agent spec was rewritten", key, exc_info=True
+            )
+        else:
+            if provider is not None and failed.get(key) is provider:
+                del failed[key]
 
 
 def _exclude(config: dict, refs: tuple[str, ...]) -> None:
@@ -137,7 +247,9 @@ def _install_mate_conductor_agent() -> None:
     like ``kirocrew-research``. It excludes the sub-agent tools, ``task_run`` and
     ``workflow_run`` (``mate_worker.MATE_CONDUCTOR_EXCLUDED_TOOLS``), keeps only
     the platform servers (``mate_worker.conductor_mcp_servers``) with
-    ``includeMcpJson`` off, and never reads the crewmate's own file.
+    ``includeMcpJson`` off, mounts the work ledger (``kirocrew-work``, the
+    ledger conductor's grants, :func:`_mount_work_ledger`), and never reads the
+    crewmate's own file.
     """
     from kiro_crew.mate_worker import (
         MATE_CONDUCTOR_EXCLUDED_TOOLS,
@@ -146,7 +258,7 @@ def _install_mate_conductor_agent() -> None:
 
     config = agent_mod.build_agent_config()
     config["name"] = "kirocrew-mate-conductor"
-    config["description"] = "The agent a crewmate's own chat runs on."
+    config["description"] = "The agent a Bot's own chat runs on."
     # The conductor dispatches and the worker does the work: its hand-off is a
     # worker session, so the sub-agent tools are not in its tool list.
     # Its MCP servers are the gateway's own, whatever servers the user has:
@@ -170,7 +282,27 @@ def _install_mate_conductor_agent() -> None:
         listed = config.get(key)
         if isinstance(listed, list):
             config[key] = [t for t in listed if _kept(t)]
+    # After the filter: ``kirocrew-work`` is a platform server, but an opt-in one
+    # that ``build_agent_config`` never emits, so the filter has nothing to keep.
+    _mount_work_ledger(config, agent_mod._LEDGER_CONDUCTOR_WORK_GRANTS)
     _exclude(config, MATE_CONDUCTOR_EXCLUDED_TOOLS)
+    # The patrol text (``crewmate_prompts.json`` ``conductor.patrol``) names the
+    # goal-conductor skill's ``accept_eval`` tool, and is rendered only where this
+    # spec mounts the work ledger (``member_mate_tools.binding_has_ledger_tools``).
+    # The mapping follows the text: a spec without the ledger names no skill, and a
+    # mapping there would only narrow the skills an unmapped spec inherits. A
+    # governance ceiling that withholds a ledger verb does not change it: the verb
+    # stays mounted and asks for approval (owner decision in docs/decisions, case N1).
+    from kiro_crew.member_mate_tools import spec_has_ledger_tools
+
+    if spec_has_ledger_tools(config):
+        # ``dashboard`` rides along because the crewmate prompt names that skill
+        # (``conductor.crew_log_section``), and ``WIDGET_POINTER_SKILLS``; a mapping
+        # of goal-conductor alone would scope the chat's skills to it and leave
+        # those out of reach.
+        skill_resources.map_prompt_skills(
+            config, "goal-conductor", "dashboard", *skill_resources.WIDGET_POINTER_SKILLS
+        )
     _write_mate_service_spec(
         _MATE_CONDUCTOR_AGENT_FILENAME, config, "_install_mate_conductor_agent"
     )
@@ -182,8 +314,12 @@ def _install_mate_worker_agent() -> None:
     The agent a crewmate's worker sessions run on: the session its chat opens
     with ``session_create`` to hand work off. Derived from the default template
     like the mate conductor above, so its base prompt, tools and ``mcpServers``
-    are the ones a crewmate's hand-off session ran on before it had a worker of
-    its own. This file is the worker's whole SOURCE BASE; a crewmate's own
+    are the template's. The ``~/.kiro/crew/mcp.json`` store is not merged in, so
+    a server added on the MCP Servers page does not reach a Bot's worker base; a
+    Bot's worker gets it only when it is added to that Bot
+    (``docs/architecture/agent-mcp-and-skill-reach.md``, "Mate worker", and
+    ``docs/decisions/*-conductors-stay-simple-and-new-abilities-go-to-workers.md``).
+    This file is the worker's whole SOURCE BASE; a crewmate's own
     additions (``~/.kiro/mates/agents/<id>.json``) are layered on at projection
     time by :mod:`kiro_crew.mate_worker`, never written here, so one file serves
     every crewmate.
@@ -191,36 +327,45 @@ def _install_mate_worker_agent() -> None:
     from kiro_crew.mate_worker import (
         MATE_WORKER_AGENT,
         MATE_WORKER_EXCLUDED_TOOLS,
-        MATE_WORKER_PROMPT,
+        mate_worker_prompt,
     )
 
     config = agent_mod.build_agent_config()
     config["name"] = MATE_WORKER_AGENT
-    config["description"] = "The agent a crewmate's worker sessions run on."
+    config["description"] = "The agent a Bot's worker sessions run on."
     # The worker's own principles ride after the shared base prompt.
-    principles = MATE_WORKER_PROMPT
+    principles = mate_worker_prompt()
     base_prompt = config.get("prompt") if isinstance(config.get("prompt"), str) else ""
     config["prompt"] = f"{base_prompt.rstrip()}\n\n{principles}" if base_prompt else principles
+    _register_edition_refs(config)
+    # A worker bound to an item in its crewmate's ledger reports on it. The base's
+    # server wins over a crewmate file's entry of the same name
+    # (``mate_worker.merge_worker_spec``), so a crewmate's file cannot replace it.
+    _mount_work_ledger(config, agent_mod._WORKER_WORK_GRANTS)
     # Asking the user for a capability is the conductor's: a worker reports a
     # missing tool back to the chat that opened it.
     _exclude(config, MATE_WORKER_EXCLUDED_TOOLS)
     _write_mate_service_spec(_MATE_WORKER_AGENT_FILENAME, config, "_install_mate_worker_agent")
 
 
-def _install_lite_agent_fallback() -> None:
-    """Write a bare kirocrew-lite config (cheap background agent)."""
-    lite_path = agent_mod.kiro_agents_dir_path() / _LITE_AGENT_FILENAME
-    lite_config = {
+def _lite_agent_config() -> dict[str, Any]:
+    """The ``kirocrew-lite`` spec as its installer and its repair build it, before the tail."""
+    return {
         "name": "kirocrew-lite",
         "model": agent_mod._background_agent_model(),
         "tools": [],
         "mcpServers": {},
         "prompt": "",
     }
+
+
+def _install_lite_agent_fallback() -> None:
+    """Write a bare kirocrew-lite config (cheap background agent)."""
+    lite_path = agent_mod.kiro_agents_dir_path() / _LITE_AGENT_FILENAME
     # Mounts nothing, so the tail has no grant to govern; what it adds here is the
     # ``includeMcpJson`` pin, without which kiro-cli merges the global ``mcp.json``.
     auto_approve.write_governed_spec(
-        lite_path, lite_config, source="_install_lite_agent_fallback", kas_policy="none"
+        lite_path, _lite_agent_config(), source="_install_lite_agent_fallback", kas_policy="none"
     )
     # Cheap model for the claude_code (CC) provider. kiro-cli resolves the lite
     # model from `model` via --agent; the CC backend can't, so the provider
@@ -296,8 +441,26 @@ def _install_knowledge_agent() -> None:
 #: rewrite; the bound keeps a file stuffed with keys from flooding the log line.
 _REPAIR_DRIFT_KEYS_SHOWN = 8
 
+#: The registered injection filters already reported as ignored, so each is logged
+#: once per process rather than on every worker spawn.
+_ignored_injections_logged: set[str] = set()
 
-def repair_knowledge_agent_spec() -> bool:
+
+def _note_injection_ignored(name: str, path: Path) -> None:
+    """Log, once per filter per process, that a registered injection was ignored."""
+    if name in _ignored_injections_logged:
+        return
+    _ignored_injections_logged.add(name)
+    agent_mod.logger.info(
+        "Agent spec %s carries an entry another tool injects into every agent "
+        "spec (registered filter %r); leaving the file as it is and launching the "
+        "agent without it",
+        path,
+        name,
+    )
+
+
+def repair_knowledge_agent_spec(*, tolerate_registered_injection: bool = False) -> bool:
     """Rewrite ``kirocrew-knowledge.json`` from its template unless the file already is it.
 
     The Knowledge Library's pool feeds untrusted document text to this agent, and
@@ -316,6 +479,15 @@ def repair_knowledge_agent_spec() -> bool:
     WARNING naming the top-level keys that differed and never their values: an
     injected server's ``env`` may hold a credential.
 
+    With *tolerate_registered_injection*, a file whose only change is an injection a
+    filter registered by the edition removes exactly
+    (:func:`kiro_crew.agent_spec_injections.only_registered_injection`) is left
+    alone: the tool that wrote it writes it back on every launch, so a rewrite only
+    starts the two taking turns on the file. The caller must then launch from a view
+    built from the template, as the native skill projection does for this agent
+    (:func:`knowledge_view_without_registered_injection`). Nothing is registered in
+    the public core, so there the flag changes nothing.
+
     Returns True when it rewrote the file. Never raises: a write this data home may
     not make (another home owns the agents directory) or one that fails leaves the
     file as it is, and the caller's confirmation still decides whether a worker
@@ -323,16 +495,15 @@ def repair_knowledge_agent_spec() -> bool:
     """
     path = agent_mod.kiro_agents_dir_path() / _KNOWLEDGE_AGENT_FILENAME
     try:
-        config = _knowledge_agent_config()
-        auto_approve.govern_spec(
-            config,
-            agent_filename=path.name,
-            source="repair_knowledge_agent_spec",
-            kas_policy="none",
-        )
-        drift = _spec_drift(path, config)
+        config = _governed_knowledge_template("repair_knowledge_agent_spec")
+        drift, on_disk = _spec_drift(path, config, operation="knowledge_spec_repair")
         if drift is None:
             return False
+        if tolerate_registered_injection:
+            injection = agent_spec_injections.only_registered_injection(on_disk, config)
+            if injection is not None:
+                _note_injection_ignored(injection, path)
+                return False
         auto_approve.write_governed_spec(
             path, config, source="repair_knowledge_agent_spec", kas_policy="none"
         )
@@ -355,28 +526,58 @@ def repair_knowledge_agent_spec() -> bool:
     return True
 
 
-def _spec_drift(path: Path, expected: dict[str, Any]) -> str | None:
-    """How the spec at *path* differs from *expected*, or ``None`` when it does not.
+def repair_lite_agent_spec() -> bool:
+    """Rewrite an existing ``kirocrew-lite.json`` from its template unless it already is it.
+
+    The background helper refuses a ``kirocrew-lite`` session on a spec that mounts
+    anything, so a tool that writes its own MCP server into every spec in the agents
+    directory stops every background turn until a rebuild. The helper calls this when
+    it is about to refuse, then reads the spec again, and that read still decides.
+    Compared and rewritten as :func:`repair_guest_agent_spec` is; a missing file is not
+    created.
+    """
+    return _repair_spec_from_template(
+        _LITE_AGENT_FILENAME,
+        _lite_agent_config,
+        source="repair_lite_agent_spec",
+        operation="lite_spec_repair",
+        label="background agent spec",
+    )
+
+
+def _governed_knowledge_template(source: str) -> dict[str, Any]:
+    """The knowledge spec as its writers put it on disk, governed tail included."""
+    config = _knowledge_agent_config()
+    auto_approve.govern_spec(
+        config, agent_filename=_KNOWLEDGE_AGENT_FILENAME, source=source, kas_policy="none"
+    )
+    return config
+
+
+def _spec_drift(
+    path: Path, expected: dict[str, Any], *, operation: str
+) -> tuple[str | None, object]:
+    """How the spec at *path* differs from *expected* (``None`` when it does not), and the spec.
 
     Read through the hardened reader, so a link planted at the name is screened
     before anything follows it. Every failure to read a spec counts as drift: the
     file is Crew's own, and the governed write replaces the directory entry rather
-    than writing through it.
+    than writing through it. The parsed spec is ``None`` when it could not be read.
     """
     try:
         on_disk = agent_discovery.read_agent_spec_strict(
-            path, operation="knowledge_spec_repair", source="unknown"
+            path, operation=operation, source="unknown"
         )
     except FileNotFoundError:
-        return "missing"
+        return "missing", None
     except (OSError, ValueError) as exc:
-        return f"unreadable: {type(exc).__name__}"
+        return f"unreadable: {type(exc).__name__}", None
     if not isinstance(on_disk, dict):
-        return "not a JSON object"
+        return "not a JSON object", on_disk
     # Type-strict: a ``0`` where the template has ``false`` is a different file to
     # kiro-cli's schema, though Python's ``==`` calls them equal.
     if strict_json_equal(on_disk, expected):
-        return None
+        return None, on_disk
     keys = sorted(
         str(key)
         for key in on_disk.keys() | expected.keys()
@@ -386,7 +587,64 @@ def _spec_drift(path: Path, expected: dict[str, Any]) -> str | None:
     )
     shown = [repr(key)[:64] for key in keys[:_REPAIR_DRIFT_KEYS_SHOWN]]
     more = len(keys) - len(shown)
-    return "differs in " + ", ".join(shown) + (f" and {more} more" if more else "")
+    return "differs in " + ", ".join(shown) + (f" and {more} more" if more else ""), on_disk
+
+
+def knowledge_view_without_registered_injection(
+    agent_name: str, spec: dict[str, Any], source: Path
+) -> dict[str, Any]:
+    """The spec the native skill projection builds *agent_name*'s view from.
+
+    For the installed ``kirocrew-knowledge`` spec whose only change is an injection a
+    registered filter removes exactly, the template the file would be repaired to:
+    the template itself, never the filter's output, so the view mounts nothing. Every
+    other spec is returned unchanged, and the file is never rewritten here.
+    """
+    if agent_name != "kirocrew-knowledge" or source.name != _KNOWLEDGE_AGENT_FILENAME:
+        return spec
+    if not agent_spec_injections.registered_spec_injection_filters():
+        return spec
+    try:
+        expected = _governed_knowledge_template("knowledge_view_without_registered_injection")
+    except Exception:
+        agent_mod.logger.debug("knowledge template unavailable for the view", exc_info=True)
+        return spec
+    injection = agent_spec_injections.only_registered_injection(spec, expected)
+    if injection is None:
+        return spec
+    _note_injection_ignored(injection, source)
+    return expected
+
+
+def lite_view_without_registered_injection(spec: dict[str, Any]) -> dict[str, Any]:
+    """The ``kirocrew-lite`` spec a KAS session is sent, given the one read from disk.
+
+    The same rule as :func:`knowledge_view_without_registered_injection`: when the only
+    change to the file is an injection a registered filter removes exactly
+    (:func:`kiro_crew.agent_spec_injections.only_registered_injection`), the governed
+    template, never the filter's output, so the spec sent mounts nothing. Every other
+    spec is returned unchanged, and the file is never rewritten here. Used only where
+    Kiro Crew sends the spec itself (KAS); kiro-cli loads the file on disk, so there
+    nothing is tolerated. Blocking.
+    """
+    if not agent_spec_injections.registered_spec_injection_filters():
+        return spec
+    try:
+        expected = _lite_agent_config()
+        auto_approve.govern_spec(
+            expected,
+            agent_filename=_LITE_AGENT_FILENAME,
+            source="lite_view_without_registered_injection",
+            kas_policy="none",
+        )
+    except Exception:
+        agent_mod.logger.debug("lite template unavailable for the view", exc_info=True)
+        return spec
+    injection = agent_spec_injections.only_registered_injection(spec, expected)
+    if injection is None:
+        return spec
+    _note_injection_ignored(injection, agent_mod.kiro_agents_dir_path() / _LITE_AGENT_FILENAME)
+    return expected
 
 
 def _without_guide_server(config: dict) -> dict:
@@ -463,7 +721,12 @@ def _mount_team_lead_dispatch(config: dict) -> None:
 
     The verbs auto-approved on them are the goal conductor's own tuples,
     ``_CONDUCTOR_DASHBOARD_GRANTS`` and ``_LEDGER_CONDUCTOR_WORK_GRANTS``, reused
-    rather than restated. The installer writes the result through the shared tail
+    rather than restated. ``tool_search`` is auto-approved beside them on the
+    conductor's rule (``conductor_agents._conductor_shipped``): with MCP Tool Search
+    active those verbs are deferred, so the load that reaches them must not prompt
+    first. It only reads a tool spec into context and is bounded by the mounted
+    catalog. It is granted only when the inherited ``tools`` mount it, so an
+    operator who removed the loader gets no dead grant. The installer writes the result through the shared tail
     (``auto_approve.write_governed_spec``), which puts the whole ``allowedTools`` list
     back through the governance ceiling, strips every inherited server's ungoverned
     ``autoApprove`` and derives the KAS ``permissions`` block from the filtered list,
@@ -482,8 +745,82 @@ def _mount_team_lead_dispatch(config: dict) -> None:
             tools.append(ref)
     config["tools"] = tools
     allowed = [t for t in config.get("allowedTools") or [] if isinstance(t, str)]
-    grants = (*agent_mod._CONDUCTOR_DASHBOARD_GRANTS, *agent_mod._LEDGER_CONDUCTOR_WORK_GRANTS)
+    loader = ("tool_search",) if {"tool_search", "*"} & set(tools) else ()
+    grants = (
+        *loader,
+        *agent_mod._CONDUCTOR_DASHBOARD_GRANTS,
+        *agent_mod._LEDGER_CONDUCTOR_WORK_GRANTS,
+    )
     config["allowedTools"] = list(dict.fromkeys((*allowed, *grants)))
+
+
+def _register_edition_refs(config: dict) -> None:
+    """Reference every edition-contributed server *config* mounts in ``tools``.
+
+    ``build_agent_config`` puts each ``_extra_mcp_servers()`` entry in
+    ``mcpServers`` but leaves ``tools`` alone; the default spec gains the refs
+    later, in ``managed_mcp.register_managed_refs``. A spec written straight from
+    ``build_agent_config`` would otherwise mount those servers with none of their
+    tools exposed, because kiro-cli exposes only servers named as ``@<server>``
+    in ``tools``. Tools only, never ``allowedTools``: the refs make the tools
+    callable, and approving them stays with the ordinary gate.
+    """
+    servers = config.get("mcpServers")
+    if not isinstance(servers, dict):
+        return
+    listed = config.get("tools")
+    if listed == "*":
+        # The scalar wildcard already exposes every mounted server's tools; keep it
+        # in the list shape the later installers read.
+        config["tools"] = ["*"]
+        return
+    tools = list(listed) if isinstance(listed, list) else []
+    for name in agent_mod._extra_mcp_servers():
+        ref = f"@{name}"
+        if name in servers and ref not in tools:
+            tools.append(ref)
+    config["tools"] = tools
+
+
+def _mount_work_ledger(config: dict, grants: tuple[str, ...]) -> None:
+    """Mount ``kirocrew-work`` on *config* in place, auto-approving *grants*.
+
+    The crewmate's conductor and worker take only the work ledger, not the
+    dashboard server :func:`_mount_team_lead_dispatch` adds: a crewmate's thread
+    gets ``kirocrew-dashboard`` per session from the member projection. The entry
+    is built through ``managed_mcp._managed_opt_in_entry`` for the same two
+    fields that fail silently (``"type": "registry"`` and the ``KIROCREW_HOME``
+    pin), and the installer's shared tail (``auto_approve.write_governed_spec``)
+    puts *grants* through the governance ceiling, so a withheld verb stays
+    mounted and prompts.
+
+    The ledger is a core component, on by default for a Bot as for conductor mode
+    (owner decision in docs/decisions, case N2): a switch-off of ``kirocrew-work``
+    on the default template (its entry's ``disabled`` or ``disabledTools``, an
+    ``excludedTools`` entry naming it) is not carried over, as
+    :func:`_mount_team_lead_dispatch` and the conductor-mode worker do not carry it.
+    """
+    servers = config.get("mcpServers")
+    if not isinstance(servers, dict):
+        servers = {}
+    servers["kirocrew-work"] = managed_mcp._managed_opt_in_entry("mcp-work")
+    config["mcpServers"] = servers
+    tools = [t for t in config.get("tools") or [] if isinstance(t, str)]
+    if "*" not in tools and "@kirocrew-work" not in tools:
+        tools.append("@kirocrew-work")
+    config["tools"] = tools
+    excluded = config.get("excludedTools")
+    if isinstance(excluded, list):
+        config["excludedTools"] = [
+            t for t in excluded if not (isinstance(t, str) and _names_work_server(t))
+        ]
+    allowed = [t for t in config.get("allowedTools") or [] if isinstance(t, str)]
+    config["allowedTools"] = list(dict.fromkeys((*allowed, *grants)))
+
+
+def _names_work_server(ref: str) -> bool:
+    """Whether the tool reference *ref* names ``kirocrew-work`` or one of its tools."""
+    return ref == "@kirocrew-work" or ref.startswith("@kirocrew-work/")
 
 
 def _install_team_lead_agent() -> None:
@@ -494,7 +831,9 @@ def _install_team_lead_agent() -> None:
     (:func:`_without_guide_server`) exactly as research does. On top of that surface
     it mounts the two opt-in servers dispatch needs, ``kirocrew-dashboard`` and
     ``kirocrew-work`` (:func:`_mount_team_lead_dispatch`), granting the goal
-    conductor's existing verb tuples through the governance ceiling.
+    conductor's existing verb tuples through the governance ceiling. Each edition
+    server it mounts gets its ``@<server>`` ref in ``tools`` (:func:`_register_edition_refs`),
+    never a grant.
 
     Rewritten on every boot, like ``kirocrew-research`` and ``kirocrew-knowledge``:
     a spec this installer wrote is replaced in place with no ceremony -- no ownership
@@ -509,13 +848,24 @@ def _install_team_lead_agent() -> None:
         "items, does the small focused ones itself, dispatches a session for every "
         "other one, and patrols that fleet."
     )
-    config["prompt"] = agent_mod._TEAM_LEAD_SYSTEM_PROMPT
-    # The three skills this agent is told to read: ``team-lead`` ("read it before
-    # acting on a goal"), ``goal-conductor`` for the patrol procedure the charter
-    # shares with the conductors, and ``dashboard`` because a lead is a crewmate and
-    # the crewmate protocol sends it there to change its own page. Without the
-    # mapping its search scope is empty and none of the three can be found.
-    skill_resources.map_prompt_skills(config, "team-lead", "goal-conductor", "dashboard")
+    # The shared conductor rules ride in the prompt, because the goal-conductor
+    # skill points at "your prompt's" rules instead of restating them.
+    config["prompt"] = conductor_agents.with_conductor_ask(
+        f"{agent_mod._TEAM_LEAD_SYSTEM_PROMPT.rstrip()}\n\n"
+        f"{agent_mod._SHARED_CONDUCTOR_RULES_BLOCK}"
+    )
+    # The skills this agent is told to read: ``team-lead`` ("read it before acting on
+    # a goal"), ``goal-conductor`` for the patrol procedure the charter shares with
+    # the conductors, and ``dashboard`` because a lead is a crewmate and the crewmate
+    # protocol sends it there to change its own page. ``WIDGET_POINTER_SKILLS`` are
+    # how it draws in the dashboard chat, as the conductor does.
+    # Without the mapping its search scope is empty and none of them can be found.
+    skill_resources.map_prompt_skills(
+        config, "team-lead", "goal-conductor", "dashboard", *skill_resources.WIDGET_POINTER_SKILLS
+    )
+    # Conductor mode chats run on this spec: expose the edition servers it mounts, as the
+    # default spec does, with every call still behind the approval prompt.
+    _register_edition_refs(config)
     _mount_team_lead_dispatch(config)
     agent_mod.kiro_agents_dir_path().mkdir(parents=True, exist_ok=True)
     path = agent_mod.kiro_agents_dir_path() / _TEAM_LEAD_AGENT_FILENAME
@@ -578,9 +928,9 @@ def _install_dashboard_manager_agent() -> None:
     config: dict[str, object] = {
         "name": agent_mod.DASHBOARD_MANAGER_AGENT_NAME,
         "description": (
-            "Changes ONE crewmate's Dashboard page on request: searches the "
+            "Changes ONE Bot's Dashboard page on request: searches the "
             "template catalog, puts the one that fits live, and rolls back to "
-            "an earlier version. Never does the crewmate's own work."
+            "an earlier version. Never does the Bot's own work."
         ),
         "model": model,
         "includeMcpJson": False,

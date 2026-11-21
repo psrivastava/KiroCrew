@@ -77,6 +77,7 @@ from kiro_crew.messaging.display_safety import (
     outside_redaction_tags,
     redact_for_display,
 )
+from kiro_crew.messaging.graphemes import joins_previous
 
 __all__ = [
     "split_markdown_safe",
@@ -86,6 +87,7 @@ __all__ = [
     "repaired_for_delivery",
     "bounded_for_delivery",
     "iter_fence_spans",
+    "close_open_fence",
     "iter_fence_lines",
     "rebalance_fenced_cuts",
     "fence_line_safe_offset",
@@ -161,6 +163,7 @@ _CLOSE_RE = re.compile(r"^ {0,3}((?:`{3,})|(?:~{3,}))[ \t]*$")
 # opening with any other character can never be one — the test a hard cut applies
 # to the remainder it defers.
 _DELIM_LEAD = frozenset(" `~")
+
 
 # Characters a GFM separator row may contain (``| --- |``, ``|:--|--:|``).
 _TABLE_SEP_CHARS = set("-:| \t")
@@ -1108,6 +1111,24 @@ def iter_fence_spans(text: str) -> Iterator[tuple[int, int]]:
         yield open_at, len(text)
 
 
+def close_open_fence(text: str) -> str:
+    """*text*, with a closer line appended when it ends inside a fenced block.
+
+    A caller that appends lines of its own after a user's text (a channel's
+    attachment paths) uses this so a fence the user left open ends before
+    them: otherwise a later delimiter line -- inside an attached file's body,
+    say -- closes that fence after the appended lines and turns them into code.
+    *text* that ends outside every fence is returned unchanged.
+    """
+    fence: _Fence | None = None
+    for line, _full, _terminated in _lines(text):
+        fence = _advance(fence, line)
+    if fence is None:
+        return text
+    separator = "" if text.endswith("\n") else "\n"
+    return f"{text}{separator}{fence.closer}"
+
+
 #: The start of a line that is, or could become, a fence delimiter: up to three
 #: spaces, then a backtick or tilde. A cut after this prefix splits a delimiter.
 _DELIMITER_PREFIX_RE = re.compile(r" {0,3}[`~]")
@@ -1233,7 +1254,10 @@ def _safe_cut(fence: _Fence | None, frag: str, room: int) -> int:
       nothing but a long enough run closes a block its own line does not.
 
     So a candidate is accepted only when neither half moves the fence state, and
-    the widest such candidate wins. The reference is the state BEFORE the line,
+    the widest such candidate wins. It must also keep every visible character
+    whole (`messaging.graphemes.joins_previous`, the grapheme rule the
+    other cutters share): a flag, a ZWJ emoji or an accented letter
+    cut in two shows as broken glyphs on both sides. The reference is the state BEFORE the line,
     never the line's own transition: for a line still arriving that transition is
     revocable, so keying the cut on it would move an already-sealed boundary once
     the rest of the line landed.
@@ -1260,7 +1284,7 @@ def _safe_cut(fence: _Fence | None, frag: str, room: int) -> int:
         if _advance(fence, frag[:width]) is not fence:
             continue
         widest = widest or width
-        if frag[width] not in _DELIM_LEAD:
+        if frag[width] not in _DELIM_LEAD and not joins_previous(frag, width):
             return width
     return widest
 

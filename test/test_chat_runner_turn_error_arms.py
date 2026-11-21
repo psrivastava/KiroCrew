@@ -45,12 +45,17 @@ from kiro_crew.dashboard.chat_utils import (
     TRANSIENT_NOTICE_RETRYING,
     TRANSIENT_RETRY_KIND,
 )
+from kiro_crew.dashboard.chat_utils_injected_rows import KIRO_CLI_SIGN_IN_KIND
 from kiro_crew.dashboard.recovery_replays import ReplayFamily
 from kiro_crew.llm_helpers import TRANSIENT_RETRIES, PromptBusyExhaustedError
 from kiro_crew.recovery.ladder import SESSION_RECOVERY_MAX_ATTEMPTS
 from kiro_crew.session_allocation import SessionClosingError
 
 _REPLY = AcpEvent(kind=EVENT_TEXT_CHUNK, text="the reply")
+_CLAUDE_START_FAILED = (
+    "JSON-RPC error: {'code': -32603, 'message': 'Internal error', "
+    "'data': {'details': 'Claude Code process exited with code 1'}}"
+)
 _SLOT_KEY = "chat-1"
 #: The prompt-busy arms re-queue a top-level turn up to three times; the budget
 #: is the arm's own literal, with no constant to read it from.
@@ -132,7 +137,8 @@ _PLAIN = ("error", None)
 _ARMS: dict[str, _Arm] = {
     "auth-required": _Arm(
         events=lambda: [Raise(AcpAuthRequired("Not signed in"))],
-        rows=[_PLAIN],
+        # The Kiro CLI harness: the row asks for kiro-cli's own sign-in commands.
+        rows=[("error", KIRO_CLI_SIGN_IN_KIND)],
         card="Not signed in",
         reset=True,
         label=_UNNAMED,
@@ -269,6 +275,14 @@ _ARMS: dict[str, _Arm] = {
         requeued=False,
         label=_UNNAMED,
         after={"_posttoken_retry_used": True},
+    ),
+    # The claude adapter's answer when Claude Code fails to start: the adapter
+    # is alive and answered, so this is the error card, not a pipe-death loop.
+    "harness-answered-process-exited": _Arm(
+        events=lambda: [Raise(AcpError(_CLAUDE_START_FAILED, code=-32603))],
+        rows=[_PLAIN],
+        card="Claude Code process exited with code 1",
+        label=_UNNAMED,
     ),
     "terminal-acp-error": _Arm(
         events=lambda: [Raise(AcpError("bad request", transient=False))],
@@ -436,3 +450,21 @@ class TestArmSpecifics:
         assert record.successors == ()
         assert record.crew_log == ()
         assert [frame.kind for frame in record.ws_frames].count("chat_done") == 1
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (AcpError("ACP process exited (code=1)"), True),
+        (AcpError("ACP process not running"), True),
+        (AcpError(_CLAUDE_START_FAILED, code=-32603), False),
+        (AcpError("JSON-RPC error: MCP server not running", code=-32603), False),
+        (RuntimeError("process exited"), False),
+    ],
+)
+def test_pipe_death_is_the_clients_own_words_not_an_answered_frame(
+    exc: BaseException, expected: bool
+) -> None:
+    from kiro_crew.llm_helpers import acp_error_is_pipe_death
+
+    assert acp_error_is_pipe_death(exc) is expected

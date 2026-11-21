@@ -20,6 +20,76 @@ export const PULL_REQUEST_MONITOR_KINDS = (
   monitorContract.pullRequestMonitorKinds as PullRequestMonitorKind[]
 )
 
+/* The monitor kind vocabulary the dashboard treats as a known, actionable
+ * structured monitor. The checked-in `contract.json` lists only the built-in
+ * pull-request kinds; an edition can contribute its own kind at boot
+ * (`register_monitor_kind`), and the backend probes it, but a kind
+ * absent here fails the `supported` gate below and renders as "blocked" with
+ * its save and restart controls disabled.
+ *
+ * `useMonitorContract` fetches the gateway's runtime kind list once and installs
+ * it through `setRuntimeMonitorContract`, so a contributed kind reads as its
+ * real state. The default is the bundled list, and a gateway without the
+ * endpoint (404), an error, or a payload without the list all leave the bundled
+ * vocabulary in force -- behaviour is unchanged with no contributed kinds. */
+const BUNDLED_MONITOR_KINDS: ReadonlySet<string> = new Set(
+  monitorContract.pullRequestMonitorKinds,
+)
+let runtimeMonitorKinds: ReadonlySet<string> | null = null
+
+/** The runtime slice of the contract the dashboard can override at runtime. */
+export interface RuntimeMonitorContract {
+  pullRequestMonitorKinds?: readonly string[]
+}
+
+/** Install the gateway's runtime monitor contract, returning whether the kind
+ * set actually changed (so a caller can repaint only when it did).
+ *
+ * The installed set is BUNDLED ∪ runtime: a gateway payload can only ADD kinds,
+ * never shrink the built-in vocabulary, so a payload that omits a built-in (an
+ * older or partial list) never makes a built-in kind read as blocked. A payload
+ * without a non-empty `pullRequestMonitorKinds` array is a no-op and leaves the
+ * bundled kinds in force. */
+export function setRuntimeMonitorContract(contract: RuntimeMonitorContract): boolean {
+  const kinds = contract.pullRequestMonitorKinds
+  if (!Array.isArray(kinds) || !kinds.length
+    || !kinds.every(kind => typeof kind === 'string')) {
+    return false
+  }
+  const merged = new Set<string>(BUNDLED_MONITOR_KINDS)
+  for (const kind of kinds) merged.add(kind)
+  const current = activeMonitorKinds()
+  const changed = merged.size !== current.size
+    || [...merged].some(kind => !current.has(kind))
+  runtimeMonitorKinds = merged
+  return changed
+}
+
+/** Drop any runtime override, falling back to the bundled contract. */
+export function resetRuntimeMonitorContract(): void {
+  runtimeMonitorKinds = null
+}
+
+/** The kind vocabulary in force: the runtime list when one was installed, else
+ * the bundled list. */
+export function activeMonitorKinds(): ReadonlySet<string> {
+  return runtimeMonitorKinds ?? BUNDLED_MONITOR_KINDS
+}
+
+/** Whether a structured monitor kind is known (built-in or contributed). */
+export function isKnownMonitorKind(kind: unknown): kind is string {
+  return typeof kind === 'string' && activeMonitorKinds().has(kind)
+}
+
+/** Whether a kind is one of the built-in pull-request kinds (as opposed to a
+ * kind an edition contributed at boot). Only the built-ins have a client-side
+ * target parser (`normalizePullRequestMonitorTarget`); a contributed kind's
+ * target is validated by its own parser on the backend, so the client must not
+ * run the built-in parser against it. */
+export function isBuiltInPullRequestMonitorKind(kind: unknown): kind is PullRequestMonitorKind {
+  return typeof kind === 'string' && BUNDLED_MONITOR_KINDS.has(kind)
+}
+
 export type NormalizedPullRequestMonitorTarget = {
   kind: PullRequestMonitorKind
   target: string
@@ -181,14 +251,22 @@ export type AutomationRecord = LegacyGoalLoop | StructuredMonitor
 
 type JsonObject = Record<string, unknown>
 
+/** Remove the dashboard prefixes from a session key: one `dashboard:` (the live
+ * transport form), then any stacked `dashboard_` (the persisted-file form, which
+ * repeated normalization can stack). `deleteHistorySession` uses it to find a
+ * deleted session's prompt stash. */
+export function stripDashboardSessionPrefixes(key: string): string {
+  let folded = key
+  if (folded.startsWith('dashboard:')) folded = folded.slice('dashboard:'.length)
+  while (folded.startsWith('dashboard_')) folded = folded.slice('dashboard_'.length)
+  return folded
+}
+
 /** Match the backend's persisted dashboard-slot filename fold. Channel session
  * keys use transport punctuation (`slack:<ts>`) while dashboard slots use the
  * corresponding safe stem (`slack_<ts>`). */
 export function dashboardAutomationSlotKey(key: string): string {
-  let folded = key
-  if (folded.startsWith('dashboard:')) folded = folded.slice('dashboard:'.length)
-  while (folded.startsWith('dashboard_')) folded = folded.slice('dashboard_'.length)
-  return folded.replace(/[^a-zA-Z0-9_.-]/g, '_')
+  return stripDashboardSessionPrefixes(key).replace(/[^a-zA-Z0-9_.-]/g, '_')
 }
 
 function object(value: unknown): JsonObject | null {
@@ -242,10 +320,6 @@ function isCount(value: unknown): value is number {
 
 function isTimestamp(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0
-}
-
-function isEnum(value: unknown, values: readonly string[]): value is string {
-  return typeof value === 'string' && values.includes(value)
 }
 
 function isNullableEnum(value: unknown, values: readonly string[]): boolean {
@@ -462,7 +536,7 @@ export function normalizeAutomationRecord(raw: unknown): AutomationRecord | null
   const lifecycleValid = typeof loop.active === 'boolean' && active !== (outcome !== null)
   const supported = !!monitor
     && monitor.version === monitorContract.monitorStateVersion
-    && isEnum(monitor.kind, monitorContract.pullRequestMonitorKinds)
+    && isKnownMonitorKind(monitor.kind)
     && text(monitor.objective) === 'review_ready'
     && !!text(monitor.target)
     && !!budgets

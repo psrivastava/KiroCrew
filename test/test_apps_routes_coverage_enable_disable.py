@@ -1,12 +1,7 @@
 """Coverage tests for the app enable and disable routes.
 
-Pins who may enable an app and grant its consent, the warning and rollback branches of
-enable and disable, repeated and concurrent toggles, the ``on_disable`` hook lookup and
-name normalization for hyphenated builtins, and that enable does not re-register MCP
-after the backend starts.
-``test_apps_routes_coverage.py`` holds install, registration and the app views, and
-names the other route modules; the shared helpers live in
-``apps_routes_coverage_helpers.py``.
+Covers consent, the warning and rollback branches, concurrent toggles and the
+``on_disable`` hook lookup. Shared helpers live in ``apps_routes_coverage_helpers.py``.
 """
 
 from __future__ import annotations
@@ -29,21 +24,20 @@ from apps_routes_coverage_helpers import (
 
 import kiro_crew.apps.routes as routes_mod
 from kiro_crew.apps.manager import AppResult, disable_app, enable_app, register_external_app
+from kiro_crew.testing.synthetic_credentials import github_classic
 from kiro_crew.testing.wait import await_until
 
-# ---------------------------------------------------------------------------
+#: A GitHub token with a valid checksum; a ghp_ without one is no token.
+_GH = github_classic(seed=143)
+
 # Enable / disable warning + rollback branches
-# ---------------------------------------------------------------------------
 
 
 class TestEnableRefusesAppTokens:
     """Enabling is the consent moment for ``permissions.sessionApproval``.
 
-    ``disable_app`` leaves the app's token valid and ``_app_owns_path`` grants
-    the token its own ``/api/apps/{name}/**`` namespace, so without a refusal
-    a disabled app -- including one an update left disabled because it newly
-    asked for session control -- could POST its own enable route and restore
-    the grant with no user moment.
+    A disabled app keeps a valid token that owns ``/api/apps/{name}/**``, so without a
+    refusal it could POST its own enable route and restore the grant.
     """
 
     @pytest.mark.asyncio
@@ -75,6 +69,51 @@ class TestEnableRefusesAppTokens:
             )
             assert resp.status == 200
         assert routes_mod.get_app(APP)["enabled"] is True
+
+    @pytest.mark.parametrize(
+        ("body", "status", "scope_consented"),
+        [
+            # The chat-only dialog was confirmed: it did not name member threads.
+            pytest.param({"sessionApprovalConsent": True}, 400, None, id="chat-only"),
+            pytest.param(
+                {"sessionApprovalConsent": True, "memberThreadsConsent": True},
+                200,
+                True,
+                id="scope-named",
+            ),
+            # A scope consent qualifies the grant consent and means nothing alone.
+            pytest.param({"memberThreadsConsent": True}, 400, None, id="scope-alone"),
+            pytest.param(
+                {"sessionApprovalConsent": True, "memberThreadsConsent": "yes"},
+                400,
+                None,
+                id="not-a-boolean",
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_member_thread_scope_consent_must_be_sent_with_the_grant_consent(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        body: dict[str, Any],
+        status: int,
+        scope_consented: bool | None,
+    ) -> None:
+        _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path, permissions={"sessionApproval": True, "memberThreads": True})
+        monkeypatch.setattr(routes_mod, "start_app_backend", lambda n: None)
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            resp = await client.post(f"/api/apps/{APP}/enable", json=body)
+            payload = await resp.json()
+        assert resp.status == status
+        info = routes_mod.get_app(APP)
+        if status == 200:
+            assert info["enabled"] is True
+            assert info["memberThreadsConsented"] is scope_consented
+        else:
+            assert payload["code"] == "session_approval_consent_required"
+            assert (info["enabled"], info["sessionApprovalConsentPending"]) == (False, True)
 
     @pytest.mark.asyncio
     async def test_grants_consent_must_name_the_entries_shown(
@@ -237,6 +276,35 @@ class TestEnableBranches:
             assert (await resp.json())["enabled"] is False
 
     @pytest.mark.asyncio
+    async def test_a_failed_rollback_does_not_claim_the_app_is_disabled(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # `disable_app` fails closed; when it fails the reply must say so, not
+        # report a disable that did not happen.
+        _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path, setup={"onEnable": "setup.sh"})
+
+        async def _failed(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            return {"output": "boom", "failed": True}
+
+        monkeypatch.setattr(routes_mod, "_run_lifecycle_script", _failed)
+        monkeypatch.setattr(routes_mod, "start_app_backend", lambda n: None)
+        monkeypatch.setattr(routes_mod, "stop_app_backend", lambda n: None)
+        monkeypatch.setattr(
+            routes_mod,
+            "disable_app",
+            lambda n: AppResult(ok=False, name=n, error="could not record the disable"),
+        )
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            resp = await client.post(f"/api/apps/{APP}/enable")
+            assert resp.status == 400
+            body = await resp.json()
+        assert body["code"] == "on_enable_failed"
+        assert "remains disabled" not in body["error"]
+        assert "could not be disabled" in body["error"]
+        assert "could not record the disable" in body["error"]
+
+    @pytest.mark.asyncio
     async def test_hook_failure_becomes_a_warning_not_a_failure(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -262,11 +330,7 @@ class TestEnableBranches:
         _install(tmp_path)
 
         async def _hooks(*args: Any, **kwargs: Any) -> dict[str, Any]:
-            return {
-                "health_status": {
-                    "issues": ["cannot reach token=ghp_0123456789abcdefghijABCDEFGHIJ0123456789"]
-                }
-            }
+            return {"health_status": {"issues": [f"cannot reach token={_GH}"]}}
 
         monkeypatch.setattr(routes_mod, "on_app_enable", _hooks)
         monkeypatch.setattr(routes_mod, "start_app_backend", lambda n: None)
@@ -274,7 +338,7 @@ class TestEnableBranches:
             resp = await client.post(f"/api/apps/{APP}/enable")
             assert resp.status == 200
             issues = (await resp.json())["hooks"]["health_status"]["issues"]
-        assert "ghp_0123456789abcdefghijABCDEFGHIJ0123456789" not in issues[0]
+        assert _GH not in issues[0]
 
     @pytest.mark.asyncio
     async def test_enable_of_unknown_app_is_404(
@@ -340,16 +404,15 @@ class TestDisableBranches:
 
         async def _failed(*args: Any, **kwargs: Any) -> dict[str, Any]:
             return {
-                "output": "failed with token=ghp_0123456789abcdefghijABCDEFGHIJ0123456789",
+                "output": f"failed with token={_GH}",
                 "failed": True,
             }
 
-        # Patched on the SHARED teardown, not on `routes`: this PR routes the
-        # disable path's hook/backend/onDisable work through
+        # Patched on the SHARED teardown, not on `routes`: the disable path's
+        # hook/backend/onDisable work runs in
         # `apps/teardown.py::teardown_app_runtime`, the one implementation the
         # trust-revocation path also calls, so `routes` does not hold these
-        # symbols. The behaviour these tests pin is unchanged — the warnings still
-        # surface on the disable response — only the module that owns the step moved.
+        # symbols. The warnings still surface on the disable response.
         from kiro_crew.apps import teardown as teardown_mod
 
         # Patched on `teardown`, NOT on `lifecycle_scripts`: teardown does
@@ -367,7 +430,7 @@ class TestDisableBranches:
             body = await resp.json()
             warnings = body["warnings"]
             assert any("onDisable script failed" in w for w in warnings)
-            assert not any("ghp_0123456789abcdefghijABCDEFGHIJ0123456789" in w for w in warnings)
+            assert not any(_GH in w for w in warnings)
             resp = await client.get(f"/api/apps/{APP}")
             assert (await resp.json())["enabled"] is False
 
@@ -382,12 +445,11 @@ class TestDisableBranches:
         async def _boom(*args: Any, **kwargs: Any) -> dict[str, Any]:
             raise RuntimeError("disable hook exploded")
 
-        # Patched on the SHARED teardown, not on `routes`: this PR routes the
-        # disable path's hook/backend/onDisable work through
+        # Patched on the SHARED teardown, not on `routes`: the disable path's
+        # hook/backend/onDisable work runs in
         # `apps/teardown.py::teardown_app_runtime`, the one implementation the
         # trust-revocation path also calls, so `routes` does not hold these
-        # symbols. The behaviour these tests pin is unchanged — the warnings still
-        # surface on the disable response — only the module that owns the step moved.
+        # symbols. The warnings still surface on the disable response.
         from kiro_crew.apps import teardown as teardown_mod
 
         monkeypatch.setattr(teardown_mod, "on_app_disable", _boom)
@@ -409,12 +471,11 @@ class TestDisableBranches:
             assert kwargs["bounded_startup_cleanup"] is False
             return {"cron_cleanup": "2 job(s) left enabled", "other": 1}
 
-        # Patched on the SHARED teardown, not on `routes`: this PR routes the
-        # disable path's hook/backend/onDisable work through
+        # Patched on the SHARED teardown, not on `routes`: the disable path's
+        # hook/backend/onDisable work runs in
         # `apps/teardown.py::teardown_app_runtime`, the one implementation the
         # trust-revocation path also calls, so `routes` does not hold these
-        # symbols. The behaviour these tests pin is unchanged — the warnings still
-        # surface on the disable response — only the module that owns the step moved.
+        # symbols. The warnings still surface on the disable response.
         from kiro_crew.apps import teardown as teardown_mod
 
         monkeypatch.setattr(teardown_mod, "on_app_disable", _hooks)
@@ -557,11 +618,8 @@ async def test_enable_does_not_re_register_after_the_backend_starts(
 ) -> None:
     """Enable must not re-register MCP after start_app_backend returns.
 
-    A call made here is queued behind the handler, so the adopted backend's watch can
-    demote and scrub in between — and the queued write would then restore the dead url,
-    without updating `mcp_healthy`, so the watch would never notice the disagreement.
-    The adoption path registers through the serialized transition instead, before its
-    watch is armed.
+    A queued call could restore a dead url after the watch scrubbed it, with
+    `mcp_healthy` unchanged. Adoption registers through the serialized transition.
     """
     _setup_env(tmp_path, monkeypatch)
     _install(tmp_path)
@@ -668,6 +726,96 @@ class TestRecordReadsRunOffTheLoop:
             open_reads, reads[:] = list(reads), []
             assert (await client.post(f"/api/apps/{APP}/disable")).status == 200
             disable_reads = list(reads)
-        assert enable_reads == [("get_app", False), ("app_enabled_state", False)]
+        assert enable_reads == [
+            ("get_app", False),
+            ("app_enabled_state", False),
+            ("get_app", False),
+        ]
         assert open_reads == [("get_app", False)]
         assert disable_reads == [("get_app", False), ("app_enabled_state", False)]
+
+
+# Native-Windows exec backend refusal reaches the enable response
+
+
+def _install_with_backend(tmp_path: Path, entry: str, body: str, **backend: Any) -> None:
+    src = _make_app_source(tmp_path, backend={"entryPoint": entry, "port": "auto", **backend})
+    (src / entry).write_text(body)
+    from kiro_crew.apps.manager import install_app
+
+    assert install_app(src).ok
+
+
+def _backend_sees_platform(monkeypatch: pytest.MonkeyPatch, *, is_posix: bool) -> None:
+    """Make only the backend module read ``platform_compat.IS_POSIX`` as *is_posix*.
+
+    The enable route's own record and config writes keep the real host's code paths;
+    the refusal under test reads ``platform_compat.IS_POSIX`` in ``backend.py``. Every
+    other attribute is read from the real module.
+    """
+    import kiro_crew.apps.backend as bmod
+
+    real = bmod.platform_compat
+
+    class _PlatformView:
+        IS_POSIX = is_posix
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(real, name)
+
+    monkeypatch.setattr(bmod, "platform_compat", _PlatformView())
+
+
+def _backend_sees_native_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    _backend_sees_platform(monkeypatch, is_posix=False)
+
+
+class TestEnableReportsWindowsExecBackendRefusal:
+    """``start_app_backend`` returns the None of "no backend declared" when it refuses
+    an exec (shell launcher) backend on native Windows. The enable response must name
+    the refusal in ``backend_refused`` instead of reading as a clean start."""
+
+    @pytest.mark.asyncio
+    async def test_exec_backend_refusal_is_in_the_enable_response(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _setup_env(tmp_path, monkeypatch)
+        _install_with_backend(tmp_path, "run.sh", "#!/bin/sh\necho hi\n", type="exec")
+        monkeypatch.setattr(routes_mod, "start_app_backend", lambda n: None)
+        _backend_sees_native_windows(monkeypatch)
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            resp = await client.post(f"/api/apps/{APP}/enable")
+            body = await resp.json()
+        # The app still enables: its other parts may work without the backend.
+        assert resp.status == 200
+        assert "backend" not in body
+        assert "not supported on native Windows" in body["backend_refused"]
+        assert APP in body["backend_refused"]
+
+    @pytest.mark.asyncio
+    async def test_python_backend_on_windows_carries_no_refusal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _setup_env(tmp_path, monkeypatch)
+        _install_with_backend(tmp_path, "server.py", "print('hi')\n", type="python")
+        monkeypatch.setattr(routes_mod, "start_app_backend", lambda n: None)
+        _backend_sees_native_windows(monkeypatch)
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            resp = await client.post(f"/api/apps/{APP}/enable")
+            body = await resp.json()
+        assert resp.status == 200
+        assert "backend_refused" not in body
+
+    @pytest.mark.asyncio
+    async def test_exec_backend_on_posix_carries_no_refusal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _setup_env(tmp_path, monkeypatch)
+        _install_with_backend(tmp_path, "run.sh", "#!/bin/sh\necho hi\n", type="exec")
+        monkeypatch.setattr(routes_mod, "start_app_backend", lambda n: None)
+        _backend_sees_platform(monkeypatch, is_posix=True)
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            resp = await client.post(f"/api/apps/{APP}/enable")
+            body = await resp.json()
+        assert resp.status == 200
+        assert "backend_refused" not in body

@@ -1,13 +1,28 @@
 /**
  * The Profile card's Sessions tab names an untitled driving session
- * "Untitled session", never by its internal slot key (#20908).
+ * "Untitled session", never by its internal slot key (#20908), and a click on a
+ * row expands it in place: it never opens the session or leaves the page.
  *
  * The card is rendered for real; only its heavy siblings are stubbed, and the
  * panel stub mounts the `sessionsBody` it is handed, which is the list under test.
  */
 import { describe, it, expect, vi } from 'vitest'
 import { render, screen, fireEvent } from '@testing-library/react'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { ReactNode } from 'react'
+
+const crewWorkerRecap = vi.fn()
+vi.mock('../../api/client', async (orig) => {
+  const real = await orig<typeof import('../../api/client')>()
+  return {
+    ...real,
+    api: {
+      ...real.api,
+      crewWorkers: () => Promise.reject(Object.assign(new Error('not found'), { status: 404 })),
+      crewWorkerRecap: (root: string, worker: string) => crewWorkerRecap(root, worker),
+    },
+  }
+})
 
 vi.mock('./CrewProfilePanel', () => ({
   default: ({ sessionsBody }: { sessionsBody: ReactNode }) => <div>{sessionsBody}</div>,
@@ -21,9 +36,9 @@ import { MembersPageProfileCard } from './MembersPageProfile'
 
 type MembersPageProfileCardProps = Parameters<typeof MembersPageProfileCard>[0]
 
-type Slot = { key: string; title: string; created_by: string }
+type Slot = { key: string; title: string; created_by: string; mate_root?: string }
 
-function mountCard(slots: Slot[], openSessionGuarded = vi.fn()) {
+function mountCard(slots: Slot[], openSessionGuarded = vi.fn(), openSessionInPanel = vi.fn()) {
   const ref = { current: () => false }
   const member = { name: 'mate', slot_key: 'chat-mate' }
   const props = {
@@ -32,7 +47,7 @@ function mountCard(slots: Slot[], openSessionGuarded = vi.fn()) {
     rosterView: { isRunning: () => false, activeView: member },
     thread: { activeSlot: '', freshStart: { isPending: false }, askFreshStart: vi.fn(), confirmedSlot: '' },
     sidePanel: {
-      profileCardW: 400, activeMemberKey: 'mate', openCrewView: vi.fn(), openSessionGuarded,
+      profileCardW: 400, activeMemberKey: 'mate', openCrewView: vi.fn(), openSessionGuarded, openSessionInPanel,
       drivingSessions: slots,
     },
     schedules: {
@@ -55,23 +70,31 @@ function mountCard(slots: Slot[], openSessionGuarded = vi.fn()) {
     activeMemberName: '',
     onGoalsDraftChange: vi.fn(),
   } as unknown as MembersPageProfileCardProps
-  render(<MembersPageProfileCard {...props} />)
-  return openSessionGuarded
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  render(<QueryClientProvider client={qc}><MembersPageProfileCard {...props} /></QueryClientProvider>)
+  return { openSessionGuarded, openSessionInPanel, navigate: props.navigate as unknown as ReturnType<typeof vi.fn> }
 }
 
-describe('MembersPageProfileCard driving-session rows', () => {
-  it('labels an untitled session "Untitled session" and keeps a named one', () => {
-    const open = mountCard([
-      { key: 'chat-3-1785440411', title: '', created_by: 'mate' },
-      { key: 'chat-named', title: 'Fix the parser', created_by: 'mate' },
+describe('MembersPageProfileCard Sessions tab rows', () => {
+  it('labels an untitled session "Untitled session" and keeps a named one', async () => {
+    mountCard([
+      { key: 'chat-3-1785440411', title: '', created_by: 'mate', mate_root: 'mate' },
+      { key: 'chat-named', title: 'Fix the parser', created_by: 'mate', mate_root: 'mate' },
     ])
-    const [untitled, named] = screen.getAllByTestId('crew-profile-driving-row')
+    const rows = await screen.findAllByTestId('mate-session-row')
+    const [untitled, named] = rows
     expect(untitled.textContent).toContain('Untitled session')
     expect(untitled.textContent).not.toContain('chat-3-1785440411')
-    expect(untitled.getAttribute('title')).toMatch(/^Untitled session · /)
     expect(named.textContent).toContain('Fix the parser')
-    // Opening the row still targets the session's own key.
-    fireEvent.click(untitled)
-    expect(open).toHaveBeenCalledWith('chat-3-1785440411')
+  })
+
+  it('opens the clicked row in the side panel, not in place and not on the chat page', async () => {
+    const { openSessionGuarded, openSessionInPanel, navigate } = mountCard([{ key: 'chat-named', title: 'Fix the parser', created_by: 'mate', mate_root: 'mate' }])
+    fireEvent.click(await screen.findByTestId('mate-session-open'))
+    expect(openSessionInPanel).toHaveBeenCalledWith('chat-named')
+    expect(screen.queryByTestId('mate-recap')).toBeNull()
+    expect(crewWorkerRecap).not.toHaveBeenCalled()
+    expect(openSessionGuarded).not.toHaveBeenCalled()
+    expect(navigate).not.toHaveBeenCalled()
   })
 })

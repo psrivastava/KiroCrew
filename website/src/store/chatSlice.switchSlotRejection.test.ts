@@ -1,7 +1,7 @@
 /**
  * The switchSlot thunk boundary carries the numeric HTTP status (#6199).
  *
- * The classifier tests in `../test/agentSessionResumeMissingSlot.test.ts` feed
+ * The classifier tests in `../apps/issue-radar/agentSessionResumeMissingSlot.test.ts` feed
  * `isMissingSlotError` its payload directly, and the flow tests there fake
  * `unwrap()` — so neither would notice if `switchSlot` itself stopped producing
  * the payload. This file pins the WIRING: the real thunk, dispatched against a
@@ -173,6 +173,25 @@ describe('switchSlot.rejected — a gone target restores the pre-switch selectio
     expect(s.activeSlot).toBe('flaky')
     expect(s.messages).toEqual([])
     expect(s.slotLoading).toBe(false)
+  })
+
+  it('a transient failure keeps the run state live frames gave the selected chat, so its Stop stays (#34428)', async () => {
+    const store = await primedStore()
+    store.dispatch(sseChatMessage({ slot: 'flaky', role: 'chunk', content: 'x' }))
+    expect(store.getState().chat.slotRun['flaky'].state).toBe('streaming')
+    let rejectFlaky!: (e: unknown) => void
+    detail.mockImplementation((key: string) => key === 'flaky'
+      ? new Promise((_resolve, reject) => { rejectFlaky = reject })
+      : Promise.resolve(PAGES[key] ?? PAGES.C))
+    const inflight = store.dispatch(switchSlot('flaky'))
+    // A frame landing during the read moves only the mirror; the keyed entry still says streaming.
+    store.dispatch(sseChatMessage({ slot: 'flaky', role: 'tool', content: '🔧 bash', meta: { tool_call_id: 'tc-1' } }))
+    rejectFlaky(apiError(500, 'gateway hiccup'))
+    await inflight
+    const s = store.getState().chat
+    expect(s.activeSlot).toBe('flaky')
+    expect(s.slotRun['flaky'].state).toBe('streaming')
+    expect([s.slotState, s.slotRunning, s.slotStopping]).toEqual(['tool_running', true, false])
   })
 
   it('a 404 landing after the user already switched on does not yank the selection', async () => {

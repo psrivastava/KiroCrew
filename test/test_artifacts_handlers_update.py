@@ -29,6 +29,7 @@ from artifacts_handlers_helpers import (  # noqa: F401 -- fixtures are requested
     patch_restricted_fixture,
 )
 from body_stream_helpers import attach_json_body
+from redaction_structured_cases import github_classic
 
 from kiro_crew import artifacts as art_mod
 from kiro_crew import mcp_core
@@ -432,6 +433,80 @@ class TestUpdateDocumentType:
         assert _json_body(resp)["kind"] == "markdown"
 
 
+class TestRevertFromVersion:
+    """A revert's ``from_version`` must name a real version of the record.
+
+    It is what the timeline prints as "Reverted to vN", so a value out of range,
+    a string or a bool is refused 400 and the write changes nothing, rather than
+    being coerced or dropped and saved.
+    """
+
+    @staticmethod
+    def _two_versions(store) -> None:
+        store.create(name="x", content="v1", slug="x")
+        store.update("x", content="v2", snapshot=True)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad", [-5, 0, 999, 3, "abc", "1", True, 1.0, [1]])
+    async def test_an_unreal_version_is_refused_and_nothing_is_written(
+        self, isolated_store, patch_restricted, bad
+    ) -> None:
+        self._two_versions(isolated_store)
+        before = isolated_store.get("x")
+        resp = await api_artifact_update(
+            _request(
+                body={"content": "v1", "event_type": "reverted", "from_version": bad},
+                match={"slug": "x"},
+            )
+        )
+        assert resp.status == 400
+        assert "from_version" in _json_body(resp)["error"]
+        after = isolated_store.get("x")
+        assert after.content == "v2"
+        assert after.version == before.version == 2
+        assert after.events == before.events
+
+    @pytest.mark.asyncio
+    async def test_a_credential_shaped_value_is_not_echoed_back(
+        self, isolated_store, patch_restricted
+    ) -> None:
+        # The refusal names the type, not the value: a caller can put any string
+        # in from_version, and the 400 body must not hand it back verbatim.
+        self._two_versions(isolated_store)
+        resp = await api_artifact_update(
+            _request(
+                body={
+                    "content": "v1",
+                    "event_type": "reverted",
+                    "from_version": "AKIAIOSFODNN7EXAMPLE",
+                },
+                match={"slug": "x"},
+            )
+        )
+        assert resp.status == 400
+        assert b"AKIAIOSFODNN7EXAMPLE" not in resp.body
+        assert "got a str" in _json_body(resp)["error"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("good", [1, 2])
+    async def test_a_real_version_is_recorded_on_the_revert(
+        self, isolated_store, patch_restricted, good
+    ) -> None:
+        self._two_versions(isolated_store)
+        resp = await api_artifact_update(
+            _request(
+                body={"content": "v1", "event_type": "reverted", "from_version": good},
+                match={"slug": "x"},
+            )
+        )
+        assert resp.status == 200
+        art = isolated_store.get("x")
+        assert art.content == "v1"
+        assert art.version == 3
+        assert art.events[-1]["type"] == "reverted"
+        assert art.events[-1]["from_version"] == good
+
+
 class TestUpdateWebappMetadata:
     """artifact_update accepts validated webapp_metadata (round-15)."""
 
@@ -649,7 +724,7 @@ class TestDashboardBindingTargets:
     ) -> None:
         resp = await api_artifact_update(_bound_request(bound, "crewmate:someone-else"))
         assert resp.status == 400
-        assert b"names no crew member" in resp.body
+        assert b"names no Bot" in resp.body
         # And the stored binding is untouched: a refused write stores nothing.
         content = isolated_store.get(bound).content or ""
         assert json.loads(content)["bound_to"] == "crewmate:atlas"
@@ -781,7 +856,7 @@ class TestDashboardBindingTargets:
             )
         )
         assert resp.status == 400
-        assert b"names no crew member" in resp.body
+        assert b"names no Bot" in resp.body
 
     @pytest.mark.asyncio
     async def test_a_create_naming_the_crewmate_on_the_roster_is_accepted(
@@ -863,18 +938,20 @@ class TestDashboardBindingTargets:
         # The refusal names the target so the author can see which binding was wrong,
         # and an agent can put anything in a bound_to slug. A credential-shaped one
         # must not come back verbatim in the 400 body.
-        resp = await api_artifact_update(_bound_request(bound, "crewmate:AKIAIOSFODNN7EXAMPLE"))
+        secret = github_classic(seed=20)
+        resp = await api_artifact_update(_bound_request(bound, f"crewmate:{secret}"))
         assert resp.status == 400
-        assert b"AKIAIOSFODNN7EXAMPLE" not in resp.body
+        assert secret.encode() not in resp.body
         assert b"REDACTED" in resp.body
 
     @pytest.mark.asyncio
     async def test_the_session_scope_refusal_is_redacted_too(self, isolated_store, bound) -> None:
         # Both scopes build their sentences through the same helper, so neither can
         # return one that was never redacted.
-        resp = await api_artifact_update(_bound_request(bound, "session:AKIAIOSFODNN7EXAMPLE"))
+        secret = github_classic(seed=21)
+        resp = await api_artifact_update(_bound_request(bound, f"session:{secret}"))
         assert resp.status == 400
-        assert b"AKIAIOSFODNN7EXAMPLE" not in resp.body
+        assert secret.encode() not in resp.body
         assert b"REDACTED" in resp.body
 
     @pytest.mark.asyncio

@@ -21,13 +21,7 @@ class TestShippedInventory:
 
     def test_registry_matches_the_scenario_loader(self) -> None:
         # One taxonomy: a slug the inventory groups by is a slug a scenario may claim.
-        # The loader's registry ships with the feature/user_story scenario schema; on a
-        # branch without it the check is skipped, not faked -- once both are on main the
-        # two must agree.
-        registry = getattr(scenarios, "FEATURES", None)
-        if registry is None:
-            pytest.skip("scenarios.FEATURES is not on this branch yet")
-        assert fc.FEATURE_TITLES == registry
+        assert fc.FEATURE_TITLES == scenarios.FEATURES
 
     def test_features_md_is_rendered_from_features_json(self) -> None:
         assert (HERE / "FEATURES.md").read_text(encoding="utf-8") == fc.render(fc.load())
@@ -39,6 +33,21 @@ class TestShippedInventory:
                 assert r["runnable"] in ("smoke", "nightly"), r["id"]
             if r["runnable"] in ("native-only", "needs-secret", "excluded"):
                 assert r["priority"] == "P3", r["id"]
+
+    def test_incognito_row_says_history_keeps_the_session(self) -> None:
+        # History and its search list incognito and temporary sessions like any
+        # other (the docs/decisions/ record "Incognito and Temporary chats keep
+        # their transcript in History"); the modes withhold only what is
+        # derived from the chat. A scenario written from this row must assert the listing, not
+        # an exclusion the product does not make.
+        rows = {r["id"]: r for r in fc.validate(fc.load())}
+        row = rows["chat-incognito-badge-and-history-exclusion"]
+        claims = " ".join((row["title"], row["user_story"], row["rationale"])).lower()
+        assert "still listed in history and search" in row["title"].lower()
+        assert "history still lists them" in row["user_story"].lower()
+        assert "excluded from history" not in claims
+        assert "out of history" not in claims
+        assert "history/search exclusion" not in claims
 
     def test_seeds_are_shipped_fixtures(self) -> None:
         fixtures = {

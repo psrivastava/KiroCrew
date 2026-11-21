@@ -290,12 +290,11 @@ def test_opus_profile_model_matches_the_ci_workflow():
 def test_charter_budgets_match_the_ci_workflows():
     """The budget numbers restated in the fallback charters must match the workflows.
 
-    The charter hand-copies CI's budgets. That copy is exactly what drifted
-    before -- the skill still claimed ≤2 BLOCKING long after CI moved to 5 --
-    so pin the wording rather than trusting prose to be kept in sync. The Opus
-    lane still carries a numeric cap; the GPT lane's budget is report-ALL (a
-    numeric cap encouraged staging discoveries across review rounds), so its
-    charter must NOT restate a numeric cap.
+    The charter hand-copies CI's budgets, and a hand copy drifts, so pin the
+    wording rather than trusting prose to be kept in sync. The Opus lane
+    carries a numeric cap; the GPT lane's budget is report-ALL (a numeric cap
+    lets a reviewer hold findings back for a later round), so its charter must
+    NOT restate a numeric cap.
     """
     skill = (SKILL_DIR / "references" / "fallback-charters.md").read_text(encoding="utf-8")
 
@@ -438,6 +437,10 @@ def test_ci_blocking_scans_are_covered_by_the_floor():
     # not provision optional native runtimes, just as it does not grant Linux
     # namespaces or supply the Darwin kernel. Its absence is not FAISS evidence.
     exempt_scripts = {
+        # Reads the open main-red issue over the GitHub API on a pull request
+        # run and lists what PR CI deselects. It judges no code and its input
+        # exists only once CI runs on a pushed head.
+        "scripts/ci_main_red_skip.py",
         # Chooses WHICH tests to run for the changed surface; not itself a gate.
         "scripts/ci-surface-tests.py",
         # Linux-only E2E orchestration, not a static scan: boots isolated
@@ -461,6 +464,11 @@ def test_ci_blocking_scans_are_covered_by_the_floor():
         # lives under .github/scripts). Network orchestration with no verdict of
         # its own, for the same reason as the barrier it probes.
         "scripts/cancel-superseded-run.sh",
+        # Reads the AI review lanes' check-runs for the pull request head over
+        # the GitHub API and holds ci.yml's heavy jobs on a published BLOCK (it
+        # lives under .github/scripts). It judges no code and its input exists
+        # only once the review workflows have run on a pushed head.
+        "scripts/ai-block-hold.sh",
         # Computes which test_*.py files a non-leaf PR added or modified (via git
         # diff against base.sha from the pull_request event payload). The scope
         # depends on the PR base commit, which only exists once the PR event
@@ -654,10 +662,11 @@ def test_scoped_runner_self_test_passes():
     script = REPO_ROOT / "scripts" / "run_scoped_tests.py"
     assert script.is_file(), "scripts/run_scoped_tests.py is missing"
     proc = subprocess.run(
-        [sys.executable, str(script), "--test"],
+        [sys.executable, "-X", "utf8", str(script), "--test"],
         cwd=str(REPO_ROOT),
         capture_output=True,
         text=True,
+        encoding="utf-8",
         check=False,
     )
     assert proc.returncode == 0, (
@@ -968,19 +977,16 @@ def test_tree_reader_worktree_and_pinned_parity(tmp_path, monkeypatch):
     wt_reader = resolve_profile.WorktreeReader(str(tmp_path))
     pinned_reader = resolve_profile.PinnedTreeReader(str(tmp_path), "HEAD")
 
-    # has()
     assert wt_reader.has("pyproject.toml") is True
     assert pinned_reader.has("pyproject.toml") is True
     assert wt_reader.has("missing.txt") is False
     assert pinned_reader.has("missing.txt") is False
 
-    # read()
     assert wt_reader.read("package.json") == '{"scripts": {"build": "npm run build"}}'
     assert pinned_reader.read("package.json") == '{"scripts": {"build": "npm run build"}}'
     assert wt_reader.read("missing.txt") is None
     assert pinned_reader.read("missing.txt") is None
 
-    # ls()
     assert wt_reader.ls(".github/workflows") == [
         ".github/workflows/other.yaml",
         ".github/workflows/test-review.yml",

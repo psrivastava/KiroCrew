@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 
 import pytest
+from redaction_structured_cases import github_classic
 
 from kiro_crew.acp import _dispatch
 from kiro_crew.acp._dispatch import parse_metadata, parse_refusal
@@ -31,6 +32,7 @@ from kiro_crew.acp.types import (
     RefusalInfo,
 )
 from kiro_crew.dashboard.chat_runner import refusal_card_text
+from kiro_crew.testing.synthetic_credentials import synth
 
 CANNED = (
     "The selected model cannot continue this conversation. Please select a different "
@@ -113,7 +115,7 @@ class TestParseRefusal:
         assert info == RefusalInfo()
 
     def test_explanation_is_redacted_and_capped(self):
-        secret = "AKIAIOSFODNN7EXAMPLE"
+        secret = github_classic(seed=22)
         info = parse_refusal(
             {
                 "stopReason": "CONTENT_FILTERED",
@@ -254,12 +256,26 @@ class TestCard:
         assert "suggests model 'm-alt'" in text
         assert "agent.refusal_fallback_model" in text
 
+    def test_disabled_fallback_off_sentence_is_unchanged(self):
+        # The Disabled wording is byte-identical: this fix must not touch it.
+        text = refusal_card_text(None, fallback_off=True)
+        assert (
+            "Automatic retry on another model is available but switched off"
+            " (`agent.refusal_fallback_model`)." in text
+        )
+
+    def test_card_has_no_same_model_sentence(self):
+        # The same-model hint is a SEPARATE notice row, never built into the
+        # card — the card text must not carry it under any flag combination.
+        assert "same as your current model" not in refusal_card_text(None)
+        assert "same as your current model" not in refusal_card_text(None, fallback_off=True)
+
 
 class TestEveryFieldIsScrubbed:
     """Round-2 GPT finding: ``category`` / ``recommendedModel`` reach the same
     log line and card as ``explanation``, so all three pass the two redactors."""
 
-    SECRET = "AKIAIOSFODNN7EXAMPLE"
+    SECRET = github_classic(seed=23)
 
     @pytest.mark.parametrize("field", ["category", "explanation", "recommendedModel"])
     def test_credential_in_any_field_is_redacted(self, field, caplog):
@@ -273,12 +289,13 @@ class TestEveryFieldIsScrubbed:
 
     @pytest.mark.parametrize("field", ["category", "recommendedModel"])
     def test_exfil_url_in_a_short_field_is_redacted(self, field):
-        url = "https://evil.example/x?t=" + "a" * 40
+        value = synth(40, seed=40)
+        url = "https://evil.example/x?access_token=" + value
         info = parse_refusal({"stopReason": "CONTENT_FILTERED", "refusal": {field: url}})
         assert info is not None
         joined = info.category + info.recommended_model
-        assert "a" * 40 not in joined
-        assert "[REDACTED" in joined
+        assert value not in joined
+        assert "?access_token=[REDACTED" in joined
 
 
 class TestProviderForwardsRefusal:
@@ -430,6 +447,35 @@ class TestWorkerPoolPathFoldsRefusal:
         await c._read_prompt_response(1, 5.0)
         assert c._last_stop_reason == STOP_REASON_REFUSAL
 
+    @pytest.mark.asyncio
+    async def test_a_v2_refusal_hop_the_target_answered_ends_end_turn(self, tmp_path):
+        # The kiro-cli V2 order: the refusal, then the hop, then the answer's
+        # end_turn. The hop unfolds the refusal it moved off, as on the stream.
+        from kiro_crew.acp import client as acp_client
+        from kiro_crew.acp.types import JsonRpcMessage
+
+        c = acp_client.AcpClient(work_dir=tmp_path)
+        hop = {"sessionUpdate": "model_fallback", "from": "model-a", "to": "model-b"}
+
+        async def _loop(req_id, timeout):
+            yield (
+                "metadata",
+                JsonRpcMessage(method="_kiro.dev/metadata", params=dict(INCIDENT_FRAME)),
+            )
+            yield (
+                "model_fallback",
+                JsonRpcMessage(
+                    method="_kiro.dev/session/update",
+                    params={"update": {**hop, "cause": "refused", "promoted": False}},
+                ),
+            )
+            yield ("complete", JsonRpcMessage(id=1, result={"stopReason": STOP_REASON_END_TURN}))
+
+        c._prompt_loop = _loop
+        await c._read_prompt_response(1, 5.0)
+        assert c._last_stop_reason == STOP_REASON_END_TURN
+        assert c._resolved_model_id == "model-b"
+
 
 class TestSendMessageStreamFoldsRefusal:
     """First Principles round: ``send_message_stream`` is the fourth prompt
@@ -561,3 +607,83 @@ class TestRefusalTerminalFlushesToolResults:
         assert [ev.kind for ev in events] == ["tool_result", EVENT_COMPLETE]
         assert events[0].tool_call_id == "t1"
         assert events[1].stop_reason == STOP_REASON_REFUSAL
+
+
+class TestV2EngineFallbackUnfoldsTheRefusal:
+    """A V2 refusal hop: the refused model's refusal arrives on metadata, then
+    the hop, then V2's own terminal. The fold must judge the terminal, not the
+    refusal the walk already moved off -- otherwise an answered turn reaches
+    every consumer (dashboard, cron, sub-agent, channels) as a refusal."""
+
+    @staticmethod
+    def _fallback(promoted: bool = False):
+        from kiro_crew.acp.types import JsonRpcMessage
+
+        return (
+            "model_fallback",
+            JsonRpcMessage(
+                method="_kiro.dev/session/update",
+                params={
+                    "sessionId": "sess-1",
+                    "update": {
+                        "sessionUpdate": "model_fallback",
+                        "from": "claude-opus-5",
+                        "to": "claude-opus-4.8",
+                        "cause": "refused",
+                        "source": "backend",
+                        "promoted": promoted,
+                    },
+                },
+            ),
+        )
+
+    @staticmethod
+    def _complete():
+        from kiro_crew.acp.types import JsonRpcMessage
+
+        return ("complete", JsonRpcMessage(id=1, result={"stopReason": STOP_REASON_END_TURN}))
+
+    async def _terminal(self, tmp_path, frames):
+        from kiro_crew.acp import client as acp_client
+        from kiro_crew.acp.types import EVENT_COMPLETE
+
+        c = acp_client.AcpClient(work_dir=tmp_path)
+        c._read_new_tool_results_sync = lambda: []
+
+        async def _loop(req_id, timeout):
+            for frame in frames:
+                yield frame
+
+        c._prompt_loop = _loop
+        events = [ev async for ev in c._dispatch_events(1, 5.0)]
+        done = [ev for ev in events if ev.kind == EVENT_COMPLETE]
+        assert len(done) == 1
+        return done[0]
+
+    @pytest.mark.asyncio
+    async def test_an_answered_hop_ends_end_turn(self, tmp_path):
+        from kiro_crew.acp.types import JsonRpcMessage
+
+        refused = (
+            "metadata",
+            JsonRpcMessage(method="_kiro.dev/metadata", params=dict(INCIDENT_FRAME)),
+        )
+        done = await self._terminal(
+            tmp_path, [refused, self._fallback(), self._fallback(promoted=True), self._complete()]
+        )
+        assert done.stop_reason == STOP_REASON_END_TURN
+        assert done.refusal is None
+
+    @pytest.mark.asyncio
+    async def test_a_target_that_refuses_too_still_ends_refusal(self, tmp_path):
+        from kiro_crew.acp.types import JsonRpcMessage
+
+        refused = (
+            "metadata",
+            JsonRpcMessage(method="_kiro.dev/metadata", params=dict(INCIDENT_FRAME)),
+        )
+        done = await self._terminal(
+            tmp_path, [refused, self._fallback(), refused, self._complete()]
+        )
+        assert done.stop_reason == STOP_REASON_REFUSAL
+        assert done.refusal is not None and done.refusal.category == "CYBER"

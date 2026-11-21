@@ -22,6 +22,7 @@ import types
 from pathlib import Path
 
 import pytest
+from spawn_test_helpers import plain_sleeper_argv
 
 from kiro_crew import platform_compat as pc
 from kiro_crew.testing.ids import UNALLOCATABLE_PID
@@ -241,13 +242,13 @@ class TestProcessArgvMatchesExact:
 
     def test_exact_argv_matches_and_near_misses_do_not(self):
         if pc.IS_POSIX:
-            # A plain binary that does NOT re-exec, so its kernel-visible argv
-            # is exactly the spawn argv on Linux AND macOS (a macOS framework
-            # python re-execs Python.app and rewrites argv[0], which is a
-            # property of the interpreter stand-in, not of the production
-            # targets — ssh and the aws v2 binary do not re-exec).
-            sleep_bin = shutil.which("sleep") or "/bin/sleep"
-            argv = [sleep_bin, "300"]
+            # A child that does NOT re-exec, so its kernel-visible argv is exactly
+            # the spawn argv on Linux AND macOS (a macOS framework python re-execs
+            # Python.app and rewrites argv[0], which is a property of the
+            # interpreter stand-in, not of the production targets — ssh and the
+            # aws v2 binary do not re-exec). ``sleep`` where it is a binary; where
+            # it is a script the helper picks this interpreter instead.
+            argv = plain_sleeper_argv(_PROBE_CHILD_LIFE_SECS)
             child = subprocess.Popen(argv, start_new_session=True, stderr=subprocess.DEVNULL)
         else:
             child, argv = self._spawn("kirocrew-argvexact-probe")
@@ -487,7 +488,7 @@ class TestProcessStartTime:
 
     @pytest.mark.skipif(sys.platform != "linux", reason="Linux /proc contract")
     def test_linux_reports_stat_field_22(self):
-        stat_text = Path(f"/proc/{os.getpid()}/stat").read_text()
+        stat_text = Path(f"/proc/{os.getpid()}/stat").read_text(encoding="utf-8")
         expected = stat_text.rsplit(")", 1)[1].split()[19]
         assert pc.process_start_time(os.getpid()) == expected
 
@@ -599,17 +600,15 @@ class TestOwnProcessStartTime:
     after an in-process provider rebuild stitch into one stream.
     """
 
-    # flake-ok: no test in this class calls monkeypatch.undo(), so the shared monkeypatch cannot lift this pin
     @pytest.fixture(autouse=True)
-    # nosemgrep: kirocrew.test-autouse-shared-monkeypatch -- no test in this class calls monkeypatch.undo()
-    def _cold_cache(self, monkeypatch):
+    def _cold_cache(self, _floor_monkeypatch):
         """Start every test on a cold cache and restore the global after.
 
         Without this, whichever test runs first fills the module global for
         the rest of the worker session, making the first-read assertions
         order-dependent.
         """
-        monkeypatch.setattr(pc, "_OWN_START_TIME", None)
+        _floor_monkeypatch.setattr(pc, "_OWN_START_TIME", None)
 
     def test_matches_the_identity_token_and_is_stable(self):
         token = pc.own_process_start_time()

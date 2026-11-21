@@ -307,7 +307,7 @@ _PAGE_SCRIPT = r"""(() => {
     `<meta http-equiv="Content-Security-Policy" content="${CONFIG.csp}">` +
     `<style>${CONFIG.baseCss} ${theme}</style>` +
     shims.map((code) => `<script>${code}</` + 'script>').join('') +
-    `</head><body class="${mode}">\n`;
+    `</head><body data-mode="${mode}">\n`;
   // Lines before the widget's first line, to turn a frame line into a file line.
   const offset = head.split('\n').length - 1;
 
@@ -590,7 +590,7 @@ def dashboard_page(
 def read_fields(path: Path) -> dict[str, object]:
     """The JSON object of field values in *path*; a ``ValueError`` says why it is not one."""
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
         # Python reads NaN, Infinity and a number past a float's range, such as 1e400;
         # JSON holds none of them, and the island could not carry one.
         json.dumps(value, allow_nan=False)
@@ -641,7 +641,7 @@ def main(argv: list[str] | None = None) -> int:
             if os.environ.get(REEXEC_ENV) or not runtime or not os.path.isfile(runtime):
                 print(
                     "harness: the Dashboard mode frames the page with Kiro Crew's own code, "
-                    "which this Python cannot import; a crewmate's shell names that "
+                    "which this Python cannot import; a Bot's shell names that "
                     "interpreter in KIROCREW_RUNTIME_PYTHON",
                     file=sys.stderr,
                 )
@@ -655,7 +655,7 @@ def main(argv: list[str] | None = None) -> int:
     widget: Path = args.widget
     out: Path = args.out or Path.cwd() / f"{widget.stem}.preview.html"
     try:
-        text = widget.read_text(encoding="utf-8")
+        text = widget.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeDecodeError) as exc:
         print(f"harness: cannot read {widget}: {exc}", file=sys.stderr)
         return 2

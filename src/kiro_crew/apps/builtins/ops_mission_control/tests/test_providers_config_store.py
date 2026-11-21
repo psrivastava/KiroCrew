@@ -13,6 +13,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 
 class TestConcurrentStoreWritesDoNotLoseData(unittest.TestCase):
     """The config store and the keystone secret store are both read-modify-writes over a file
@@ -23,8 +25,13 @@ class TestConcurrentStoreWritesDoNotLoseData(unittest.TestCase):
     `store._IndexLock` / `ledger._LedgerLock` / `policy_store._PolicyLock`.
     """
 
+    @pytest.fixture(autouse=True)
+    def _per_test_dirs(self, tmp_path):
+        """Hand ``setUp`` pytest's per-test directory for the data home."""
+        self._tmp_path = tmp_path
+
     def setUp(self) -> None:
-        self.tmp = tempfile.mkdtemp()
+        self.tmp = str(self._tmp_path)
         self._prev = os.environ.get("KIROCREW_HOME")
         os.environ["KIROCREW_HOME"] = self.tmp
 
@@ -33,7 +40,6 @@ class TestConcurrentStoreWritesDoNotLoseData(unittest.TestCase):
             os.environ.pop("KIROCREW_HOME", None)
         else:
             os.environ["KIROCREW_HOME"] = self._prev
-        shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_concurrent_config_writes_keep_both_keys(self):
         import threading
@@ -57,8 +63,8 @@ class TestConcurrentStoreWritesDoNotLoseData(unittest.TestCase):
             for th in threads:
                 th.start()
             for th in threads:
-                # flake-ok: pre-existing unbounded join of self-completing writers, moved verbatim
-                th.join()
+                th.join(timeout=30.0)
+                self.assertFalse(th.is_alive(), "a concurrent writer did not finish within 30 s")
             cfg = read_config()
             if cfg.get("primary_instance") is not False or (
                 cfg.get("providers", {}).get("cloudwatch", {}).get("region") != "new"
@@ -81,8 +87,8 @@ class TestConcurrentStoreWritesDoNotLoseData(unittest.TestCase):
             for th in threads:
                 th.start()
             for th in threads:
-                # flake-ok: pre-existing unbounded join of self-completing writers, moved verbatim
-                th.join()
+                th.join(timeout=30.0)
+                self.assertFalse(th.is_alive(), "a concurrent writer did not finish within 30 s")
             if backend.get("pagerduty", "api_token") != "pd" or (
                 backend.get("datadog", "api_key") != "dd"
             ):

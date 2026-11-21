@@ -26,7 +26,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from kiro_crew import platform_compat
-from kiro_crew.testing.wait import async_wait_until, finished, wait_until
+from kiro_crew.testing.wait import FALLBACK_TIMEOUT_SECS, async_wait_until, finished, wait_until
 
 pytestmark = pytest.mark.skipif(
     not platform_compat.IS_POSIX, reason="POSIX process groups and a POSIX shell"
@@ -35,6 +35,14 @@ pytestmark = pytest.mark.skipif(
 #: A cli.sh-shaped installer: moves the venv aside, restores it on TERM (after
 #: an optional delay, "$2"), then runs a long step. Records its process group so
 #: teardown can reap it. Touches only the case directory it is handed.
+#:
+#: The long step runs in a process group of its own (``set -m``), as cli.sh's
+#: ``_run_step`` runs it on macOS, so only the shell gets the group's SIGTERM and
+#: the trap stops the step. Left in the signalled group, the step died of the
+#: same SIGTERM, and bash 3.2 (macOS /bin/sh) then sometimes returned from
+#: ``wait`` with the step's 143 and exited without running the trap: no
+#: ``outcome``, about 1 run in 150 on a loaded Mac. Teardown reaps the step's
+#: group through ``steppid``.
 _FAKE_INSTALLER = r"""
 set -u
 D="$1"
@@ -51,8 +59,11 @@ restore() {
   exit 130
 }
 trap restore TERM INT
+set -m 2>/dev/null || true
 sleep 30 &
 step=$!
+set +m 2>/dev/null || true
+echo "$step" > "$D/steppid"
 echo moved > "$D/phase"
 wait "$step"
 """
@@ -147,7 +158,8 @@ async def _cancel_and_settle(task: asyncio.Task) -> None:
     task.cancel()
 
     with pytest.raises(asyncio.CancelledError):
-        await finished(task, "cancel settle", timeout=15)
+        # The safety net, not a literal shorter than the grace a stop may use.
+        await finished(task, "cancel settle", timeout=FALLBACK_TIMEOUT_SECS)
 
 
 class TestTerminateAndReapSync:
@@ -204,6 +216,20 @@ class TestTerminateAndReapSync:
 
 
 class TestCommandProviderRollsBack:
+    @pytest.fixture(autouse=True)
+    def _a_generous_term_grace(self, _floor_monkeypatch):
+        # The real routes stop the installer with the PRODUCTION TERM grace (4 s,
+        # a share of the gateway's shutdown cap). That is a product deadline, not a
+        # test boundary: a loaded Mac stalled the stand-in's rollback for ~7 s, the
+        # group was SIGKILLed mid-trap and ``outcome`` was never written. These
+        # tests pin the rollback, so it gets the suite's safety net; a test about
+        # the expired grace still sets literal 0 itself.
+        from kiro_crew.platform import update_provider
+
+        _floor_monkeypatch.setattr(
+            update_provider, "UPDATE_INSTALLER_TERM_GRACE_SECS", FALLBACK_TIMEOUT_SECS
+        )
+
     @pytest.mark.asyncio
     async def test_cancel_arm_lets_the_apply_command_restore(self, tmp_path, reap_groups):
         from kiro_crew.platform.update_provider import CommandProvider
@@ -241,6 +267,118 @@ class TestCommandProviderRollsBack:
             await _cancel_and_settle(task)
 
         _assert_restored(case)
+
+    @pytest.mark.asyncio
+    async def test_a_cancel_while_the_child_is_starting_lets_the_apply_command_restore(
+        self, monkeypatch, tmp_path, reap_groups
+    ):
+        from asyncio import base_subprocess
+
+        from kiro_crew.platform.update_provider import CommandProvider
+
+        case = _case(tmp_path)
+        released = asyncio.Event()
+        connect_pipes = base_subprocess.BaseSubprocessTransport._connect_pipes
+
+        async def _held_connect_pipes(transport, waiter):
+            await released.wait()
+            await connect_pipes(transport, waiter)
+
+        monkeypatch.setattr(
+            base_subprocess.BaseSubprocessTransport, "_connect_pipes", _held_connect_pipes
+        )
+        provider = CommandProvider(
+            check_command="true", apply_command=_installer_command(tmp_path, case)
+        )
+        task = asyncio.create_task(provider.apply())
+        try:
+            await _wait_for_file(case / "phase")
+            task.cancel()
+            await asyncio.sleep(0)
+        finally:
+            released.set()
+            await _cancel_and_settle(task)
+
+        _assert_restored(case)
+
+    @pytest.mark.asyncio
+    async def test_a_start_that_never_finishes_does_not_hold_the_cancel(
+        self, monkeypatch, tmp_path, reap_groups
+    ):
+        from asyncio import base_subprocess
+
+        from kiro_crew.platform import update_provider
+        from kiro_crew.platform.update_provider import CommandProvider
+
+        case = _case(tmp_path)
+        released = asyncio.Event()
+        held: list[asyncio.Task] = []
+        connect_pipes = base_subprocess.BaseSubprocessTransport._connect_pipes
+
+        async def _held_connect_pipes(transport, waiter):
+            held.append(asyncio.current_task())
+            await released.wait()
+            await connect_pipes(transport, waiter)
+
+        monkeypatch.setattr(
+            base_subprocess.BaseSubprocessTransport, "_connect_pipes", _held_connect_pipes
+        )
+        # Literal 0: the grace has already run out when the cancel lands.
+        monkeypatch.setattr(update_provider, "UPDATE_INSTALLER_TERM_GRACE_SECS", 0)
+        provider = CommandProvider(
+            check_command="true", apply_command=_installer_command(tmp_path, case)
+        )
+        task = asyncio.create_task(provider.apply())
+        try:
+            await _wait_for_file(case / "phase")
+            task.cancel()
+            done, _ = await asyncio.wait({task}, timeout=10)
+            assert task in done
+            assert task.cancelled()
+        finally:
+            released.set()
+            await _cancel_and_settle(task)
+            if held:
+                await asyncio.wait(held, timeout=10)
+
+    @pytest.mark.asyncio
+    async def test_a_start_that_uses_up_the_grace_logs_the_ungraceful_stop(
+        self, monkeypatch, caplog
+    ):
+        from kiro_crew.platform import update_provider
+
+        stop = AsyncMock()
+        monkeypatch.setattr(update_provider, "_stop_installer", stop)
+        proc = MagicMock()
+        released = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        real_time = loop.time
+        skew = 0.0
+
+        async def _slow_spawn():
+            nonlocal skew
+            await released.wait()
+            # The injected clock jumps past the whole grace while the start runs.
+            skew = update_provider.UPDATE_INSTALLER_TERM_GRACE_SECS + 1.0
+            return proc
+
+        loop.time = lambda: real_time() + skew
+        try:
+            task = asyncio.create_task(update_provider._start_installer(_slow_spawn()))
+            await asyncio.sleep(0)
+            task.cancel()
+            await asyncio.sleep(0)
+            released.set()
+            with (
+                caplog.at_level("WARNING", logger=update_provider.logger.name),
+                pytest.raises(asyncio.CancelledError),
+            ):
+                await task
+        finally:
+            del loop.time
+
+        stop.assert_awaited_once_with(proc, grace=0.0)
+        assert "after the TERM grace ran out" in caplog.text
 
 
 class TestTerminateAndReap:

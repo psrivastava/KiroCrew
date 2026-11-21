@@ -1,7 +1,7 @@
 """The cron page's job list and the folders it groups jobs into.
 
-``GET /api/crons`` and the cron-folder routes, which serialize their mutations
-under one loop-bound lock.
+``GET /api/crons``, ``GET /api/crons/{id}`` and the cron-folder routes, which
+serialize their mutations under one loop-bound lock.
 
 Served through :mod:`kiro_crew.dashboard.handlers.cron`, which callers and tests import and patch; this module
 never imports it.
@@ -10,6 +10,7 @@ never imports it.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import json
 import logging
@@ -25,8 +26,11 @@ from kiro_crew.dashboard.handlers.cron_shared import (
     _audit_app_cron,
     _invalid_path_id_response,
     _redacted_grant_map,
+    _refuse_foreign_app_job,
 )
-from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
+from kiro_crew.dashboard.handlers.source_providers import (  # noqa: F401 -- a handlers.cron public name
+    is_owner_dashboard_request,
+)
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
@@ -35,6 +39,12 @@ from kiro_crew.validation import MAX_SHORT_STRING
 from ._shared import guard_owner_surface_routes, read_bounded_json
 
 logger = logging.getLogger("kiro_crew.dashboard.handlers.cron")
+
+#: How much of each job's ``last_result`` and ``last_error`` the list carries.
+#: A row's tooltip and the partial-block phrase, which opens the error, need no
+#: more, and a few hundred long results sent whole made the body megabytes. The
+#: job dialog reads the whole text from ``GET /api/crons/{id}``.
+_LIST_TEXT_PREVIEW = 1000
 
 
 def _job_snapshot(job: Any) -> Any:
@@ -58,6 +68,23 @@ def _job_snapshot(job: Any) -> Any:
 
 
 async def api_crons(request: web.Request) -> web.Response:
+    """``GET /api/crons``: every job, its last result and error cut to a preview."""
+    return await _jobs_response(request, None)
+
+
+async def api_cron_get(request: web.Request) -> web.Response:
+    """``GET /api/crons/{id}``: one job's row, its last result and error whole."""
+    state: DashboardState = request.app["state"]
+    job_id = request.match_info["job_id"]
+    if (_e := _invalid_path_id_response(job_id, "job_id")) is not None:
+        return _e
+    app_denied = await _refuse_foreign_app_job(request, state, [job_id], "crons.get")
+    if app_denied is not None:
+        return app_denied
+    return await _jobs_response(request, job_id)
+
+
+async def _jobs_response(request: web.Request, job_id: str | None) -> web.Response:
     # Function-local for the reason the helpers in cron_shared are: importing
     # `kiro_crew.apps.cron_sdk` executes `kiro_crew.apps.__init__`, which pulls
     # `bridges` and its documented mcp_cron cycle. Nothing on the boot path
@@ -65,16 +92,34 @@ async def api_crons(request: web.Request) -> web.Response:
     # module import order entirely.
     from kiro_crew.apps.cron_sdk import app_owner_name
     from kiro_crew.cron import (  # noqa: F811
+        _job_tz,
         compute_next_run_ts,
+        default_timezone_name,
         effective_wake_budget,
         format_schedule,
         get_local_tz,
+        job_zone_name,
     )
+    from kiro_crew.cron_service.model import parked_by_its_run
     from kiro_crew.cron_service.schedule import backoff_delaying_next_run
+    from kiro_crew.dashboard.chat_utils_display import _redact_for_display
+    from kiro_crew.host_timezone import published_host_timezone
+    from kiro_crew.security.redaction_switch import always_scan, credential_pass_bypassed
 
     def _r(text: str) -> str:
         # The two redaction passes every free-text field below goes through.
         return redact_credentials(redact_exfiltration_urls(text)[0])[0]
+
+    def _result_text(text: str) -> str:
+        # The credential pass over the whole text, through the display redaction's
+        # cache: it keeps the answer under a keyed digest of the text and of every
+        # setting the pass reads, so a list re-read redacts only the results it does
+        # not hold. That pass opens the chat seam, which the owner's redaction setting
+        # stands down; `_r` stands down only in a scope the caller opened, so outside
+        # one the pass runs in full. The list carries the opening of the answer.
+        with contextlib.nullcontext() if credential_pass_bypassed() else always_scan():
+            text = _redact_for_display(text)
+        return text if job_id is not None else text[:_LIST_TEXT_PREVIEW]
 
     state: DashboardState = request.app["state"]
     # Freshness-guaranteed list for the user-facing GET: offloads a locked
@@ -98,17 +143,31 @@ async def api_crons(request: web.Request) -> web.Response:
     # internal-secret callers (``app == ""``) skip the filter and the audit, so
     # the owner-view poll stays unaudited and unaffected, as before.
     app = _app_caller(request)
-    if app:
+    if job_id is not None:
+        # api_cron_get has already refused, and audited, a job this app does not own.
+        jobs = [j for j in jobs if j.id == job_id]
+    elif app:
         jobs = [j for j in jobs if app_owner_name(j.created_by) == app]
         _audit_app_cron(app, "crons.list", "allowed", f"jobs={len(jobs)}")
     # A crewmate's goal check-ins are controlled only by its Goals tab switches,
     # so neither the Schedule page nor a crewmate's Schedules tab lists them;
-    # the store still runs them. Only those: every other managed job stays.
+    # the store still runs them. The stale-wake job is controlled only by its
+    # Feature preview switch, so it is left out too. Only those: every other
+    # managed job stays.
     from kiro_crew.dashboard.goal_reminder import is_reminder_job
+    from kiro_crew.dashboard.stale_wake import is_stale_wake_job
 
-    jobs = [j for j in jobs if not is_reminder_job(j)]
+    jobs = [j for j in jobs if not is_reminder_job(j) and not is_stale_wake_job(j)]
+    if job_id is not None and not jobs:
+        return web.json_response({"error": "job not found", "code": "job_not_found"}, status=404)
     now = time.time()
     tz_name, _ = get_local_tz()
+    # What a job with no zone of its own follows, as the job form offers it: the
+    # configured zone, or "local" when none is configured. And the zone "local"
+    # resolves to right now, so the page can say where "local" is. Both are
+    # snapshots: no config or host read on the loop.
+    default_tz = default_timezone_name()
+    host_tz = published_host_timezone()
     # Secret-grant metadata is owner-view only (see the field comment below).
     # This is a read-path CLASSIFICATION on the dashboard's polling endpoint,
     # deliberately NOT SEL-audited per decision: the panel refreshes every few
@@ -116,7 +175,10 @@ async def api_crons(request: web.Request) -> web.Response:
     # and no secret VALUE is ever serialized here (names only). Every
     # privileged grant MUTATION (request, approve, deny, revoke, and both
     # denial branches) writes its own SEL event.
-    _owner_view = is_owner_dashboard_request(request)
+    # The secret grants are the vault's, which stays the machine owner's.
+    from kiro_crew.dashboard.handlers.source_providers import is_host_owner_dashboard_request
+
+    _owner_view = is_host_owner_dashboard_request(request)
     # The run claims and the slot registry belong to the loop, so they are read
     # here; everything else is built in a worker thread below. Building every
     # row (each free-text field through both redaction passes) and encoding the
@@ -141,7 +203,7 @@ async def api_crons(request: web.Request) -> web.Response:
                 "name": _r(j.name),
                 "message": _r(j.message),
                 "enabled": j.enabled,
-                "schedule": _r(format_schedule(j.schedule, tz_name=j.timezone or tz_name)),
+                "schedule": _r(format_schedule(j.schedule, tz_name=job_zone_name(j) or tz_name)),
                 "cron_expr": j.schedule.cron_expr if j.schedule.kind == "cron" else None,
                 "every_secs": j.schedule.every_secs if j.schedule.kind == "every" else None,
                 "created_ts": j.created_ts or None,
@@ -161,6 +223,11 @@ async def api_crons(request: web.Request) -> web.Response:
                 # consecutive failures is the WORST one, which `unhealthy_jobs_from_disk`
                 # already treats that way by skipping only user pauses.
                 "user_paused": j.user_paused,
+                # A fired one-shot is parked with the user-pause flags. This says
+                # the park is its run's, so a failed one-shot stays a health signal.
+                "parked_after_run": parked_by_its_run(
+                    j.schedule.kind, j.user_paused, j.user_pause_requested, j.last_run_ts
+                ),
                 "agent": _r(j.agent_id or "") or None,
                 "member_id": j.member_id or None,
                 "memory_store": j.memory_store or None,
@@ -171,7 +238,8 @@ async def api_crons(request: web.Request) -> web.Response:
                 "agent_sequence": [_r(a or "") for a in (j.agent_sequence or [])],
                 "model": _r(j.model or "") or None,
                 "channel": _r(j.channel or "") or None,
-                "approval_mode": _r(j.approval_mode or "") or None,
+                # "" not null: the stored default, and a value PATCH accepts.
+                "approval_mode": _r(j.approval_mode or ""),
                 # The chat session that owns this job. Ownership decides chat-side
                 # reachability: cron_list only shows a session its own jobs, so a job
                 # whose key is empty (None here) is invisible to every chat session
@@ -193,9 +261,11 @@ async def api_crons(request: web.Request) -> web.Response:
                 # to the store's True and a save would silently re-enable the
                 # persistent session on a job the user set to ephemeral.
                 "persistent_session": j.persistent_session,
+                "new_chat_per_run": j.new_chat_per_run,
                 # The edit form's auto-pause field reads it so a save shows the
                 # job's real limit; 0 means the job never auto-pauses.
                 "auto_pause_after_failures": j.auto_pause_after_failures,
+                "alert_after_failures": j.alert_after_failures,
                 "folder_id": j.folder_id,
                 "chat_folder_id": j.chat_folder_id,
                 # The Schedule-page template this job was seeded from, or None. A
@@ -228,6 +298,11 @@ async def api_crons(request: web.Request) -> web.Response:
                 # disabled job and for one whose next slot is later anyway.
                 "failure_backoff_until": backoff_delaying_next_run(j, now=now),
                 "timezone": _r(j.timezone or "") or None,
+                # The IANA zone the scheduler reads the job's wall clock in right
+                # now (UTC when a configured name cannot load), so a page in another
+                # zone (a browser on a phone) never resolves "local" or an inherited
+                # zone itself, and never gets a name the browser cannot format in.
+                "effective_tz": _r(getattr(_job_tz(j), "key", "") or "UTC"),
                 "skip_dates": ([_r(d) for d in j.skip_dates] if j.skip_dates else None),
                 "script": _r(j.script or "") or None,
                 "command": _r(j.command or "") or None,
@@ -245,17 +320,24 @@ async def api_crons(request: web.Request) -> web.Response:
                     _redacted_grant_map(j.secret_env_pending) if _owner_view else None
                 ),
                 "secret_env_pending_ts": (j.secret_env_pending_ts or None) if _owner_view else None,
-                "last_result": _r(j.last_result or "") or None,
-                "last_error": _r(j.last_error or "") or None,
+                "last_result": _result_text(j.last_result or "") or None,
+                # When `last_result` was produced (epoch), so a notification can
+                # tell whether the job's result is still the one it carries.
+                "last_result_ts": j.last_result_ts or None,
+                "last_error": _result_text(j.last_error or "") or None,
                 "is_running": live[j.id][1],
                 "running_since": live[j.id][2],
             }
             for j in jobs
         ]
+        if job_id is not None:
+            return json.dumps(data[0])
         return json.dumps(
             {
                 "jobs": data,
                 "server_tz": _r(tz_name or "") or None,
+                "default_tz": _r(default_tz),
+                "host_tz": _r(host_tz) or None,
             }
         )
 
@@ -344,6 +426,13 @@ async def create_or_adopt_cron_folder(state: DashboardState, name: str) -> tuple
     if _FOLDER_ID_SHAPE.fullmatch(name):
         return "", f"cron folder not found: {name!r} looks like a folder id"
     async with _get_cron_folders_lock():
+        # A failed boot load leaves the in-memory list empty: re-read it before
+        # matching, or a name already on disk would be created a second time.
+        try:
+            await asyncio.to_thread(state._reload_cron_folders_if_unknown)
+        except Exception:
+            logger.warning("Failed to read cron folders before adopt", exc_info=True)
+            return "", "failed to save folder"
         matches = [f for f in state._cron_folders if f["name"].strip().lower() == name.lower()]
         if len(matches) > 1:
             return "", f"{len(matches)} cron folders are named {name!r}"

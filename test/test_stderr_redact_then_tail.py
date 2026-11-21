@@ -30,15 +30,14 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from redaction_structured_cases import github_classic
 from test_theme_clone_stderr_redact_before_bound import _find_slice_before_redact_offenders
 
 import kiro_crew.apps.builtins.dev_fleet.gateway_service as gateway_service
-import kiro_crew.apps.builtins.ops_mission_control.backend.providers.github_issues as github_issues
 import kiro_crew.cli_setup as cli_setup
 import kiro_crew.dashboard.tailnet as tailnet
 import kiro_crew.env as env_mod
 import kiro_crew.voice_reply as voice_reply
-from kiro_crew.apps.builtins.ops_mission_control.backend.models import ACTION_COMMENT, Signal
 from kiro_crew.hooks import (
     HOOK_EVENT_PRE_TOOL_USE,
     HOOK_EVENT_USER_PROMPT_SUBMIT,
@@ -47,7 +46,8 @@ from kiro_crew.hooks import (
 )
 
 # Built at runtime so no credential-shaped literal lands in the repo.
-_FAKE_KEY = "AKIA" + "B" * 16  # matches the AWS access-key-id pattern
+_FAKE_KEY = github_classic(seed=50)  # a GitHub classic token with a valid checksum
+_KEY_RIGHT = _FAKE_KEY[4:]  # the key without its ``ghp_`` prefix
 _MARKER = "[REDACTED:"
 _MARKER_TAIL = "credential]"  # the redaction marker ends "...: credential]"
 
@@ -55,12 +55,12 @@ _MARKER_TAIL = "credential]"  # the redaction marker ends "...: credential]"
 def _straddling(bound: int) -> str:
     """A stream whose last *bound* chars begin 4 chars INTO the fake key.
 
-    A raw ``[-bound:]`` keeps ``"B" * 16 + tail``: no ``AKIA`` prefix, so the
+    A raw ``[-bound:]`` keeps the key without its ``ghp_`` prefix, so the
     fragment matches nothing and leaks; the same is true after a slice-then-
     redact reorder. Redact-then-slice yields the marker's tail instead.
     """
-    tail = "e" * (bound - 16)
-    return "p" * 40 + _FAKE_KEY + tail
+    tail = " " + "e" * (bound - len(_KEY_RIGHT) - 1)
+    return "p" * 40 + " " + _FAKE_KEY + tail
 
 
 def _two_markers(bound: int) -> str:
@@ -70,7 +70,7 @@ def _two_markers(bound: int) -> str:
 
 def _assert_straddle_redacted(excerpt: str, bound: int) -> None:
     assert _FAKE_KEY not in excerpt
-    assert "B" * 16 not in excerpt, excerpt  # the raw right half must not survive
+    assert _KEY_RIGHT not in excerpt, excerpt  # the raw right half must not survive
     # Positive proof the payload flowed through redaction (not a vacuous pass on
     # an empty excerpt): the tail window opens INSIDE the replacement marker, so
     # the marker's tail, not the key's, is what survives the cut.
@@ -81,63 +81,6 @@ def _assert_straddle_redacted(excerpt: str, bound: int) -> None:
 def _assert_tail_anchored(excerpt: str) -> None:
     assert "LAST-LINE-MARKER" in excerpt
     assert "FIRST-LINE-MARKER" not in excerpt
-
-
-# ── ops_mission_control github_issues (dashboard-visible) ────────────────────
-
-
-def _configured_adapter(monkeypatch: pytest.MonkeyPatch) -> github_issues.GitHubIssuesAdapter:
-    monkeypatch.setattr(github_issues.GitHubIssuesAdapter, "configured", lambda self: True)
-    monkeypatch.setattr(github_issues, "config_value", lambda *_a, **_k: "o/r")
-    monkeypatch.setattr(github_issues, "config_list", lambda *_a, **_k: [])
-    return github_issues.GitHubIssuesAdapter()
-
-
-def _signal() -> Signal:
-    return Signal(
-        id="s1", source="github-issues", title="t", labels={"repo": "o/r", "issue_number": "7"}
-    )
-
-
-class TestGitHubIssuesStderrExcerpts:
-    @pytest.mark.asyncio
-    async def test_poll_failure_redacts_the_whole_stream_before_the_tail_cut(self, monkeypatch):
-        adapter = _configured_adapter(monkeypatch)
-        monkeypatch.setattr(
-            github_issues, "_run_gh", AsyncMock(return_value=(1, "", _straddling(200)))
-        )
-        with pytest.raises(RuntimeError) as info:
-            await adapter.poll()
-        _assert_straddle_redacted(str(info.value).removeprefix("gh issue list failed: "), 200)
-
-    @pytest.mark.asyncio
-    async def test_poll_failure_keeps_the_tail_of_gh_stderr(self, monkeypatch):
-        adapter = _configured_adapter(monkeypatch)
-        monkeypatch.setattr(
-            github_issues, "_run_gh", AsyncMock(return_value=(1, "", _two_markers(200)))
-        )
-        with pytest.raises(RuntimeError) as info:
-            await adapter.poll()
-        _assert_tail_anchored(str(info.value))
-
-    @pytest.mark.asyncio
-    async def test_execute_failure_redacts_the_whole_stream_before_the_tail_cut(self, monkeypatch):
-        adapter = _configured_adapter(monkeypatch)
-        monkeypatch.setattr(
-            github_issues, "_run_gh", AsyncMock(return_value=(1, "", _straddling(200)))
-        )
-        result = await adapter.execute(_signal(), ACTION_COMMENT, {"note": "n"})
-        assert result.ok is False
-        _assert_straddle_redacted(result.error, 200)
-
-    @pytest.mark.asyncio
-    async def test_execute_failure_keeps_the_tail_of_gh_stderr(self, monkeypatch):
-        adapter = _configured_adapter(monkeypatch)
-        monkeypatch.setattr(
-            github_issues, "_run_gh", AsyncMock(return_value=(1, "", _two_markers(200)))
-        )
-        result = await adapter.execute(_signal(), ACTION_COMMENT, {"note": "n"})
-        _assert_tail_anchored(result.error)
 
 
 # ── dev_fleet gateway_service (returned as the user-visible failure reason) ──
@@ -385,8 +328,16 @@ class TestHookLastErrorAnchor:
 # ── structural pins ─────────────────────────────────────────────────────────
 
 
+#: Ops Mission Control's GitHub Issues adapter is named by path, not imported: core tests
+#: do not import a built-in app, and its behavioural straddle and tail cases run in that
+#: app's own ``tests/``. The row leaves with the file.
+_OMC_GITHUB_ISSUES = (
+    Path(__file__).resolve().parents[1]
+    / "src/kiro_crew/apps/builtins/ops_mission_control/backend/providers/github_issues.py"
+)
+
 _CONVERTED_MODULES = (
-    Path(github_issues.__file__),
+    _OMC_GITHUB_ISSUES,
     Path(gateway_service.__file__),
     Path(cli_setup.__file__),
     Path(env_mod.__file__),
@@ -426,7 +377,8 @@ def test_chat_runner_hook_excerpts_anchor_by_exit_semantics() -> None:
     """
     block = _hook_fire_block()
     assert block.count("r.stdout[:200]") == 1
-    assert block.count("r.stderr[:200] if r.stderr else") == 2  # BLOCKED payload + warning log
+    # BLOCKED payload + warning log
+    assert block.count("r.stderr[:HOOK_DENY_REASON_MAX_CHARS] if r.stderr else") == 2
     assert block.count("r.stderr[:100] if r.stderr else") == 1  # BLOCKED activity event
     assert "r.stderr[-200:] if r.stderr else" in block  # fail-closed crash detail
     assert block.rstrip().endswith("r.stderr[-200:])")  # non-gating crash warning
@@ -434,7 +386,11 @@ def test_chat_runner_hook_excerpts_anchor_by_exit_semantics() -> None:
 
 
 def test_slack_pip_failure_logs_keep_the_redacted_tail() -> None:
-    """Both pip-failure logs in the Slack gateway bound the REDACTED text at its tail."""
+    """The pip-failure log in the Slack gateway bounds the REDACTED text at its tail.
+
+    The unattended apply's second pip-failure log left the gateway with the apply itself
+    (the update now runs at the next start, in a child whose output is redacted first).
+    """
     import kiro_crew.slack.gateway as slack_gateway
 
     facade = Path(slack_gateway.__file__)
@@ -443,6 +399,5 @@ def test_slack_pip_failure_logs_keep_the_redacted_tail() -> None:
         for path in (facade, *sorted((facade.parent / "gateway_runtime").glob("*.py")))
     )
     assert 'logger.error("Dep repair failed: %s", dep_err[-500:])' in text
-    assert 'redact_log_via_context(fb_err.decode(errors="replace"))[-300:]' in text
     assert 'fb_err.decode(errors="replace")[:300]' not in text
     assert "dep_err[:500]" not in text

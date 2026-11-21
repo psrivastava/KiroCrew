@@ -33,6 +33,11 @@ from kiro_crew.members import (
     members_root,
     write_dm_binding,
 )
+from kiro_crew.testing.synthetic_credentials import github_classic
+
+#: A synthetic GitHub token with a valid checksum, which the redactor removes. A
+#: bare 40-character run with no label or key ID beside it stays visible by design.
+_TOKEN = github_classic(seed=54)
 
 
 class TestMemberActivityRoute:
@@ -70,14 +75,8 @@ class TestMemberActivityRoute:
     async def test_the_read_never_asks_the_log_for_every_event(self, tmp_path):
         """The allocation happens INSIDE `history`, so the caller must bound the ask.
 
-        With `limit=None` and a log past `MAX_RETAINED_EVENTS`, `history` builds every
-        event in the lifetime file into a list and reverses it before the caller sees
-        anything -- so no amount of care in this handler bounds it. The member log has
-        no rotation, so outgrowing the retained tail is ordinary ageing, and the
-        response it feeds shows `_ACTIVITY_LIMIT` rows.
-
-        The test above (1001 buried envelopes) proves paging still FINDS the records.
-        This one pins the reason paging exists: every ask carries a limit.
+        With `limit=None` past `MAX_RETAINED_EVENTS`, `history` lists every event in the
+        unrotated file before the caller sees anything, so every ask must carry a limit.
         """
         state = _make_state(tmp_path)
         from unittest import mock
@@ -126,12 +125,8 @@ class TestMemberActivityRoute:
     async def test_activity_survives_more_than_a_thousand_later_events(self, tmp_path):
         """The cap applies to this member's ACTIVITY, not to a slice of the log.
 
-        One log carries config, binding, rules, message, slot and patrol events
-        beside activity records, and a colliding slug's log carries another exact
-        name's records too. Reading a fixed slice of the newest envelopes and
-        filtering afterwards therefore drops activity the drawer promises to show:
-        a member with a busy message history loses their whole timeline even though
-        the records are still in the log. The filter runs before any cap.
+        The log also holds config, message, slot and other names' events, so filtering
+        a fixed newest slice would drop a busy member's timeline. The filter runs first.
         """
         state = _make_state(tmp_path)
         from kiro_crew.eventlog import types as _types
@@ -247,7 +242,7 @@ class TestMemberActivityRoute:
             CREW,
             "dashboard_chat-1",
             "persistent",
-            project="/repos/AKIAIOSFODNN7EXAMPLE/app",
+            project="/repos/" + _TOKEN + "/app",
             via="chat",
         )
         with _patched_config([CREW]):
@@ -258,7 +253,7 @@ class TestMemberActivityRoute:
                 assert resp.status == 200
                 data = await resp.json()
         assert len(data["entries"]) == 1
-        assert "AKIAIOSFODNN7EXAMPLE" not in data["entries"][0]["project"]
+        assert _TOKEN not in data["entries"][0]["project"]
 
     @pytest.mark.asyncio
     async def test_display_cap_reports_capped_and_keeps_newest(self, tmp_path):
@@ -285,27 +280,9 @@ class TestMemberActivityRoute:
 class TestEventlogSingletonDoesNotLeakAcrossTests:
     """The process-wide ``get_service()`` singleton must not survive a test.
 
-    Grouped onto ONE worker: the pair is ordered, and under ``--dist loadgroup`` an
-    ungrouped pair is split across workers, where the second test asserts nothing.
-
-    ``get_service()`` memoises one service per process and rebuilds it only when
-    the crew-log root moves. The root follows ``KIROCREW_HOME``, which the autouse
-    ``_isolate_kirocrew_home`` fixture repoints at a fresh tmp dir per test -- so a
-    test that touches the service leaves a live singleton BOUND TO ITS OWN HOME,
-    and the next test on the same xdist worker inherits it after that home is torn
-    down. On POSIX ``get_service()`` then rebuilds against the new home and the
-    inheritor is fine; on Windows the leaked ``MemberLog`` handles under the dead
-    directory block teardown and the inheritor's first ``record_activity`` write
-    fails, returning ``False`` -- the Windows-only shard-8 red on the class above,
-    reproduced by any predecessor that used the service without resetting it
-    (``test_members_roster_recency``'s roster-read tests do exactly that).
-
-    These two tests run in order WITHOUT a local reset fixture, so they exercise
-    only the ``_reset_member_eventlog_singleton`` floor in ``conftest.py``. The
-    first builds a service bound to its own home; the second asserts it did NOT
-    inherit that binding. Platform-independent: it pins the leak's CAUSE (a
-    singleton crossing the boundary) rather than the Windows-only SYMPTOM, so it is
-    a real regression guard on Linux CI too.
+    Grouped onto one worker: split by ``--dist loadgroup``, the second asserts nothing.
+    A leaked singleton stays bound to a torn-down home (on Windows the next write fails).
+    With no local reset these exercise only ``_reset_member_eventlog_singleton``.
     """
 
     #: Set by the first test to the home its service bound to, read by the second
@@ -342,25 +319,10 @@ class TestEventlogSingletonDoesNotLeakAcrossTests:
 class TestEventlogServiceRetirementReleasesHandles:
     """Retiring the service must release its cached handles NOW, not at a GC pass.
 
-    The class above pins that the singleton reference does not cross a test
-    boundary. That is necessary but not sufficient for the Windows-only shard-8
-    red on ``TestMemberActivityRoute``: ``get_service()`` and its cached
-    ``MemberLog`` -> ``CrewLog`` chain sit in a REFERENCE CYCLE (the projection
-    registry holds ``set_on_change(service._on_change)``, a bound method back to
-    the service), so ``set_service(None)`` drops the last EXTERNAL reference but
-    does not free the graph -- the cycle keeps it alive until the cyclic collector
-    runs. Each cached ``CrewLog`` releases its write lease through a
-    ``weakref.finalize`` that fires only then, and holds its file descriptor until
-    then. On POSIX that deferral is invisible; on Windows the still-open descriptor
-    keeps a mandatory lock that pins the (torn-down) home directory and fails the
-    next writer on the inheriting worker -- ``record_activity`` returns ``False``,
-    which is exactly the observed traceback (`assert _record_or_explain(...) is False`).
-
-    So retirement (``set_service`` replacing the singleton, and ``get_service``
-    rebuilding on a home change) must DETERMINISTICALLY release those handles and
-    sever the cycle rather than wait for GC. These tests pin that contract on the
-    retired instance directly, so they fail on Linux the moment the release is
-    dropped -- the CAUSE, provable without Windows.
+    The service and its ``MemberLog`` -> ``CrewLog`` chain form a reference cycle
+    (``set_on_change(service._on_change)``), so ``set_service(None)`` frees nothing until
+    GC; on Windows the open descriptor locks the old home. Checked on the retired
+    instance, so it fails on Linux too.
     """
 
     def test_set_service_none_clears_cached_logs_and_breaks_cycle(self, tmp_path):
@@ -523,7 +485,7 @@ class TestMemberBriefingEndpoint:
     @pytest.mark.asyncio
     async def test_the_upkeep_text_crosses_the_redaction_chain(self, tmp_path):
         """Field names come from the crewmate's editable copy of the manifest."""
-        token = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+        token = github_classic(seed=55)
         state = _make_state(tmp_path)
         fake = {
             "pointer": "p",
@@ -722,7 +684,7 @@ class TestMemberBriefingEndpoint:
         """The briefing is an AGENT-written file; a token the crewmate pasted
         into its own notes must not reach the browser verbatim."""
         state = _make_state(tmp_path)
-        self._write_briefing("Deploy key for staging: AKIAIOSFODNN7EXAMPLE — rotate monthly.")
+        self._write_briefing(f"Deploy key for staging: {_TOKEN} — rotate monthly.")
         with _patched_config([CREW]):
             async with TestClient(TestServer(_make_members_app(state))) as client:
                 resp = await client.get(
@@ -730,7 +692,7 @@ class TestMemberBriefingEndpoint:
                 )
                 assert resp.status == 200
                 data = await resp.json()
-        assert "AKIAIOSFODNN7EXAMPLE" not in data["text"]
+        assert _TOKEN not in data["text"]
         assert "rotate monthly" in data["text"]
         # The flag is what lets the panel withhold Edit: the viewer's Save would
         # otherwise write this redacted text over the original.
@@ -745,7 +707,7 @@ class TestMemberBriefingEndpoint:
         drops the trailing split word so nothing ends mid-token."""
         state = _make_state(tmp_path)
         lead = "word " * ((MEMBER_BRIEFING_MAX_CHARS - 10) // 5)  # ends 10 chars short
-        self._write_briefing(lead + "AKIAIOSFODNN7EXAMPLE rest of the line\n" + "tail\n" * 40)
+        self._write_briefing(lead + _TOKEN + " rest of the line\n" + "tail\n" * 40)
         with _patched_config([CREW]):
             async with TestClient(TestServer(_make_members_app(state))) as client:
                 resp = await client.get(
@@ -753,7 +715,7 @@ class TestMemberBriefingEndpoint:
                 )
                 assert resp.status == 200
                 data = await resp.json()
-        assert "AKIA" not in data["text"]
+        assert _TOKEN[:8] not in data["text"]
         assert "briefing truncated" in data["text"]
         assert data["redacted"] is True
         assert data["truncated"] is True
@@ -792,9 +754,9 @@ class TestMemberBriefingEndpoint:
         marker, no word dropped, ``truncated`` false."""
         state = _make_state(tmp_path)
         lead = "word " * ((MEMBER_BRIEFING_MAX_CHARS - 400) // 5)
-        # Ten 60-char keys (~610 chars) push the raw text past the cap; each
+        # Ten 40-char tokens (~410 chars) push the raw text past the cap; each
         # collapses to a 22-char placeholder, so the redacted text fits.
-        keys = " ".join("ghp_" + ("A" * 56) for _ in range(10))
+        keys = " ".join(github_classic(seed=60 + n) for n in range(10))
         self._write_briefing(lead + keys + " last\n")
         with _patched_config([CREW]):
             async with TestClient(TestServer(_make_members_app(state))) as client:
@@ -838,15 +800,8 @@ class TestMemberBriefingEndpoint:
 class TestDenialAuditOffload:
     """Deny-path SEL audits are direct enqueues, because startup warms SEL.
 
-    A per-site ``asyncio.to_thread`` wrapper would only be needed if a fresh
-    gateway's first ``_sel()`` touch performed synchronous filesystem
-    initialization (HMAC key load/create, chain-head read). That first touch
-    now happens once at gateway startup (``sel.warm_sel_singleton``, awaited
-    by both server start paths — pinned in test_sel_startup_warm.py), so a
-    handler-side ``log_api_access`` is a non-blocking enqueue and the thread
-    hop is gone. Each test records the thread the audit ran on and fails if
-    it is NOT the event-loop thread — re-adding a pointless per-site offload
-    turns the recorded ident back into a worker's and fails these.
+    ``sel.warm_sel_singleton`` does the synchronous init at startup (see
+    test_sel_startup_warm.py), so ``log_api_access`` must run on the event-loop thread.
     """
 
     @staticmethod
@@ -905,11 +860,8 @@ class TestDenialAuditOffload:
         """AST guard: no ``log_api_access`` call in members.py hides inside an
         ``asyncio.to_thread`` lambda.
 
-        The startup warm makes a post-init ``log_api_access`` a non-blocking
-        enqueue, so a per-site thread hop is pure overhead — an extra
-        suspension point and a worker dispatch per denial. A future site that
-        genuinely needs a synchronous write (``critical=True``) must offload
-        AND adjust this guard with that reasoning.
+        After the startup warm the call is a non-blocking enqueue. A site needing a
+        synchronous write (``critical=True``) must offload and adjust this guard.
         """
         import ast
         import importlib
@@ -947,5 +899,5 @@ class TestDenialAuditOffload:
         assert not wrapped, (
             f"to_thread-wrapped _sel().log_api_access at lines {wrapped}; SEL is "
             "warmed at startup (sel.warm_sel_singleton), so a non-critical audit "
-            "is a direct enqueue (#8608)"
+            "is a direct enqueue"
         )

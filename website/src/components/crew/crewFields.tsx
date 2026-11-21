@@ -5,7 +5,8 @@
  *  the crew profile settings mount them, each importing this module directly.
  *  It imports no page, so a consumer never closes a module cycle through it.
  *  `KiroCrewAgentsPage.tsx` re-exports every name for its existing importers. */
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
+import { AlertTriangle } from 'lucide-react'
 import { api } from '../../api/client'
 import { FOLDER_COLOR_PALETTE } from '../folderColorCatalog'
 import { Btn, SendBtn, Input } from '../ui'
@@ -29,6 +30,9 @@ export interface AgentMutationResult {
   error?: string
   name?: string
   memory_store?: string
+  /** Set by a create that succeeded with a caveat, such as a `copy_from` source
+   *  whose folder is gone (the workspace is made empty). */
+  warnings?: string[]
 }
 
 /** The stored spelling for "no per-agent pin, inherit the next tier down". The
@@ -56,18 +60,26 @@ type FormSubject = 'agent' | 'member'
  *  name between openings for free. Hoisting it into the parent (which stays
  *  mounted so Radix can run its own close transition) would persist it. */
 function WorkspaceForm({
+  open,
   workspaceOptions,
   onCreated,
   onClose,
   onDirtyChange,
+  onWarnedChange,
   onSaveChain,
 }: {
+  /** The modal's `open`: Radix keeps this form mounted through the close
+   *  animation, so mounted is not the same as still showing. */
+  open: boolean
   workspaceOptions: string[]
   onCreated: (name: string) => void
   onClose: () => void
   /** Whether the form holds unsaved input; the modal reads it to refuse
    *  Escape / backdrop dismissal while it does. */
   onDirtyChange?: (dirty: boolean) => void
+  /** The workspace a create made while the form shows its warning, else null;
+   *  the modal reads it so its X and Escape report that create, not a cancel. */
+  onWarnedChange: (name: string | null) => void
   /** Register the in-flight create POST with the host so its navigation guard
    *  tracks it to SETTLEMENT, not to this form's lifetime: a boolean cleared on
    *  unmount would release the guard the instant the modal closes (Cancel)
@@ -80,7 +92,21 @@ function WorkspaceForm({
   const [wsDir, setWsDir] = useState('workspace')
   const [dirTouched, setDirTouched] = useState(false)
   const [copyFrom, setCopyFrom] = useState('')
-  const dirty = wsName !== '' || dirTouched || copyFrom !== ''
+  // A create that succeeded with a warning (a copy whose source folder is gone):
+  // the workspace exists, so the form shows the server's words instead of closing
+  // and reports the create when the person leaves. Nothing is unsaved by then.
+  const [warned, setWarned] = useState<{ name: string; warnings: string[] } | null>(null)
+  useEffect(() => { onWarnedChange(warned?.name ?? null); return () => onWarnedChange(null) }, [warned, onWarnedChange])
+  // An answer that lands after the dialog closed has no view to show its warning
+  // in, so it reports the create as a clean one would, letting the host refresh.
+  const showing = useRef(false)
+  // A warned create no exit has reported yet. Done, X and Escape report it and
+  // close the dialog, so one still set at teardown means the page went away
+  // under the warning (a navigation): report it then, so the host still refreshes.
+  const unreported = useRef<(() => void) | null>(null)
+  useEffect(() => { showing.current = open; if (!open) unreported.current = null; return () => { showing.current = false } }, [open])
+  useEffect(() => () => unreported.current?.(), [])
+  const dirty = !warned && (wsName !== '' || dirTouched || copyFrom !== '')
   // With a cleanup: Radix unmounts this form when the dialog closes, and a
   // draft that went with it must not leave the host reading `dirty` as true
   // (its Escape/backdrop guard and the crewmate dialog's navigation stake
@@ -118,12 +144,41 @@ function WorkspaceForm({
       onSaveChain?.(createWrite)
       const r: AgentMutationResult = await createWrite
       if (r.error) { setWsError(r.error); setSubmitting(false); return }
+      if (r.warnings?.length && showing.current) {
+        const name = r.name || n
+        unreported.current = () => onCreated(name)
+        setWarned({ name, warnings: r.warnings })
+        return
+      }
       onCreated(r.name || n)
     } catch (e) {
       setWsError(e instanceof Error ? e.message : i18nT('pages.kiroCrewAgentsPage.failed_to_create_workspace'))
     } finally {
       setSubmitting(false)
     }
+  }
+
+  if (warned) {
+    return (
+      <>
+        <DialogHeader>
+          <DialogTitle>{i18nT('pages.kiroCrewAgentsPage.create_workspace')}</DialogTitle>
+        </DialogHeader>
+        <DialogBody>
+          {/* Not an ErrorNotice: the create succeeded, so it wears the warn status. */}
+          <div id="ws-create-warning" className="bg-warn-subtle border border-warn/20 rounded-lg p-3 flex items-start gap-3" role="status">
+            <AlertTriangle size={16} className="text-warn shrink-0 mt-0.5" aria-hidden="true" />
+            <div className="flex-1 min-w-0 flex flex-col gap-1 text-[13px] break-words">
+              <p>{i18nT('pages.kiroCrewAgentsPage.workspace_created_named', { name: warned.name })}</p>
+              {warned.warnings.map(w => <p key={w} className="text-warn-text">{w}</p>)}
+            </div>
+          </div>
+        </DialogBody>
+        <DialogFooter>
+          <SendBtn onClick={() => onCreated(warned.name)} aria-describedby="ws-create-warning" autoFocus>{i18nT('pages.kiroCrewAgentsPage.done')}</SendBtn>
+        </DialogFooter>
+      </>
+    )
   }
 
   return (
@@ -173,7 +228,7 @@ function WorkspaceForm({
       </DialogBody>
       <DialogFooter>
         <Btn onClick={onClose}>{i18nT('pages.kiroCrewAgentsPage.cancel')}</Btn>
-        <SendBtn onClick={submit} disabled={submitting}>{submitting ? i18nT('pages.kiroCrewAgentsPage.creating') : i18nT('pages.kiroCrewAgentsPage.create')}</SendBtn>
+        <SendBtn onClick={submit} busy={submitting}>{submitting ? i18nT('pages.kiroCrewAgentsPage.creating') : i18nT('pages.kiroCrewAgentsPage.create')}</SendBtn>
       </DialogFooter>
     </>
   )
@@ -205,6 +260,9 @@ export function WorkspaceModal({
   // name/directory/copy-from. The explicit Cancel and the X still close.
   const [dirty, setDirty] = useState(false)
   useEffect(() => { onDirtyChange?.(dirty) }, [dirty, onDirtyChange])
+  // Set while the form shows a warned create: the workspace exists, so every
+  // way out of the dialog hands the host its name, as a clean create does.
+  const [warned, setWarned] = useState<string | null>(null)
   /* Kept MOUNTED and driven by `open`, rather than conditionally rendered.
      Radix tracks dismissable layers in a global stack, and tearing this whole
      subtree out the instant it closes skipped the layer's own deregistration —
@@ -217,7 +275,7 @@ export function WorkspaceModal({
      content sits at z-[101]; at an equal z-index this would render behind its
      own opener. */
   return (
-    <Dialog open={open} onOpenChange={next => { if (!next) onClose() }}>
+    <Dialog open={open} onOpenChange={next => { if (!next) { if (warned === null) onClose(); else onCreated(warned) } }}>
       <DialogContent
         maxWidth={448}
         className="z-[110]"
@@ -229,7 +287,7 @@ export function WorkspaceModal({
         onEscapeKeyDown={e => { if (dirty) e.preventDefault() }}
         onPointerDownOutside={e => { if (dirty) e.preventDefault() }}
       >
-        <WorkspaceForm workspaceOptions={workspaceOptions} onCreated={onCreated} onClose={onClose} onDirtyChange={setDirty} onSaveChain={onSaveChain} />
+        <WorkspaceForm open={open} workspaceOptions={workspaceOptions} onCreated={onCreated} onClose={onClose} onDirtyChange={setDirty} onWarnedChange={setWarned} onSaveChain={onSaveChain} />
       </DialogContent>
     </Dialog>
   )
@@ -263,7 +321,7 @@ function withCurrent(opts: string[], cur: string): string[] {
  * composes them in its Advanced settings; the editor mounts them individually,
  * one per rail pane.
  */
-export function WorkspaceField({ options, value, onChange, onNewWorkspace, subject, hint, ownOption = false }: {
+export function WorkspaceField({ options, value, onChange, onNewWorkspace, subject, hint, ownOption = false, disabled }: {
   options: string[]; value: string; onChange: (v: string) => void; onNewWorkspace: () => void; subject: FormSubject
   /** Replaces the subject's default hint. The defaults are EDIT-time copy
    *  ("new chats start fresh in the new folder"); a create form has no old
@@ -273,6 +331,9 @@ export function WorkspaceField({ options, value, onChange, onNewWorkspace, subje
    *  forms only: the API allocates on create and never on update, so the
    *  editor must not show a choice it cannot save. */
   ownOption?: boolean
+  /** Locks the select while a form submit is in flight. A select never
+   *  implicitly submits a form, so a native lock here cannot drop focus. */
+  disabled?: boolean
 }) {
   const choices = ownOption
     ? [OWN_WORKSPACE, ...withCurrent(options, value).filter(o => o !== OWN_WORKSPACE)]
@@ -289,6 +350,7 @@ export function WorkspaceField({ options, value, onChange, onNewWorkspace, subje
         value={value}
         onChange={onChange}
         action={{ label: i18nT('pages.kiroCrewAgentsPage.new_workspace_action'), onSelect: onNewWorkspace }}
+        disabled={disabled}
         aria-label={i18nT('pages.kiroCrewAgentsPage.workspace_2')}
       />
     </Field>
@@ -311,20 +373,39 @@ export function memberMemoryState(member: string, store: string, stores: Record<
   return 'unavailable'
 }
 
-export function ModelField({ options, value, onChange, hint }: {
-  options: string[]; value: string; onChange: (v: string) => void; hint?: string
+export function ModelField({ options, value, onChange, hint, servedAs, harness = '', disabled }: {
+  options: string[]; value: string; onChange: (v: string) => void; hint?: string; disabled?: boolean
+  /** The id the crew's harness serves a stored pin `options` lacks as, `''` for none
+   *  (`resolved-model`'s `pin_served_as`). Omitted while no live session has said. */
+  servedAs?: string
+  /** That harness's name, for a pin it does not offer. */
+  harness?: string
 }) {
+  // A stored pin spelled as another harness spells it is the row it runs as, not a second row for
+  // the same model: two rows read as two models, and the readout below still names the stored id.
+  const folded = servedAs !== undefined && servedAs !== value && options.includes(servedAs)
+  const shown = folded ? options : withCurrent(options, value)
+  // Otherwise the off-list pin says what this harness does with it.
+  const offList = !folded && servedAs !== undefined && servedAs !== value && !options.includes(value)
+  const label = (m: string) => {
+    if (m === INHERIT_MODEL) return i18nT('pages.kiroCrewAgentsPage.inherited')
+    if (m !== value || !offList) return m
+    return servedAs
+      ? i18nT('pages.kiroCrewAgentsPage.pin_runs_as', { model: m, served: servedAs })
+      : i18nT('pages.kiroCrewAgentsPage.pin_not_offered', { model: m, harness })
+  }
   return (
     <Field label={i18nT('pages.kiroCrewAgentsPage.model')} hint={hint}>
       <SimpleSelect
-        options={withCurrent(options, value)}
+        options={shown}
         // The inherit option must NOT read as "auto": in the chat picker "auto"
         // promises task-based routing, whereas here it means "pin nothing,
         // inherit the next tier" — which can resolve to a concrete model. Label
         // it as the card does so the round trip stays honest.
-        optionLabels={withCurrent(options, value).map(m => (m === INHERIT_MODEL ? i18nT('pages.kiroCrewAgentsPage.inherited') : m))}
-        value={value}
+        optionLabels={shown.map(label)}
+        value={folded ? servedAs : value}
         onChange={onChange}
+        disabled={disabled}
         aria-label={i18nT('pages.kiroCrewAgentsPage.edit_model')}
         {...uiLocation('agents.model')}
       />
@@ -335,16 +416,19 @@ export function ModelField({ options, value, onChange, hint }: {
 /** The crew's reasoning-effort pin. Rendered only when the model the crew will
  *  actually run on supports effort — the same gate the chat picker uses, so a
  *  crew on Haiku is not offered a control the backend would drop. */
-export function EffortField({ value, onChange }: {
+export function EffortField({ value, onChange, levels }: {
   value: string; onChange: (v: string) => void
+  /** The levels the crew's harness takes; the shared vocabulary when it reported none. */
+  levels?: readonly string[]
 }) {
+  const options = levels ? ['', ...levels.filter(l => l && l !== 'default')] : [...EFFORT_LEVELS]
   return (
     <Field label={i18nT('pages.kiroCrewAgentsPage.reasoning_effort')} hint={i18nT('pages.kiroCrewAgentsPage.reasoning_effort_hint')}>
       <SimpleSelect
-        options={[...EFFORT_LEVELS]}
+        options={options}
         // '' is the inherit sentinel, labelled as such rather than as a level:
         // it means "take the global default", which may itself be a level.
-        optionLabels={EFFORT_LEVELS.map(l => (l === '' ? i18nT('pages.kiroCrewAgentsPage.inherited') : effortLabel(l)))}
+        optionLabels={options.map(l => (l === '' ? i18nT('pages.kiroCrewAgentsPage.inherited') : effortLabel(l)))}
         value={value}
         onChange={onChange}
         aria-label={i18nT('pages.kiroCrewAgentsPage.edit_reasoning_effort')}
@@ -388,7 +472,9 @@ export function displayNameFallback(agent: KiroCrewAgent | null | undefined, key
 
 /** The routing-keyword input. Rendered by the create form and by the editor's
  *  routing pane, so it is a component rather than two copies. */
-export function TriggersField({ value, onChange, subject }: { value: string; onChange: (v: string) => void; subject: FormSubject }) {
+export function TriggersField({ value, onChange, subject, busy }: { value: string; onChange: (v: string) => void; subject: FormSubject; /** Held, not disabled, while a form submit is out: Enter in this text
+   *  field implicitly submits, so a native disable would blur it to <body>. */
+  busy?: boolean }) {
   const hint = subject === 'member'
     ? i18nT('pages.kiroCrewAgentsPage.triggers_hint_member')
     : i18nT('pages.kiroCrewAgentsPage.triggers_hint')
@@ -401,6 +487,8 @@ export function TriggersField({ value, onChange, subject }: { value: string; onC
         placeholder={i18nT('pages.kiroCrewAgentsPage.triggers_placeholder')}
         value={value}
         onChange={e => onChange(e.target.value)}
+        readOnly={busy}
+        aria-disabled={busy || undefined}
         aria-label={i18nT('pages.kiroCrewAgentsPage.triggers')}
       />
     </Field>
@@ -409,7 +497,10 @@ export function TriggersField({ value, onChange, subject }: { value: string; onC
 
 /** Session color picker for agent configuration. Sets the default session
  *  tint color for new sessions created with this agent. */
-export function SessionColorField({ value, onChange, subject }: { value: string; onChange: (v: string) => void; subject: FormSubject }) {
+export function SessionColorField({ value, onChange, subject, busy }: { value: string; onChange: (v: string) => void; subject: FormSubject; /** Locks the field while a form submit is out: the hex text input is
+   *  held (Enter in it implicitly submits), the swatches / picker / Clear
+   *  are natively disabled -- none of those can submit a form. */
+  busy?: boolean }) {
   const HEX_RE = /^#[0-9a-f]{6}$/i
   const [draft, setDraft] = useState(value || '')
   // Re-sync the draft when the committed value changes from outside (e.g. the
@@ -466,6 +557,7 @@ export function SessionColorField({ value, onChange, subject }: { value: string;
               // SessionColorSwatches uses, and it separates from every hue here.
               className={`h-5 w-5 p-0 cursor-pointer rounded-full border-2 transition-transform hover:brightness-125 swatch-cue ${active ? 'border-text-strong scale-110' : 'border-border'}`}
               style={{ background: c }}
+              disabled={busy}
               onClick={() => onChange(c)}
             />
           )
@@ -477,6 +569,7 @@ export function SessionColorField({ value, onChange, subject }: { value: string;
           value={value || HEX_COLOR_EXAMPLE}
           onChange={e => onChange(e.target.value.toLowerCase())}
           className="h-8 w-8 flex-none cursor-pointer p-0.5"
+          disabled={busy}
           aria-label={i18nT('pages.kiroCrewAgentsPage.session_color')}
         />
         <Input
@@ -491,6 +584,10 @@ export function SessionColorField({ value, onChange, subject }: { value: string;
           }}
           onBlur={e => commit(e.target.value)}
           className="flex-1 font-mono text-[13px]"
+          // Held, not disabled: Enter in this hex field implicitly submits the
+          // create form, so a native disable would blur it to <body>.
+          readOnly={busy}
+          aria-disabled={busy || undefined}
           aria-label={i18nT('pages.kiroCrewAgentsPage.session_color_hex')}
         />
         {value && (
@@ -498,6 +595,7 @@ export function SessionColorField({ value, onChange, subject }: { value: string;
             type="button"
             onClick={() => onChange('')}
             className="text-[11px]"
+            disabled={busy}
             aria-label={i18nT('pages.kiroCrewAgentsPage.session_color_clear')}
           >
             {i18nT('pages.kiroCrewAgentsPage.session_color_clear')}

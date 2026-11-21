@@ -2,21 +2,27 @@
  * SourcesPopover — the gear affordance on the Apps page header.
  *
  * Houses the store's supply-side controls, out of the shopper flow: external
- * registry management (add/remove/sync) and the
+ * registry management (add/remove/sync), the Kiro Space stores the build
+ * offers (MarketRegistryManager, absent when it offers none), and the
  * developer Install-from-Path escape hatch. Controlled open state so the
  * rail's "Add source" button can open it programmatically.
  */
 import { useState } from 'react'
+import { Trans } from 'react-i18next'
 import { Database, FolderOpen } from 'lucide-react'
 import { api } from '../../api/client'
 import { recordEvent } from '../../rum'
 import { Btn, Input, IconButton } from '../ui'
 import { Popover, PopoverTrigger, PopoverContent } from '../ui/popover'
 import RegistryManager from '../RegistryManager'
+import MarketRegistryManager from './MarketRegistryManager'
+import { backendRefusedNotice } from './backendRefused'
 
 import { i18nT } from '../../i18n/t'
 import { uiLocation } from '../../uiLocations/uiLocation'
 import { useImeGuard } from '../../hooks/useImeGuard'
+import { useConnected } from '../../hooks/useConnected'
+import { offlineProps } from '../../utils/offline'
 export default function SourcesPopover({ open, onOpenChange, onError, onInstalled }: {
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -29,9 +35,12 @@ export default function SourcesPopover({ open, onOpenChange, onError, onInstalle
   const ime = useImeGuard()
   const [installPath, setInstallPath] = useState('')
   const [installing, setInstalling] = useState(false)
+  // Install writes to the gateway, so it is refused while the gateway is
+  // offline (offlineProps names why), as on the Discover page around it.
+  const connected = useConnected()
 
   const handleInstall = async () => {
-    if (!installPath.trim() || installing) return
+    if (!installPath.trim() || installing || !connected) return
     setInstalling(true)
     try {
       const result = await api.installApp(installPath.trim())
@@ -42,6 +51,9 @@ export default function SourcesPopover({ open, onOpenChange, onError, onInstalle
       // mc:apps-changed listener in shell/appShell.tsx, for every dispatch site at once.
       window.dispatchEvent(new Event('mc:apps-changed'))
       onInstalled?.(installedName)
+      // Installed, but the host refused its backend: a warning, not only a success.
+      const refused = backendRefusedNotice(installedName, result)
+      if (refused) onError(refused)
       onOpenChange(false)
     } catch (e) {
       onError((e as Error)?.message || i18nT('components.appstore.sourcesPopover.install_failed'))
@@ -59,21 +71,34 @@ export default function SourcesPopover({ open, onOpenChange, onError, onInstalle
       </PopoverTrigger>
       <PopoverContent align="end" className="w-[480px] max-w-[92vw] max-h-[70vh] overflow-y-auto">
         <RegistryManager bare />
+        <MarketRegistryManager />
         <div className="border-t border-border mt-4 pt-4">
           <div className="text-sm font-semibold tracking-tight text-text-strong mb-2 flex items-center gap-2">
             {i18nT('components.appstore.sourcesPopover.install_from_path')}
           </div>
-          <p className="text-[12px] text-muted mb-2.5">{i18nT('components.appstore.sourcesPopover.developer_install_of_a_local_app_directory_equiv')} <code className="bg-bg-elevated px-1 py-0.5 rounded">{i18nT('components.appstore.sourcesPopover.kirocrew_app_install_path')}</code>).</p>
+          <p className="text-[12px] text-muted mb-2.5">
+            <Trans
+              i18nKey="components.appstore.sourcesPopover.developer_install_equivalent_to_command"
+              components={{
+                command: <code className="bg-bg-elevated px-1 py-0.5 rounded">{i18nT('components.appstore.sourcesPopover.kirocrew_app_install_path')}</code>,
+              }}
+            />
+          </p>
           <div className="flex items-center gap-2">
             <FolderOpen size={15} className="text-muted shrink-0" />
             <Input
               placeholder={i18nT('components.appstore.sourcesPopover.path_to_app_directory')}
+              aria-label={i18nT('components.appstore.sourcesPopover.app_directory_path_label')}
               value={installPath}
               onChange={(e: React.ChangeEvent<HTMLInputElement>) => setInstallPath(e.target.value)}
               {...ime.bindEnter({ onEnter: () => handleInstall() })}
               className="flex-1"
             />
-            <Btn onClick={handleInstall} disabled={installing || !installPath.trim()}>
+            <Btn
+              onClick={handleInstall}
+              disabled={installing || !installPath.trim() || !connected}
+              {...offlineProps(connected, i18nT('utils.offline.manage_apps'), i18nT('components.appstore.sourcesPopover.install'))}
+            >
               {installing ? i18nT('components.appstore.sourcesPopover.installing') : i18nT('components.appstore.sourcesPopover.install')}
             </Btn>
           </div>

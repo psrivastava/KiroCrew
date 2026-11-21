@@ -3,6 +3,7 @@ import { store } from '../../store'
 import { sseSlots } from '../../store/dashboardSlice'
 import type { ChatSlot } from '../../types'
 import { crewWorkerRoot } from './attention'
+import { turnOffCrewModeAsLts } from '../../test/crewModeOff'
 
 const row = (key: string, extra: Partial<ChatSlot> = {}): ChatSlot =>
   ({ key, title: key, messages: 1, running: false, ...extra }) as ChatSlot
@@ -30,5 +31,11 @@ describe('crewWorkerRoot', () => {
     expect(crewWorkerRoot('root')).toBe('')
     expect(crewWorkerRoot('nope')).toBe('')
     expect(crewWorkerRoot('')).toBe('')
+  })
+
+  it('in a build without conductor mode (LTS), lets a crew member alert like any chat', () => {
+    turnOffCrewModeAsLts()
+    store.dispatch(sseSlots([row('root', { crew_mode_root: true }), row('w1', { crew_root: 'root' })]))
+    expect(crewWorkerRoot('w1')).toBe('')
   })
 })

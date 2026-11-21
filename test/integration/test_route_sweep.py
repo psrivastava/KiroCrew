@@ -59,16 +59,27 @@ UNGUARDED_GET: dict[str, tuple[int, str]] = {
     "/": (200, "the SPA shell; an unauthenticated browser needs it to render the login"),
     "/favicon.ico": (200, "SPA asset served beside the shell"),
     "/logo.png": (200, "SPA asset served beside the shell"),
-    "/browser-view": (
-        404,
-        "native browser panel route; this build serves no panel, so 404 to everyone",
-    ),
     "/api/health": (200, "liveness probe for supervisors; carries only ok/app/version"),
     "/api/live": (200, "liveness probe (alias of health)"),
     "/api/ready": (200, "readiness probe for supervisors; boolean startup checks only"),
     "/api/theme/boot": (
         200,
         "pre-login theme and onboarding flags the SPA needs to render the login",
+    ),
+    "/.well-known/oauth-authorization-server": (
+        200,
+        "local authorization's metadata (RFC 8414): endpoint addresses and scope names, "
+        "served only to a direct loopback request",
+    ),
+    "/oauth/authorize": (
+        400,
+        "local authorization: an app with no credential yet asks for a grant; it records "
+        "a request the owner must answer and grants nothing, and no parameters is a 400",
+    ),
+    "/api/connections/oauth/callback": (
+        400,
+        "a vendor's OAuth redirect back to a pod's DCR sign-in; admitted only by a pending "
+        "sign-in's state, else a fixed 400 page",
     ),
 }
 
@@ -108,6 +119,9 @@ UNAVAILABLE_ON_A_FRESH_HOME: dict[str, str] = {
     "/api/capability/mcp/registry": "capability manager not available",
     "/api/capability/plugins": "capability manager not available",
     "/api/capability/skills": "capability manager not available",
+    # A fresh home has added no Kiro Space store, so the listings read for one
+    # answers 503 market_registry_unavailable, as every store route does then.
+    "/api/apps/market/listings": "this Kiro Space store is not added",
 }
 
 #: Substituted for every ``{token}`` in a parameterized path. Chosen so it
@@ -128,6 +142,16 @@ CONSTRAINED_STAND_IN: dict[str, str] = {
 #: Mutating or parameterized routes that answer something other than 401/403
 #: WITHOUT credentials: ``(METHOD, canonical path) -> (status, reason)``.
 UNGUARDED_OTHER: dict[tuple[str, str], tuple[int, str]] = {
+    ("POST", "/oauth/token"): (
+        400,
+        "local authorization: redeems a one-time code with the asking app's PKCE verifier, "
+        "or a refresh token; neither is a 400",
+    ),
+    ("POST", "/oauth/revoke"): (
+        400,
+        "local authorization (RFC 7009): an app gives up the grant of a token it holds; "
+        "no token is a 400",
+    ),
     ("GET", "/{name}"): (
         200,
         "PWA asset route (manifest, service worker, icons), fetched by the browser before "
@@ -147,13 +171,14 @@ UNGUARDED_OTHER: dict[tuple[str, str], tuple[int, str]] = {
         404,
         "import-map shims, public like /assets (token_auth bypass); the stand-in names no file",
     ),
-    ("GET", "/browser-view/{tail}"): (
-        404,
-        "native browser panel route; this build serves no panel",
-    ),
     ("GET", "/artifact-app/{slug}/{token}/{path}"): (
         404,
         "authenticated by the token in the URL, not the cookie; an unknown token is 404",
+    ),
+    ("GET", "/app-frame/{name}/{point}/{point_id}/{frame_id}/{token}"): (
+        404,
+        "an app frame (link preview, message action), authenticated by the token in the URL, not the "
+        "cookie; an unknown token is 404",
     ),
     ("GET", "/sandbox-doc/{doc_id}/{token}"): (
         404,

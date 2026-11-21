@@ -17,7 +17,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from test_decisions_strip_rides_message import _quiet_sel, _runner_state, _settle, _slot
+from test_decisions_strip_rides_message import (  # noqa: F401 - the fixture is used by name
+    _quiet_sel,
+    _runner_state,
+    _settle,
+    _slot,
+    generous_decision_log_append,
+)
 
 from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK
 from kiro_crew.config.sections import DECISION_PROVIDER_ENDPOINT_DEFAULT, DecisionsConfig
@@ -28,6 +34,8 @@ from kiro_crew.decisions import outcomes
 from kiro_crew.decisions.points import model_route as mr
 from kiro_crew.decisions.types import Answer
 from kiro_crew.providers.base import LLMEvent
+
+pytestmark = pytest.mark.usefixtures("generous_decision_log_append")
 
 ADVERTISED = ["model-a", "model-b", "model-c"]
 TIER_MAP = {"simple": "model-a", "medium": "model-b", "complex": "model-c"}
@@ -69,7 +77,7 @@ def switch(monkeypatch):
 
 @pytest.fixture
 def answers(monkeypatch):
-    import kiro_crew.decisions.impl_jev as impl_mod
+    import kiro_crew.decisions.impl_systemone as impl_mod
 
     state = {"tier": "simple"}
 
@@ -77,7 +85,7 @@ def answers(monkeypatch):
         async def ask(self, _state, questions):
             return {q.id: Answer(id=q.id, value=state["tier"], p=0.91) for q in questions}
 
-    monkeypatch.setattr(impl_mod, "JevOracle", lambda provider: _Oracle())
+    monkeypatch.setattr(impl_mod, "SystemOneProvider", lambda provider: _Oracle())
 
     def _set(tier: str) -> None:
         state["tier"] = tier

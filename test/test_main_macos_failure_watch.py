@@ -81,7 +81,9 @@ def test_the_watched_names_are_the_two_workflows_with_a_macos_push_leg() -> None
 @pytest.mark.parametrize("name", ["ci.yml", "build.yml"])
 def test_each_watched_workflow_runs_on_a_push_to_main(name: str) -> None:
     push = _triggers(_load(WORKFLOWS / name))["push"]
-    assert push["branches"] == ["main"]
+    # Release branches run these workflows on a push too; the watcher itself
+    # only pages for main.
+    assert push["branches"][0] == "main"
 
 
 @pytest.mark.parametrize("name", ["ci.yml", "build.yml"])
@@ -135,7 +137,15 @@ def test_the_watcher_never_checks_out_or_runs_source_code() -> None:
     job = _job()
     for step in job["steps"]:
         assert "uses" not in step, step
-    assert job["runs-on"] == "ubuntu-latest"
+    # A GitHub-hosted Ubuntu VM either way: the `kirocrew-runners` group in this
+    # repository, the standard pool in a fork, which cannot reach an
+    # organization group. Pinned by equality rather than relaxed, so a drift to
+    # a self-hosted runner -- where "no checkout" stops being the whole
+    # isolation story -- still fails here.
+    assert job["runs-on"] == (
+        "${{ github.repository == 'kirodotdev/KiroCrew' && "
+        "'kirocrew-linux-4-core' || 'ubuntu-latest' }}"
+    )
     assert job["timeout-minutes"] <= 10
 
 

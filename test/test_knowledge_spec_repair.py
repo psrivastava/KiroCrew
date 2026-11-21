@@ -25,6 +25,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from kiro_crew import agent as agent_mod
+from kiro_crew import agent_spec_injections
 from kiro_crew.acp import client as acp_client
 from kiro_crew.acp import skill_projection as projection
 from kiro_crew.acp_backends import ACP_BACKEND_KIRO, ACP_BACKEND_OPENCODE
@@ -400,12 +401,17 @@ class TestTheRepairRunsBeforeEverySpawn:
         client.effective_spec_declares_zero_tools = MagicMock(
             side_effect=lambda **_kwargs: calls.append("effective") or True
         )
-        monkeypatch.setattr(llm_pool, "_repair_agent_spec", lambda: calls.append("repair") or False)
+        monkeypatch.setattr(
+            llm_pool,
+            "_repair_agent_spec",
+            lambda tolerate=False: calls.append(f"repair tolerate={tolerate}") or False,
+        )
         monkeypatch.setattr(llm_pool, "AcpClient", MagicMock(return_value=client))
 
         await AcpWorker(acp_backend=ACP_BACKEND_KIRO, sandbox_mode="auto").start()
 
-        assert calls == ["repair", "authored", "ready", "effective"]
+        # kiro-cli launches from the view, which drops a registered injection.
+        assert calls == ["repair tolerate=True", "authored", "ready", "effective"]
 
     @pytest.mark.asyncio
     async def test_a_mirrored_backend_spawn_is_repaired_too(self, monkeypatch):
@@ -415,9 +421,479 @@ class TestTheRepairRunsBeforeEverySpawn:
         client.backend = ACP_BACKEND_OPENCODE
         client.spec_zero_tools = True
         client.ensure_ready.side_effect = lambda: calls.append("ready")
-        monkeypatch.setattr(llm_pool, "_repair_agent_spec", lambda: calls.append("repair") or False)
+        monkeypatch.setattr(
+            llm_pool,
+            "_repair_agent_spec",
+            lambda tolerate=False: calls.append(f"repair tolerate={tolerate}") or False,
+        )
         monkeypatch.setattr(llm_pool, "AcpClient", MagicMock(return_value=client))
 
         await AcpWorker(acp_backend=ACP_BACKEND_OPENCODE, sandbox_mode="auto").start()
 
-        assert calls == ["repair", "ready"]
+        # The mirror parses the file itself, so nothing is tolerated there.
+        assert calls == ["repair tolerate=False", "ready"]
+
+
+# -- an injection a filter registered by the edition removes ---------------------------
+
+#: The server a test tool injects into every spec, and the UUID it writes in ``env``.
+_TOOL_SERVER = "tool-creds"
+_TOOL_REF = "@" + _TOOL_SERVER
+_TOOL_ENTRY = {
+    "command": "/opt/tool/bin/tool",
+    "args": ["serve", "creds"],
+    "env": {"TOOL_INJECTION": "0b6c2a3e-5d0f-4a8e-9f1b-2c3d4e5f6a7b"},
+}
+_TOOL_PERMISSIONS = {
+    "rules": [{"capability": "mcp", "match": [f"{_TOOL_SERVER}/*"], "effect": "allow"}]
+}
+
+
+def _tool_entry(**overrides: Any) -> dict[str, Any]:
+    return {**json.loads(json.dumps(_TOOL_ENTRY)), **overrides}
+
+
+def _inject_tool(path: Path, entry: dict[str, Any] | None = None) -> None:
+    """Add to *path* what the test tool adds to a spec with ``tools: []``."""
+    spec = _read(path)
+    spec["mcpServers"] = {**spec["mcpServers"], _TOOL_SERVER: entry or _tool_entry()}
+    spec["tools"] = [*spec["tools"], _TOOL_REF]
+    spec["allowedTools"] = [_TOOL_REF]
+    spec["permissions"] = _TOOL_PERMISSIONS
+    spec["toolsSettings"] = {}
+    path.write_text(json.dumps(spec, indent=2), encoding="utf-8")
+
+
+def _tool_filter(spec: dict[str, Any]) -> dict[str, Any] | None:
+    """What an edition registers: remove exactly the test tool's injection."""
+    servers = spec.get("mcpServers")
+    if not isinstance(servers, dict) or servers.get(_TOOL_SERVER) != _TOOL_ENTRY:
+        return None
+    tools = spec.get("tools")
+    if not isinstance(tools, list) or not tools or tools[-1] != _TOOL_REF:
+        return None
+    if spec.get("allowedTools") != [_TOOL_REF] or spec.get("permissions") != _TOOL_PERMISSIONS:
+        return None
+    if spec.get("toolsSettings") != {}:
+        return None
+    for key in ("allowedTools", "permissions", "toolsSettings"):
+        del spec[key]
+    del servers[_TOOL_SERVER]
+    spec["tools"] = tools[:-1]
+    return spec
+
+
+@pytest.fixture
+def registered_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The test tool's filter, registered for this test only."""
+    monkeypatch.setattr(agent_spec_injections, "_FILTERS", {"test-tool": _tool_filter})
+    monkeypatch.setattr(service_agents, "_ignored_injections_logged", set())
+
+
+def _repair_tolerant() -> bool:
+    return service_agents.repair_knowledge_agent_spec(tolerate_registered_injection=True)
+
+
+class TestARegisteredInjection:
+    """A tool that writes its entry back on every launch makes a rewrite start another
+    round. An edition registers a filter for its exact shape; core then leaves the file
+    alone and launches from the template, and repairs everything else as before."""
+
+    def test_with_nothing_registered_the_injection_is_repaired(self, agents_dir, monkeypatch):
+        monkeypatch.setattr(agent_spec_injections, "_FILTERS", {})
+        template = _template(agents_dir)
+        _inject_tool(_spec_path(agents_dir))
+
+        assert _repair_tolerant() is True
+        assert _read(_spec_path(agents_dir)) == template
+
+    def test_the_registered_injection_is_left_in_the_file(self, agents_dir, registered_tool):
+        _template(agents_dir)
+        _inject_tool(_spec_path(agents_dir))
+        before = _spec_path(agents_dir).read_bytes()
+
+        assert _repair_tolerant() is False
+        assert _spec_path(agents_dir).read_bytes() == before
+
+    def test_without_tolerance_the_injection_is_still_repaired(self, agents_dir, registered_tool):
+        template = _template(agents_dir)
+        _inject_tool(_spec_path(agents_dir))
+
+        assert service_agents.repair_knowledge_agent_spec() is True
+        assert _read(_spec_path(agents_dir)) == template
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            pytest.param(_tool_entry(command="/tmp/other/tool"), id="other-command"),
+            pytest.param(_tool_entry(args=["serve", "x"]), id="other-args"),
+            pytest.param(_tool_entry(env={}), id="other-env"),
+            pytest.param({**_tool_entry(), "autoApprove": ["get_creds"]}, id="extra-key"),
+        ],
+    )
+    def test_a_lookalike_entry_is_repaired(self, agents_dir, registered_tool, entry):
+        template = _template(agents_dir)
+        _inject_tool(_spec_path(agents_dir), entry)
+
+        assert _repair_tolerant() is True
+        assert _read(_spec_path(agents_dir)) == template
+
+    @pytest.mark.parametrize(
+        "change",
+        [
+            pytest.param(lambda s: s["tools"].insert(0, "fs_read"), id="another-tool"),
+            pytest.param(lambda s: s["allowedTools"].append("fs_read"), id="another-grant"),
+            pytest.param(
+                lambda s: s["mcpServers"].update(other={"command": "other", "args": []}),
+                id="another-server",
+            ),
+            pytest.param(lambda s: s.update(model="another-model"), id="another-key"),
+        ],
+    )
+    def test_any_other_change_beside_the_injection_is_repaired(
+        self, agents_dir, registered_tool, change
+    ):
+        template = _template(agents_dir)
+        path = _spec_path(agents_dir)
+        _inject_tool(path)
+        spec = _read(path)
+        change(spec)
+        path.write_text(json.dumps(spec), encoding="utf-8")
+
+        assert _repair_tolerant() is True
+        assert _read(path) == template
+
+    def test_a_filter_that_raises_counts_as_no_match(self, agents_dir, monkeypatch):
+        def broken(spec: dict[str, Any]) -> dict[str, Any] | None:
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(agent_spec_injections, "_FILTERS", {"broken": broken})
+        template = _template(agents_dir)
+        _inject_tool(_spec_path(agents_dir))
+
+        assert _repair_tolerant() is True
+        assert _read(_spec_path(agents_dir)) == template
+
+    def test_the_ignored_injection_is_logged_once(self, agents_dir, registered_tool, caplog):
+        _template(agents_dir)
+        _inject_tool(_spec_path(agents_dir))
+
+        with caplog.at_level(logging.INFO, logger="kiro_crew.agent"):
+            for _ in range(3):
+                _repair_tolerant()
+
+        ignored = [r.getMessage() for r in caplog.records if "registered filter" in r.getMessage()]
+        assert len(ignored) == 1
+        assert not any(
+            _TOOL_ENTRY["env"]["TOOL_INJECTION"] in r.getMessage() for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_worker_starts_with_zero_tools_and_the_file_is_not_rewritten(
+        self, agents_dir, workspace, monkeypatch, registered_tool
+    ):
+        _template(agents_dir)
+        _inject_tool(_spec_path(agents_dir))
+        before = _spec_path(agents_dir).read_bytes()
+
+        for _ in range(2):
+            worker, made = await _start(monkeypatch, workspace)
+
+            assert len(made) == 1 and worker._client is made[0]
+            prepared = made[0]._native_skill_projection
+            assert prepared is not None
+            _assert_mounts_nothing(prepared.specs[AGENT_NAME])
+            _assert_mounts_nothing(_read(_alias_path(agents_dir, prepared)))
+            assert "toolsSettings" not in prepared.specs[AGENT_NAME]
+            assert _spec_path(agents_dir).read_bytes() == before
+
+    @pytest.mark.asyncio
+    async def test_a_filter_cannot_add_a_tool_to_the_view(self, agents_dir, workspace, monkeypatch):
+        """The view is the template, never the filter's output."""
+
+        def adds_a_tool(spec: dict[str, Any]) -> dict[str, Any] | None:
+            stripped = _tool_filter(spec)
+            if stripped is not None:
+                stripped["tools"] = ["fs_read"]
+            return stripped
+
+        monkeypatch.setattr(agent_spec_injections, "_FILTERS", {"adds": adds_a_tool})
+        template = _template(agents_dir)
+        _inject_tool(_spec_path(agents_dir))
+
+        worker, made = await _start(monkeypatch, workspace)
+
+        assert len(made) == 1 and worker._client is made[0]
+        _assert_mounts_nothing(made[0]._native_skill_projection.specs[AGENT_NAME])
+        assert _read(_spec_path(agents_dir)) == template
+
+    @pytest.mark.asyncio
+    async def test_a_spawn_that_got_no_view_repairs_the_file_and_starts_again(
+        self, agents_dir, workspace, monkeypatch, registered_tool
+    ):
+        """kiro-cli loads the authored file itself there, so it must be the template."""
+        monkeypatch.setenv("KIROCREW_NATIVE_SKILL_PROJECTION", "0")
+        template = _template(agents_dir)
+        _inject_tool(_spec_path(agents_dir))
+
+        worker, made = await _start(monkeypatch, workspace)
+
+        assert len(made) == 2 and worker._client is made[1]
+        made[0].shutdown.assert_awaited_once()
+        made[0].send_message.assert_not_awaited()
+        assert made[1]._native_skill_projection is None
+        assert _read(_spec_path(agents_dir)) == template
+
+    @pytest.mark.asyncio
+    async def test_a_spawn_that_got_no_view_starts_again_when_another_worker_repaired_first(
+        self, agents_dir, workspace, monkeypatch, registered_tool
+    ):
+        """Two workers start at once; the other one's repair rewrote the file first."""
+        monkeypatch.setenv("KIROCREW_NATIVE_SKILL_PROJECTION", "0")
+        template = _template(agents_dir)
+        _inject_tool(_spec_path(agents_dir))
+        real_repair = llm_pool._repair_agent_spec
+
+        def repaired_by_someone_else(tolerate: bool = False) -> bool:
+            rewrote = real_repair(tolerate)
+            return rewrote and tolerate
+
+        monkeypatch.setattr(llm_pool, "_repair_agent_spec", repaired_by_someone_else)
+
+        worker, made = await _start(monkeypatch, workspace)
+
+        assert len(made) == 2 and worker._client is made[1]
+        made[0].send_message.assert_not_awaited()
+        assert _read(_spec_path(agents_dir)) == template
+
+    @pytest.mark.asyncio
+    async def test_another_tool_beside_the_injection_still_refuses_when_unrepairable(
+        self, agents_dir, workspace, monkeypatch, registered_tool
+    ):
+        _template(agents_dir)
+        path = _spec_path(agents_dir)
+        _inject_tool(path)
+        spec = _read(path)
+        spec["tools"].insert(0, "fs_read")
+        path.write_text(json.dumps(spec), encoding="utf-8")
+
+        def refuse(*args: object, **kwargs: object) -> None:
+            raise agent_mod.SharedAgentHomeRefused("this data home does not own it")
+
+        monkeypatch.setattr(auto_approve, "write_governed_spec", refuse)
+        made: list[acp_client.AcpClient] = []
+        monkeypatch.setattr(llm_pool, "AcpClient", _client_factory(workspace, made))
+        worker = AcpWorker(acp_backend=ACP_BACKEND_KIRO, sandbox_mode="auto")
+
+        with pytest.raises(RuntimeError, match="could not be confirmed"):
+            await worker.send_message("untrusted document text")
+
+        made[0].send_message.assert_not_awaited()
+        assert worker._client is None
+
+
+# -- a spec that is rewritten again at every launch -----------------------------------
+
+
+def _reinjecting_factory(
+    work_dir: Path, agents: Path, made: list[acp_client.AcpClient]
+) -> Callable[..., acp_client.AcpClient]:
+    """``_client_factory`` behind a tool that rewrites every spec when kiro-cli launches.
+
+    The repair before each spawn puts the template back, and the launch writes the
+    injection again before the harness reads it, so no repair ever sticks.
+    """
+    inner = _client_factory(work_dir, made)
+
+    def make(**kwargs: Any) -> acp_client.AcpClient:
+        client = inner(**kwargs)
+        ready = client.ensure_ready
+
+        async def ensure_ready() -> None:
+            _inject(_spec_path(agents))
+            await ready()
+
+        client.ensure_ready = ensure_ready
+        return client
+
+    return make
+
+
+@pytest.fixture
+def pool_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An ACP pool on Kiro CLI with no config file behind it."""
+    monkeypatch.setattr(llm_pool, "_read_config", lambda: {})
+    monkeypatch.setattr(
+        llm_pool, "_get_acp_backend", lambda config=None, *, sessions=None: ACP_BACKEND_KIRO
+    )
+    monkeypatch.setattr(llm_pool, "_get_sandbox_mode", lambda config=None: "auto")
+
+
+class TestASpecThatNeverSticks:
+    """One refusal ends the batch, and the pool stops spawning for a while."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("projection_on", [True, False])
+    async def test_a_batch_spawns_once_and_fails_naming_the_file(
+        self, agents_dir, workspace, monkeypatch, pool_env, projection_on
+    ):
+        if not projection_on:
+            monkeypatch.setenv("KIROCREW_NATIVE_SKILL_PROJECTION", "0")
+        _template(agents_dir)
+        made: list[acp_client.AcpClient] = []
+        monkeypatch.setattr(
+            llm_pool, "AcpClient", _reinjecting_factory(workspace, agents_dir, made)
+        )
+        pool = llm_pool.LLMPool(pool_size=2)
+
+        with pytest.raises(llm_pool.KnowledgeSpecUnconfirmed) as caught:
+            await pool.send_batch([f"chunk {i}" for i in range(29)])
+
+        # One spawn for the whole batch, not one per chunk.
+        assert len(made) == 1
+        for client in made:
+            client.send_message.assert_not_awaited()
+        message = str(caught.value)
+        assert str(_spec_path(agents_dir)) in message
+        assert "mcpServers" in message and "allowedTools" in message
+        assert _NONCE not in message and "launcher-creds" not in message
+        # The refusal names the likely writer and what to do about it.
+        assert "leave Kiro Crew's tool-less specs alone" in message
+
+        # A later ingest inside the window spawns nothing.
+        with pytest.raises(llm_pool.KnowledgeSpecUnconfirmed):
+            await pool.send("another chunk")
+        assert len(made) == 1
+        await pool.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_the_pool_tries_again_after_the_window(
+        self, agents_dir, workspace, monkeypatch, pool_env
+    ):
+        from kiro_crew.testing.clock import ManualClock
+
+        clock = ManualClock()
+        clock.install(monkeypatch, llm_pool)
+        _template(agents_dir)
+        made: list[acp_client.AcpClient] = []
+        monkeypatch.setattr(
+            llm_pool, "AcpClient", _reinjecting_factory(workspace, agents_dir, made)
+        )
+        pool = llm_pool.LLMPool(pool_size=1)
+        with pytest.raises(llm_pool.KnowledgeSpecUnconfirmed):
+            await pool.send("chunk")
+        assert len(made) == 1
+
+        # The tool that rewrote the file is gone; the window passes.
+        monkeypatch.setattr(llm_pool, "AcpClient", _client_factory(workspace, made))
+        clock.advance(llm_pool.SPEC_REFUSAL_COOLDOWN_SECS + 1)
+        monkeypatch.setattr(AcpWorker, "is_alive", lambda self: self._client is not None)
+
+        assert await pool.send("chunk") == "{}"
+        assert len(made) > 1
+        await pool.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_the_extractor_fails_the_ingest_instead_of_storing_empty_chunks(
+        self, agents_dir, workspace, monkeypatch, pool_env
+    ):
+        from kiro_crew.knowledge.extractor import EntityExtractor
+
+        _template(agents_dir)
+        made: list[acp_client.AcpClient] = []
+        monkeypatch.setattr(
+            llm_pool, "AcpClient", _reinjecting_factory(workspace, agents_dir, made)
+        )
+        pool = llm_pool.LLMPool(pool_size=1)
+
+        with pytest.raises(llm_pool.KnowledgeSpecUnconfirmed):
+            await EntityExtractor(pool).extract_batch(["one", "two", "three"])
+        with pytest.raises(llm_pool.KnowledgeSpecUnconfirmed):
+            await EntityExtractor(pool).extract("four")
+        assert len(made) == 1
+        await pool.shutdown()
+
+
+class TestAProjectSpecCannotShadowTheWorker:
+    """The worker runs in a Crew-owned cwd, and a checkout claim there is refused."""
+
+    def test_the_worker_cwd_is_crew_owned(self):
+        client = acp_client.AcpClient(agent=AGENT_NAME, acp_backend=ACP_BACKEND_KIRO)
+        assert client._work_dir == paths.config_dir() / paths.KEYLESS_WORK_DIR_NAME
+
+    def test_a_project_spec_of_the_same_name_is_refused_before_spawn(self, tmp_path):
+        from kiro_crew.acp.managed_agent_shadow import managed_agent_shadow_refusal
+
+        project_agents = tmp_path / ".kiro" / "agents"
+        project_agents.mkdir(parents=True)
+        (project_agents / KNOWLEDGE_AGENT_FILENAME).write_text(
+            json.dumps({"name": AGENT_NAME, "tools": ["*"]}), encoding="utf-8"
+        )
+
+        refusal = managed_agent_shadow_refusal(AGENT_NAME, tmp_path)
+
+        assert refusal is not None
+        assert str(project_agents / KNOWLEDGE_AGENT_FILENAME) in refusal
+
+
+class TestAnAliasRewrittenAtEveryLaunch:
+    """The authored spec is clean; a tool rewrites the published alias kiro-cli loads."""
+
+    @pytest.mark.asyncio
+    async def test_the_batch_fails_once_naming_the_alias_not_the_authored_spec(
+        self, agents_dir, workspace, monkeypatch, pool_env
+    ):
+        template = _template(agents_dir)
+        made: list[acp_client.AcpClient] = []
+        monkeypatch.setattr(
+            llm_pool,
+            "AcpClient",
+            _client_factory(
+                workspace, made, lambda prepared: _inject(_alias_path(agents_dir, prepared))
+            ),
+        )
+        pool = llm_pool.LLMPool(pool_size=2)
+
+        with pytest.raises(llm_pool.KnowledgeSpecUnconfirmed) as caught:
+            await pool.send_batch([f"chunk {i}" for i in range(29)])
+
+        assert len(made) == 1
+        made[0].send_message.assert_not_awaited()
+        alias = _alias_path(agents_dir, made[0]._native_skill_projection)
+        message = str(caught.value)
+        assert f"the published skill-view alias {alias} sets" in message
+        assert "rewritten after Kiro Crew published it" in message
+        assert str(_spec_path(agents_dir)) not in message
+        assert "project" not in message
+        assert _NONCE not in message and "launcher-creds" not in message
+        # The authored spec was never the problem, and it is left as it was.
+        assert _read(_spec_path(agents_dir)) == template
+        await pool.shutdown()
+
+
+class TestTheRefusalNamesTheResolvedSpec:
+    """Without a view, the message names what the declared-name resolver returned."""
+
+    @pytest.mark.asyncio
+    async def test_a_second_claimant_is_named_not_blamed_on_a_rewrite(
+        self, agents_dir, workspace, monkeypatch, pool_env
+    ):
+        monkeypatch.setenv("KIROCREW_NATIVE_SKILL_PROJECTION", "0")
+        _template(agents_dir)
+        copy = agents_dir / "kirocrew-knowledge-copy.json"
+        copy.write_text(json.dumps({"name": AGENT_NAME, "tools": ["*"]}), encoding="utf-8")
+        made: list[acp_client.AcpClient] = []
+        monkeypatch.setattr(llm_pool, "AcpClient", _client_factory(workspace, made))
+        pool = llm_pool.LLMPool(pool_size=1)
+
+        with pytest.raises(llm_pool.KnowledgeSpecUnconfirmed) as caught:
+            await pool.send_batch(["one", "two", "three"])
+
+        message = str(caught.value)
+        # The ambiguity error repr()s each path, so a Windows path shows doubled
+        # backslashes; the file's own name is the same on every platform.
+        assert copy.name in message
+        assert "another tool rewrote it" not in message
+        for client in made:
+            client.send_message.assert_not_awaited()
+        await pool.shutdown()

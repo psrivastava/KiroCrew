@@ -628,7 +628,7 @@ class TestTheCacheIsHiddenFromAgentSubprocesses:
         "of which Windows has -- and ``_build_launcher_script`` calls POSIX-only "
         "os.getuid. Guarded rather than listed in windows-expected-failures.txt: that "
         "list is a burn-down backlog, and an OS sandbox Windows does not implement is a "
-        "permanent boundary. Same route as test_sandbox_mount_checked.py (#2041)."
+        "permanent boundary. Same route as test_sandbox_mount_checked.py."
     ),
 )
 class TestAnExposedCacheIsStillReadOnly:
@@ -643,8 +643,7 @@ class TestAnExposedCacheIsStillReadOnly:
     """
 
     @pytest.fixture(autouse=True)
-    # nosemgrep: kirocrew.test-autouse-shared-monkeypatch -- the class's in-process ssh probe, moved verbatim; tracked for a de-flake pass
-    def _pinned_ssh_probe(self, monkeypatch):
+    def _pinned_ssh_probe(self, _floor_monkeypatch):
         """Answer the launcher's ``ssh -V`` probe in-process.
 
         A namespace plan consults ``_ssh_supports_accept_new`` for the
@@ -655,7 +654,7 @@ class TestAnExposedCacheIsStillReadOnly:
         """
         from kiro_crew import sandbox
 
-        monkeypatch.setattr(sandbox, "_ssh_supports_accept_new", lambda: True)
+        _floor_monkeypatch.setattr(sandbox, "_ssh_supports_accept_new", lambda: True)
 
     @staticmethod
     def _cache_path():

@@ -37,7 +37,9 @@ ASSEMBLERS: tuple[str, ...] = (
     "dashboard/goal_reminder.py",
     "dashboard/goal_setup.py",
     "dashboard/mate_thread_wakes.py",
+    "dashboard/mate_user_actions.py",
     "dashboard/mate_welcome.py",
+    "dashboard/stale_wake.py",
     "mate_upgrade_notice.py",
     "mate_capability_catalog.py",
     "dashboard_agentic.py",
@@ -144,7 +146,7 @@ def test_no_sentence_of_a_piece_is_left_as_a_literal(rel: str) -> None:
 
 #: The server modules whose tools only a crewmate is given.
 _CREWMATE_SERVERS: tuple[str, ...] = (
-    "mcp_mate.py",
+    "mcp_mate_tool_list.py",
     "mcp_panel.py",
     "mcp_crew_log.py",
     "mcp_work.py",
@@ -165,6 +167,8 @@ _EXEMPT: dict[str, str] = {
     "work_brief": "a worker's tool (mcp_work.WORKER_TOOLS), never the conductor's",
     "work_report": "a worker's tool (mcp_work.WORKER_TOOLS), never the conductor's",
     "work_ledger_rebuild": "repairs a damaged or missing ledger, not part of the ordinary loop",
+    "accept_eval": "named by the act-by-status rule, rendered only with the ledger (see below)",
+    "work_ask_record": "named by the act-by-status rule, rendered only with the ledger (see below)",
     "offer_dashboard_page": (
         "named by its per-turn note (dashboard/page_offer.py), which is the only time "
         "the crewmate may call it"
@@ -250,3 +254,405 @@ def test_every_crewmate_only_tool_is_named_in_the_assembled_conductor_prompt() -
     prompt = _conductor_prompt()
     missing = sorted(t for t in _crewmate_tools() if not re.search(rf"\b{t}\b", prompt))
     assert missing == [], f"the crewmate conductor prompt never names: {missing}"
+
+
+# Bug-bash H4: a crewmate said "Yes, I'll install Rust", hit a safety rule, then
+# offered the chip "Ask for a card to let you install it", which no card kind can
+# honour. These pin the guidance that stops each step.
+
+#: Internal words a reply written in the user's voice must not carry.
+_CHIP_JARGON = ("card", "propose_change", "worker", "helper")
+
+
+def _all_pieces() -> dict[str, str]:
+    return {key: crewmate_prompts.text(key) for key in crewmate_prompts.keys()}
+
+
+def test_the_conductor_prompt_hedges_a_gated_action_instead_of_promising_it() -> None:
+    prompt = _conductor_prompt()
+    assert "Promise only what you can do." in prompt
+    assert "say you will try" in prompt
+    # The no-loosening clause moved to ASK_CORE, which the Bot conductor gets at
+    # agent rank (test_ask_core_guidance.py pins it in the rendered block).
+    assert "Never offer to ask for a permission or a card" not in prompt
+
+
+def test_a_blocked_command_is_handed_over_as_the_run_yourself_card() -> None:
+    """The fence the chat draws as RunYourselfCard (website/src/components)."""
+    prompt = _conductor_prompt()
+    assert "```run-yourself" in prompt
+    assert '```run-yourself summary="<what it installs or does, and from where>"' in prompt
+    assert "facts only, no persuasion" in prompt
+    assert "If a rule blocks a command and no allowed path reaches the goal" in " ".join(
+        prompt.split()
+    )
+    card = (ROOT / "website" / "src" / "components" / "RunYourselfCard.tsx").read_text(
+        encoding="utf-8"
+    )
+    assert "export const RUN_YOURSELF_LANG = 'run-yourself'" in card
+
+
+def test_no_piece_makes_a_flat_promise_of_a_gated_action() -> None:
+    flat = re.compile(r"\bI(?:'|’)?ll (?:install|run the install|set (?:it|that) up)\b", re.I)
+    offenders = sorted(key for key, text in _all_pieces().items() if flat.search(text))
+    assert offenders == []
+
+
+def test_the_chip_guidance_offers_only_what_the_mate_can_do() -> None:
+    prompt = _conductor_prompt()
+    assert "offer only what you can then do" in prompt
+    assert "never ask you for a card" in prompt
+    for word in _CHIP_JARGON:
+        assert word in prompt.split("no internal word:", 1)[1], word
+
+
+def test_no_piece_carries_an_example_chip_with_jargon() -> None:
+    """An example [OPTIONS:] line in a prompt is copied verbatim by the model."""
+    offenders = []
+    for key, text in _all_pieces().items():
+        for labels in re.findall(r"\[OPTIONS?:([^\]]*)\]", text):
+            for label in labels.split("|"):
+                if any(re.search(rf"\b{w}s?\b", label, re.I) for w in _CHIP_JARGON):
+                    offenders.append(f"{key}: {label.strip()}")
+    assert offenders == []
+
+
+def test_the_worker_hands_a_blocked_command_back_for_the_user() -> None:
+    text = crewmate_prompts.text("worker.principles")
+    assert "When a safety rule blocks a command" in text
+    assert "do not look for a way around it" not in text
+    assert "and no allowed path is left, say so in your report" in text
+    assert "exact command in a code block" in text
+    assert "what it installs or does, and from where" in text
+    assert "no persuasion" in text
+
+
+# -- ledger tracking and the gated patrol, only where the ledger is mounted ---- #
+
+#: What the patrol text must name, and what a render without the ledger must not.
+_PATROL_MARKS = (
+    'watch="work-ledger"',
+    "every 300 seconds",
+    "7-day runaway backstop",
+    "ONE final report",
+)
+#: The ledger verbs the tracking sentence names only where they are mounted.
+_LEDGER_TOOLS = ("work_ledger_record", "work_ledger_read", "work_ledger_rebuild")
+
+
+def test_the_patrol_piece_names_the_gated_ledger_watch_band_and_renewal() -> None:
+    from kiro_crew.context_assembly import member
+
+    text = member.ledger_rules_block("conductor.patrol")
+    for mark in _PATROL_MARKS:
+        assert mark in text, mark
+    assert "Never pass gate:false on a patrol." in text
+    # Bind before seed: create, then session_create, then bind, then the seed.
+    order = [
+        text.index("action=create"),
+        text.index("2. `session_create`"),
+        text.index("action=bind"),
+        text.index("4. `session_send`"),
+    ]
+    assert order == sorted(order)
+    # Every dispatched task is an item, a single one too, with a goal only for
+    # work with more than one item; the refused-arm fallback stays.
+    assert "a single task too" in text
+    assert "a single task needs no goal" in text
+    assert "needs no item" not in text
+    assert "the [Worker report] turns stay your patrol" in text
+
+
+def test_both_conductors_send_one_final_report_before_they_stop_the_patrol() -> None:
+    """Bot and conductor mode end a patrol the same way: the final report first, the stop
+    in a later step, and no bound for the model to pick (rfc-permanent-patrol.md)."""
+    from kiro_crew import agent
+    from kiro_crew.context_assembly import member
+
+    bot = " ".join(member.ledger_rules_block("conductor.patrol").split())
+    root = " ".join(agent._CONDUCTOR_SYSTEM_PROMPT.split())
+    for text in (bot, root):
+        report = text.index("First send the user ONE final report")
+        stop = text.index("Then, in a later step, stop the loop with `autonudge_stop`")
+        assert report < stop
+        assert "The final report is your last message to the user." in text
+        assert "Pass no `interval_secs`, no `max_cycles` and no `max_runtime_secs`" in text
+        assert "mode=renew" not in text
+    assert "stop the loop with monitor_stop" not in bot
+
+
+def test_the_ledger_tracking_sentence_tracks_every_dispatched_task() -> None:
+    mounted = crewmate_prompts.text("conductor.tracking_ledger")
+    assert "Every task you hand to a worker" in mounted
+    assert "more than one item" not in mounted
+
+
+def test_the_worker_reads_its_brief_and_reports_on_its_item() -> None:
+    from kiro_crew.mate_worker import mate_worker_prompt
+
+    assert "{brief_first}" in crewmate_prompts.text("worker.principles")
+    assert "**Start by calling `work_brief`" in mate_worker_prompt()
+    assert "Report at each real milestone with `work_report`" in mate_worker_prompt()
+
+
+def test_the_tracking_sentence_without_the_ledger_names_no_ledger_tool() -> None:
+    plain = crewmate_prompts.text("conductor.tracking")
+    assert not any(tool in plain for tool in _LEDGER_TOOLS)
+    mounted = crewmate_prompts.text("conductor.tracking_ledger")
+    assert "work_ledger_record" in mounted and "work_ledger_read" in mounted
+
+
+def _render(monkeypatch: pytest.MonkeyPatch, *, ledger: bool, off: str = "config") -> str:
+    """``build_member_section`` plus ``operating_mode_block``, as the session start
+    joins them, with the ledger answer forced either way."""
+    from types import SimpleNamespace
+
+    from kiro_crew import context as ctx
+    from kiro_crew import member_mate_tools
+    from kiro_crew.context_assembly import member
+
+    binding = SimpleNamespace(
+        description="", triggers="", kiro_agent="", workspace="", member_id=""
+    )
+    cfg = ctx.KiroCrewConfig()
+    cfg.agents["Atlas"] = binding
+    monkeypatch.setattr(ctx.KiroCrewConfig, "load", staticmethod(lambda *a, **k: cfg))
+    reason = "" if ledger else off
+    monkeypatch.setattr(member_mate_tools, "binding_ledger_off_reason", lambda _b: reason)
+    section = member.build_member_section("Atlas", include_briefing=False)
+    return section + member.operating_mode_block("Atlas", ledger=ledger)
+
+
+def test_a_render_with_the_ledger_teaches_tracking_and_the_gated_patrol(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from kiro_crew.context_assembly import member
+
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+    text = _render(monkeypatch, ledger=True)
+    for mark in _PATROL_MARKS:
+        assert mark in text, mark
+    assert crewmate_prompts.text("conductor.tracking_ledger") in text
+    assert member.ledger_rules_block("conductor.patrol") in text
+    assert _READ_THE_SKILL in text
+
+
+#: The words that send the crewmate to the skill's operating procedure.
+_READ_THE_SKILL = "before planning work with more than one item"
+
+
+def test_the_skill_line_points_at_goal_conductor_for_the_whole_procedure() -> None:
+    from kiro_crew.context_assembly import member
+
+    text = member.ledger_rules_block("conductor.patrol")
+    head = text[: text.index("Tracked work:")]
+    assert "`goal-conductor` skill" in head and _READ_THE_SKILL in head
+    assert "follow it for dispatch, patrol, verdicts and worker debate" in head
+
+
+def test_a_render_without_the_ledger_never_sends_the_crewmate_to_the_skill(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+    text = _render(monkeypatch, ledger=False)
+    assert _READ_THE_SKILL not in text
+    assert "goal-conductor" not in text
+
+
+def test_a_render_without_the_ledger_is_the_text_every_crewmate_had(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from kiro_crew.context_assembly import member
+
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+    text = _render(monkeypatch, ledger=False)
+    for mark in _PATROL_MARKS:
+        assert mark not in text, mark
+    assert "monitor_start" not in text
+    assert crewmate_prompts.text("conductor.tracking") in text
+    assert crewmate_prompts.text("conductor.tracking_ledger") not in text
+    assert member.operating_mode_block("Atlas") == crewmate_prompts.fill(
+        "conductor.operating_mode", agent_label="Atlas"
+    )
+
+
+@pytest.mark.parametrize("off", ["config", "unreadable"])
+def test_a_render_without_the_ledger_says_why_tracking_is_off(
+    off: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Owner decision in docs/decisions, cases N3 and N4: no ledger text, never silently."""
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+    text = _render(monkeypatch, ledger=False, off=off)
+    assert crewmate_prompts.text(f"conductor.tracking_off_{off}") in text
+    other = "unreadable" if off == "config" else "config"
+    assert crewmate_prompts.text(f"conductor.tracking_off_{other}") not in text
+    assert crewmate_prompts.text("conductor.tracking_ledger") not in text
+
+
+def test_a_render_with_the_ledger_names_no_off_reason(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+    text = _render(monkeypatch, ledger=True)
+    assert "Tracking is off" not in text
+
+
+def test_the_off_reason_follows_the_chat_spec(monkeypatch: pytest.MonkeyPatch) -> None:
+    from kiro_crew import member_mate_tools
+
+    monkeypatch.setattr(member_mate_tools, "_chat_spec", lambda _b: _conductor_spec())
+    assert member_mate_tools.binding_ledger_off_reason(object()) == ""
+    monkeypatch.setattr(
+        member_mate_tools,
+        "_chat_spec",
+        lambda _b: _conductor_spec(excludedTools=["@kirocrew-work"]),
+    )
+    assert member_mate_tools.binding_ledger_off_reason(object()) == "config"
+    monkeypatch.setattr(member_mate_tools, "_chat_spec", lambda _b: None)
+    assert member_mate_tools.binding_ledger_off_reason(object()) == "unreadable"
+    assert member_mate_tools.binding_ledger_off_reason(None) == "unreadable"
+
+
+@pytest.mark.parametrize("mounted, backend_can_dispatch", [(False, True), (None, False)])
+def test_a_turn_without_the_dispatch_tools_is_not_told_to_track_its_hand_offs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mounted: bool | None,
+    backend_can_dispatch: bool,
+) -> None:
+    """The ledger is mounted but the operating-mode block is withheld (this session
+    lacks the ``session_*`` mount, or the backend cannot mount it): the tracking
+    sentence is the plain one, not the one about tasks handed to workers."""
+    from types import SimpleNamespace
+
+    from kiro_crew import context as ctx
+    from kiro_crew import member_mate_tools
+    from kiro_crew.context_assembly import member
+
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+    cfg = ctx.KiroCrewConfig()
+    cfg.agents["Atlas"] = SimpleNamespace(
+        description="", triggers="", kiro_agent="", workspace="", member_id=""
+    )
+    monkeypatch.setattr(ctx.KiroCrewConfig, "load", staticmethod(lambda *a, **k: cfg))
+    monkeypatch.setattr(member_mate_tools, "binding_ledger_off_reason", lambda _b: "")
+    monkeypatch.setattr(ctx, "_member_backend_can_dispatch", lambda *_a: backend_can_dispatch)
+    text = member.build_member_section("Atlas", include_briefing=False, dispatch_mounted=mounted)
+    assert crewmate_prompts.text("conductor.tracking") in text
+    assert crewmate_prompts.text("conductor.tracking_ledger") not in text
+    held = member.build_member_section("Atlas", include_briefing=False, dispatch_mounted=True)
+    assert crewmate_prompts.text("conductor.tracking_ledger") in held
+
+
+# -- which spec counts as having the ledger ---------------------------------- #
+
+
+def _conductor_spec(**over: object) -> dict:
+    spec: dict = {
+        "mcpServers": {"kirocrew-work": {"command": "kirocrew", "args": ["mcp-work"]}},
+        "tools": ["fs_read", "@kirocrew-work"],
+        "allowedTools": [
+            "@kirocrew-work/work_ledger_read",
+            "@kirocrew-work/work_ledger_record",
+        ],
+    }
+    spec.update(over)
+    return spec
+
+
+def test_a_spec_that_mounts_and_grants_the_ledger_has_it() -> None:
+    from kiro_crew.member_mate_tools import spec_has_ledger_tools
+
+    assert spec_has_ledger_tools(_conductor_spec())
+    # Owner decision in docs/decisions, case N1: a ceiling that withholds the verb leaves it
+    # mounted and asking for approval, so the ledger is still taught.
+    assert spec_has_ledger_tools(_conductor_spec(allowedTools=["@kirocrew-work/work_ledger_read"]))
+    assert spec_has_ledger_tools(_conductor_spec(allowedTools=[]))
+    assert spec_has_ledger_tools(_conductor_spec(tools="*"))
+    assert spec_has_ledger_tools(_conductor_spec(allowedTools=["@kirocrew-work"]))
+    assert spec_has_ledger_tools(_conductor_spec(tools=["@kirocrew-work/work_ledger_record"]))
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        pytest.param({"mcpServers": {}}, id="not-mounted"),
+        pytest.param({"tools": ["fs_read"]}, id="server-not-in-tools"),
+        pytest.param({"tools": ["@kirocrew-work/work_ledger_read"]}, id="only-read-selected"),
+        pytest.param(
+            {"mcpServers": {"kirocrew-work": {"command": "k", "disabled": True}}},
+            id="muted",
+        ),
+        pytest.param(
+            {"excludedTools": ["@kirocrew-work/work_ledger_record"]},
+            id="record-excluded",
+        ),
+        pytest.param(
+            {
+                "mcpServers": {
+                    "kirocrew-work": {
+                        "command": "k",
+                        "args": ["mcp-work"],
+                        "disabledTools": ["work_ledger_record"],
+                    }
+                }
+            },
+            id="record-switched-off-on-the-entry",
+        ),
+    ],
+)
+def test_a_spec_without_the_mounted_granted_ledger_has_none(over: dict) -> None:
+    from kiro_crew.member_mate_tools import spec_has_ledger_tools
+
+    assert not spec_has_ledger_tools(_conductor_spec(**over))
+
+
+def test_a_binding_whose_chat_spec_cannot_be_read_has_no_ledger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kiro_crew import member_mate_tools
+
+    def boom(_b: object) -> dict:
+        raise OSError("unreadable")
+
+    monkeypatch.setattr(member_mate_tools, "_chat_spec", boom)
+    assert member_mate_tools.binding_has_ledger_tools(object()) is False
+    assert member_mate_tools.binding_has_ledger_tools(None) is False
+    assert member_mate_tools.member_has_ledger_tools("no-such-bot") is False
+
+
+def test_the_ledger_preview_fixture_renders_the_patrol_cleanly() -> None:
+    """The operating mode only: the conductor section varies by platform (briefing
+    reads), so the golden beside the fixture is a reading aid, not compared here."""
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-X",
+            "utf8",
+            str(ROOT / "scripts" / "crewmate_prompt_preview.py"),
+            "--fixture",
+            "ledger",
+            "--piece",
+            "operating_mode",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=_PREVIEW_TIMEOUT_SECONDS,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    for mark in (*_PATROL_MARKS, _READ_THE_SKILL):
+        assert mark in proc.stdout, mark
+
+
+def test_how_you_work_tells_the_bot_to_close_a_finished_one_off_worker() -> None:
+    """A Bot opens one worker per task; without a close rule the finished
+    workers pile up in its panel as WAITING. The rule keeps open only a worker
+    that gets the next step of its own task (a standing scanner)."""
+    words = " ".join(crewmate_prompts.text("conductor.how_you_work").split())
+    assert "once a one-off worker's report is handled" in words.lower()
+    assert "close it with session_close" in words
+    assert "keep open only a worker that will get the next step of its own task" in words
+    assert "never close a worker that waits on the user" in words.lower()
+    # The report turn names the worker's key, so the Bot can close it directly.
+    assert "{key}" in crewmate_prompts.text("worker_report.session")

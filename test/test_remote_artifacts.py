@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from body_stream_helpers import attach_json_body
+from redaction_structured_cases import github_classic
 
 from kiro_crew import artifacts as art_mod
 from kiro_crew import publish_provider, publish_sync
@@ -41,6 +42,10 @@ from kiro_crew.dashboard.handlers.artifacts import (
     api_remote_artifacts_fork,
 )
 from kiro_crew.publish_provider import Capability, PublishProvider, RemoteComment
+
+# A GitHub token with a valid checksum, which the plan redacts. An AWS key ID
+# stays visible as an identifier, so it cannot show that a value is redacted.
+_SECRET_TOKEN = github_classic(seed=46)
 
 # ── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -683,14 +688,14 @@ class TestRedactRemoteResponse:
     def test_redacts_credential_nested_in_list_within_list(self):
         """The prior walker only redacted strings/dicts inside a TOP-LEVEL list;
         a list nested inside a list silently passed through unredacted."""
-        secret = "AKIAIOSFODNN7EXAMPLE"
+        secret = _SECRET_TOKEN
         data = {"rows": [["safe", [secret, "also-safe"]]]}
         out = art_handlers._redact_remote_response(data)
         assert secret not in json.dumps(out)
         assert out["rows"][0][1][0] == "[REDACTED: credential]"
 
     def test_redacts_credential_in_dict_within_nested_list(self):
-        secret = "AKIAIOSFODNN7EXAMPLE"
+        secret = _SECRET_TOKEN
         data = {"a": [[{"token": secret}]]}
         out = art_handlers._redact_remote_response(data)
         assert secret not in json.dumps(out)
@@ -712,7 +717,7 @@ class TestRedactRemoteResponse:
     def test_already_redacted_keys_are_not_rescanned(self):
         # A key named in ``already_redacted`` is passed through verbatim (the
         # caller already redacted it) — proves the double-pass is skipped.
-        raw = "AKIAIOSFODNN7EXAMPLE"
+        raw = _SECRET_TOKEN
         out = art_handlers._redact_remote_response(
             {"content": raw, "other": raw}, already_redacted=frozenset({"content"})
         )
@@ -862,7 +867,7 @@ class TestIndexByArtifactId:
             "artifacts": [
                 {
                     "external_id": "aB3xY9Qm2LpN8kR5tV7wZ1cD4eF6gH0jS2uI9oP7",
-                    "title": "leak AKIAIOSFODNN7EXAMPLE here",
+                    "title": f"leak {_SECRET_TOKEN} here",
                     "snippet": "",
                 }
             ],
@@ -871,7 +876,7 @@ class TestIndexByArtifactId:
         resp = await api_remote_artifacts_browse(_request(match={"provider": "fakeprov"}))
         row = _json_body(resp)["artifacts"][0]
         assert row["external_id"] == "aB3xY9Qm2LpN8kR5tV7wZ1cD4eF6gH0jS2uI9oP7"
-        assert "AKIAIOSFODNN7EXAMPLE" not in row["title"]
+        assert _SECRET_TOKEN not in row["title"]
 
     @pytest.mark.asyncio
     async def test_browse_redacts_credential_embedded_in_external_id(
@@ -982,16 +987,16 @@ class TestRemoteAuditRedaction:
         sel_stub = self._capture_sel(monkeypatch)
 
         async def _boom(*, scope="mine", page_token=None):
-            raise RuntimeError("upstream 500 for token AKIAIOSFODNN7EXAMPLE")
+            raise RuntimeError(f"upstream 500 for token {_SECRET_TOKEN}")
 
         monkeypatch.setattr(registered_provider, "list_remote", _boom)
         resp = await api_remote_artifacts_browse(_request(match={"provider": "fakeprov"}))
         assert resp.status == 502
         # Both the response AND the persisted audit error are redacted.
-        assert "AKIAIOSFODNN7EXAMPLE" not in _json_body(resp)["error"]
+        assert _SECRET_TOKEN not in _json_body(resp)["error"]
         kwargs = sel_stub.log_tool_invocation.call_args.kwargs
         assert kwargs["outcome"] == "error"
-        assert "AKIAIOSFODNN7EXAMPLE" not in kwargs["error"]
+        assert _SECRET_TOKEN not in kwargs["error"]
 
     @pytest.mark.asyncio
     async def test_clone_error_redacts_credential_in_external_id_metadata(
@@ -1005,14 +1010,14 @@ class TestRemoteAuditRedaction:
             raise RuntimeError("clone failed")
 
         monkeypatch.setattr(publish_sync, "clone_from_remote", _boom)
-        bad_id = "doc-AKIAIOSFODNN7EXAMPLE-tail"
+        bad_id = f"doc-{_SECRET_TOKEN}-tail"
         resp = await api_remote_artifacts_clone(
             _request(match={"provider": "fakeprov"}, body={"external_id": bad_id})
         )
         assert resp.status == 502
         kwargs = sel_stub.log_tool_invocation.call_args.kwargs
         assert kwargs["outcome"] == "error"
-        assert "AKIAIOSFODNN7EXAMPLE" not in json.dumps(kwargs["metadata"])
+        assert _SECRET_TOKEN not in json.dumps(kwargs["metadata"])
 
 
 class TestPullLatestErrorMapping:
@@ -1210,6 +1215,41 @@ class TestRemoteCommentGovernanceGate:
         assert resp.status == 201
         assert comment_provider.writes == ["post"]
         assert gate_open == ["fakeprov"]
+
+
+class TestRemotePostCommentAnchorInts:
+    """A remote anchor's offsets and version reach the provider only as ints."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "ints",
+        [
+            {"start_offset": "0", "end_offset": 4, "version_number": 1},
+            {"start_offset": 0, "end_offset": 4.5, "version_number": 1},
+            {"start_offset": 5, "end_offset": 4, "version_number": 1},
+            {"start_offset": 0, "end_offset": 4, "version_number": True},
+            {"start_offset": 0, "end_offset": 4, "version_number": -3},
+        ],
+    )
+    async def test_bad_anchor_int_400_before_egress(
+        self, patch_restricted, comment_provider, gate_open, ints
+    ):
+        anchor = {"quote": "body", **ints}
+        req = _request(body={"text": "hi", "anchor": anchor}, match=_MATCH)
+        resp = await api_remote_artifact_post_comment(req)
+        assert resp.status == 400
+        assert _json_body(resp)["error"].startswith("anchor.")
+        assert comment_provider.writes == []
+
+    @pytest.mark.asyncio
+    async def test_valid_anchor_ints_reach_provider(
+        self, patch_restricted, comment_provider, gate_open
+    ):
+        anchor = {"quote": "body", "start_offset": 0, "end_offset": 4, "version_number": 1}
+        req = _request(body={"text": "hi", "anchor": anchor}, match=_MATCH)
+        resp = await api_remote_artifact_post_comment(req)
+        assert resp.status == 201
+        assert comment_provider.writes == ["post"]
 
 
 class TestRemoteDenialAudit:

@@ -3,15 +3,22 @@
 from __future__ import annotations
 
 import dataclasses
+from types import SimpleNamespace
 
 import pytest
+from redaction_structured_cases import github_classic
 
 from conftest import CREDENTIAL_STRADDLE_SHAPES, assert_rejected_without_backtracking
 from kiro_crew.messaging.display_safety import canonicalize_display
 from kiro_crew.messaging.renderer import _default_redactor
-from kiro_crew.wecom.client import WECOM_MAX_REPLY_BYTES
+from kiro_crew.wecom.client import WECOM_MAX_REPLY_BYTES, WECOM_SAFE_REPLY_CHARS
 from kiro_crew.wecom.renderer import WeComRenderer, _render_options_as_text
-from kiro_crew.wecom.transport import WECOM_CAPABILITIES
+from kiro_crew.wecom.transport import WECOM_CAPABILITIES, WeComTransport
+
+# The split credential is a synthetic GitHub token the plan redacts by its
+# structure; neither half is a credential alone.
+_KEY = github_classic(seed=1)
+_KEY_HEAD, _KEY_TAIL = _KEY[:8], _KEY[8:]
 
 # The PEM markers are ASSEMBLED from fragments, never written as one literal, so
 # the internal content scan (rule ``credential-private-key``, which matches a
@@ -257,11 +264,11 @@ class TestThinkReasoningRedaction:
         await r.on_turn_start()
         c.frames.clear()
         r._last_send = 0.0  # clear the throttle so the reasoning frame goes out
-        await r.on_thinking("leaking AKIAIOSF**ODNN7EXAMPLE** in the trace")
+        await r.on_thinking(f"leaking {_KEY_HEAD}**{_KEY_TAIL}** in the trace")
 
         think = "".join(f["content"] for f in c.frames)
         assert "<think>" in think, f"no reasoning frame was sent: {c.frames}"
-        assert "AKIAIOSFODNN7EXAMPLE" not in canonicalize_display(think)
+        assert _KEY not in canonicalize_display(think)
 
     @pytest.mark.asyncio
     async def test_think_reasoning_keeps_clean_text(self) -> None:
@@ -294,11 +301,11 @@ class TestAnswerBodyRedaction:
 
         c = FakeClient()
         r = _renderer(c)
-        await r.on_text_chunk("the key is AKIAIOSF**ODNN7EXAMPLE** ok")
+        await r.on_text_chunk(f"the key is {_KEY_HEAD}**{_KEY_TAIL}** ok")
         await r.on_done()
 
         final = c.frames[-1]["content"]
-        assert "AKIAIOSFODNN7EXAMPLE" not in canonicalize_display(final)
+        assert _KEY not in canonicalize_display(final)
 
     def test_text_stays_raw_for_persistence(self) -> None:
         # text() is what drive_turn persists; the redaction lives only on the
@@ -454,12 +461,12 @@ class TestTheCapCutsWhereTheReaderCannotRejoin:
     async def test_a_link_split_key_does_not_cross_two_bubbles(self) -> None:
         # The acceptance case: a Markdown link whose target carries a comma, which a
         # hand-written character class does not reach.
-        head, tail = "[AKIA](https://ex.test/a,b)", "IOSFODNN7EXAMPLE"
+        head, tail = f"[{_KEY_HEAD}](https://ex.test/a,b)", _KEY_TAIL
         c = await _stream_across_a_rotation(_answer_whose_cap_lands_between(head, tail))
 
         on_screen, in_a_copy = _reader_views(c)
-        assert "AKIAIOSFODNN7EXAMPLE" not in on_screen
-        assert "AKIAIOSFODNN7EXAMPLE" not in in_a_copy
+        assert _KEY not in on_screen
+        assert _KEY not in in_a_copy
         _assert_nothing_reached_the_reader(c)
 
     @pytest.mark.parametrize(("head", "tail"), CREDENTIAL_STRADDLE_SHAPES)
@@ -599,12 +606,12 @@ class TestACredentialCannotStraddleTheRotationSeam:
         # The acceptance case, at the seam: a Markdown link whose target carries a
         # comma — the shape no hand-written character class reached across six review
         # rounds — with its completion in the bubble AFTER the seal.
-        head, tail = "[AKIA](https://ex.test/a,b)", "IOSFODNN7EXAMPLE"
+        head, tail = f"[{_KEY_HEAD}](https://ex.test/a,b)", _KEY_TAIL
         c = await _stream_across_a_seam(head, tail)
 
         on_screen, in_a_copy = _reader_views(c)
-        assert "AKIAIOSFODNN7EXAMPLE" not in on_screen
-        assert "AKIAIOSFODNN7EXAMPLE" not in in_a_copy
+        assert _KEY not in on_screen
+        assert _KEY not in in_a_copy
         _assert_nothing_reached_the_reader(c)
 
     @pytest.mark.parametrize(("head", "tail"), CREDENTIAL_STRADDLE_SHAPES)
@@ -626,7 +633,7 @@ class TestACredentialCannotStraddleTheRotationSeam:
         # continuation: a blanket drop would lose legitimate answer text and turn a
         # security guard into data loss (the failure mode the conductor decision
         # rejected — visible dup beats silent loss, and here we do neither).
-        head, tail = "AKIAIOSF", "ODNN7EXAMPLE"
+        head, tail = _KEY_HEAD, _KEY_TAIL
         marker_word = "afterwardsuniquetoken"
         c = FakeClient()
         r = _capped_renderer(c)
@@ -640,7 +647,7 @@ class TestACredentialCannotStraddleTheRotationSeam:
         await r.close()
 
         on_screen, _copy = _reader_views(c)
-        assert "AKIAIOSFODNN7EXAMPLE" not in on_screen, "the key must not survive the seam"
+        assert _KEY not in on_screen, "the key must not survive the seam"
         delivered = "".join(f["content"] for f in c.frames) + "".join(p[1] for p in c.pushed)
         assert marker_word in delivered, "trailing prose past the completion was dropped"
         _assert_nothing_reached_the_reader(c)
@@ -679,13 +686,13 @@ class TestACredentialCannotStraddleTheRotationSeam:
         # credential-bearing label far back in the seam, so a windowed grade would
         # scan a span the key's start was never inside and pass vacuously. Grading
         # the WHOLE delivered seam closes it.
-        head = "[AKIA](https://ex.test/" + "a" * 600 + ",b)"
-        tail = "IOSFODNN7EXAMPLE"
+        head = f"[{_KEY_HEAD}](https://ex.test/" + "a" * 600 + ",b)"
+        tail = _KEY_TAIL
         c = await _stream_across_a_seam(head, tail, cap=700)
 
         on_screen, in_a_copy = _reader_views(c)
-        assert "AKIAIOSFODNN7EXAMPLE" not in on_screen
-        assert "AKIAIOSFODNN7EXAMPLE" not in in_a_copy
+        assert _KEY not in on_screen
+        assert _KEY not in in_a_copy
         _assert_nothing_reached_the_reader(c)
 
     @pytest.mark.asyncio
@@ -702,12 +709,12 @@ class TestACredentialCannotStraddleTheRotationSeam:
         c = FakeClient()
         r = _capped_renderer(c, cap=200)
         await r.on_turn_start()
-        await r.on_thinking("thinking, the key is AKIAIOSF")
+        await r.on_thinking(f"thinking, the key is {_KEY_HEAD}")
         await r._push(force=True)
         # The bubble ages past the stream lifetime with its reasoning ACCEPTED and
         # displayed (not refused): the next push rolls to a fresh bubble.
         r._stream_opened_at = _time.monotonic() - 10_000
-        await r.on_text_chunk("ODNN7EXAMPLE completes it, then more prose")
+        await r.on_text_chunk(f"{_KEY_TAIL} completes it, then more prose")
         await r._push(force=True)
         await r.on_done()
         await r.close()
@@ -725,7 +732,7 @@ class TestACredentialCannotStraddleTheRotationSeam:
             "".join(canonicalize_display(b) for b in _seen(c)),
             canonicalize_display("".join(_seen(c))),
         ):
-            assert "AKIAIOSFODNN7EXAMPLE" not in reading
+            assert _KEY not in reading
             assert _default_redactor(reading) == reading, "the key rejoined on screen"
 
     @pytest.mark.asyncio
@@ -741,21 +748,21 @@ class TestACredentialCannotStraddleTheRotationSeam:
         c = FakeClient()
         r = _capped_renderer(c, cap=200)
         await r.on_turn_start()
-        await r.on_thinking("reasoning, the key is AKIAIOSF")
+        await r.on_thinking(f"reasoning, the key is {_KEY_HEAD}")
         await r._push(force=True)
         await r.on_thinking(" and some more reasoning after it")
         await r._push(force=True)
         # Both reasoning frames are candidates the fresh bubble is graded against —
         # the prefix-ending one is NOT dropped.
         assert any(
-            "AKIAIOSF" in s and s.endswith("AKIAIOSF") for s in r._shown_reasonings
+            _KEY_HEAD in s and s.endswith(_KEY_HEAD) for s in r._shown_reasonings
         ), "the credential-prefix reasoning frame is retained as a candidate"
         # The bubble ages out (reasoning displayed, no answer yet); the answer opens
         # with the completion and rolls to a fresh bubble.
         import time as _time
 
         r._stream_opened_at = _time.monotonic() - 10_000
-        await r.on_text_chunk("ODNN7EXAMPLE and then ordinary prose")
+        await r.on_text_chunk(f"{_KEY_TAIL} and then ordinary prose")
         await r._push(force=True)
 
         answer_frames = [f["content"] for f in c.frames if f["stream_id"] == r._stream_id]
@@ -763,10 +770,10 @@ class TestACredentialCannotStraddleTheRotationSeam:
         # Whichever reasoning the reader sees, the answer head is redacted so no
         # candidate rejoins the key.
         for candidate in (
-            "reasoning, the key is AKIAIOSF",
-            "reasoning, the key is AKIAIOSF and some more reasoning after it",
+            f"reasoning, the key is {_KEY_HEAD}",
+            f"reasoning, the key is {_KEY_HEAD} and some more reasoning after it",
         ):
-            assert "AKIAIOSFODNN7EXAMPLE" not in canonicalize_display(
+            assert _KEY not in canonicalize_display(
                 candidate + answer_frames[-1]
             ), "the key rejoined across the reasoning seam"
 
@@ -990,10 +997,10 @@ class TestACredentialCannotStraddleTheRotationSeam:
         # The verbatim grade still catches a GENUINE split: `AKIAIOSF` directly
         # abutting `ODNN7EXAMPLE` with no separator forms the key on screen and must
         # be redacted.
-        c = await _stream_across_a_seam("AKIAIOSF", "ODNN7EXAMPLE")
+        c = await _stream_across_a_seam(_KEY_HEAD, _KEY_TAIL)
         on_screen, in_a_copy = _reader_views(c)
-        assert "AKIAIOSFODNN7EXAMPLE" not in on_screen
-        assert "AKIAIOSFODNN7EXAMPLE" not in in_a_copy
+        assert _KEY not in on_screen
+        assert _KEY not in in_a_copy
         _assert_nothing_reached_the_reader(c)
 
     @pytest.mark.asyncio
@@ -1020,3 +1027,105 @@ class TestACredentialCannotStraddleTheRotationSeam:
         assert any(
             "省略" in d and "推理" in d for d in delivered
         ), "the reasoning-overflow notice was not announced"
+
+
+class TestInlineImages:
+    @pytest.mark.asyncio
+    async def test_a_picture_that_fails_to_send_puts_its_path_back(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        # Extraction already cut the reference out of the answer, so a refused
+        # send must bring the path back rather than leave the reader with neither.
+        monkeypatch.setattr("kiro_crew.wecom.renderer._STREAM_THROTTLE_S", 0.0)
+        chart = tmp_path / "chart.png"
+        chart.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
+        c = FakeClient()
+
+        async def refuse(conversation_id, document):
+            return None
+
+        r = WeComRenderer(
+            c,
+            "rq1",
+            "https://resp.url",
+            WECOM_CAPABILITIES,
+            chat_id="Wei",
+            send_document=refuse,
+            send_message=WeComTransport(c, allowed_users=["Wei"]).send_message,
+        )
+        r.authorize_upload_root(str(tmp_path))
+        await r.on_turn_start()
+        await r.on_text_chunk(f"![chart]({chart})")
+        await r.on_done()
+        await r.close()
+
+        assert c.frames[-1]["content"] == "…"  # a picture-only reply still seals
+        assert c.pushed == [("Wei", f"⚠️ 以下图片未能发送，文件仍在本机：\n- `{chart}`")]
+
+    @pytest.mark.asyncio
+    async def test_a_picture_follows_the_whole_answer_including_its_overflow(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        # The tail of a long answer is released from close(); a picture sent before
+        # it would land between two chunks of one answer.
+        monkeypatch.setattr("kiro_crew.wecom.renderer._STREAM_THROTTLE_S", 0.0)
+        chart = tmp_path / "chart.png"
+        chart.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
+        c = FakeClient()
+
+        async def send_document(conversation_id, document):
+            c.pushed.append((conversation_id, f"<picture {document.path}>"))
+            return "mid-1"
+
+        r = WeComRenderer(
+            c,
+            "rq1",
+            "https://resp.url",
+            WECOM_CAPABILITIES,
+            chat_id="Wei",
+            send_document=send_document,
+            send_message=WeComTransport(c, allowed_users=["Wei"]).send_message,
+        )
+        r.authorize_upload_root(str(tmp_path))
+        await r.on_turn_start()
+        await r.on_text_chunk(f"![chart]({chart})\n\n" + "word " * WECOM_SAFE_REPLY_CHARS)
+        await r.on_done()
+        await r.close()
+
+        *tail, last = c.pushed
+        assert tail and all("<picture" not in content for _, content in tail)
+        assert last == ("Wei", "<picture chart.png>")
+
+    @pytest.mark.asyncio
+    async def test_a_recipient_removed_during_the_upload_is_not_sent_the_paths(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        # The failure report goes through the transport's authorized push, so a
+        # userid taken off the allow-list mid-upload gets neither the picture nor
+        # a message naming its local path.
+        monkeypatch.setattr("kiro_crew.wecom.renderer._STREAM_THROTTLE_S", 0.0)
+        chart = tmp_path / "chart.png"
+        chart.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
+        c = FakeClient()
+        transport = WeComTransport(c, allowed_users=["Wei"])
+
+        async def revoked_during_upload(conversation_id, document):
+            transport.reconfigure(SimpleNamespace(allowed_users=[]))
+            return None
+
+        r = WeComRenderer(
+            c,
+            "rq1",
+            "https://resp.url",
+            WECOM_CAPABILITIES,
+            chat_id="Wei",
+            send_document=revoked_during_upload,
+            send_message=transport.send_message,
+        )
+        r.authorize_upload_root(str(tmp_path))
+        await r.on_turn_start()
+        await r.on_text_chunk(f"![chart]({chart})")
+        await r.on_done()
+        await r.close()
+
+        assert c.pushed == []

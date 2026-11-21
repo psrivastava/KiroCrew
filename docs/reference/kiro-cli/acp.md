@@ -7,7 +7,7 @@ Source: https://kiro.dev/docs/cli/acp/ (fetched 2026-09-06)
 > `_kiro.dev/mcp/server_init_failure` and `_kiro.dev/agent/switched` rows have no
 > counterpart in upstream's method table; they are measured here and describe Kiro
 > Crew's claude-agent-acp path. A re-fetch must preserve them. Upstream's own
-> table now carries `_session/terminate`, so that row is no longer local-only.
+> table carries `_session/terminate`, so that row is mirrored, not local.
 > Two wire names are corrected locally against what Kiro Crew sends and reads:
 > session updates arrive as the `session/update` notification, and
 > `session/prompt` carries its content blocks in `params.prompt`.
@@ -230,6 +230,7 @@ Sending the wrong shape yields `-32602 Invalid params` or `-32601 Method not fou
 |----------|----------|
 | macOS | `$TMPDIR/kiro-log/kiro-chat.log` |
 | Linux | `$XDG_RUNTIME_DIR/kiro-log/kiro-chat.log` |
+| Windows | `%TEMP%\kiro-log\logs\kiro-chat.log` |
 
 These defaults name ONE file per machine. A process that starts while that
 file is over 10 MiB unlinks it, and every running process keeps writing into
@@ -241,7 +242,9 @@ land beside it). The directory is reclaimed with the process by the scratch
 sweep, and the gateway rotates any of the three logs that outgrows 64 MiB in
 place every five minutes (the newest 8 MiB is kept as `<name>.1`), so a
 session left at `KIRO_LOG_LEVEL=debug` cannot fill the disk. On Windows the
-cap cannot run, so the pin is not set and kiro-cli keeps its default location.
+cap cannot run, so the pin is not set and kiro-cli keeps its default location,
+which inside a spawned process is `<scratch dir>\kiro-log\logs\`. The
+diagnostics bundle probes both the flat and the `logs` level.
 See `agent_scratch.cap_kiro_cli_logs`.
 
 ```bash

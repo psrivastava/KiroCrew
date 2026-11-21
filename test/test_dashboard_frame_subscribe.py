@@ -20,14 +20,23 @@ has to prove first that it can see one.
 from __future__ import annotations
 
 import json
+import os
+import queue
 import shutil
+import signal
 import subprocess
+import sys
+import threading
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from kiro_crew import dashboard_frame
+from kiro_crew.testing.wait import default_timeout
+
+# One ``node`` serves every case in this module, so the module stays on one worker.
+pytestmark = pytest.mark.xdist_group(name="node_child_frame_subscribe")
 
 #: The DOM the bootstrap actually touches, and nothing else.
 #:
@@ -70,6 +79,108 @@ def _island(read: dict[str, Any]) -> str:
     return json.dumps(read, ensure_ascii=False)
 
 
+#: Runs each case in a NEW ``vm`` context, so every case starts from empty globals as it
+#: did in its own process. ``"use strict"`` keeps the strict-mode semantics the module
+#: entry point gave. Only ``console`` is handed in; any other host global the bootstrap
+#: reaches is a ReferenceError, so a case cannot quietly depend on one.
+_DRIVER = r"""
+const vm = require('node:vm');
+const rl = require('node:readline').createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const req = JSON.parse(line);
+  const out = [];
+  const context = vm.createContext({ console: { log: (...a) => out.push(a.join(' ')) } });
+  let reply;
+  try {
+    vm.runInContext('"use strict";\n' + req.program, context, { timeout: req.timeout_ms });
+    reply = { id: req.id, ok: true, out };
+  } catch (err) {
+    reply = { id: req.id, ok: false, err: String((err && err.stack) || err), out };
+  }
+  process.stdout.write(JSON.stringify(reply) + '\n');
+});
+"""
+
+
+class _NodeChild:
+    """One ``node`` for the whole module; it keeps no state between cases."""
+
+    def __init__(self, node: str) -> None:
+        self._node = node
+        self._next_id = 0
+        self._start()
+
+    def _start(self) -> None:
+        kwargs: dict[str, Any] = {}
+        if sys.platform == "win32":
+            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            kwargs["start_new_session"] = True
+        self._proc = subprocess.Popen(
+            [self._node, "-e", _DRIVER],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            **kwargs,
+        )
+        self._lines: queue.Queue[str] = queue.Queue()
+        stdout = self._proc.stdout
+        threading.Thread(target=lambda: [self._lines.put(x) for x in stdout], daemon=True).start()
+
+    def run(self, program: str) -> list[Any]:
+        # Lost-run ceiling: half the test's timeout (``default_timeout``), so a hung case
+        # fails here by name. A case takes ~0.03 s once node is warm on a dev host.
+        ceiling = default_timeout()
+        self._next_id += 1
+        req = {"id": self._next_id, "program": program, "timeout_ms": int(ceiling * 500)}
+        assert self._proc.stdin is not None
+        self._proc.stdin.write(json.dumps(req) + "\n")
+        self._proc.stdin.flush()
+        try:
+            reply = json.loads(self._lines.get(timeout=ceiling))
+        except queue.Empty:
+            self.close()
+            self._start()  # the next case gets a child with no stale reply queued
+            raise AssertionError(f"node gave no verdict within {ceiling}s") from None
+        assert reply["id"] == self._next_id, reply
+        assert reply["ok"], reply["err"]
+        return list(json.loads(reply["out"][-1]))
+
+    def close(self) -> None:
+        proc = self._proc
+        try:
+            if proc.stdin is not None:
+                proc.stdin.close()
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            if sys.platform == "win32":
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True)
+            else:
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=10)
+
+
+_CHILD: _NodeChild | None = None
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _node_child():
+    """Start the module's one ``node`` and always reap it."""
+    global _CHILD
+    node = shutil.which("node")
+    if node is None:  # pragma: no cover - CI builds the website, so node is present
+        yield
+        return
+    _CHILD = _NodeChild(node)
+    try:
+        yield
+    finally:
+        _CHILD.close()
+        _CHILD = None
+
+
 def _run(bootstrap: str, read: dict[str, Any], page_js: str) -> list[Any]:
     """Run *bootstrap* then *page_js* over *read*; return what the page recorded.
 
@@ -77,8 +188,7 @@ def _run(bootstrap: str, read: dict[str, Any], page_js: str) -> list[Any]:
     and it pushes onto ``__calls``, so the assertion is about what the PAGE observed
     rather than about the bootstrap's internals.
     """
-    node = shutil.which("node")
-    if node is None:  # pragma: no cover - CI builds the website, so node is present
+    if _CHILD is None:  # pragma: no cover - CI builds the website, so node is present
         pytest.skip("node is needed to execute the frame bootstrap")
     program = "\n".join(
         (
@@ -90,15 +200,7 @@ def _run(bootstrap: str, read: dict[str, Any], page_js: str) -> list[Any]:
             "console.log(JSON.stringify(globalThis.__calls));",
         )
     )
-    done = subprocess.run(
-        [node, "--input-type=module", "-e", program],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        timeout=60,
-    )
-    assert done.returncode == 0, done.stderr
-    return list(json.loads(done.stdout.strip().splitlines()[-1]))
+    return _CHILD.run(program)
 
 
 def _read(**over: Any) -> dict[str, Any]:
@@ -119,11 +221,8 @@ class TestSubscribeOnFirstLoad:
     def test_a_subscriber_is_called_with_the_value_the_island_carries(self) -> None:
         """FIRST LOAD, before any push.
 
-        A page's inline script runs during parse, which is before the host has filled a
-        single binding -- so a subscriber that only fired on a push would draw nothing on
-        first paint and the reader would see an empty page over a log that has the
-        numbers in it. Firing at subscribe time is what makes the callback the page's one
-        entry point instead of a thing it needs a binding beside.
+        The inline script runs during parse, before any binding is filled, so a
+        subscriber fired only on a push would leave the first paint empty.
         """
         calls = _run(
             dashboard_frame._BOOTSTRAP_JS,
@@ -212,6 +311,44 @@ class TestSubscribeOnEveryPush:
         )
         assert calls == [2]
 
+    def test_a_subscriber_added_during_a_push_hears_that_push_once(self) -> None:
+        """Delivery walks a COPY of the subscriber list, so a callback that subscribes
+        mid-push does not also reach the newcomer from the same loop.
+
+        The newcomer already heard the push from its own first-load call. A field the
+        push names missing is told on every delivery (there is no "unmoved" check for
+        it), so a loop over the live list would tell the newcomer twice.
+        """
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(),
+            "globalThis.__pushing = false;"
+            "window.kirocrew.subscribe('owner', () => {"
+            "  if (!__pushing || globalThis.__added) return;"
+            "  globalThis.__added = true;"
+            "  window.kirocrew.subscribe('boards', (v, _n, meta) => __calls.push([v, meta.missing]));"
+            "});"
+            "__pushing = true;"
+            "__push({ fields: { owner: 'nyx', boards: 2 }, agentic: [], seq: 2, stale: false,"
+            "         missing: ['boards'] });",
+        )
+        assert calls == [[2, True]]
+
+    def test_a_non_string_name_registers_nothing(self) -> None:
+        """``subscribe`` with a name that is not a string is refused: no callback, and
+        the page does not count as one a refill reaches.
+
+        JavaScript reads ``fields[5]`` as ``fields['5']``, so without the type check a
+        numeric name would quietly bind to a field of that spelling.
+        """
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(fields={"boards": 2, "5": 1}),
+            "const off = window.kirocrew.subscribe(5, (v) => __calls.push(v));"
+            f"__calls.push(typeof off, window[{json.dumps(dashboard_frame._REFILL_FLAG)}] === true);",
+        )
+        assert calls == ["function", False]
+
     def test_a_push_from_another_frame_calls_nothing_back(self) -> None:
         """The sender check the refill already applies, asserted through the new path.
 
@@ -236,14 +373,10 @@ class TestSubscribeOnEveryPush:
 
 class TestTheBindingsStayTextOnly:
     def test_a_subscribed_value_is_never_written_as_markup(self) -> None:
-        """The one containment rule of this module, re-asserted for the field that now
-        also reaches a callback: a value can be drawn by the page's own script, and the
-        HOST still only ever writes it as a text node.
+        """The host still writes a subscribed value only as a text node.
 
-        ``subscribe`` hands the page a string and what the page does with it is the
-        page's business. What must not change is the host's half -- so the bootstrap
-        carries no ``innerHTML``, no ``insertAdjacentHTML`` and no ``outerHTML``, in the
-        fill path or in the delivery path.
+        The bootstrap carries no ``innerHTML``, ``insertAdjacentHTML`` or ``outerHTML``,
+        in the fill path or the delivery path.
         """
         js = dashboard_frame._BOOTSTRAP_JS
         assert "textContent = text(" in js, "the host no longer fills bindings as text"
@@ -306,13 +439,10 @@ def _posted(bootstrap: str, read: dict[str, Any], page_js: str) -> list[Any]:
 
 
 class TestAPatchCarriesOnlyWhatMoved:
-    """The controller pushes the fields that changed and nothing else, which makes the
-    frame responsible for the half a partial push cannot carry.
+    """A push carries only the changed fields, so the frame merges it into the rest.
 
-    Without a merge here, a push of one field would leave ``window.kirocrew.fields``
-    holding that field alone -- so a chart reading a second field would find
-    ``undefined`` and the host's own fill would mark every other cell missing. A page
-    would then go blank one field at a time, each push, with no state saying why.
+    Without the merge ``window.kirocrew.fields`` would hold that one field and every
+    other cell would read missing.
     """
 
     def test_a_patch_keeps_the_fields_it_does_not_carry(self) -> None:
@@ -436,14 +566,10 @@ class TestAVersionGapRefetches:
 
 
 class TestAnOlderFullReadCannotReplaceANewerOne:
-    """Two gaps can be in flight at once, and their answers can arrive in either order.
+    """Two gap reads can answer in either order; the older must not replace the newer.
 
-    A full read REPLACES, so the older answer puts back every value the newer one
-    already moved past -- and it reports `stale: false` while doing it, so the page
-    presents a number from the past as the current one with nothing saying otherwise.
-    The version alone cannot decide it: an armed page's counter starts again in the
-    next one, so a lower number from a re-armed page is NEWER. The generation says
-    which counter a number belongs to.
+    The version alone cannot decide: a re-armed page restarts its counter, so a lower
+    number can be newer. The generation says which counter a number belongs to.
     """
 
     def test_a_reply_that_arrived_late_is_dropped(self) -> None:
@@ -659,3 +785,336 @@ def test_a_field_named_constructor_is_not_dimmed_while_it_resolves() -> None:
         "__calls.push([cell.textContent, cell.attrs['data-dashboard-missing'] || null]);",
     )
     assert calls == [["7", None]], calls
+
+
+#: A page script recording what each callback was told: value, and the meta flags.
+_RECORD = (
+    "window.kirocrew.subscribe('boards', (v, n, m) =>"
+    "  __calls.push([v, m.missing, Object.keys(m).length]));"
+)
+
+
+class TestASubscriberIsToldAFieldStoppedResolving:
+    """A field named in ``missing`` reaches its subscriber, flagged, with the value the
+    page already drew. Before this a chart drawn from a subscriber froze on the old
+    value at full strength while the bound cells beside it dimmed."""
+
+    def test_present_then_missing_then_present_on_full_reads(self) -> None:
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(),
+            _RECORD
+            + "__push({ fields: { owner: 'atlas' }, agentic: [], seq: 2, missing: ['boards'],"
+            "         version: 1 });"
+            "__push({ fields: { boards: 5 }, agentic: [], seq: 3, missing: [], version: 2 });",
+        )
+        assert calls == [[2, False, 1], [2, True, 1], [5, False, 1]]
+
+    def test_a_two_argument_callback_still_gets_values_only(self) -> None:
+        """An existing page that reads ``cb(value, name)`` redraws what it had: the
+        value it is handed while missing is the one it already drew, never a new one."""
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(),
+            "window.kirocrew.subscribe('boards', (v, n) => __calls.push([v, n]));"
+            "__push({ fields: {}, agentic: [], seq: 2, missing: ['boards'], version: 1 });",
+        )
+        assert calls == [[2, "boards"], [2, "boards"]]
+
+    def test_zero_is_a_value_present_and_missing(self) -> None:
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(fields={"boards": 0}),
+            _RECORD
+            + "__push({ fields: {}, agentic: [], seq: 2, missing: ['boards'], version: 1 });",
+        )
+        assert calls == [[0, False, 1], [0, True, 1]]
+
+    def test_a_patch_naming_it_missing_tells_once_and_its_recovery_is_told(self) -> None:
+        """A patch that names the field missing tells the subscriber; a second patch
+        still naming it does not repeat; a patch that drops it from ``missing`` without
+        carrying it (resolved again, unmoved) tells it with the merged value."""
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(),
+            _RECORD + "__push({ patch: true, version: 1, fields: {}, missing: ['boards'] });"
+            "__push({ patch: true, version: 2, fields: { owner: 'nyx' }, missing: ['boards'] });"
+            "__push({ patch: true, version: 3, fields: {}, missing: [] });"
+            "__push({ patch: true, version: 4, fields: {}, missing: [] });",
+        )
+        assert calls == [[2, False, 1], [2, True, 1], [2, False, 1]]
+
+    def test_a_read_carrying_an_older_value_it_names_missing_flags_it(self) -> None:
+        """``missing`` wins over presence, exactly as the fill reads it."""
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(fields={"boards": 4}, missing=["boards"]),
+            _RECORD,
+        )
+        assert calls == [[4, True, 1]]
+
+    def test_an_agentic_field_going_missing_is_told(self) -> None:
+        """``meta`` carries only ``missing``; the agentic marks stay on the global."""
+        stamp = "2026-10-30T12:00:00Z"
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(agentic=["boards"], written_at={"boards": stamp}),
+            _RECORD + "__push({ fields: {}, agentic: ['boards'], seq: 2, missing: ['boards'],"
+            f"         written_at: {{ boards: '{stamp}' }}, version: 1 }});",
+        )
+        assert calls == [[2, False, 1], [2, True, 1]]
+
+    def test_a_field_the_page_never_held_stays_silent_when_named_missing(self) -> None:
+        """No older value exists to mark, and ``undefined`` is not a value."""
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(fields={"owner": "atlas"}, missing=["boards"]),
+            _RECORD
+            + "__push({ fields: {}, agentic: [], seq: 2, missing: ['boards'], version: 1 });",
+        )
+        assert calls == []
+
+
+def _cell_js(name: str) -> str:
+    return (
+        "const cell = { attrs: {}, textContent: 'old',"
+        f"  getAttribute(k) {{ return k === 'data-dashboard-field' ? '{name}' : this.attrs[k]; }},"
+        "  setAttribute(k, v) { this.attrs[k] = v; }, removeAttribute(k) { delete this.attrs[k]; } };"
+        "nodes.push(cell);"
+    )
+
+
+_CELL_STATE = (
+    "__calls.push([cell.textContent, cell.attrs['data-dashboard-missing'] || null,"
+    "  cell.attrs['data-dashboard-missing-label'] || null]);"
+)
+
+
+class TestAMissingCellSaysSo:
+    """Dimming alone read as a real number. A missing cell carries a label the host CSS
+    draws after the value, in the reader's language, and keeps the value it showed."""
+
+    def test_the_label_is_set_while_missing_and_cleared_on_recovery(self) -> None:
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(),
+            _cell_js("boards")
+            + "__push({ fields: { boards: 3 }, agentic: [], seq: 2, missing: [], version: 1 });"
+            + _CELL_STATE
+            + "__push({ fields: {}, agentic: [], seq: 3, missing: ['boards'], version: 2 });"
+            + _CELL_STATE
+            + "__push({ fields: { boards: 0 }, agentic: [], seq: 4, missing: [], version: 3 });"
+            + _CELL_STATE,
+        )
+        assert calls == [
+            ["3", None, None],
+            ["3", "true", "not current"],
+            ["0", None, None],
+        ]
+
+    def test_the_label_is_in_the_readers_language(self) -> None:
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(),
+            _cell_js("boards")
+            + "__push({ fields: {}, agentic: [], seq: 2, missing: ['boards'], version: 1,"
+            "         locale: 'zh-CN' });" + _CELL_STATE,
+        )
+        assert calls == [["old", "true", dashboard_frame._MISSING_LABELS["zh-CN"]]]
+
+    def test_every_shipped_catalog_has_a_label(self) -> None:
+        from kiro_crew.context_assembly.output_contract import _UI_LANGUAGE_CATALOGS
+
+        assert set(dashboard_frame._MISSING_LABELS) == set(_UI_LANGUAGE_CATALOGS)
+        assert all(label.strip() for label in dashboard_frame._MISSING_LABELS.values())
+
+    def test_the_host_css_draws_the_label(self) -> None:
+        css = dashboard_frame._HOST_CSS
+        assert "[data-dashboard-missing='true']::after" in css
+        assert "attr(data-dashboard-missing-label)" in css
+
+
+#: A page script counting the page-wide event.
+_COUNT_EVENTS = (
+    "globalThis.__events = 0;"
+    "addEventListener('kirocrew-dashboard', () => { globalThis.__events += 1; });"
+)
+_EVENTS = "__calls.push(globalThis.__events);"
+
+
+def _push(**over: Any) -> str:
+    """A full read in the shape the host posts, as a page-script push."""
+    return f"__push({json.dumps(_read(**over))});"
+
+
+class TestAnUnchangedReadRedrawsNothing:
+    """A read whose values did not move must not redraw the page.
+
+    The tab re-reads the whole page on every fold advance, on a reconnect and on the
+    60 s fallback, so most reads carry exactly what the page already shows. Firing
+    every subscriber and the page event for them made each one redraw the whole page,
+    which a reader sees as the page reloading.
+    """
+
+    def test_a_full_read_with_the_same_values_calls_no_subscriber(self) -> None:
+        calls = _run(dashboard_frame._BOOTSTRAP_JS, _read(), _RECORD + _push(version=1))
+        assert calls == [[2, False, 1]]
+
+    def test_a_full_read_with_the_same_values_fires_no_page_event(self) -> None:
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS, _read(), _COUNT_EVENTS + _push(version=1) + _EVENTS
+        )
+        assert calls == [0]
+
+    def test_a_full_read_with_the_same_values_does_not_rewrite_a_cell(self) -> None:
+        """A page that writes its own text over a bound cell keeps it."""
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(),
+            _cell_js("boards") + "cell.textContent = 'page text';" + _push(version=1) + _CELL_STATE,
+        )
+        assert calls == [["page text", None, None]]
+
+    def test_a_patch_repeating_a_held_value_calls_no_subscriber(self) -> None:
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(),
+            _RECORD + "__push({ patch: true, version: 1, fields: { boards: 2 }, missing: [] });",
+        )
+        assert calls == [[2, False, 1]]
+
+    def test_an_equal_read_with_fields_in_a_new_order_is_unchanged(self) -> None:
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(fields={"boards": [1, 2], "owner": "atlas"}),
+            _COUNT_EVENTS + _push(fields={"owner": "atlas", "boards": [1, 2]}, version=1) + _EVENTS,
+        )
+        assert calls == [0]
+
+    def test_a_changed_field_still_calls_back_and_fires_the_event_once(self) -> None:
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(),
+            _COUNT_EVENTS + "window.kirocrew.subscribe('owner', (v) => __calls.push(['owner', v]));"
+            "window.kirocrew.subscribe('boards', (v) => __calls.push(['boards', v]));"
+            + _push(fields={"boards": 3, "owner": "atlas"}, version=1)
+            + _EVENTS,
+        )
+        assert calls == [["owner", "atlas"], ["boards", 2], ["boards", 3], 1]
+
+    def test_a_changed_read_key_outside_fields_still_fires_the_event(self) -> None:
+        """A page may draw any key of the read, such as ``last_user_at``."""
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(),
+            _COUNT_EVENTS + _push(version=1, last_user_at="2026-11-01T00:00:00Z") + _EVENTS,
+        )
+        assert calls == [1]
+
+    def test_an_equal_full_read_after_a_patch_redraws_nothing(self) -> None:
+        """A patch keeps the read's ``subject`` and ``last_user_at``, so the full read
+        that repeats it is not taken for a change."""
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(last_user_at="2026-11-01T00:00:00Z"),
+            _COUNT_EVENTS
+            + "__push({ patch: true, version: 1, fields: { boards: 3 }, missing: [] });"
+            + _push(
+                version=2,
+                fields={"boards": 3, "owner": "atlas"},
+                last_user_at="2026-11-01T00:00:00Z",
+            )
+            + "__calls.push(window.kirocrew.last_user_at);"
+            + _EVENTS,
+        )
+        assert calls == ["2026-11-01T00:00:00Z", 1]
+
+    def test_a_host_shaped_patch_keeps_the_held_subject_and_stamp(self) -> None:
+        """The host's patch carries the builder's defaults for ``subject`` and
+        ``last_user_at``; the page keeps its own, and the equal full read after it
+        redraws nothing."""
+        stamp = "2026-11-01T00:00:00Z"
+        patch = _read(fields={"boards": 3}, version=1)
+        patch["patch"] = True
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(subject="session", last_user_at=stamp),
+            _COUNT_EVENTS
+            + f"__push({json.dumps(patch)});"
+            + "__calls.push(window.kirocrew.subject, window.kirocrew.last_user_at);"
+            + _push(
+                version=2,
+                fields={"boards": 3, "owner": "atlas"},
+                subject="session",
+                last_user_at=stamp,
+            )
+            + _EVENTS,
+        )
+        assert patch["subject"] == "crewmate" and patch["last_user_at"] == ""
+        assert calls == ["session", stamp, 1]
+
+    def test_an_unchanged_read_a_minute_later_still_fires_the_event_only(self) -> None:
+        """A page drawing "idle for 20 min" from the clock redraws on the event, so an
+        unchanged read still fires it once a minute, without refill or callbacks."""
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(),
+            _COUNT_EVENTS + _RECORD + "const t0 = Date.now(); let now = t0;"
+            "Date.now = () => now;"
+            + _push(version=1)
+            + "now = t0 + 61000;"
+            + _push(version=2)
+            + "now = t0 + 62000;"
+            + _push(version=3)
+            + _EVENTS,
+        )
+        assert calls == [[2, False, 1], 1]
+
+    def test_the_minute_tick_refills_a_cell_before_the_page_redraws(self) -> None:
+        """A page that reformats a bound cell's text (a shortened timestamp) redraws
+        from the recorded value on the tick, not from its own earlier output."""
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(),
+            _cell_js("boards")
+            + "addEventListener('kirocrew-dashboard', () => __calls.push(cell.textContent));"
+            "const t0 = Date.now(); let now = t0; Date.now = () => now;"
+            "cell.textContent = 'page text';"
+            "now = t0 + 61000;" + _push(version=1),
+        )
+        assert calls == ["2"]
+
+    def test_only_missing_moving_still_fires_the_event(self) -> None:
+        """A field going missing changes what the page shows (the dim and the label)."""
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(),
+            _COUNT_EVENTS + _push(version=1, missing=["boards"]) + _EVENTS,
+        )
+        assert calls == [1]
+
+    def test_missing_and_back_are_still_told_across_unchanged_reads(self) -> None:
+        """The missing contract: "gone" once, "back" once, with full reads between that
+        repeat the same values staying silent."""
+        gone = {"fields": {"owner": "atlas"}, "missing": ["boards"]}
+        calls = _run(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(),
+            _RECORD
+            + _push(version=1, **gone)
+            + _push(version=2, **gone)
+            + _push(version=3)
+            + _push(version=4),
+        )
+        assert calls == [[2, False, 1], [2, True, 1], [2, False, 1]]
+
+    def test_the_unchanged_read_still_moves_the_version_the_page_holds(self) -> None:
+        """Skipping the redraw must not skip the bookkeeping: the next patch is checked
+        against the read that just landed."""
+        posted = _posted(
+            dashboard_frame._BOOTSTRAP_JS,
+            _read(),
+            _push(version=9)
+            + "__push({ patch: true, version: 10, fields: { boards: 4 }, missing: [] });",
+        )
+        assert posted == []

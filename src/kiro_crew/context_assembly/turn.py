@@ -58,21 +58,23 @@ def post_compaction_parts(
     context_provider: Any,
     native_launch_sources: Collection[str],
     query_text: str = "",
+    steering_off: frozenset[str] = frozenset(),
 ) -> list[str]:
     """What a turn re-injects after a confirmed compaction dropped session start.
 
     The agent contract, the memory activity index, the skills index (same gate and
     glob restriction as session start), the learned-lessons block (same store,
     gates and budgets as session start, ranked against *query_text*, the user's
-    own text for this turn), the CURRENT reply-style preferences and the CURRENT
+    own text for this turn), the CURRENT reply-style preferences, the Claude Code
+    backend's steering resources (same gate as session start) and the CURRENT
     folder steering. The member section is re-injected by the caller, through the
     member lifecycle chokepoint. Also starts the session's shown-lesson record
     again, from the lessons block re-sent here.
 
     A minimal-context turn (shared and guest channel turns, minimal crons) gets back
     only what its minimal session start carried: the agent contract and the
-    reply-style preferences. The operator's memory, lessons, skills and folder
-    steering stay out of a prompt other people read.
+    reply-style preferences. The operator's memory, lessons, skills, steering
+    resources and folder steering stay out of a prompt other people read.
     """
     from kiro_crew import context as ctx  # circular import: the facade imports this owner
 
@@ -163,6 +165,62 @@ def post_compaction_parts(
     # Lessons are session-start context too: the user's standing corrections
     # went with the compaction, and nothing else brings them back (the
     # per-message block only adds new matches, and is off by default).
+    parts.extend(
+        lessons_parts(
+            builder,
+            session_key=session_key,
+            project=project,
+            private_owner=private_owner,
+            blocks_reads=blocks_reads,
+            context_groups=context_groups,
+            workspace=workspace,
+            memory_store=memory_store,
+            model_window=model_window,
+            essentials=_essentials,
+            query_text=query_text,
+        )
+    )
+    if _prefs:
+        parts.append("[REINJECTED AFTER COMPACTION — response preferences]\n" + _prefs)
+    parts.extend(
+        steering_parts(
+            agent=agent,
+            project=project,
+            context_groups=context_groups,
+            model_window=model_window,
+            steering_dirs=steering_dirs,
+            essentials=_essentials,
+            provider_type=provider_type,
+            context_provider=context_provider,
+            native_launch_sources=native_launch_sources,
+            steering_off=steering_off,
+        )
+    )
+    return parts
+
+
+def lessons_parts(
+    builder: ContextBuilder,
+    *,
+    session_key: str | None,
+    project: str | None,
+    private_owner: bool,
+    blocks_reads: bool,
+    context_groups: frozenset[str] | None,
+    workspace: str | None,
+    memory_store: str | None,
+    model_window: int | None,
+    essentials: str,
+    query_text: str,
+) -> list[str]:
+    """The learned-lessons block a turn re-sends when session start may be gone.
+
+    Same store, gates and budgets as session start, ranked against *query_text*.
+    """
+    from kiro_crew import context as ctx  # circular import: the facade imports this owner
+
+    parts: list[str] = []
+    _essentials = essentials
     _lessons_ctx = _store_admission.compaction_lessons_block(
         builder,
         private=private_owner,
@@ -174,6 +232,7 @@ def post_compaction_parts(
         model_window=model_window,
         essentials=_essentials,
         query_text=query_text,
+        session_key=session_key,
     )
     if _lessons_ctx:
         if session_key and ctx.KiroCrewConfig.load().memory.inject_lessons_per_turn:
@@ -186,8 +245,47 @@ def post_compaction_parts(
             + ctx._neutralize_structural_markers(_lessons_ctx)
             + "\n[END REINJECTED]\n\n"
         )
-    if _prefs:
-        parts.append("[REINJECTED AFTER COMPACTION — response preferences]\n" + _prefs)
+    return parts
+
+
+def steering_parts(
+    *,
+    agent: str | None,
+    project: str | None,
+    context_groups: frozenset[str] | None,
+    model_window: int | None,
+    steering_dirs: tuple[str, ...],
+    essentials: str,
+    provider_type: str | None,
+    context_provider: Any,
+    native_launch_sources: Collection[str],
+    steering_off: frozenset[str] = frozenset(),
+) -> list[str]:
+    """The steering resources and CURRENT folder steering a turn re-sends when
+    session start may be gone, under the same gates as session start."""
+    from kiro_crew import context as ctx  # circular import: the facade imports this owner
+
+    parts: list[str] = []
+    _essentials = essentials
+    # A harness that reads no agent ``resources`` (Claude Code, Codex, OpenCode, Pi) got the
+    # agent config's steering resources as session-start prompt text, so the
+    # compaction dropped them; kiro-cli keeps its natively loaded ``resources``,
+    # so the gate is the session-start one.
+    # The files are user-written: scrub the payload, keep the wrapper outside it.
+    _steering_ctx = _inclusion.steering_resources_part(
+        agent=agent,
+        provider_type=provider_type,
+        essentials=_essentials,
+        context_groups=context_groups,
+        project=project,
+        steering_off=steering_off,
+    )
+    if _steering_ctx:
+        parts.append(
+            "[REINJECTED AFTER COMPACTION — steering resources]\n"
+            + ctx._neutralize_structural_markers(_steering_ctx)
+            + "\n[END REINJECTED]\n\n"
+        )
     # Folder steering is session-start context too, and unlike kiro's
     # native project steering it has no host-side persistence across a
     # compaction -- it was prompt text, and the compaction dropped it.
@@ -196,13 +294,18 @@ def post_compaction_parts(
     # non-fresh turn above, so they need no separate block. The payload
     # is operator-authored files; the renderer scrubs their bodies and
     # labels before minting the genuine frame.
-    if steering_dirs and not _essentials:
+    if (
+        steering_dirs
+        and not _essentials
+        and _inclusion._group_included(context_groups, _inclusion.CONTEXT_GROUP_PROJECT)
+    ):
         _caps_fs = ctx._resolve_caps(model_window)
         _skip_folder_roots, _declared_sources = _inclusion._folder_steering_delivery_snapshot(
             provider_type=provider_type,
             native_steering=context_provider is not None and context_provider.native_steering,
             project=project,
             native_launch_sources=native_launch_sources,
+            agent=agent,
         )
         _folder_ctx = _inclusion._render_folder_steering_section(
             steering_dirs,
@@ -221,6 +324,46 @@ def post_compaction_parts(
                 + "\n[END REINJECTED]\n\n"
             )
     return parts
+
+
+def conductor_reread_part(
+    *, agent: str | None, mode: str, session_key: str | None, dispatch_mounted: bool | None
+) -> str:
+    """The goal-conductor re-read pointer for a conductor's post-compaction turn, or ``""``.
+
+    A conductor runs on the ``goal-conductor`` skill, and the compaction dropped the
+    body it read; the skills index re-injected above names the skill but not that it
+    was read and lost. Two kinds get the line: a chat on the conductor whose charter
+    names that skill (``kirocrew-conductor`` and its deprecated aliases; the pipeline,
+    security and team-lead conductors run their own skills) and a crewmate's chat
+    that runs the ledger patrol, under the same gate session start appends
+    ``conductor.patrol`` with (``session_start``: a member DM slot that holds the
+    dispatch tools, on a binding with the ledger tools). Workers and plain chats get
+    nothing.
+    """
+    from kiro_crew import crew_mode
+
+    root = crew_mode.DEFAULT_CREW_MODE_AGENT
+    if agent != root and crew_mode.CONDUCTOR_ALIASES.get(agent or "") != root:
+        from kiro_crew import context as ctx  # circular import: the facade imports this owner
+        from kiro_crew.crewmate_harness import crewmate_for_session
+        from kiro_crew.member_mate_tools import binding_has_ledger_tools
+        from kiro_crew.members import DM_SLOT_MODE
+
+        if mode != DM_SLOT_MODE:
+            return ""
+        cfg = ctx.KiroCrewConfig.load()
+        crewmate = crewmate_for_session(cfg, session_key)
+        if not (
+            ctx._member_dispatch_held(dispatch_mounted, cfg, crewmate)
+            and binding_has_ledger_tools(cfg.agents.get(crewmate))
+        ):
+            return ""
+    return (
+        "[REINJECTED AFTER COMPACTION — goal-conductor]\n"
+        "You were compacted: re-read the goal-conductor skill before your next action.\n"
+        "[END REINJECTED]\n\n"
+    )
 
 
 def ledger_reinjection_part(session_key: str | None, turn_text: str) -> str:
@@ -383,7 +526,16 @@ def rail_parts(
     # come from operator config (profile name, workdir).
     remote = remote_workspace_for(session_key)
     project_on = _inclusion._group_included(context_groups, _inclusion.CONTEXT_GROUP_PROJECT)
-    if remote is not None and project_on:
+    if remote is not None and project_on and not remote[1]:
+        # No directory: the agent itself runs in a Kiro cloud sandbox, which Kiro
+        # Crew never reaches, so name the sandbox and nothing on the gateway.
+        parts.append(
+            f"[PROJECT] This session runs in a Kiro Cloud Sessions sandbox ({remote[0]}). "
+            "Its files, commands and tools all live in that sandbox. Kiro Crew's own "
+            "tools, MCP servers and the gateway machine's files are not available "
+            "there.\n\n"
+        )
+    elif remote is not None and project_on:
         env_name, env_workdir = remote
         parts.append(
             f"[PROJECT] This session runs in a remote environment ({env_name}). "
@@ -489,7 +641,7 @@ def rail_parts(
             if _rline:
                 parts.append(_rline + "\n\n")
                 logger.info(
-                    "🔍 Injected resource pressure line (posture=%s, avail=%.1fGB)",
+                    "Injected resource pressure line (posture=%s, avail=%.1fGB)",
                     _rstatus.posture,
                     _rstatus.available_gb,
                 )
@@ -565,9 +717,24 @@ def interactive_guidance(
     session_key: str | None,
     agent: str | None,
     minimal_context: bool,
+    producer_is_user_facing: bool = False,
 ) -> list[str]:
-    """The per-turn ``[OPTIONS:]`` and dashboard-tool guidance paragraphs."""
+    """The ``[OPTIONS:]`` and dashboard-tool guidance paragraphs of a turn.
+
+    Every built message carries them. Whether the engine is sent them again is
+    the provider's call at the wire (``build_message`` binds the block as the
+    turn's delivery envelope): once per engine conversation on a harness whose
+    compaction Kiro Crew sees, every message elsewhere and in a member's chat.
+
+    *producer_is_user_facing* says a person sent this turn on a dashboard
+    slot. It defaults to False, the applier's own default, so a caller that
+    does not say is never offered a tool the applier refuses.
+    """
     from kiro_crew import context as ctx  # circular import: the facade imports this owner
+
+    # Function-local: context_assembly owners import no kiro_crew module at module
+    # scope (test_owners_import_no_kiro_crew_module_at_module_scope).
+    from kiro_crew.directive_origin import user_origin_gate_admits
 
     _interactive_guidance: list[str] = []
     if interactive:
@@ -603,25 +770,41 @@ def interactive_guidance(
                         "Do not enable generation, spawn a builder or publish a duplicate "
                         "status artifact.)"
                     )
+                # A conductor's offer to let workers grill a costly choice, and the
+                # ``[GRILL:]`` card line it answers a pick with: only while the
+                # ``worker_grill`` feature preview is on. Off, nothing is added.
+                from kiro_crew.worker_grill_preview import guidance_for
+
+                _grill = guidance_for(agent, current_config)
+                if _grill:
+                    _interactive_guidance.append(_grill)
             _interactive_guidance.append(
                 "\n\n(The ask_question tool shows a dashboard card and BLOCKS until the "
                 "user responds; the answers are its tool result. "
                 "DEFAULT TO SILENCE: use it only when work cannot continue without a "
-                "human-only decision (permission, irreversible/costly action, or an "
-                "uninferable preference). Decide anything you can read, run, search "
+                "human-only decision (one of the ask cases (a)-(e) in CRITICAL "
+                "RULES). Decide anything you can read, run, search "
                 "or infer yourself; never ask to reconfirm an authorized plan or "
                 "merely because a choice exists. Do not end your turn after calling "
-                "unless the result says so. When ending anyway, [OPTIONS:] is cheaper.)"
+                "unless the result says so.)"
             )
             # A follow-up card is distinct from both: it offers concrete NEXT
             # tasks after work is done, optionally handing one to a worktree.
-            _interactive_guidance.append(
-                "\n\n(The suggest_followup tool offers up to 3 NEXT tasks below the "
-                "composer, each with a complete standalone handoff prompt. DEFAULT TO "
-                "SILENCE: only after a genuinely large finished task and only for "
-                "valuable follow-ups. Never after small tasks, per-turn, to repeat "
-                "an acted-on card, or for a clarifying question -- ask that inline.)"
-            )
+            # The applier also asks WHO sent the turn: a cron, a loop's wake, a
+            # sub-agent or a peer send riding this tab is refused. Offer the
+            # tool only when that same gate would let the card through.
+            if user_origin_gate_admits(
+                "suggest_followup",
+                session_key or "",
+                producer_is_user_facing=producer_is_user_facing,
+            ):
+                _interactive_guidance.append(
+                    "\n\n(The suggest_followup tool offers up to 3 NEXT tasks below the "
+                    "composer, each with a complete standalone handoff prompt. DEFAULT TO "
+                    "SILENCE: only after a genuinely large finished task and only for "
+                    "valuable follow-ups. Never after small tasks, per-turn, to repeat "
+                    "an acted-on card, or for a clarifying question -- ask that inline.)"
+                )
     return _interactive_guidance
 
 

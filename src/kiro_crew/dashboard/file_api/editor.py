@@ -7,7 +7,6 @@ import functools
 import logging
 import os
 import subprocess
-import tempfile
 import urllib.parse
 from typing import TYPE_CHECKING
 
@@ -16,6 +15,7 @@ from aiohttp import web
 if TYPE_CHECKING:
     from kiro_crew.dashboard.handlers.files import (
         _CRED_RUN_REVERSED_RE,
+        _FILE_BUSY_ERROR,
         _FILE_DIFF_MAX_BYTES,
         _FILE_READ_CAP,
         _MAX_UPLOAD_BYTES,
@@ -37,8 +37,10 @@ if TYPE_CHECKING:
         _resolve_project_relative,
         _run_path_probe,
         _sel,
+        bounded_read,
         git_command_env,
         is_sensitive_path,
+        platform_compat,
         read_bounded_json,
         redact,
         redact_owner_view_via_context,
@@ -46,6 +48,7 @@ if TYPE_CHECKING:
         require_owner_dashboard_request,
         sniff_raster_mime,
     )
+    from kiro_crew.git_no_index_diff import no_index_diff, patch_hunks
 
 
 def _read_safe_end(text: str, cap: int) -> int:
@@ -163,6 +166,17 @@ async def api_file_read(request: web.Request) -> web.Response:
             session_key="dashboard", tool_name="file_read", outcome="success", resources=path
         )
         return web.Response(status=200, headers={"X-Path-Kind": "file"})
+    if outcome.kind == "busy":
+        # Another program holds the file without sharing it. The prefix logged
+        # the cause; the same read succeeds once that program closes the file.
+        _sel().log_tool_invocation(
+            session_key="dashboard",
+            tool_name="file_read",
+            outcome="failure",
+            resources=path,
+            error="file_busy",
+        )
+        return web.json_response({"error": _FILE_BUSY_ERROR, "code": "file_busy"}, status=503)
     try:
         if outcome.kind == "read_failed":
             raise OSError(f"file_read could not read {path}")
@@ -346,7 +360,10 @@ def _resolve_diff_path(raw: str) -> tuple[str, bool]:
 
     Blocking (``realpath`` then ``isfile``) -- callers run it on a worker thread.
     """
-    path = os.path.realpath(os.path.expanduser(raw))
+    try:
+        path = os.path.realpath(os.path.expanduser(raw))
+    except ValueError:  # a NUL byte or a lone surrogate in the path
+        return raw, False
     return path, os.path.isfile(path)
 
 
@@ -496,8 +513,10 @@ async def api_file_diff(request: web.Request) -> web.Response:
     _env: dict[str, str] = {}
 
     def _run() -> dict:
+        # Each git call's timeout ends git's whole tree: on Windows `git` is often
+        # a launcher whose child would otherwise hold the pipes past it.
         try:
-            subprocess.run(
+            platform_compat.run_killing_tree_on_timeout(
                 [*_git, "rev-parse", "--git-dir"],
                 cwd=dirpath,
                 capture_output=True,
@@ -522,7 +541,7 @@ async def api_file_diff(request: web.Request) -> web.Response:
             return {"diff": "", "original": "", "status": "not_git"}
         try:
             # Get HEAD content
-            root = subprocess.run(
+            root = platform_compat.run_killing_tree_on_timeout(
                 [*_git, "rev-parse", "--show-toplevel"],
                 cwd=dirpath,
                 capture_output=True,
@@ -542,7 +561,7 @@ async def api_file_diff(request: web.Request) -> web.Response:
             # Probed with the same bare `git` the calls below run.
             if repo_exec_driver_reason(dirpath, git="git"):
                 return {"diff": "", "original": "", "status": "error"}
-            head = subprocess.run(
+            head = platform_compat.run_killing_tree_on_timeout(
                 # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args -- fixed git argv; the path is repo-relative and passed as one argument
                 [*_git, "show", "--no-textconv", f"HEAD:{rel}"],
                 cwd=dirpath,
@@ -554,7 +573,7 @@ async def api_file_diff(request: web.Request) -> web.Response:
                 env=_env,
             )
             original = head.stdout if head.returncode == 0 else ""
-            r = subprocess.run(
+            r = platform_compat.run_killing_tree_on_timeout(
                 [*_git, "diff", "--no-textconv", "--no-ext-diff", "HEAD", "--", raw_path],
                 cwd=dirpath,
                 capture_output=True,
@@ -567,7 +586,7 @@ async def api_file_diff(request: web.Request) -> web.Response:
             diff = r.stdout.strip() if r.returncode == 0 else ""
             if not diff:
                 # Check for untracked file
-                r2 = subprocess.run(
+                r2 = platform_compat.run_killing_tree_on_timeout(
                     [*_git, "status", "--porcelain", "--", raw_path],
                     cwd=dirpath,
                     capture_output=True,
@@ -578,7 +597,7 @@ async def api_file_diff(request: web.Request) -> web.Response:
                     env=_env,
                 )
                 if r2.returncode == 0 and r2.stdout.strip().startswith("??"):
-                    r3 = subprocess.run(
+                    r3 = platform_compat.run_killing_tree_on_timeout(
                         [
                             *_git,
                             "diff",
@@ -624,43 +643,19 @@ async def api_file_diff(request: web.Request) -> web.Response:
 
         A patch shows lines out of their surrounding text, which is what the
         redactor reads, so the pass runs on whole bodies and only masked text is
-        diffed. The temp files hold masked text only, in a private dir outside
-        any repo.
+        diffed, by the shared ``no_index_diff``.
         """
-        with tempfile.TemporaryDirectory(prefix="kc-file-diff-") as tmp:
-            a = os.path.join(tmp, "a")
-            b = os.path.join(tmp, "b")
-            with open(a, "w", encoding="utf-8", newline="") as fh:
-                fh.write(old)
-            with open(b, "w", encoding="utf-8", newline="") as fh:
-                fh.write(new)
-            r = subprocess.run(
-                [*_git, "diff", "--no-index", "--no-textconv", "--no-ext-diff", "--", a, b],
-                cwd=tmp,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=10,
-                env=_env,
-            )
-        # --no-index answers 1 for "differs"; anything else is a failure, and a
-        # failure must not fall back to the raw patch.
-        if r.returncode not in (0, 1):
-            raise subprocess.CalledProcessError(r.returncode, "git diff --no-index")
-        # "\n" only: splitlines() also cuts on form feed, U+2028 and other
-        # characters that sit inside a patch line.
-        lines = r.stdout.rstrip("\n").split("\n")
-        first = next((i for i, ln in enumerate(lines) if ln.startswith("@@")), None)
+        patch = no_index_diff(old, new, git=_git, env=_env)
+        hunks = patch_hunks(patch)
         name = redact_fn(rel).replace("\n", " ")
         header = [f"diff --git a/{name} b/{name}"]
-        if first is None:
+        if hunks is None:
             # No hunks: no change, or git judged the text binary.
-            if not r.stdout.strip():
+            if not patch.strip():
                 return ""
             return "\n".join([*header, f"Binary files a/{name} and b/{name} differ"])
         header += ["--- /dev/null" if new_file else f"--- a/{name}", f"+++ b/{name}"]
-        return "\n".join([*header, *lines[first:]])
+        return "\n".join([*header, *hunks])
 
     # Same verdict as ``api_file_read`` for the same caller: the panel compares
     # the buffer that read served against this ``original``, so the two MUST be
@@ -710,7 +705,7 @@ async def api_file_diff(request: web.Request) -> web.Response:
                 if isinstance(checked, _OpenDenied):
                     raise OSError(checked.code)
                 with checked.file as fh:
-                    data = fh.read(_FILE_DIFF_MAX_BYTES + 1)
+                    data = bounded_read(fh, _FILE_DIFF_MAX_BYTES + 1)
                 if len(data) > _FILE_DIFF_MAX_BYTES:
                     result["status"] = "error"
                     return result

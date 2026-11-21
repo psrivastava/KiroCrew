@@ -8,7 +8,7 @@
  * the open handed up from a tree row is checked through the real wiring.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent, within, waitFor } from '@testing-library/react'
+import { act, render, screen, fireEvent, within, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 const H = vi.hoisted(() => ({
@@ -24,13 +24,18 @@ const H = vi.hoisted(() => ({
 // helper (which the reveal button now routes through) branches on it.
 vi.mock('../api/client', () => ({ api: H.api, ApiError: class ApiError extends Error {} }))
 
-// The reveal-in-file-manager button is gated on branding.directLocal: a remote
-// session degrades reveal to a clipboard copy, so the affordance is hidden
-// there. Default to a local session so the existing header assertions hold; a
-// dedicated case below flips it to pin the hidden (remote) state.
-const brandingEnv = vi.hoisted(() => ({ directLocal: true }))
+// The reveal-in-file-manager button is gated on the shared reveal gate
+// (branding.directLocal AND branding.desktopLauncher): a remote or headless
+// session could only have reveal answered with a clipboard copy, so the
+// affordance is hidden there. Default to a local desktop session so the existing
+// header assertions hold; dedicated cases below pin the hidden states.
+const brandingEnv = vi.hoisted(() => ({ directLocal: true, desktopLauncher: true }))
 vi.mock('../hooks/useBranding', () => ({
-  useBranding: () => ({ botName: 'Test', avatar: '', directLocal: brandingEnv.directLocal }),
+  useBranding: () => ({
+    botName: 'Test', avatar: '',
+    directLocal: brandingEnv.directLocal,
+    desktopLauncher: brandingEnv.desktopLauncher,
+  }),
 }))
 
 vi.mock('../pierre/tree', () => ({
@@ -76,13 +81,21 @@ beforeEach(() => {
   H.api.projectGitStatus.mockReset().mockResolvedValue({ repo: true, files: [] })
   H.api.revealPath.mockReset().mockResolvedValue(undefined)
   brandingEnv.directLocal = true
+  brandingEnv.desktopLauncher = true
 })
 
 describe('FilesHomePanel header', () => {
   it('titles the tab and names the project by its last path segment', () => {
     mount()
     expect(screen.getByText('Files')).toBeInTheDocument()
-    expect(screen.getByText('my-project')).toHaveAttribute('title', DIR)
+    // The full path shows in the shared bubble on keyboard focus, and is the name's
+    // description, never only a native `title` the desktop app may not paint.
+    const name = screen.getByText('my-project')
+    expect(name).not.toHaveAttribute('title')
+    expect(name).toHaveAttribute('tabindex', '0')
+    expect(document.getElementById(name.getAttribute('aria-describedby') ?? '')).toHaveTextContent(DIR)
+    fireEvent.focus(name)
+    expect(screen.getByRole('tooltip')).toHaveTextContent(DIR)
   })
 
   it('ignores trailing slashes when naming the project', () => {
@@ -92,7 +105,7 @@ describe('FilesHomePanel header', () => {
 
   it('falls back to the whole path when it has no name segment', () => {
     mount('/')
-    expect(screen.getByTitle('/')).toHaveTextContent('/')
+    expect(screen.getByText('/')).not.toHaveAttribute('aria-describedby')
   })
 
   it('drops the project name and its actions when no directory is set', () => {
@@ -125,13 +138,13 @@ describe('FilesHomePanel header', () => {
     expect(screen.getAllByLabelText('Refresh')).toHaveLength(1)
   })
 
-  it('reveals the project directory in the file manager', () => {
+  it('reveals the project directory in the file manager', async () => {
     // The button routes through the shared revealOrOpen helper (so a failed
     // reveal surfaces the shared message instead of dead-clicking), which calls
     // api.revealPath with the explicit 'reveal' action. The label is the shared
     // platform-aware wording — generic here, with no gateway platform seeded.
     mount()
-    fireEvent.click(within(header()).getByLabelText('Show in file manager'))
+    await act(async () => { fireEvent.click(within(header()).getByLabelText('Show in file manager')) })
     expect(H.api.revealPath).toHaveBeenCalledWith(DIR, 'reveal')
   })
 
@@ -139,6 +152,14 @@ describe('FilesHomePanel header', () => {
     // A remote session cannot drive the operator's file manager, so the button
     // is gated out entirely rather than firing a reveal that degrades to a copy.
     brandingEnv.directLocal = false
+    mount()
+    expect(within(header()).queryByLabelText('Show in file manager')).toBeNull()
+  })
+
+  it('hides the reveal action when the gateway host has no desktop launcher', () => {
+    // Direct-local (an `ssh -L` browser reads as one) but headless: the reveal
+    // could only be answered with a copy of the project path.
+    brandingEnv.desktopLauncher = false
     mount()
     expect(within(header()).queryByLabelText('Show in file manager')).toBeNull()
   })

@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -34,6 +35,10 @@ _TRUST_REPOSITORIES_SETTING_PATH = "agent.apps_trusted_repositories"
 _MAX_GRANT_NAME_LEN = 128
 _MAX_GRANT_ENTRIES = 512
 APP_NAME_RE = re.compile(rf"[a-z0-9][a-z0-9_-]{{0,{_MAX_GRANT_NAME_LEN - 1}}}")
+
+#: Longest ``installedAt`` a record that names an install keeps; an ISO timestamp is
+#: far shorter. The value comes from the app's own ``installed.json``.
+INSTALLED_AT_MAX_CHARS = 64
 
 
 def _builtin_manifest_sources() -> tuple[Path, ...]:
@@ -69,14 +74,36 @@ def _builtin_manifest_sources() -> tuple[Path, ...]:
 def shipped_builtin_app_root(app_name: str) -> Path | None:
     """Return the immutable package directory that ships ``app_name``.
 
-    The package ``app.json`` is authoritative. Mutable installed metadata is
-    deliberately ignored, and a directory without a valid shipped manifest is
-    not a builtin even when its name resembles one.
+    The package ``app.json`` is authoritative: a directory without a valid shipped
+    manifest is not a builtin even when its name resembles one. Installed metadata
+    can only REMOVE that provenance, never grant it: when the wheel copy of the
+    app is released (``builtin_adoption.builtin_released``: the record was adopted
+    from its own repository, or uninstalled after that) there is no shipped root,
+    so every root chooser resolves the data-home tree instead.
     """
     for root, name in _shipped_builtin_apps():
         if name == app_name:
-            return root
+            return None if _wheel_copy_released(app_name) else root
     return None
+
+
+_released_guard = threading.local()
+
+
+def _wheel_copy_released(app_name: str) -> bool:
+    """``builtin_released(app_name)``, False when that call raises or re-enters."""
+    if getattr(_released_guard, "active", False):
+        return False
+    _released_guard.active = True
+    try:
+        from kiro_crew.apps.builtin_adoption import builtin_released
+
+        return builtin_released(app_name)
+    except Exception:  # noqa: BLE001 - an unanswerable question keeps today's root
+        logger.debug("builtin release check failed for %s", app_name, exc_info=True)
+        return False
+    finally:
+        _released_guard.active = False
 
 
 def shipped_builtin_app_name_at(path: Path) -> str | None:
@@ -93,9 +120,49 @@ def shipped_builtin_app_name_at(path: Path) -> str | None:
     return None
 
 
+#: The last scan: ``(stamp of the sources it read, the pairs it found)``.
+_shipped_cache: tuple[tuple[tuple[Path, int, int], ...], tuple[tuple[Path, str], ...]] | None = None
+
+
+def _sources_stamp(sources: tuple[Path, ...]) -> tuple[tuple[Path, int, int], ...]:
+    """Each source with its directory's inode and mtime, so an added or removed app shows."""
+    stamp = []
+    for source in sources:
+        try:
+            st = source.stat()
+        except OSError:
+            continue
+        stamp.append((source, st.st_ino, st.st_mtime_ns))
+    return tuple(stamp)
+
+
+def invalidate_shipped_builtin_apps() -> None:
+    """Forget the last scan of the shipped builtins; the next ask scans again."""
+    global _shipped_cache
+    _shipped_cache = None
+
+
 def _shipped_builtin_apps() -> Iterator[tuple[Path, str]]:
-    """Yield ``(resolved root, manifest name)`` for every shipped builtin."""
-    for source in _builtin_manifest_sources():
+    """Yield ``(resolved root, manifest name)`` for every shipped builtin.
+
+    Asked once per installed app on every agent-owner lookup, so the scan (a
+    resolve and a manifest read per builtin) is kept. It is scanned again when a
+    source directory's inode or mtime moves, when the sources themselves change,
+    and after :func:`invalidate_shipped_builtin_apps` (app install, update,
+    uninstall and builtin registration call it).
+    """
+    global _shipped_cache
+    stamp = _sources_stamp(_builtin_manifest_sources())
+    cached = _shipped_cache
+    if cached is None or cached[0] != stamp:
+        cached = (stamp, tuple(_scan_shipped_builtin_apps(tuple(s for s, _, _ in stamp))))
+        _shipped_cache = cached
+    return iter(cached[1])
+
+
+def _scan_shipped_builtin_apps(sources: tuple[Path, ...]) -> Iterator[tuple[Path, str]]:
+    """Read every shipped builtin under *sources* from disk."""
+    for source in sources:
         try:
             entries = sorted(source.iterdir())
         except OSError:
@@ -140,7 +207,7 @@ def builtin_app_names() -> frozenset[str]:
     not a user app that merely shadows a builtin name.
 
     Does filesystem I/O (dir scan + manifest reads + one installed-record read
-    per candidate); callers warm it ONCE off the event loop. A source that fails
+    per candidate); callers run it off the event loop. A source that fails
     to read is skipped, and an unreadable installed record drops just that name
     (fail-closed) — neither ever widens provenance.
     """
@@ -191,9 +258,11 @@ def builtin_app_mcp_servers() -> frozenset[str]:
 
     The keys of :func:`_builtin_app_mcp_server_configs`, the one enumeration
     :func:`builtin_app_host_cli_mcp_launches` also reads, so the two can never
-    disagree on which servers are shipped. Filesystem I/O; callers warm it ONCE
-    off the event loop. A source or manifest that fails to read is skipped
-    (fail-closed), never widening the trusted set.
+    disagree on which servers are shipped. Filesystem I/O; callers run it off
+    the event loop. A source or manifest that fails to read is skipped
+    (fail-closed), never widening the trusted set. An adopted former builtin's
+    servers are never here: the gate's refresh adds the ones that keep the gate grant
+    from ``builtin_adoption_gate``, so the host-CLI launches stay builtin-only.
     """
     return frozenset(_builtin_app_mcp_server_configs())
 
@@ -278,11 +347,13 @@ def builtin_app_host_cli_mcp_launches() -> dict[str, tuple[str, tuple[str, ...]]
     return launches
 
 
-def builtin_app_agents() -> dict[str, str]:
+def builtin_app_agents(adopted: frozenset[str] = frozenset()) -> dict[str, str]:
     """Map each agent DECLARED by a shipped builtin manifest to its owning app.
 
     For every first-party manifest (the SAME sources and builtin-owned-install
-    narrowing as :func:`builtin_app_names`), read each entry of its ``agents``
+    narrowing as :func:`builtin_app_names`, plus each app in *adopted*: a former
+    built-in whose adopted record keeps the gate's own-server trust, named by
+    ``builtin_adoption_gate``), read each entry of its ``agents``
     list and map that agent's declared ``name`` to the app that ships it. Both
     the bare name and the ``f"{app}--{agent}"`` link form (the filename
     ``bridges._safe_link_name`` registers it under) are emitted, because a chat
@@ -301,7 +372,7 @@ def builtin_app_agents() -> dict[str, str]:
     An agent name declared by MORE than one app is dropped entirely rather than
     resolved arbitrarily — ambiguous provenance must not grant either app's
     identity (fail-closed). Filesystem I/O (manifest + one read per declared
-    agent file); callers warm it ONCE off the event loop. A source, manifest, or
+    agent file); callers run it off the event loop. A source, manifest, or
     agent file that fails to read is skipped, never widening the mapping.
     """
     # Deferred import: manager imports this module at load time (see
@@ -334,7 +405,7 @@ def builtin_app_agents() -> dict[str, str]:
             if not (isinstance(name, str) and name and isinstance(agents, list)):
                 continue
             if name not in owned:
-                owned[name] = builtin_owns_installed(name)
+                owned[name] = name in adopted or builtin_owns_installed(name)
             if not owned[name]:
                 continue
             for rel in agents:
@@ -709,7 +780,11 @@ def _execution_admission(
         return None, provenance
 
     reason = repository_denied or (
-        "third-party app execution is disabled; trust this app alone in Settings "
+        # Settings -> Security -> Third-party apps only lists and revokes per-app
+        # grants; the grant itself is made by the App Store's install, update or
+        # enable prompt.
+        "third-party app execution is disabled; trust this app alone from the "
+        "dashboard's App Store, whose install, update and enable prompts ask for it "
         f"({_TRUST_SETTING_PATH}), or set {_ALLOW_ALL_SETTING_PATH}=true to allow "
         "every third-party app's Python, backend, and manifest shell code"
     )

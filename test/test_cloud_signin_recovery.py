@@ -1,22 +1,12 @@
 """Recovering a cloud crew whose Kiro sign-in did not finish.
 
-A managed launch can register a working, billing crew and still end up with no
-Kiro session: the device code timed out, nobody approved it, the gateway
-restarted mid-wait, or the owner cancelled. Three seams, no AWS and no live
-gateway:
+A launch can register a billing crew with no Kiro session (code timed out, not
+approved, gateway restarted, owner cancelled). Three seams, no AWS, no live gateway:
 
-* ``cloud/login.py`` — :func:`~kiro_crew.cloud.login.cancel_device_login` stops a
-  cancelled login WITHOUT signing the box out (which ``logout`` would do to a
-  session the cancelled attempt never established).
-* ``cloud/launch_job.py`` — :func:`~kiro_crew.cloud.launch_job.run_signin_retry`
-  re-runs only the sign-in step, a cancel stops the remote login, and a restart
-  mid-sign-in keeps a crew that is already signed in.
-* ``dashboard/handlers_cloud.py`` — ``POST /api/cloud/launch/{id}/signin/restart``
-  is owner-only, serialized, and never re-provisions.
-
-The identity model itself (``KiroLoginTarget``, the pty login driver, launch-body
-field validation) is covered by ``test_cloud_login_target.py``,
-``test_cloud_login.py`` and ``test_cloud_handlers.py``.
+* ``cloud/login.py`` — ``cancel_device_login`` stops a login WITHOUT signing the box out.
+* ``cloud/launch_job.py`` — ``run_signin_retry`` re-runs only the sign-in step.
+* ``dashboard/handlers_cloud.py`` — ``POST /api/cloud/launch/{id}/signin/restart`` is
+  owner-only, serialized, and never re-provisions.
 """
 
 from __future__ import annotations
@@ -1186,7 +1176,7 @@ class TestSigninRestartRoute:
 
         broken = store.get(job_id)
         assert lj.target_is_unreadable(broken)
-        assert hc._preserved_code_may_be_approved(broken) is False
+        assert hc._unsigned_crew_may_be_reprobed(broken) is False
 
         probed = []
         monkey = getattr(hc, "_probe_signin_on_box")
@@ -1316,11 +1306,8 @@ class TestSigninRestartRoute:
     async def test_the_job_is_claimed_before_the_worker_starts(self, tmp_path, monkeypatch):
         """The guard is only a guard if the state it reads is already written.
 
-        The worker persists RUNNING itself, but it runs AFTER the lock is
-        released — so a second restart arriving in that window read a terminal
-        job, passed the "nothing active" check, and raced a second remote login
-        with one cancel handle between them. Observed at the moment the worker is
-        started, which is that window's first instant.
+        The worker runs after the lock is released, so a second restart in that window
+        would read a terminal job and race a second remote login. Observed at worker start.
         """
         state, job_id = await self._unsigned_job(tmp_path)
         store = state.cloud_launch_store
@@ -1347,6 +1334,28 @@ class TestSigninRestartRoute:
         )
         assert resp.status == 409
         assert _read(resp)["code"] == "launch_already_running"
+
+    @pytest.mark.asyncio
+    async def test_a_restart_is_refused_while_a_job_record_is_not_utf8(self, tmp_path, monkeypatch):
+        """The race guard reads the job list, which skips a job file whose bytes are
+        not UTF-8. That record may be a launch or sign-in still running on this
+        instance, so the restart refuses rather than start a second remote login."""
+        state, job_id = await self._unsigned_job(tmp_path)
+        store = state.cloud_launch_store
+        other = store.create(profile="dev", region="us-east-1", size_key="balanced")
+        store._path(other.id).write_bytes(b'\xff\xfe{"status": "running"}')
+        monkeypatch.setattr(
+            hc, "_start_signin_worker", lambda *a, **k: pytest.fail("a sign-in worker started")
+        )
+
+        resp = await hc.api_cloud_launch_signin_restart(
+            _req("POST", "/x", state=state, match_info={"id": job_id})
+        )
+
+        assert resp.status == 409
+        body = _read(resp)
+        assert body["code"] == "launch_record_unreadable"
+        assert f"{other.id}.json" in body["error"]
 
     @pytest.mark.asyncio
     async def test_a_launch_with_no_instance_yet_still_blocks(self, tmp_path):
@@ -1570,11 +1579,8 @@ class TestSigninRestartRoute:
 class TestSigninPromptReprobe:
     """A preserved code approved out of band must not badge the crew forever.
 
-    A timed-out sign-in deliberately KEEPS its code and leaves the remote login
-    polling, so the user can still approve it from the open browser tab. Nothing
-    re-probed the box after the job went terminal, so an approval that landed
-    signed the crew in while ``signin_detected`` stayed False — "Needs sign-in"
-    forever, Connect held.
+    A timed-out sign-in KEEPS its code and the remote login polling, so the user can
+    still approve it; the box is re-probed so ``signin_detected`` can turn True.
     """
 
     async def _preserved(self, tmp_path):
@@ -1597,28 +1603,21 @@ class TestSigninPromptReprobe:
     async def test_the_box_probe_itself_writes_nothing(self, tmp_path, monkeypatch):
         """The SSM query runs in an executor thread; the write must not.
 
-        This is the property that makes the lock meaningful. While the mutation
-        lived beside the query on the worker thread, nothing serialised it against
-        a restart persisting RUNNING under `_launch_lock` -- so the write moved to
-        `_record_probed_signin`, on the loop, under that lock. If a future change
-        puts a `save` back into the query path, this fails.
+        The write lives in `_record_probed_signin`, on the loop under `_launch_lock`, so
+        it is serialised against a restart persisting RUNNING.
         """
         state, job = await self._preserved(tmp_path)
         store = state.cloud_launch_store
         before = json.dumps(store.get(job.id).to_dict(), sort_keys=True)
 
-        monkeypatch.setattr(hc.login_mod, "is_logged_in", lambda *a, **k: True)
+        monkeypatch.setattr(hc.login_mod, "signin_state", lambda *a, **k: True)
         assert hc._probe_signin_on_box(state, job) is True
 
         after = json.dumps(store.get(job.id).to_dict(), sort_keys=True)
         assert after == before, "the probe must query only; the write is the caller's"
 
     async def test_the_recorded_write_is_a_coroutine_taking_the_lock(self) -> None:
-        """`_record_probed_signin` has to be awaitable to take the async lock.
-
-        A sync helper cannot `async with _launch_lock(...)`, which is exactly why
-        the first attempt at this fix settled for a bare re-read.
-        """
+        """`_record_probed_signin` must be a coroutine: only that can `async with _launch_lock`."""
         import inspect
 
         assert inspect.iscoroutinefunction(hc._record_probed_signin)
@@ -1634,28 +1633,25 @@ class TestSigninPromptReprobe:
         store = state.cloud_launch_store
         job.error = "Interrupted — Kiro Crew restarted while the Kiro sign-in was running."
         job.step(lj.STEP_CONNECT).detail = (
-            "Added to Your crews. Sign in to Kiro on the crew after you connect."
+            "Added to My Crews. Sign in to Kiro on the crew after you connect."
         )
         store.save(job)
 
-        monkeypatch.setattr(hc.login_mod, "is_logged_in", lambda *a, **k: True)
+        monkeypatch.setattr(hc.login_mod, "signin_state", lambda *a, **k: True)
         await self._fetch(state, job.id)
 
         out = store.get(job.id)
         assert out.signin_detected is True
         assert out.error == "", f"stale error survived a confirmed sign-in: {out.error!r}"
-        assert out.step(lj.STEP_CONNECT).detail == "Added to Your crews."
+        assert out.step(lj.STEP_CONNECT).detail == "Added to My Crews."
         assert out.step(lj.STEP_SIGNIN).state == lj.STEP_DONE
         assert out.step(lj.STEP_SIGNIN).detail == "Signed in."
 
     async def test_a_probe_result_is_dropped_when_the_job_moved_on(self, tmp_path, monkeypatch):
         """The probe holds a snapshot from BEFORE an SSM round trip of seconds.
 
-        If a restart was admitted in that window it has already persisted RUNNING
-        under the launch lock -- and that claim is the only thing stopping two
-        remote logins racing one cancel handle. Writing this stale terminal
-        snapshot over it would undo exactly that. The probe must re-read and drop
-        its own result.
+        A restart admitted in that window has persisted RUNNING, the claim that stops
+        two remote logins racing; the probe must re-read and drop its stale result.
         """
         state, job = await self._preserved(tmp_path)
         store = state.cloud_launch_store
@@ -1671,7 +1667,7 @@ class TestSigninPromptReprobe:
             store.save(moved)
             return True
 
-        monkeypatch.setattr(hc.login_mod, "is_logged_in", _logged_in)
+        monkeypatch.setattr(hc.login_mod, "signin_state", _logged_in)
         await self._fetch(state, job.id)
 
         out = store.get(job.id)
@@ -1689,7 +1685,7 @@ class TestSigninPromptReprobe:
             probed.append((iid, target))
             return True
 
-        monkeypatch.setattr(hc.login_mod, "is_logged_in", _logged_in)
+        monkeypatch.setattr(hc.login_mod, "signin_state", _logged_in)
         resp = await self._fetch(state, job.id)
         assert resp.status == 409
         assert _read(resp)["code"] == "signin_already_complete"
@@ -1723,7 +1719,7 @@ class TestSigninPromptReprobe:
         seen: list = []
         monkeypatch.setattr(
             hc.login_mod,
-            "is_logged_in",
+            "signin_state",
             lambda iid, profile, region, *, target=None: seen.append(target) or False,
         )
         await self._fetch(state, job.id)
@@ -1731,7 +1727,7 @@ class TestSigninPromptReprobe:
 
     async def test_a_box_that_is_still_unsigned_is_left_alone(self, tmp_path, monkeypatch):
         state, job = await self._preserved(tmp_path)
-        monkeypatch.setattr(hc.login_mod, "is_logged_in", lambda *a, **k: False)
+        monkeypatch.setattr(hc.login_mod, "signin_state", lambda *a, **k: False)
         resp = await self._fetch(state, job.id)
         assert resp.status == 409
         assert _read(resp)["code"] == "no_signin_pending"
@@ -1749,7 +1745,7 @@ class TestSigninPromptReprobe:
         def _boom(*_a, **_k):
             raise RuntimeError("ssm unreachable")
 
-        monkeypatch.setattr(hc.login_mod, "is_logged_in", _boom)
+        monkeypatch.setattr(hc.login_mod, "signin_state", _boom)
         resp = await self._fetch(state, job.id)
         assert resp.status == 502
         assert _read(resp) == {
@@ -1764,18 +1760,20 @@ class TestSigninPromptReprobe:
             error="could not reach the crew to check its sign-in",
         )
 
-    @pytest.mark.parametrize("raises, expected", [(True, None), (False, False)])
+    @pytest.mark.parametrize(
+        "raises, answer, expected", [(True, None, None), (False, False, False), (False, None, None)]
+    )
     async def test_the_probe_distinguishes_unknown_from_unsigned(
-        self, tmp_path, monkeypatch, raises, expected
+        self, tmp_path, monkeypatch, raises, answer, expected
     ):
         state, job = await self._preserved(tmp_path)
 
         def _logged_in(*_a, **_k):
             if raises:
                 raise RuntimeError("ssm unreachable")
-            return False
+            return answer
 
-        monkeypatch.setattr(hc.login_mod, "is_logged_in", _logged_in)
+        monkeypatch.setattr(hc.login_mod, "signin_state", _logged_in)
         assert hc._probe_signin_on_box(state, job) is expected
 
     async def test_a_non_terminal_job_is_never_probed(self, tmp_path, monkeypatch):
@@ -1789,7 +1787,7 @@ class TestSigninPromptReprobe:
         calls: list = []
         monkeypatch.setattr(
             hc.login_mod,
-            "is_logged_in",
+            "signin_state",
             lambda *a, **k: calls.append(1) or True,
         )
         resp = await self._fetch(state, job.id)
@@ -1803,32 +1801,48 @@ class TestSigninPromptReprobe:
         job.status = lj.AWAITING_SIGNIN
         state.cloud_launch_store.save(job)
         calls: list = []
-        monkeypatch.setattr(hc.login_mod, "is_logged_in", lambda *a, **k: calls.append(1) or True)
+        monkeypatch.setattr(hc.login_mod, "signin_state", lambda *a, **k: calls.append(1) or True)
         resp = await self._fetch(state, job.id)
         assert resp.status == 200
         assert _read(resp)["signin"]["code"] == "A"
         assert calls == []
 
-    async def test_a_job_with_no_preserved_code_is_not_probed(self, tmp_path, monkeypatch):
-        """Nothing is pending approval, so there is nothing that could have been
-        approved — probing every terminal job would be the blanket poll this
-        deliberately is not."""
+    @pytest.mark.parametrize(
+        "box, status, code, signed",
+        [
+            # Signed in later by a path the job never saw (the crew's own
+            # dashboard, a shell on it): the badge must clear.
+            (True, 409, "signin_already_complete", True),
+            # The box answered that it is not signed in: the badge is real.
+            (False, 409, "no_signin_pending", False),
+            # The box could not be asked (SSM down, a crew with no Kiro sign-in
+            # program): unknown, never "signed out".
+            (None, 502, "signin_probe_failed", False),
+        ],
+    )
+    async def test_a_job_with_no_preserved_code_is_reprobed(
+        self, tmp_path, monkeypatch, box, status, code, signed
+    ):
+        """The false "Needs sign-in": a crew whose code expired, later signed in
+        another way, stayed badged forever because only a job still holding a code
+        was ever re-probed."""
         state, job = await self._preserved(tmp_path)
         job.signin = None
         state.cloud_launch_store.save(job)
         calls: list = []
-        monkeypatch.setattr(hc.login_mod, "is_logged_in", lambda *a, **k: calls.append(1) or True)
+        monkeypatch.setattr(hc.login_mod, "signin_state", lambda *a, **k: calls.append(1) or box)
         resp = await self._fetch(state, job.id)
-        assert resp.status == 409
-        assert _read(resp)["code"] == "no_signin_pending"
-        assert calls == []
+        assert resp.status == status
+        assert _read(resp)["code"] == code
+        assert calls == [1]
+        assert state.cloud_launch_store.get(job.id).signin_detected is signed
 
     async def test_an_already_signed_job_is_not_probed(self, tmp_path, monkeypatch):
         state, job = await self._preserved(tmp_path)
         job.signin_detected = True
         state.cloud_launch_store.save(job)
         calls: list = []
-        monkeypatch.setattr(hc.login_mod, "is_logged_in", lambda *a, **k: calls.append(1) or True)
+        monkeypatch.setattr(hc.login_mod, "signin_state", lambda *a, **k: calls.append(1) or True)
         await self._fetch(state, job.id)
         assert calls == []
 
@@ -1853,15 +1867,9 @@ def test_ssm_module_is_untouched_by_these_tests():
 class TestKillPatternMatchesWhatTheBoxLaunches:
     """The `pkill` pattern is only ever exercised on the remote box.
 
-    The design lane's objection is exact: `pkill` exits 1 when the pattern
-    matches nothing, the same status as a login that already exited, so an
-    assertion about our own command text proves nothing about whether the box's
-    login would be found.
-
-    Two guards stand in for a live run. This class is the static one -- it ties
-    our killer to main's launcher, so a rename on EITHER side fails here instead
-    of silently matching nothing over SSM. The runtime one is the `pgrep`
-    re-probe, which reports UNCONFIRMED rather than a clean stop.
+    `pkill` exits 1 both for no match and for a login that already exited, so this
+    ties the pattern to the real launcher: a rename on either side fails here. The
+    runtime guard is the `pgrep` re-probe, which reports UNCONFIRMED.
     """
 
     def test_the_pattern_is_a_substring_of_the_launched_command_line(self) -> None:

@@ -13,6 +13,167 @@ from kiro_crew.config.sections_defaults import SectionReader
 
 logger = logging.getLogger("kiro_crew.config.loader")
 
+#: Longest stored value for any ``slack.code_channel_defaults`` string. A folder
+#: path, agent name or model id is far shorter; the cap keeps a hand-edited
+#: config.json from carrying an unbounded string into every code-channel session.
+CODE_CHANNEL_DEFAULT_MAX = 256
+
+#: ``slack.code_channel_defaults.approval_mode`` values. ``ask`` is the default
+#: and today's behaviour (every tool call asks), so it is stored as unset;
+#: ``trust_reads`` and ``trust`` are the dashboard approval picker's Reads and
+#: Trust. ``yolo`` is absent on purpose: it is process-global, never a property
+#: of one session.
+CODE_CHANNEL_APPROVAL_ASK = "ask"
+CODE_CHANNEL_APPROVAL_MODES = (CODE_CHANNEL_APPROVAL_ASK, "trust_reads", "trust")
+
+
+@dataclass
+class CodeChannelDefaultsConfig:
+    """What a new Slack code-channel session starts with.
+
+    Every field is optional: ``None`` means "no default here, fall through to the
+    next source". Resolution for a new code-channel session (implemented once, in
+    :func:`kiro_crew.slack.features.resolve_code_channel_session`):
+
+    * agent / model / effort: the explicit value here, else the folder's own
+      ``default_agent``, else the agent Slack already uses; with ``conductor_mode``
+      on (where conductor mode is offered) the agent is the conductor mode agent;
+    * project: the folder's ``project_dir``, else the project bound to the thread
+      the channel was opened from, else none.
+    """
+
+    folder: str | None = field(
+        default=None,
+        metadata=_meta(
+            "Default Folder",
+            "Sidebar folder (id, or a 'Parent/Child' path) new code-channel "
+            "sessions are filed in. The session inherits that folder's project "
+            "directory, default agent and steering. A folder deleted after it was "
+            "chosen is ignored: sessions are then unfiled and the other defaults "
+            "still apply.",
+            tags=["slack"],
+        ),
+    )
+    agent: str | None = field(
+        default=None,
+        metadata=_meta(
+            "Default Agent",
+            "Agent new code-channel sessions run. Wins over the folder's default "
+            "agent. Empty uses the folder's agent, else the agent Slack already uses.",
+            tags=["slack"],
+        ),
+    )
+    model: str | None = field(
+        default=None,
+        metadata=_meta(
+            "Default Model",
+            "Model id new code-channel sessions start on (as listed by the model "
+            "picker). Empty keeps the agent's own model.",
+            tags=["slack"],
+        ),
+    )
+    reasoning_effort: str | None = field(
+        default=None,
+        metadata=_meta(
+            "Default Reasoning Effort",
+            "Reasoning effort new code-channel sessions start with: low, medium, "
+            "high, xhigh or max. Empty keeps the agent's own effort. Ignored on "
+            "models that do not support effort.",
+            tags=["slack"],
+        ),
+    )
+    approval_mode: str | None = field(
+        default=None,
+        metadata=_meta(
+            "Default Approval Mode",
+            "Tool approval mode new code-channel sessions start in: ask (the "
+            "default: look-ups such as file reads, web searches and read-only shell "
+            "commands run on their own, everything else asks), trust_reads (also "
+            "searches of memory, past chats, skills and the knowledge library) or "
+            "trust (every tool runs without asking). Trust lets anyone allowed to "
+            "talk to the bot in the channel drive an agent whose tools run unprompted, "
+            "and sessions it spawns inherit that. The mode can still be changed on "
+            "the session afterwards.",
+            enum=list(CODE_CHANNEL_APPROVAL_MODES),
+            tags=["slack"],
+        ),
+    )
+    conductor_mode: bool | None = field(
+        default=None,
+        metadata=_meta(
+            "Always use conductor mode",
+            "Run every new code channel in conductor mode, on the conductor mode agent "
+            "(agent.crew_mode_agent). It overrides the code-channel default agent "
+            "and the folder's agent for new code channels; a session already "
+            "running keeps its agent. Applies only where conductor mode is "
+            "offered (every build but LTS). A conductor hands work to helper agents, so "
+            "slack.code_channel_dispatch should be on too. Off when unset; a "
+            "missing or malformed value reads as off.",
+            tags=["slack"],
+        ),
+    )
+
+
+def is_slack_user_id(value: object) -> bool:
+    """A Slack member id: ``U`` or ``W`` then 1 to 19 upper-case letters or digits.
+
+    Validated by ``USER_ID_RE``, the pattern the messaging schemas use. A bot id
+    (``B...``) and a workspace id (``T...``) never match.
+    """
+    # Here, not at the top: a module-level name would be a facade owner name the
+    # config.sections facade must bind, and not the kiro_crew.validation facade
+    # either, which imports config.sections, which imports this module.
+    from kiro_crew.validation_parts.input_bounds import USER_ID_RE
+
+    return isinstance(value, str) and USER_ID_RE.fullmatch(value) is not None
+
+
+def shared_user_ids(raw: object) -> list[str]:
+    """``slack.shared_access.user_ids`` as stored ids: trimmed, well-formed, deduped.
+
+    A non-list reads as empty and a malformed entry is dropped, so a hand edit can
+    never admit an id the gateway would not have accepted.
+    """
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for item in raw:
+        value = item.strip() if isinstance(item, str) else ""
+        if is_slack_user_id(value) and value not in out:
+            out.append(value)
+    return out
+
+
+@dataclass
+class SlackSharedAccessConfig:
+    """The owner's opt-in to let named Slack users drive this Crew as the owner.
+
+    Read on every Slack event, so a removal or a switch-off applies to the next one.
+    Separate from ``allowed_users``, which stays inert: turning this on never admits
+    a stale allowlist entry.
+    """
+
+    enabled: bool = field(
+        default=False,
+        metadata=_meta(
+            "Share Slack Access",
+            "Let the Slack users listed in user_ids use this Crew's Slack bot. They act "
+            "as you: with your files, git and cloud credentials and connected tools. "
+            "Off by default; applies to the next Slack event.",
+            tags=["slack"],
+        ),
+    )
+    user_ids: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Shared Slack Users",
+            "Slack member IDs (U... or W...) allowed to use the bot while shared access "
+            "is on. Each is checked with Slack before it is used: same workspace as the "
+            "bot, a person, not deactivated, not the owner.",
+            tags=["slack"],
+        ),
+    )
+
 
 @dataclass
 class SlackConfig:
@@ -42,12 +203,12 @@ class SlackConfig:
         default="kirocrew",
         metadata=_meta(
             "Command",
-            "Slack slash command trigger word.",
-            # Boot-read: the trigger is registered in the Slack app MANIFEST, so
-            # a local reload cannot make Slack route a new word. Applying it
-            # in-process would only change the help text and report success for a
-            # command that still does not exist on Slack's side.
-            restart=True,
+            "Slash command name shown in Slack help. The gateway also answers "
+            "/kirocrew and any /kirocrew-<alias> the app registers.",
+            # Live: Slack routes only commands the app MANIFEST registers, and the
+            # gateway answers every manifest-shaped name (``/kirocrew`` and
+            # ``/kirocrew-<alias>``) whatever this says. This adds a custom name
+            # and is the name help text shows; the Slack applier refreshes it.
         ),
     )
     forward_to_agent_callback: str = field(
@@ -134,6 +295,17 @@ class SlackConfig:
             tags=["slack"],
         ),
     )
+    home_tab_builtin: bool = field(
+        default=True,
+        metadata=_meta(
+            "Built-in Home Tab",
+            "Publish the Kiro Crew status page to the bot's Slack Home tab each "
+            "time an allowed user opens it. Turn it off to keep a Home view you "
+            "publish yourself with the same bot: the tab then stays as you "
+            "published it. Read at each open, so a change needs no restart.",
+            tags=["slack"],
+        ),
+    )
     home_tab_sessions_per_kind: int = field(
         default=5,
         metadata=_meta(
@@ -169,10 +341,30 @@ class SlackConfig:
         metadata=_meta(
             "Session Folder",
             "Optional sidebar folder for sessions that start on this channel. "
-            "Empty (the default) leaves them unfiled; any other value is the "
+            "Empty (the default) files them in a 'Slack' folder, created on "
+            "first use, while Show Slack Conversations In The Session List is "
+            "on, and leaves them unfiled while it is off; any other value is the "
             "folder name, created when these settings are saved and marked with "
             "the channel's brand mark. A configured folder that no longer exists "
             "leaves conversations unfiled until the next save recreates it.",
+            tags=["slack"],
+        ),
+    )
+    show_in_session_list: bool = field(
+        default=False,
+        metadata=_meta(
+            "Show Slack Conversations In The Session List",
+            "List conversations that start in Slack (threads, DMs, channel "
+            "mentions) in the dashboard's session list. Off (the default) "
+            "keeps them out of the list only: they keep working in Slack, stay "
+            "in History and search, and still raise approvals and "
+            "notifications; nothing is closed or deleted. The conversation "
+            "open in the dashboard, and one waiting on an approval or an "
+            "answer, keep their rows. On, and with no Session Folder set, new "
+            "ones are filed in a 'Slack' folder, created on first use. "
+            "Sessions started in the dashboard and linked to Slack, and Slack "
+            "code channel sessions with their helper agents, are always listed "
+            "and stay in their own folders. No restart.",
             tags=["slack"],
         ),
     )
@@ -204,6 +396,57 @@ class SlackConfig:
             "needs that manifest update and a reinstall before it takes effect, and "
             "until then Slack behaves as before. Slack cannot switch an app back "
             "from agent_view to assistant_view. Off by default; no restart.",
+            tags=["slack"],
+        ),
+    )
+    code_channel_dispatch: bool = field(
+        default=False,
+        metadata=_meta(
+            "Code Channel Dispatch",
+            "Let a Slack code channel's own session hand work to worker sessions: "
+            "create them, bind them to its work ledger and follow their status. "
+            "Only on turns the owner started, only for workers it created itself, "
+            "one level deep, filed in the channel's folder, with the channel's own "
+            "approval mode and never more; channels shared beyond this workspace "
+            "are excluded. Needs slack.code_channels on as well; a save that first "
+            "turns that on from the settings page turns this on with it, unless a "
+            "value is already stored (an explicit off is kept). Off keeps the full "
+            "channel containment: a conductor in a code channel cannot hand off "
+            "work. Off when unset, and a missing, unreadable or malformed value "
+            "reads as off. Takes effect on the next call; no restart.",
+            tags=["slack"],
+        ),
+    )
+    code_channels: bool = field(
+        default=False,
+        metadata=_meta(
+            "Code Channels",
+            "Let the agent open a Slack code channel for coding work: a channel "
+            "that is one session, with a context bar and a diff tab. Adds "
+            "features.code_channels and the code-channel scopes "
+            "(code_channels:manage, chat:write.customize, canvases:write, "
+            "channels:write.invites, groups:write.invites, pins:write) to the generated app "
+            "manifest; an installed app needs that update and a reinstall, and the "
+            "workspace must have Slack code channels enabled. Until both hold, "
+            "Slack behaves as before. Off by default; no restart.",
+            tags=["slack"],
+        ),
+    )
+    code_channel_defaults: CodeChannelDefaultsConfig = field(
+        default_factory=CodeChannelDefaultsConfig,
+        metadata=_meta(
+            "Code Channel Defaults",
+            "Folder, agent, model, reasoning effort and approval mode a new "
+            "code-channel session starts with. Takes effect on the next new code "
+            "channel; no restart.",
+            tags=["slack"],
+        ),
+    )
+    shared_access: SlackSharedAccessConfig = field(
+        default_factory=SlackSharedAccessConfig,
+        metadata=_meta(
+            "Shared Access",
+            "Let other Slack users drive this Crew as you. Off by default.",
             tags=["slack"],
         ),
     )
@@ -300,5 +543,62 @@ def _validate_tracking_channels(raw: list) -> list[dict]:
             '"channel_id" field or bare channel ID strings starting with C/D/G). '
             "These entries were ignored.",
             rejected,
+        )
+    return result
+
+
+def _validate_allowed_users(raw: list) -> list[dict]:
+    """Validate and coerce ``slack.allowed_users`` entries to the canonical shape.
+
+    The canonical entry is ``{"slack_id": "U...", "name": "..."}`` — the key the
+    allowlist writer persists and every reader looks up.
+    ``slack/gateway_runtime/orchestrator_init.py`` builds a ``set`` of these ids, so a non-string ``slack_id`` (a list or dict from a
+    hand-edited config) would raise ``TypeError: unhashable type`` at gateway
+    startup; the id must therefore be a non-empty string to be kept.
+
+    A ``user_id`` key with no usable ``slack_id`` is the common near-miss spelling.
+    Its value moves under ``slack_id`` rather than being dropped: a dropped entry
+    makes ``config get slack.allowed_users`` read back ``[]`` while the write
+    succeeded, which reads as a failed save. Coercion emits one warning.
+
+    Accepted:
+    - ``{"slack_id": "U...", ...}`` with a non-empty string ``slack_id`` — passed
+      through (``name`` and any extra keys kept)
+    - ``{"user_id": "U...", ...}`` whose ``slack_id`` is absent or unusable and whose
+      ``user_id`` is a non-empty string — the ``user_id`` value becomes ``slack_id``,
+      with a warning; other keys except ``slack_id``/``user_id`` are kept
+
+    Any other entry is ignored.
+    """
+    if not raw:
+        return []
+
+    def _usable_id(value: object) -> str | None:
+        return value if isinstance(value, str) and value else None
+
+    result: list[dict] = []
+    coerced = 0
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        if _usable_id(entry.get("slack_id")) is not None:
+            result.append(entry)
+            continue
+        user_id = _usable_id(entry.get("user_id"))
+        if user_id is not None:
+            # Move the near-miss ``user_id`` value under ``slack_id``. Build a new
+            # dict so the original is untouched and the key order reads ``slack_id``
+            # first; drop the source ``user_id`` and any unusable ``slack_id`` so
+            # neither clobbers the resolved id.
+            renamed = {"slack_id": user_id}
+            renamed.update({k: v for k, v in entry.items() if k not in ("user_id", "slack_id")})
+            result.append(renamed)
+            coerced += 1
+    if coerced:
+        logger.warning(
+            'Config: slack.allowed_users has %d entry(ies) with a "user_id" key — '
+            'auto-coerced to {"slack_id": "..."} format. '
+            'Prefer: [{"slack_id": "U...", "name": "..."}]',
+            coerced,
         )
     return result

@@ -22,10 +22,9 @@ from __future__ import annotations
 
 import base64
 import bisect
-import contextvars
 import math
 import re
-import zlib
+import urllib.parse
 from collections import Counter
 from collections.abc import Iterator
 
@@ -69,56 +68,6 @@ _BARE_SECRET_RUN_RE = re.compile(r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{40,}(?![A-Za-
 # (rather than ">=40") is what lets the structural gates below cleanly separate
 # real keys from 64-char sha256 hex, base64 document blobs, etc.
 _SECRET_KEY_LEN = 40
-
-#: Inside code text (``redaction_switch.code_text``) pass 3 leaves a run alone only when it is
-#: one of two things that can be told from a key by what they are, never by a name near them.
-#: A data URI payload: a run of ``_DATA_URI_PAYLOAD_MIN`` characters or more that follows
-#: ``data:<type>;base64,``. An alphabet: every 40-character window of the run has at least
-#: ``_ALPHABET_STEPS`` adjacent pairs that step up by one character code (``abc...``,
-#: ``ABC...``, ``012...``), which a table a program indexes into has and a random key does
-#: not. Everything else, a glued run included, is judged exactly as outside the scope.
-_DATA_URI_BEFORE_RE = re.compile(
-    r"data:[A-Za-z0-9.+-]+/[A-Za-z0-9.+-]+(?:;[A-Za-z0-9=.+-]+)*;base64,\Z", re.IGNORECASE
-)
-#: How far back from a run the data URI header may start.
-_DATA_URI_REACH = 128
-#: A payload shorter than this is judged, so a lone key behind a ``data:`` header is masked.
-_DATA_URI_PAYLOAD_MIN = 64
-#: An alphabet run longer than this is judged, which bounds the cost of reading one.
-_ALPHABET_RUN_MAX = 4096
-#: Adjacent pairs in a 40-character window (39) that must step up by one. A table of the
-#: letters and digits has 59 of 61 per 62; a random key has one such pair in about 64.
-_ALPHABET_STEPS = 30
-
-
-def _steps_up(run: str, at: int) -> int:
-    """1 when the character after ``run[at]`` is the next character code, else 0."""
-    return 1 if ord(run[at + 1]) == ord(run[at]) + 1 else 0
-
-
-def _is_code_literal(text: str, start: int, run: str) -> bool:
-    """Whether the run at *start* is a data URI payload or an ordered alphabet.
-
-    Both are read off the run and the few characters before it, and a run that is neither
-    stops the read at the first window that fails, so the cost of one run is fixed by
-    ``_DATA_URI_REACH`` and ``_ALPHABET_RUN_MAX`` whatever the text holds. A run this cannot
-    place is judged, which is the side that masks.
-    """
-    if len(run) >= _DATA_URI_PAYLOAD_MIN and _DATA_URI_BEFORE_RE.search(
-        text, max(0, start - _DATA_URI_REACH), start
-    ):
-        return True
-    if not _SECRET_KEY_LEN <= len(run) <= _ALPHABET_RUN_MAX:
-        return False
-    window = _SECRET_KEY_LEN - 1
-    total = sum(_steps_up(run, i) for i in range(window))
-    if total < _ALPHABET_STEPS:
-        return False
-    for i in range(window, len(run) - 1):
-        total += _steps_up(run, i) - _steps_up(run, i - window)
-        if total < _ALPHABET_STEPS:
-            return False
-    return True
 
 
 # Shannon-entropy floor (bits/char). A uniformly-random 40-char base64 string
@@ -225,14 +174,6 @@ _HEX_ONLY_RE = re.compile(r"\A[0-9a-fA-F]+\Z")
 #: bytes past the directory letter can still yield a positive window below 24 and stays
 #: redacted, as without the exemption. A key glued across the id with less overlap is judged.
 _HOST_ID_EXEMPT_OVERLAP = 24
-_DARWIN_USER_DIR_PREFIX_RE = r"(?<![A-Za-z0-9+/])(?:/private)?/var/folders/"
-_DARWIN_USER_DIR_SUFFIX_RE = r"/[CT](?![A-Za-z0-9+])"
-# ``_CS_DARWIN_USER_TEMP_DIR`` in Darwin's ``<unistd.h>``; Python has no name for
-# it, and its answer is the temp root with a trailing separator.
-_CS_DARWIN_USER_TEMP_DIR = 65537
-_DARWIN_USER_TEMP_DIR_RE = re.compile(
-    r"\A(?:/private)?/var/folders/(?P<id>[a-z0-9_]{2}/[a-z0-9_]{30})/T/?\Z"
-)
 
 # The Shannon term ``(c / _SECRET_KEY_LEN) * log2(c / _SECRET_KEY_LEN)``, indexed by
 # the character count ``c``. Element 0 is a ``0.0`` placeholder that keeps ``c``
@@ -666,107 +607,373 @@ def _text_contains_bare_secret(text: str) -> bool:
     return any(_contains_bare_secret(match.group()) for match in _BARE_SECRET_RUN_RE.finditer(text))
 
 
-# ── Document links the bare-secret pass leaves alone ──
-# `/` is in the run alphabet, so in `https://docs.google.com/document/d/<id>/edit`
-# the whole of `com/document/d/<id>/edit` is ONE run, and a Google document id is
-# ~44 uniformly random base64url characters: a 40-char window inside it clears
-# every gate of `_looks_like_secret_key`. No entropy or structural gate can tell
-# that id from a key, so the decision is made on the link instead. Pass 3 skips a
-# run only when the run lies wholly inside a match of `_DOCUMENT_LINK_RE`, which
-# admits nothing but a fixed route on a fixed host:
-#   * HTTPS, a lowercase literal host right after the scheme (no userinfo, no
-#     port), `docs.google.com`, `drive.google.com`, `<tenant>.atlassian.net`, or
-#     a PlantUML server: a host whose first label is `plantuml` (after an
-#     optional `www.`), such as `www.plantuml.com`;
-#   * every path segment fixed or drawn from a closed class: a Google id is
-#     25-72 chars of `[A-Za-z0-9_-]`, a Confluence space key is alphanumeric, a
-#     page id is digits, a PlantUML diagram is `[/plantuml]/<png|svg|txt|uml>/`
-#     then its deflate text in PlantUML's `[0-9A-Za-z_-]` alphabet;
-#   * no piece of the link is a whole key: a piece exactly 40 characters long
-#     voids the match when `_looks_like_secret_key` accepts it. Pieces are cut
-#     twice, once at every non-run character (`/`, `-`, `_`, `%`, `.`, `~`)
-#     and once also at `+`, the space of a Confluence title slug, so a key
-#     pasted in as the id or as a title word is still redacted. A PlantUML
-#     diagram is random-looking by construction, so it is judged by decoding
-#     instead: it must inflate, whole, to printable text with nothing after the
-#     stream but the encoder's zero padding, and every credential pass must
-#     leave that text unchanged. The text inflated per call is capped (see
-#     `_PLANTUML_SOURCE_CAP`). A key as the diagram, glued to one, or written
-#     in its source voids the match;
-#   * the link ends where the route ends, with one optional trailing `/`: a
-#     further base64-alphabet character (a glued key, another `/segment`)
-#     fails the match.
-# The query and fragment are outside the match, so a key there, a `?token=`
-# value and every pass-1 and pass-2 hit are judged exactly as before.
-#
-# ACCEPTED RESIDUAL: a markerless key without `/` glued to more letters or
-# digits inside the id or the page title, or carrying its own `+` inside a
-# title, is indistinguishable from the text it sits in and is not redacted.
-# About 2% of real Google ids carry a key-shaped 40-char piece between their
-# random `-`/`_` and stay redacted. That placement is not an accidental leak,
-# and pass 3 is no control against a deliberate one: a single `-` already
-# splits any run.
-_DOCUMENT_ID = r"[A-Za-z0-9_-]{25,72}"
-_PLANTUML_DIAGRAM = r"[A-Za-z0-9_-]{1,16384}"
-_GOOGLE_USER = r"(?:u/[0-9]{1,2}/)?"
-_RUN_PIECE_RES = (re.compile(r"[A-Za-z0-9+]+"), re.compile(r"[A-Za-z0-9]+"))
-_DOCUMENT_LINK_RE = re.compile(
-    r"(?<![A-Za-z0-9+.-])https://(?:"
-    r"docs\.google\.com/(?:document|spreadsheets|presentation|drawings|forms)/"
-    + _GOOGLE_USER
-    + r"d/(?:e/)?"
-    + _DOCUMENT_ID
-    + r"(?:/(?:edit|view|preview|copy|viewform|pub|pubhtml|htmlview))?"
-    r"|drive\.google\.com/"
-    + _GOOGLE_USER
-    + r"(?:file/d/"
-    + _DOCUMENT_ID
-    + r"(?:/(?:view|edit|preview))?"
-    r"|drive/" + _GOOGLE_USER + r"folders/" + _DOCUMENT_ID + r")"
-    r"|[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.atlassian\.net/wiki/spaces/~?[A-Za-z0-9]{1,64}/"
-    r"(?:overview|pages/(?:edit-v2/)?[0-9]{1,20}"
-    r"(?:/[A-Za-z0-9+%._~-]{1,255})?)"
-    r"|(?:www\.)?plantuml(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+(?:/plantuml)?/(?:png|svg|txt|uml)/"
-    r"(?P<diagram>" + _PLANTUML_DIAGRAM + r")"
-    r")/?(?![A-Za-z0-9+/_-])"
+# ── Outlook on the web and Slack links, matched by structure ──
+# An Outlook mail or calendar item id is the base64 of an Exchange id with its
+# `+`, `/` and `=` written `%2B`, `%2F` and `%3D`, and a Slack `client` link
+# joins its two ids and its message stamp into one 40+ char run, so pass 3
+# masks both. They are exempt by structure, with no pattern: the link is cut
+# out of the text by fixed character sets, split by `urllib.parse.urlsplit`,
+# its host compared exactly against a fixed set, its path segments compared
+# as exact tokens, and its ids checked character by character:
+#   * `https://` right after a character that cannot glue onto a key, then a
+#     lowercase literal host and a
+#     path of `_LINK_PATH_CHARS` only. The link ends at the first other
+#     character, so the query, the fragment and a sentence's `.` are outside
+#     it and everything there is judged as before. A host with userinfo, a
+#     port, or an uppercase letter is not a link here at all;
+#   * Outlook: one of `_OUTLOOK_HOSTS`, then `mail/[<n>/][<folder>/]id/<id>`
+#     (a folder is one of `_OUTLOOK_FOLDERS`; a folder id is not admitted),
+#     `mail/deeplink/<compose|read>/<id>`, `calendar/[<n>/]item/<id>` or
+#     `calendar/deeplink/read/<id>`, the id last, with no trailing `/`. The id
+#     opens with an Exchange id prefix (`AAMk`, `AAQk`, `AQMk`, `AQQk`), then
+#     12-252 characters of `[A-Za-z0-9_-]` or the escapes `%2B`, `%2F`,
+#     `%3D`, and must decode to one whole Exchange id (`_is_whole_exchange_id`);
+#   * Outlook's own open-in-browser link (Microsoft Graph `webLink`), the one
+#     route whose id rides in the query: exactly `/owa/?ItemID=<id>&exvsurl=1
+#     &viewmodel=ReadMessageItem` or `/owa/?itemid=<id>&exvsurl=1&path=
+#     /calendar/item`, fields in that order, nothing else, the id judged as
+#     above (`_OWA_WEB_LINK_QUERIES`). Only on `/owa/` does the link read past
+#     `?`, so every other route's query stays outside it as before;
+#   * Slack: `app.slack.com`, `<workspace>.slack.com` or
+#     `<workspace>.enterprise.slack.com`, then exactly `client/<id>/<id>/<msg>`
+#     and one optional trailing `/`, where an id is one uppercase letter and
+#     7-11 uppercase letters or digits and a message is `p` and 16 digits;
+#   * no piece of the link is a whole key, as for a document link. An Outlook
+#     link is also cut with each `%XX` escape read as a separator (a key
+#     between two escapes) and with each `/` segment holding an escape
+#     percent-decoded (a key whose own `/` or `+` is escaped).
+# So a key as an id or a segment, glued to an id, after the route, escaped, or
+# inside a crafted Exchange header is still redacted.
+_LINK_ALNUM = frozenset("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
+_LINK_HOST_CHARS = frozenset("0123456789abcdefghijklmnopqrstuvwxyz.-")
+_LINK_PATH_CHARS = _LINK_ALNUM | frozenset("+/_-%")
+#: Longest path a chat or mail link is read for; a real one is a few hundred chars.
+_LINK_PATH_MAX = 2048
+_OUTLOOK_HOSTS = frozenset(
+    {"outlook.office.com", "outlook.office365.com", "outlook.live.com", "outlook.cloud.microsoft"}
 )
-_PLANTUML_ALPHABET = {
-    c: i for i, c in enumerate("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_")
-}
-#: Decoded diagram text one call may inflate, in total, and per encoded
-#: character. Real diagrams stay under 10x; anything larger keeps its link
-#: masked, which is how it was judged before this route. The total bounds the
-#: extra scan a call can be made to do to that of a plain text this long.
-_PLANTUML_SOURCE_CAP = 16384
-_PLANTUML_RATIO_CAP = 16
-#: Set while a decoded diagram is being scanned, so a diagram link inside it is
-#: judged as any other link and decoding never nests.
-_IN_DIAGRAM_SCAN: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "_IN_DIAGRAM_SCAN", default=False
+# Well-known folder names only: a folder given by its id would let a key whose
+# last character is `/` hide as the tail of that id plus its separator.
+_OUTLOOK_FOLDERS = frozenset(
+    {"inbox", "drafts", "sentitems", "deleteditems", "archive", "junkemail", "outbox", "search"}
 )
+_OUTLOOK_ID_PREFIXES = ("AAMk", "AAQk", "AQMk", "AQQk")
+_OUTLOOK_ID_ESCAPES = frozenset({"%2B", "%2b", "%2F", "%2f", "%3D", "%3d"})
+#: The Graph `webLink` query of a message and of an event: the id field's exact
+#: name, then the fixed fields that follow it, in order.
+_OWA_WEB_LINK_QUERIES = (
+    ("ItemID", ("exvsurl=1", "viewmodel=ReadMessageItem")),
+    ("itemid", ("exvsurl=1", "path=/calendar/item")),
+)
+_OWA_WEB_LINK_PATH = "/owa/"
+_OWA_QUERY_CHARS = _LINK_PATH_CHARS | frozenset("=&")
+#: A URL path's segment separator: `/` on every platform, never `os.sep`.
+_URL_PATH_SEP = "/"
 
 
-def _plantuml_source(encoded: str, limit: int) -> str | None:
-    """Return the diagram text *encoded* inflates to, whole, or None."""
-    if limit <= 0 or len(encoded) % 4:
+def _char_runs(text: str, alphabet: frozenset[str]) -> Iterator[str]:
+    """Yield every maximal run of *text* whose characters are all in *alphabet*."""
+    start = -1
+    for i, ch in enumerate(text):
+        if ch in alphabet:
+            if start < 0:
+                start = i
+        elif start >= 0:
+            yield text[start:i]
+            start = -1
+    if start >= 0:
+        yield text[start:]
+
+
+def _escapes_as_slash(text: str) -> str:
+    """*text* with every `%XX` escape replaced by `/`, a separator."""
+    out = []
+    i = 0
+    while i < len(text):
+        hex_pair = text[i + 1 : i + 3]
+        if (
+            text[i] == "%"
+            and len(hex_pair) == 2
+            and all(c in "0123456789ABCDEFabcdef" for c in hex_pair)
+        ):
+            out.append("/")
+            i += 3
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
+def _chat_mail_link_pieces(link: str, *, outlook: bool) -> Iterator[str]:
+    """Yield every piece of a chat or mail link that could be a whole key.
+
+    Cut like pass 3's own pieces, with and without `+`; an Outlook link is also
+    cut with each escape as a separator and with each escaped segment decoded.
+    """
+    alphabets = (_LINK_ALNUM | frozenset("+"), _LINK_ALNUM)
+    texts = (link, _escapes_as_slash(link)) if outlook else (link,)
+    for text in texts:
+        for alphabet in alphabets:
+            yield from _char_runs(text, alphabet)
+    if outlook:
+        for segment in link.split(_URL_PATH_SEP):
+            if "%" in segment:
+                decoded = urllib.parse.unquote(segment)
+                yield from _char_runs(decoded, _LINK_ALNUM | frozenset("+/"))
+
+
+def _outlook_item_id(segments: list[str]) -> str | None:
+    """The item id when *segments* are an Outlook mail or calendar item route."""
+    if len(segments) < 2 or segments[0] not in ("mail", "calendar"):
         return None
-    bits = [_PLANTUML_ALPHABET[c] for c in encoded]
-    raw = bytearray()
-    for i in range(0, len(bits), 4):
-        word = bits[i] << 18 | bits[i + 1] << 12 | bits[i + 2] << 6 | bits[i + 3]
-        raw += word.to_bytes(3, "big")
-    inflater = zlib.decompressobj(-zlib.MAX_WBITS)
+    app, route, item = segments[0], tuple(segments[1:-1]), segments[-1]
+    deeplinks = (
+        {("deeplink", "compose"), ("deeplink", "read")} if app == "mail" else {("deeplink", "read")}
+    )
+    if route in deeplinks:
+        return item
+    # An optional one- or two-digit account index, then (mail only) a folder.
+    if route[:1] and 0 < len(route[0]) <= 2 and all(c in "0123456789" for c in route[0]):
+        route = route[1:]
+    if app == "mail" and route[:1] and route[0] in _OUTLOOK_FOLDERS:
+        route = route[1:]
+    return item if route == (("id",) if app == "mail" else ("item",)) else None
+
+
+def _outlook_web_link_item(path: str, query: str) -> str | None:
+    """The item id when *path* and *query* are exactly an Outlook `webLink`."""
+    if path != _OWA_WEB_LINK_PATH:
+        return None
+    fields = query.split("&")
+    for id_name, fixed in _OWA_WEB_LINK_QUERIES:
+        name, sep, item = fields[0].partition("=")
+        if name == id_name and sep and tuple(fields[1:]) == fixed:
+            return item
+    return None
+
+
+def _outlook_web_link_tail(
+    domain: str, path_and_query: str, port: str, is_https: bool
+) -> str | None:
+    """What the exfil gate still judges when the URL opens with an Outlook `webLink`.
+
+    None when it does not. The gate asks this so it judges the link with the
+    very matcher the credential pass uses, rather than a second copy that could
+    drift. The link (``_OWA_WEB_LINK_QUERIES``) has a fixed path, fixed fields
+    in a fixed order, and an id that decodes as one whole Exchange entry id with
+    no key-shaped piece. Like the Slack app-create carve-out it VALIDATES the
+    bytes rather than trusting the host: the id's free fields are GUIDs and
+    counters of at most 22 bytes each, less than the sub-200-char query any URL
+    may carry past those heuristics today. Whatever the scan glued after the
+    link (a sentence's `.`, a fragment) is returned, so it stays judged.
+    HTTPS with no explicit port only, like the OAuth and Slack carve-outs.
+    """
+    if not is_https or port:
+        return None
+    url = f"https://{domain}{path_and_query}"
+    end = _chat_mail_link_at(url, 0)
+    return url[end:] if end is not None and "?" in url[:end] else None
+
+
+def _is_outlook_id(item: str) -> bool:
+    """Whether *item* has an Outlook id's prefix, alphabet and length, and decodes whole."""
+    if not item.startswith(_OUTLOOK_ID_PREFIXES):
+        return False
+    units = 0
+    i = len(_OUTLOOK_ID_PREFIXES[0])
+    while i < len(item):
+        if item[i] in _LINK_ALNUM or item[i] in "_-":
+            i += 1
+        elif item[i : i + 3] in _OUTLOOK_ID_ESCAPES:
+            i += 3
+        else:
+            return False
+        units += 1
+        if units > 252:
+            return False
+    return units >= 12 and _is_whole_exchange_id(item)
+
+
+def _is_slack_host(host: str) -> bool:
+    """Whether *host* is `app.slack.com` or one workspace's own Slack host."""
+    if host == "app.slack.com":
+        return True
+    for suffix in (".enterprise.slack.com", ".slack.com"):
+        if host.endswith(suffix):
+            label = host[: -len(suffix)]
+            return (
+                0 < len(label) <= 63
+                and "." not in label
+                and label[0] != "-"
+                and label[-1] != "-"
+                and all(c in _LINK_HOST_CHARS for c in label)
+            )
+    return False
+
+
+def _is_slack_client_route(segments: list[str]) -> bool:
+    """Whether *segments* are exactly `client/<id>/<id>/p<16 digits>`, one `/` allowed after."""
+
+    def is_id(segment: str) -> bool:
+        return (
+            8 <= len(segment) <= 12
+            and "A" <= segment[0] <= "Z"
+            and all("A" <= c <= "Z" or "0" <= c <= "9" for c in segment)
+        )
+
+    if segments[-1:] == [""]:
+        segments = segments[:-1]
+    if len(segments) != 4 or segments[0] != "client":
+        return False
+    message = segments[3]
+    return (
+        is_id(segments[1])
+        and is_id(segments[2])
+        and len(message) == 17
+        and message[0] == "p"
+        and all("0" <= c <= "9" for c in message[1:])
+    )
+
+
+def _chat_mail_link_at(text: str, start: int) -> int | None:
+    """The end of an exempt Outlook or Slack link at *start*, or None."""
+    if start and (text[start - 1] in _LINK_ALNUM or text[start - 1] in "+.-"):
+        return None
+    host_start = host_end = start + len("https://")
+    while host_end < len(text) and text[host_end] in _LINK_HOST_CHARS:
+        host_end += 1
+    end = host_end
+    limit = min(len(text), host_end + _LINK_PATH_MAX + 1)
+    while end < limit and text[end] in _LINK_PATH_CHARS:
+        end += 1
+    host = text[host_start:host_end]
+    outlook = host in _OUTLOOK_HOSTS
+    # Only the `webLink` route reads on into its query; its fixed fields bound it.
+    if outlook and text[host_end:end] == _OWA_WEB_LINK_PATH and text[end : end + 1] == "?":
+        end += 1
+        while end < limit and text[end] in _OWA_QUERY_CHARS:
+            end += 1
+    if end - host_end > _LINK_PATH_MAX:
+        return None
+    link = text[start:end]
+    parts = urllib.parse.urlsplit(link)
+    if (
+        parts.scheme != "https"
+        or parts.netloc != host
+        or parts.hostname != host
+        or (parts.query and not outlook)
+        or parts.fragment
+        or not parts.path.startswith("/")
+    ):
+        return None
+    segments = parts.path[1:].split(_URL_PATH_SEP)
+    if outlook:
+        item = (
+            _outlook_web_link_item(parts.path, parts.query)
+            if parts.query
+            else _outlook_item_id(segments)
+        )
+        if item is None or not _is_outlook_id(item):
+            return None
+    elif not (_is_slack_host(host) and _is_slack_client_route(segments)):
+        return None
+    if any(
+        len(piece) == _SECRET_KEY_LEN and _looks_like_secret_key(piece)
+        for piece in _chat_mail_link_pieces(link, outlook=outlook)
+    ):
+        return None
+    return end
+
+
+def _chat_mail_link_spans(text: str) -> list[tuple[int, int]]:
+    """Return the spans of the Outlook and Slack links in *text* that hold no key."""
+    spans = []
+    start = text.find("https://")
+    while start >= 0:
+        end = _chat_mail_link_at(text, start)
+        if end is not None:
+            spans.append((start, end))
+        start = text.find("https://", start + 1)
+    return spans
+
+
+# The decoded Exchange id: a compression flag, the id storage type, the 36-byte
+# mailbox GUID text with its 16-bit length, a processing byte, then the store id
+# with its 16-bit length, which must end the id exactly and (for a long-term id)
+# carry an entry id's fixed flag, type and padding bytes.
+#: Offsets of the four `-` in a GUID's 36-byte text form; every other byte is hex.
+_EXCHANGE_GUID_DASHES = frozenset({8, 13, 18, 23})
+_EXCHANGE_ID_MAX_BYTES = 1024
+
+
+def _expand_exchange_runs(data: bytes) -> bytes | None:
+    """Undo an Exchange id's run-length compression, or return None if malformed.
+
+    Two equal bytes in a row are followed by a count of further repeats.
+    """
+    out = bytearray()
+    i = 0
+    while i < len(data):
+        if i + 1 < len(data) and data[i] == data[i + 1]:
+            if i + 2 >= len(data):
+                return None
+            out += bytes([data[i]]) * (2 + data[i + 2])
+            i += 3
+        else:
+            out.append(data[i])
+            i += 1
+        if len(out) > _EXCHANGE_ID_MAX_BYTES:
+            return None
+    return bytes(out)
+
+
+def _is_whole_exchange_id(text: str) -> bool:
+    """Whether an Outlook item id decodes to one complete Exchange id.
+
+    Every field length must account for every decoded byte, so a key glued after
+    an id, or after a bare id prefix, fails the decode instead of riding the route.
+    """
+    encoded = urllib.parse.unquote(text).replace("-", "+").replace("_", "/").rstrip("=")
+    if len(encoded) % 4 == 1:
+        return False
     try:
-        source = inflater.decompress(bytes(raw), limit).decode("utf-8")
-    except (zlib.error, UnicodeDecodeError):
-        return None
-    # The encoder emits whole 4-character groups and pads only the last one,
-    # with at most two zero bytes. A further group, a stream cut short, or one
-    # over the limit is not a whole diagram, so text glued after a diagram, or a
-    # diagram cut mid-group, is never kept.
-    padding = inflater.unused_data
-    if not inflater.eof or len(padding) > 2 or padding.strip(b"\0") or not source.strip():
-        return None
-    if not all(c.isprintable() or c in "\t\n\r" for c in source):
-        return None
-    return source
+        data = base64.b64decode(encoded + "=" * (-len(encoded) % 4), validate=True)
+    except ValueError:
+        return False
+    if data[:1] == b"\x01":
+        expanded = _expand_exchange_runs(data[1:])
+        if expanded is None:
+            return False
+        data = b"\x01" + expanded
+    if len(data) < 43 or data[1] not in (3, 4) or data[2:4] != b"\x24\x00":
+        return False
+    if not _is_guid_text(data[4:40]):
+        return False
+    store = data[43:]
+    if len(store) != (data[41] | data[42] << 8):
+        return False
+    if data[1] == 4:
+        return len(store) == 16
+    return _is_item_entry_id(store)
+
+
+def _is_item_entry_id(store: bytes) -> bool:
+    """Whether a store id is a folder or message entry id with its fixed bytes.
+
+    Zero flags, the folder (1) or message (7) type and the zero padding after
+    each long-term id leave no free stretch longer than 22 bytes, about 30
+    base64 characters, so no 40-char key fits in one.
+    """
+    if len(store) not in (46, 70) or store[:4] != b"\0\0\0\0":
+        return False
+    kind = b"\x07\x00" if len(store) == 70 else b"\x01\x00"
+    pads = store[44:46] + store[68:70]
+    return store[20:22] == kind and pads == b"\0" * len(pads)
+
+
+def _is_guid_text(raw: bytes) -> bool:
+    """Whether *raw* is a GUID's 36-byte text form: hex in 8-4-4-4-12 groups."""
+    return len(raw) == 36 and all(
+        byte == ord("-") if i in _EXCHANGE_GUID_DASHES else byte in b"0123456789ABCDEFabcdef"
+        for i, byte in enumerate(raw)
+    )

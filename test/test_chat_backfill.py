@@ -18,12 +18,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 from chat_test_helpers import _make_state
+from redaction_structured_cases import github_classic
 from test_chat_slack import _make_slack_app
 
 from kiro_crew.dashboard import chat_slack
 from kiro_crew.dashboard.chat_backfill import select_backfill_messages
 from kiro_crew.dashboard.chat_slack import drain_slack_backfill
 from kiro_crew.slack.format import SLACK_MAX_TEXT, SLACK_MSG_LIMIT
+
+# A GitHub token with a valid checksum: the plan redacts it, while an AWS key ID
+# stays visible as an identifier.
+_SECRET = github_classic(seed=41)
 
 
 def _state(tmp_path):
@@ -224,7 +229,7 @@ class TestBackfillFormatting:
         answer_parts = [text for text in posted if "line 0 " in text or "line 119 " in text]
         assert len(posted) >= 3, f"expected the answer to span parts, got {len(posted)}"
         assert all(len(text) <= SLACK_MSG_LIMIT for text in posted)
-        # Every line survives somewhere — the old 2,000-char cap dropped the rest.
+        # Every line survives somewhere; a fixed 2,000-char cap would drop the rest.
         body = "\n".join(posted)
         for i in (0, 60, 119):
             assert f"line {i} " in body, f"line {i} lost"
@@ -247,7 +252,7 @@ class TestBackfillFormatting:
     async def test_credentials_are_redacted(self, tmp_path):
         state = _state(tmp_path)
         slot = state.get_or_create_slot("s1")
-        secret = "AKIAIOSFODNN7EXAMPLE"
+        secret = _SECRET
         _seed(slot, [("user", "here are creds"), ("assistant", f"key is {secret}")])
 
         posted = await _drain(state, slot)
@@ -258,11 +263,8 @@ class TestBackfillFormatting:
     async def test_table_straddling_a_split_keeps_every_row(self, tmp_path):
         """A split must not let a data row become the table's header.
 
-        ``_convert_tables`` labels a table from the first ``|`` row it sees, so a
-        block starting part-way through one adopts a DATA row as its header. That
-        row's values then only ever appear as labels — and disappear completely if
-        no data rows follow — while later rows get the wrong labels. Tables are
-        therefore left raw whenever the pre-split produced more than one block.
+        ``_convert_tables`` takes the first ``|`` row as the header, so tables stay raw
+        whenever the pre-split produced more than one block.
         """
         state = _state(tmp_path)
         slot = state.get_or_create_slot("s1")
@@ -301,11 +303,8 @@ class TestBackfillFormatting:
     async def test_message_past_the_mrkdwn_limit_keeps_its_tail(self, tmp_path):
         """Splitting must happen around ``to_slack_mrkdwn``, not after it.
 
-        ``to_slack_mrkdwn`` self-truncates at ``SLACK_MAX_TEXT``, so converting
-        the whole message and splitting the result silently drops everything past
-        39,000 characters — the same tail loss as the 2,000-char cap this
-        replaces, just further out. The text is pre-split below the limit so no
-        block ever reaches that internal truncation.
+        ``to_slack_mrkdwn`` self-truncates at ``SLACK_MAX_TEXT`` (39,000), so the text is
+        pre-split below that limit.
         """
         state = _state(tmp_path)
         slot = state.get_or_create_slot("s1")
@@ -325,31 +324,25 @@ class TestBackfillFormatting:
     async def test_ansi_credential_straddling_a_split_boundary_is_redacted(self, tmp_path):
         """The hard case: obfuscated AND cut across two posts.
 
-        If ANSI is only stripped per block (inside ``to_slack_mrkdwn``), a
-        credential broken by an escape and cut by the pre-split leaves each block
-        holding an unmatchable fragment. Both blocks redact clean individually,
-        and the two adjacent posts hand the reader the whole key. Normalising the
-        escapes before the FIRST redaction — while the text is still one piece —
-        is what closes it.
-
-        The preconditions below are asserted rather than assumed: an earlier
-        version of this test put the cut inside the filler instead of inside the
-        credential, so the second redaction pass caught it and the test passed
-        even with the fix removed.
+        Each half alone redacts clean, so escapes must be normalised before the FIRST
+        redaction, while the text is one piece. The preconditions are asserted: a cut
+        in the filler instead of the credential would pass without the fix.
         """
         from kiro_crew.slack.format import CONTINUATION
 
         state = _state(tmp_path)
         slot = state.get_or_create_slot("s1")
-        secret = "AKIAIOSFODNN7EXAMPLE"
+        secret = _SECRET
         split_secret = secret[:6] + "\x1b[0m" + secret[6:]
 
         # split_message reserves room for CONTINUATION and, with no newline to
         # snap to, cuts exactly there.
         boundary = SLACK_MAX_TEXT // 2
         cut = boundary - len(CONTINUATION)
-        filler = "q" * (cut - 12)
-        content = filler + split_secret + ("z" * 200)
+        filler = (
+            "q" * (cut - 13) + " "
+        )  # a blank: a token glued to a letter is no token by its format
+        content = filler + split_secret + " " + ("z" * 199)
 
         assert len(content) > boundary, "no split would happen at all"
         assert len(filler) < cut < len(filler) + len(split_secret), (
@@ -373,9 +366,9 @@ class TestBackfillFormatting:
         """
         state = _state(tmp_path)
         slot = state.get_or_create_slot("s1")
-        secret = "AKIAIOSFODNN7EXAMPLE"
+        secret = _SECRET
         # An ANSI reset dropped into the middle of the key: invisible to the
-        # credential regex, removed entirely by _strip_ansi.
+        # credential regex, removed entirely by the ANSI strip.
         split_secret = secret[:4] + "\x1b[0m" + secret[4:]
         _seed(slot, [("user", "paste"), ("assistant", f"key is {split_secret}")])
 
@@ -387,21 +380,16 @@ class TestBackfillFormatting:
     async def test_credential_straddling_the_mrkdwn_boundary_is_redacted(self, tmp_path):
         """Ordering guard: redaction must precede ``to_slack_mrkdwn``.
 
-        ``to_slack_mrkdwn`` self-truncates at ``SLACK_MAX_TEXT`` (39,000) before
-        it converts anything. Converting first would therefore hand the redactor
-        a credential that has already been cut in half, leaving a prefix no
-        regex matches -- a partial secret on the wire.
-
-        The padding is deliberately newline-free so ``rfind("\\n")`` returns -1
-        and the cut lands exactly on 39,000, and the secret starts 10 chars
-        before it, so convert-first leaves precisely its first 10 characters
-        behind. A secret placed entirely past the boundary would simply be
-        deleted, which is why the obvious version of this test proves nothing.
+        Truncating at ``SLACK_MAX_TEXT`` first would leave a secret prefix no regex matches.
+        The padding has no newline so the cut lands at 39,000, 10 chars into the secret;
+        a secret wholly past the boundary would just be deleted and prove nothing.
         """
         state = _state(tmp_path)
         slot = state.get_or_create_slot("s1")
-        secret = "AKIAIOSFODNN7EXAMPLE"
-        filler = "x" * (SLACK_MAX_TEXT - 10)
+        secret = _SECRET
+        filler = (
+            "x" * (SLACK_MAX_TEXT - 11) + " "
+        )  # a blank: a token glued to a letter is no token by its format
         content = filler + secret
         assert len(content) > SLACK_MAX_TEXT
         assert "\n" not in filler
@@ -539,11 +527,8 @@ class TestBackfillHandlerWiring:
     async def test_link_backgrounds_the_drain_and_seeds_the_thread(self, tmp_path, monkeypatch):
         """The response must not wait on the backfill.
 
-        Slack accepts about one message per second per channel, so a long
-        history held the request open long enough for the browser fetch to time
-        out. The drain is blocked here on an event so the test can prove the
-        handler returned with the seeding still in flight, rather than racing a
-        drain that happens to finish instantly against AsyncMock.
+        Slack takes about one message per second, so a long drain would time out the
+        fetch. The drain blocks on an event to prove the handler returned first.
         """
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         state = _state(tmp_path)

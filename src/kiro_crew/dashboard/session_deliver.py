@@ -3,9 +3,11 @@
 The sender names WHO it is (:class:`Origin`); this module decides HOW the text
 lands. An idle slot gets the origin's row and a turn; a running slot gets the
 origin's running-path delivery (a steer for an automation wake, the queue for a
-cron notification or an app message). The row's role and meta come from the
-origin alone (:func:`origin_row`), so the same sender never draws as two
-different rows depending on whether the slot happened to be busy. A peer
+cron notification or an app message). An automation sender that brings its own
+turn starter has it run on an idle slot and declined on a running one. The row's
+role and meta come from the origin alone (:func:`origin_row`), so the same
+sender never draws as two different rows depending on whether the slot happened
+to be busy. A peer
 session's ``session_send`` is a ``user`` row on both paths: a steer when it asks
 for one and the slot is running, else the queue-or-run path.
 
@@ -22,15 +24,19 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from collections.abc import Awaitable, Callable
+
     from kiro_crew.dashboard.state import DashboardState, _ChatSlot
 
 logger = logging.getLogger(__name__)
 
 #: Who sent the text. ``automation`` is a monitor loop's wake, ``cron`` a cron
-#: job's notification, ``app`` an embedded MCP App's message.
+#: job's notification, ``app`` an embedded MCP App's message, ``resource`` a
+#: wake for an MCP resource subscription (rfc-mcp-resource-subscriptions §4.9.2).
 ORIGIN_AUTOMATION = "automation"
 ORIGIN_CRON = "cron"
 ORIGIN_APP = "app"
+ORIGIN_RESOURCE = "resource"
 #: Another session's ``session_send``: its row is a ``user`` row, written by the
 #: steer or the queue-or-run path like a typed message, and never the human stamp.
 ORIGIN_PEER = "peer"
@@ -48,37 +54,57 @@ QUEUE_FULL = "queue_full"
 class Origin:
     """The sender of a delivery and what its row names.
 
-    ``label`` is the cron job or app label the row shows; ``nudge`` is the
-    ``meta.nudge`` (``{"cycle", "loop_id"}``) an automation wake's row carries.
-    Build one with :func:`cron`, :func:`app` or :func:`automation`.
+    ``label`` is the cron job, app or MCP server label the row shows; ``nudge``
+    is the ``meta.nudge`` (``{"cycle", "loop_id"}``) an automation wake's row
+    carries, plus, for a steered wake, the loop's config generation under
+    :data:`WAKE_GENERATION`, which no row carries; ``subscription`` is the
+    resource subscription a ``resource`` wake is for. Build one with
+    :func:`cron`, :func:`app`, :func:`resource` or :func:`automation`.
     """
 
     kind: str
     label: str = ""
     nudge: dict | None = None
     steer: bool = False
+    #: A peer's own Crew session key, for the trace link its delivery carries.
+    sender: str = ""
+    subscription: str = ""
 
 
 def cron(label: str) -> Origin:
     return Origin(ORIGIN_CRON, label=label)
 
 
-def peer(*, steer: bool) -> Origin:
+def peer(*, steer: bool, sender: str = "") -> Origin:
     """A peer session's text.
 
     ``steer=True`` is the steer arm only: it never queues or starts a turn, so a
     caller whose turn ended before the steer ran gets :data:`NOT_DELIVERED` and
-    makes the one queue-or-run delivery itself (``steer=False``).
+    makes the one queue-or-run delivery itself (``steer=False``). *sender* is the
+    peer's session key, read only to link the turn the text starts to the sender's.
     """
-    return Origin(ORIGIN_PEER, steer=steer)
+    return Origin(ORIGIN_PEER, steer=steer, sender=sender)
 
 
 def app(label: str) -> Origin:
     return Origin(ORIGIN_APP, label=label)
 
 
-def automation(cycle: int, loop_id: str) -> Origin:
-    return Origin(ORIGIN_AUTOMATION, nudge={"cycle": cycle, "loop_id": loop_id})
+def resource(server: str, subscription_id: str) -> Origin:
+    return Origin(ORIGIN_RESOURCE, label=server, subscription=subscription_id)
+
+
+#: The key a steered wake's ``nudge`` holds its loop's config generation under. The
+#: steer keeps it so the turn that carries the wake can charge that loop's cycle
+#: (``steer_queue``); the steer's row and a requeued entry's meta drop it.
+WAKE_GENERATION = "generation"
+
+
+def automation(cycle: int, loop_id: str, *, generation: int | None = None) -> Origin:
+    nudge: dict[str, Any] = {"cycle": cycle, "loop_id": loop_id}
+    if generation is not None:
+        nudge[WAKE_GENERATION] = generation
+    return Origin(ORIGIN_AUTOMATION, nudge=nudge)
 
 
 def origin_row(origin: Origin) -> tuple[str, str, dict[str, Any]]:
@@ -110,8 +136,9 @@ def write_origin_row(
 ) -> dict[str, Any]:
     """Append *origin*'s row (:func:`origin_row`) with *text*; return the row.
 
-    The one writer the idle paths share: :func:`deliver`'s own, and the idle
-    autonudge fire, which writes its nudge row when its turn is accepted.
+    Its one caller is the autonudge fire's turn starter, which :func:`deliver`
+    runs on an idle slot and which writes the nudge row when its turn is
+    accepted.
     *extra_meta* adds sender facts the origin does not carry (a monitor
     wake's ``monitor`` record) and never replaces the origin's own keys.
     """
@@ -127,19 +154,25 @@ async def deliver(
     *,
     admission: dict | None = None,
     queue_meta: dict | None = None,
+    relay_meta: dict | None = None,
     evict_oldest: bool = False,
+    start_turn: "Callable[[], Awaitable[str]] | None" = None,
 ) -> str:
     """Deliver *text* from *origin* into *slot*; return a ``DELIVERED_*`` outcome.
 
-    Idle slot: a cron or app message is queued and the queue drain starts it
-    (:func:`_deliver_idle`); a slot that is closing or the gateway is shutting
+    Idle slot: a cron, app or resource message is queued and the queue drain
+    starts it (:func:`_deliver_idle`); a slot that is closing or the gateway is shutting
     down answers :data:`NOT_DELIVERED` and the caller falls back. Running slot: an
     automation wake is steered into the turn (its row is the same nudge row,
-    written by ``steer_into_running_turn``), and a cron or app message is queued
+    written by ``steer_into_running_turn``), and a cron, app or resource message is queued
     behind it with a ``queued`` card, so an injection never starts a second
-    turn. An idle automation wake returns :data:`NOT_DELIVERED`: that turn is the
-    autonudge fire's own path (``_fire_dashboard_nudge``), which owns its
-    completion hook.
+    turn.
+
+    An automation wake that brings *start_turn* starts its own turn: an idle slot
+    returns ``await start_turn()`` as is (the starter's own answer, not a
+    ``DELIVERED_*`` value; *text* is unused), and a running slot returns
+    :data:`NOT_DELIVERED` with nothing written, so the sender may steer it instead.
+    An idle automation wake without one returns :data:`NOT_DELIVERED`.
 
     *admission* is the containment snapshot the caller's gate held: the steer
     records it for a requeue, and an app message's queue entry carries it so the
@@ -151,7 +184,9 @@ async def deliver(
     its out-of-session fallback.
     """
     if origin.kind == ORIGIN_PEER:
-        return await _deliver_peer(state, slot, text, origin, admission, queue_meta)
+        return await _deliver_peer(state, slot, text, origin, admission, queue_meta, relay_meta)
+    if origin.kind == ORIGIN_AUTOMATION and start_turn is not None:
+        return NOT_DELIVERED if slot.running else await start_turn()
     if slot.running:
         return await _deliver_running(state, slot, text, origin, admission, evict_oldest)
     if origin.kind == ORIGIN_AUTOMATION:
@@ -167,18 +202,21 @@ async def _deliver_idle(
     admission: dict | None,
     evict_oldest: bool,
 ) -> str:
-    """The idle-slot half of :func:`deliver` for a cron or app message.
+    """The idle-slot half of :func:`deliver` for a cron, app or resource message.
 
     The message is queued as the running-slot half queues it, then the queue
     drain starts it, so it takes the checks every queued message takes before
     its turn: memory preparation still running, a Stop being resolved, a sign-in
     hold and an entry already waiting ahead of it. When one of them refuses, the
-    card waits for the next drain. A slot that is closing, was replaced while
-    this waited for its lock, or receives the message during gateway shutdown
-    takes nothing: its queued card would not survive this process, so the caller
-    falls back as for a gone session.
+    card waits for the next drain. When a sweep drops this message's entry while
+    another entry starts, the answer is :data:`DELIVERED_QUEUED`, so the caller
+    finds the entry gone from the queue as when nothing started. A slot that is
+    closing, was replaced while this waited for its lock, or receives the message
+    during gateway shutdown takes nothing: its queued card would not survive this
+    process, so the caller falls back as for a gone session.
     """
     from kiro_crew.dashboard.chat_runner import (
+        _STARTED_QUEUE_IDS,
         _gateway_shutdown_requested,
         _start_next_queued_turn,
         idle_slot_admits_drain,
@@ -191,15 +229,23 @@ async def _deliver_idle(
             or _gateway_shutdown_requested(state)
         ):
             return NOT_DELIVERED
+        ids_before = {item["id"] for item in slot._queue}
         outcome = _queue_entry(state, slot, text, origin, admission, evict_oldest)
         if outcome != DELIVERED_QUEUED or not idle_slot_admits_drain(state, slot):
             return outcome
+        own_ids = {item["id"] for item in slot._queue} - ids_before
+        started_ids: list[str] = []
+        collecting = _STARTED_QUEUE_IDS.set(started_ids)
         slot._turn_admission_reserved = True
         try:
             started = await _start_next_queued_turn(state, slot)
         finally:
             slot._turn_admission_reserved = False
-    return DELIVERED_TURN if started else DELIVERED_QUEUED
+            _STARTED_QUEUE_IDS.reset(collecting)
+        own_entry_dropped = own_ids.isdisjoint(started_ids) and own_ids.isdisjoint(
+            item["id"] for item in slot._queue
+        )
+    return DELIVERED_TURN if started and not own_entry_dropped else DELIVERED_QUEUED
 
 
 async def _deliver_running(
@@ -242,7 +288,7 @@ def _queue_entry(
     admission: dict | None,
     evict_oldest: bool,
 ) -> str:
-    """Queue a cron or app message as a card and return the delivery outcome."""
+    """Queue a cron, app or resource message as a card and return the delivery outcome."""
     if origin.kind == ORIGIN_CRON:
         from kiro_crew.dashboard.cron_inject import queue_cron_notification
 
@@ -283,7 +329,7 @@ def _queue_entry(
                 # Open dashboards render queue cards from WebSocket frames, not
                 # from this slot's message list.
                 state.broadcast_ws("queue_cancel", {"slot": slot.key, "queue_id": evicted["id"]})
-        queue_cron_notification(slot, text, origin.label)
+        _broadcast_queue_push(state, slot, queue_cron_notification(slot, text, origin.label))
         return DELIVERED_QUEUED
     if origin.kind == ORIGIN_APP:
         from kiro_crew.dashboard.chat_utils import MCP_APP_MESSAGE_KIND
@@ -305,8 +351,61 @@ def _queue_entry(
             "msg msg-queued",
             meta={"kind": MCP_APP_MESSAGE_KIND, "appLabel": origin.label, "queueId": qid},
         )
+        _broadcast_queue_push(state, slot, qid)
+        return DELIVERED_QUEUED
+    if origin.kind == ORIGIN_RESOURCE:
+        from kiro_crew.dashboard.chat_utils_injected_rows import (
+            RESOURCE_WAKE_KIND,
+            resource_inject_row,
+        )
+        from kiro_crew.dashboard.slot_queue_repository import MAX_LIVE_QUEUE_ENTRIES
+
+        if len(slot._queue) >= MAX_LIVE_QUEUE_ENTRIES:
+            return QUEUE_FULL
+        # As an app message: the identity rides the entry meta beside the
+        # containment stamp, so the drain can build the row and re-check the stamp.
+        identity = resource_inject_row(origin.label, origin.subscription)[2]
+        identity.pop("injectKind")
+        qid = slot.queue_append(
+            text, kind=RESOURCE_WAKE_KIND, meta={**identity, **(admission or {})}
+        )
+        slot.append(
+            "queued",
+            text,
+            "msg msg-queued",
+            meta={"kind": RESOURCE_WAKE_KIND, **identity, "queueId": qid},
+        )
+        _broadcast_queue_push(state, slot, qid)
         return DELIVERED_QUEUED
     raise ValueError(f"unknown delivery origin: {origin.kind!r}")
+
+
+def _broadcast_queue_push(state: "DashboardState", slot: "_ChatSlot", queue_id: str) -> None:
+    """Draw the new entry's card on open dashboards, which render from WS frames.
+
+    The frame carries the entry's wire view (``queue_entry_view``), the same
+    content and meta a slot-detail fetch would list for it.
+    """
+    from datetime import datetime, timezone
+
+    from kiro_crew.dashboard.chat_delivery import queue_entry_view
+
+    entry = next((e for e in slot._queue if e.get("id") == queue_id), None)
+    if entry is None:
+        return
+    view = queue_entry_view(entry)
+    push: dict[str, Any] = {
+        "slot": slot.key,
+        "content": view["content"],
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "queue_id": queue_id,
+    }
+    if view.get("meta"):
+        push["meta"] = view["meta"]
+    from kiro_crew.dashboard import responsive_chat as _rc
+
+    _rc.mark_written_on_push(slot, queue_id, push)
+    state.broadcast_ws("queue_push", push)
 
 
 async def _deliver_peer(
@@ -316,6 +415,7 @@ async def _deliver_peer(
     origin: Origin,
     admission: dict | None,
     queue_meta: dict | None,
+    relay_meta: dict | None = None,
 ) -> str:
     """A peer's text: the steer arm when asked, else queue or run it.
 
@@ -337,7 +437,7 @@ async def _deliver_peer(
         )
 
         outcome = await steer_into_running_turn(
-            state, slot, text, user_origin=False, admission=admission
+            state, slot, text, user_origin=False, admission=admission, relay_meta=relay_meta
         )
         if outcome == STEER_STEERED:
             return DELIVERED_STEERED
@@ -345,6 +445,15 @@ async def _deliver_peer(
             return DELIVERED_REQUEUED
         return NOT_DELIVERED
     from kiro_crew.dashboard.chat_runner import _run_chat
+    from kiro_crew.tracing import steps as trace_steps
 
-    started = slot.enqueue_or_run_prompt(text, _run_chat, state, extra_meta=queue_meta)
+    # The turn this starts, now or at its drain, links to the sender's (tracing/steps.py).
+    with trace_steps.sending(origin.sender) as sender_meta:
+        started = slot.enqueue_or_run_prompt(
+            text,
+            _run_chat,
+            state,
+            extra_meta={**(queue_meta or {}), **sender_meta} or queue_meta,
+            relay_meta=relay_meta,
+        )
     return DELIVERED_TURN if started else DELIVERED_QUEUED

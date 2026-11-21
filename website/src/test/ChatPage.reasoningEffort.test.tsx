@@ -4,8 +4,9 @@
  * level; the slider that changes it lives inside the model picker.
  * Tests the ChatInput component directly to avoid ChatPage's complex dependencies.
  */
+import { useLayoutEffect } from 'react'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent, act } from '@testing-library/react'
+import { render, screen, fireEvent, act, waitFor } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
@@ -150,6 +151,19 @@ describe('ChatInput reasoning effort on the model chip', () => {
     expect(modelSupportsEffort('minimax-m2.5')).toBe(false)
     expect(modelSupportsEffort('glm-5')).toBe(false)
   })
+
+  it('modelSupportsEffort offers Haiku 5.5 and later, never older Haiku (#26173)', () => {
+    // kiro-cli accepts /effort on claude-haiku-5.5 and refuses it on 4.5.
+    expect(modelSupportsEffort('claude-haiku-5.5')).toBe(true)
+    expect(modelSupportsEffort('global.anthropic.claude-haiku-5-5[1m]')).toBe(true)
+    expect(modelSupportsEffort('claude-haiku-5.6')).toBe(true)
+    expect(modelSupportsEffort('claude-haiku-6')).toBe(true)
+    expect(modelSupportsEffort('claude-haiku-4.5')).toBe(false)
+    expect(modelSupportsEffort('anthropic.claude-haiku-4-5-20251001-v1:0')).toBe(false)
+    expect(modelSupportsEffort('claude-3-5-haiku-20241022')).toBe(false)
+    expect(modelSupportsEffort('claude-haiku-5')).toBe(false)
+    expect(modelSupportsEffort('claude-haiku')).toBe(false)
+  })
 })
 
 const mockApi = vi.hoisted(() => ({ chatSlotReasoningEffort: vi.fn().mockResolvedValue({ ok: true }), effortLevels: vi.fn().mockResolvedValue(['low', 'medium', 'high', 'xhigh', 'max']) }))
@@ -266,7 +280,7 @@ describe('ReasoningEffortDropdown', () => {
       // The pick is no longer the newest intent...
       expect(pendingSlotSwitchTarget('reasoning_effort', 's1')).toBe('max')
       // ...so the debounce firing must NOT put 'xhigh' on the wire.
-      await vi.advanceTimersByTimeAsync(200)
+      await act(async () => { await vi.advanceTimersByTimeAsync(200) })
       expect(mockApi.chatSlotReasoningEffort).not.toHaveBeenCalledWith('s1', 'xhigh')
       await race
     } finally {
@@ -278,9 +292,12 @@ describe('ReasoningEffortDropdown', () => {
     mockApi.chatSlotReasoningEffort.mockRejectedValueOnce(new Error('boom'))
     const { store } = renderDropdown()
     const slider = await screen.findByRole('slider', { name: 'Reasoning effort' })
-    await vi.waitFor(() => expect(slider.getAttribute('aria-valuemax')).toBe('4'))
+    await waitFor(() => expect(slider.getAttribute('aria-valuemax')).toBe('4'))
     fireEvent.keyDown(slider, { key: 'ArrowRight' })
-    await vi.waitFor(() => expect(mockApi.chatSlotReasoningEffort).toHaveBeenCalled())
+    await waitFor(() => expect(mockApi.chatSlotReasoningEffort).toHaveBeenCalled())
+    // The failure rolls the popover back to the authoritative level, which
+    // lands after the rejected persist. Wait for that before reading the store.
+    await waitFor(() => expect(slider.getAttribute('aria-valuetext')).toBe('High'))
     // The failed pick changed nothing server-side; the store keeps the
     // pre-pick value (the popover's own optimistic label is local-only).
     expect(store.getState().dashboard.slots.find(s => s.key === 's1')?.reasoning_effort).toBe('high')
@@ -291,13 +308,13 @@ describe('ReasoningEffortDropdown', () => {
     mockApi.chatSlotReasoningEffort.mockRejectedValueOnce(new Error('effort rejected'))
     const { store } = renderDropdown()
     const slider = await screen.findByRole('slider', { name: 'Reasoning effort' })
-    await vi.waitFor(() => expect(slider.getAttribute('aria-valuemax')).toBe('4'))
+    await waitFor(() => expect(slider.getAttribute('aria-valuemax')).toBe('4'))
 
     fireEvent.keyDown(slider, { key: 'ArrowRight' })
     expect(slider.getAttribute('aria-valuetext')).toBe('Extra High')
 
-    await vi.waitFor(() => expect(mockApi.chatSlotReasoningEffort).toHaveBeenCalledWith('s1', 'xhigh'))
-    await vi.waitFor(() => expect(slider.getAttribute('aria-valuetext')).toBe('High'))
+    await waitFor(() => expect(mockApi.chatSlotReasoningEffort).toHaveBeenCalledWith('s1', 'xhigh'))
+    await waitFor(() => expect(slider.getAttribute('aria-valuetext')).toBe('High'))
     expect(store.getState().chat.agentSwitchNotice?.message).toBe('effort rejected')
   })
 
@@ -314,18 +331,20 @@ describe('ReasoningEffortDropdown', () => {
       fireEvent.keyDown(slider, { key: 'ArrowRight' })
       expect(slider.getAttribute('aria-valuetext')).toBe('Extra High')
 
-      await vi.advanceTimersByTimeAsync(150)
+      await act(async () => { await vi.advanceTimersByTimeAsync(150) })
       expect(mockApi.chatSlotReasoningEffort).toHaveBeenCalledWith('s1', 'xhigh')
       expect(pendingSlotSwitchTarget('reasoning_effort', 's1')).toBe('xhigh')
 
-      await vi.advanceTimersByTimeAsync(SWITCH_CONFIRM_TIMEOUT_MS)
+      await act(async () => { await vi.advanceTimersByTimeAsync(SWITCH_CONFIRM_TIMEOUT_MS) })
       await vi.waitFor(() => expect(slider.getAttribute('aria-valuetext')).toBe('High'))
       await vi.waitFor(() => expect(store.getState().chat.agentSwitchNotice?.message).toBe(
         'Switch not confirmed yet — it will apply if the connection recovers.',
       ))
     } finally {
-      resolveRequest({ reasoning_effort: 'xhigh' })
-      await vi.advanceTimersByTimeAsync(0)
+      await act(async () => {
+        resolveRequest({ reasoning_effort: 'xhigh' })
+        await vi.advanceTimersByTimeAsync(0)
+      })
       vi.useRealTimers()
     }
   })
@@ -429,6 +448,52 @@ describe('ReasoningEffortDropdown', () => {
     await vi.waitFor(() => expect(mockApi.chatSlotReasoningEffort).toHaveBeenCalledWith('s1', 'high'))
   })
 
+  // With a configured default and no override, the thumb is the only
+  // graphical readout of the level and must sit where the header and the
+  // switch say the session runs. A fixed middle notch looked right only when
+  // the default happened to be High.
+  it('starts the thumb on the configured default when the slot has no override', async () => {
+    renderDropdown({ currentEffort: '', defaultEffort: 'xhigh' })
+    const slider = await screen.findByRole('slider', { name: 'Reasoning effort' })
+    await vi.waitFor(() => expect(slider.getAttribute('aria-valuemax')).toBe('4'))
+    expect(slider).toHaveAttribute('aria-valuenow', '3')
+    expect(slider).toHaveAttribute('aria-valuetext', 'Extra High')
+    expect(screen.getByText('Default · Extra High')).toBeInTheDocument()
+  })
+
+  it('seeds a default below the middle notch too', async () => {
+    renderDropdown({ currentEffort: '', defaultEffort: 'low' })
+    const slider = await screen.findByRole('slider', { name: 'Reasoning effort' })
+    await vi.waitFor(() => expect(slider.getAttribute('aria-valuemax')).toBe('4'))
+    expect(slider).toHaveAttribute('aria-valuenow', '0')
+    expect(slider).toHaveAttribute('aria-valuetext', 'Low')
+  })
+
+  it('toggling default off pins the configured default, not the middle notch', async () => {
+    renderDropdown({ currentEffort: '', defaultEffort: 'xhigh' })
+    const slider = await screen.findByRole('slider', { name: 'Reasoning effort' })
+    await vi.waitFor(() => expect(slider.getAttribute('aria-valuemax')).toBe('4'))
+    fireEvent.click(screen.getByRole('switch', { name: 'Use default effort (Extra High)' }))
+    await vi.waitFor(() => expect(mockApi.chatSlotReasoningEffort).toHaveBeenCalledWith('s1', 'xhigh'))
+    expect(mockApi.chatSlotReasoningEffort).not.toHaveBeenCalledWith('s1', 'high')
+    expect(slider).toHaveAttribute('aria-valuetext', 'Extra High')
+  })
+
+  it('follows the configured default while the switch is on', async () => {
+    const view = renderDropdown({ currentEffort: '', defaultEffort: 'high', levelsOverride: ['low', 'medium', 'high', 'xhigh', 'max'] })
+    const slider = screen.getByRole('slider', { name: 'Reasoning effort' })
+    expect(slider).toHaveAttribute('aria-valuenow', '2')
+    view.rerender(
+      <QueryClientProvider client={new QueryClient()}>
+        <Provider store={view.store}>
+          <ReasoningEffortDropdown slot="s1" currentEffort="" defaultEffort="max" onClose={vi.fn()} levelsOverride={['low', 'medium', 'high', 'xhigh', 'max']} />
+        </Provider>
+      </QueryClientProvider>,
+    )
+    expect(slider).toHaveAttribute('aria-valuenow', '4')
+    expect(slider).toHaveAttribute('aria-valuetext', 'Max')
+  })
+
   // With a Settings default configured, the no-override state names the
   // configured value ("Default · High") rather than a bare "Default", which
   // would read as "the model decides" and hide the value the turn runs at.
@@ -467,12 +532,41 @@ describe('ReasoningEffortDropdown', () => {
 
   it('syncs the default thumb when live levels arrive asynchronously', async () => {
     mockApi.effortLevels.mockResolvedValueOnce(['low', 'max'])
-    renderDropdown({ currentEffort: '', defaultEffort: 'max' })
+    const { store } = renderDropdown({ currentEffort: '', defaultEffort: 'max' })
     const slider = await screen.findByRole('slider', { name: 'Reasoning effort' })
-    await vi.waitFor(() => expect(slider.getAttribute('aria-valuemax')).toBe('1'))
+    await waitFor(() => expect(slider.getAttribute('aria-valuemax')).toBe('1'))
     const toggle = screen.getByRole('switch', { name: 'Use default effort (Max)' })
     fireEvent.click(toggle)
-    await vi.waitFor(() => expect(mockApi.chatSlotReasoningEffort).toHaveBeenCalledWith('s1', 'max'))
+    await waitFor(() => expect(mockApi.chatSlotReasoningEffort).toHaveBeenCalledWith('s1', 'max'))
+    // The debounced persist writes the slot row after the mock resolves; wait
+    // for that write so it lands inside the waiting window, not after the test.
+    await waitFor(() => expect(store.getState().dashboard.slots.find(s => s.key === 's1')?.reasoning_effort).toBe('max'))
+  })
+
+  it('pins the configured default when the switch flips in the render the level list changes in', async () => {
+    // The thumb follows the default through an effect, so for one render after
+    // the list changes the stored index still points into the old list. A
+    // click landing in that render (as on a loaded runner) must still pin
+    // the level the switch names: here 'high', which sits at index 0 of the
+    // new list while the stale index 2 is past its end.
+    function FlipWhenLevelsChange({ levels }: { levels: string[] }) {
+      useLayoutEffect(() => {
+        if (levels.length === 2) screen.getByRole('switch', { name: 'Use default effort (High)' }).click()
+      }, [levels])
+      return <ReasoningEffortDropdown slot="s1" currentEffort="" defaultEffort="high" onClose={vi.fn()} levelsOverride={levels} />
+    }
+    const store = configureStore({
+      reducer: { dashboard: dashboardReducer, chat: chatReducer, notifications: notificationsReducer },
+      preloadedState: {
+        dashboard: { slots: [{ key: 's1', messages: 0, running: false, reasoning_effort: '' }], unreadSlots: [], refreshTrigger: 0, subagentRunning: {}, subagentDetails: {}, subagentText: {} } as unknown as RootState['dashboard'],
+      } as Partial<RootState>,
+    })
+    const tree = (levels: string[]) => <QueryClientProvider client={new QueryClient()}><Provider store={store}><FlipWhenLevelsChange levels={levels} /></Provider></QueryClientProvider>
+    const view = render(tree(['low', 'medium', 'high', 'xhigh', 'max']))
+    view.rerender(tree(['high', 'max']))
+    await waitFor(() => expect(mockApi.chatSlotReasoningEffort).toHaveBeenCalledWith('s1', 'high'))
+    expect(mockApi.chatSlotReasoningEffort).toHaveBeenCalledTimes(1)
+    await waitFor(() => expect(store.getState().dashboard.slots.find(s => s.key === 's1')?.reasoning_effort).toBe('high'))
   })
 
   it('keeps the remembered concrete pick while persisting default inheritance', async () => {

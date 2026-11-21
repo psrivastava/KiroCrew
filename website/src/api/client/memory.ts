@@ -39,6 +39,23 @@ const memoryStoreQuery = (store?: string, sep: '?' | '&' = '?'): string => {
   return sep === '?' ? `?store=${value}` : `&store=${value}`
 }
 
+/** What one `GET /api/sel/recurring-failures` row carries
+ *  (`failure_recurrence.Recurrence`): never a session key or command text. */
+export interface RecurringFailure {
+  signature: string
+  tool_kind: string
+  /** The MCP tool name, or the class error (`turn_limit`); `''` when neither applies. */
+  tool: string
+  rule_id: string
+  /** The error with paths, ids and numbers collapsed. */
+  error: string
+  hits: number
+  sessions: number
+  days: number
+  previous_hits: number
+  trend: 'new' | 'growing' | 'steady'
+}
+
 /** What one `GET /api/memory/carve` read asks for. */
 export interface MemoryCarveQuery {
   store?: string
@@ -96,13 +113,16 @@ export function createMemoryEndpoints({ get, post, put, del, j, jfetch: fetch }:
     // `memoryStoreQuery`. `/api/memory/settings` is deliberately NOT in the set:
     // the consolidation cadence is one install-wide setting, not a per-store one.
     memoryPreferences: (store?: string) => fetch('/api/memory/preferences' + memoryStoreQuery(store)).then(j) as Promise<{ content?: string; content_redacted?: boolean }>,
-    saveMemoryPreferences: (content: string, store?: string) => put('/api/memory/preferences' + memoryStoreQuery(store), { content }),
+    // Every save below parses with `.then(j)`: a refused write (403, 400, a 409
+    // changed baseline) rejects instead of resolving to a Response its Save
+    // button would read as success.
+    saveMemoryPreferences: (content: string, store?: string) => put('/api/memory/preferences' + memoryStoreQuery(store), { content }).then(j) as Promise<{ ok: boolean }>,
     memoryProjects: (store?: string) => fetch('/api/memory/projects' + memoryStoreQuery(store)).then(j) as Promise<{ content?: string; content_redacted?: boolean }>,
-    saveMemoryProjects: (content: string, store?: string) => put('/api/memory/projects' + memoryStoreQuery(store), { content }),
+    saveMemoryProjects: (content: string, store?: string) => put('/api/memory/projects' + memoryStoreQuery(store), { content }).then(j) as Promise<{ ok: boolean }>,
     memoryHistory: (store?: string) => fetch('/api/memory/history' + memoryStoreQuery(store)).then(j) as Promise<{ content?: string; content_redacted?: boolean }>,
-    saveMemoryHistory: (content: string, store?: string) => put('/api/memory/history' + memoryStoreQuery(store), { content }),
+    saveMemoryHistory: (content: string, store?: string) => put('/api/memory/history' + memoryStoreQuery(store), { content }).then(j) as Promise<{ ok: boolean }>,
     memorySettings: () => fetch('/api/memory/settings').then(j),
-    saveMemorySettings: (s: {history_idle_hours?: number; history_max_days?: number}) => put('/api/memory/settings', s),
+    saveMemorySettings: (s: {history_idle_hours?: number; history_max_days?: number}) => put('/api/memory/settings', s).then(j) as Promise<{ ok: boolean }>,
     /** Every declared store with its lineage, row counts and backup state.
      *
      *  Owner-gated unconditionally — it enumerates every silo — and takes no
@@ -116,6 +136,13 @@ export function createMemoryEndpoints({ get, post, put, del, j, jfetch: fetch }:
       fetch('/api/memory/stores').then(j) as Promise<{
         stores: MemoryStoreSummary[]
         active: string
+      }>,
+    /** Kept member stores no crewmate owns (a deleted crewmate's memory), which a
+     *  new crewmate can start from: `POST /api/agents` with `adopt_memory_store`.
+     *  Owner-gated. `former_owner` is a display name only. */
+    memoryOwnerlessStores: () =>
+      fetch('/api/memory/ownerless-stores').then(j) as Promise<{
+        stores: { name: string; former_owner: string }[]
       }>,
     memoryRetired: (store?: string, limit?: number, offset = 0) =>
       fetch('/api/memory/retired' + memoryQuery({ store, limit, ...(offset ? { offset } : {}) })).then(j) as Promise<{ retired: RetiredMemory[] }>,
@@ -198,20 +225,39 @@ export function createMemoryEndpoints({ get, post, put, del, j, jfetch: fetch }:
   const lessons = {
     // Lessons
     lessons: () => fetch('/api/lessons').then(j),
-    createLesson: (rule: string, category: string) =>
-      post('/api/lessons', { rule, category }).then(j) as Promise<{
+    // `row` is set by an edit: the rewritten rule goes back with the edited
+    // row's file (`scope` / `workspace`) and `repo_scope`; the server keeps the
+    // row's stored tier and NOT-clause, so only its text changes.
+    createLesson: (
+      rule: string,
+      category: string,
+      // `replaces` names the edited row; the server rewrites it in place and
+      // answers `replaced`, or refuses and changes nothing.
+      row?: {
+        scope?: 'global' | 'workspace'; workspace?: string; repo_scope?: string
+        replaces?: { rule: string; repo_scope: string }
+      },
+    ) =>
+      post('/api/lessons', { rule, category, ...row }).then(j) as Promise<{
         ok: boolean
-        outcome: 'inserted' | 'enriched' | 'unchanged' | 'deduped' | 'refused'
+        outcome: 'inserted' | 'enriched' | 'unchanged' | 'deduped' | 'refused' | 'replaced'
         reason: string
         // Present only on `deduped`: the stored lesson the write lost to.
         winner?: string
         winner_repo_scope?: string | null
       }>,
+    // Owner only, and under /api/sel/ rather than /api/lessons: the rows come
+    // from the security event log (sel.md).
+    recurringFailures: () =>
+      fetch('/api/sel/recurring-failures').then(j) as Promise<{ failures: RecurringFailure[]; window_days: number }>,
   }
 
   const knowledge = {
     // Knowledge
     knowledgeSearch: (q: string) => get(`/api/knowledge/search-for-context?q=${encodeURIComponent(q)}`).then(j),
+    /** Fill the missing knowledge vectors (the route's default, non-rebuild path). */
+    knowledgeEmbeddingGenerate: () =>
+      post('/api/knowledge/embedding/generate', {}).then(j) as Promise<{ embedded: number; total: number; remaining: number }>,
   }
 
   return { memoryAndVectors, lessons, knowledge }

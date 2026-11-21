@@ -51,9 +51,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _pathcheck import (  # noqa: E402
     open_media_input,
     read_json_input,
+    require_output_support,
     safe_open_output,
     safe_output_path,
 )
+from _toolpath import user_bin_dirs, which_any  # noqa: E402
 
 from kiro_crew.deploy.engine import resolve_aws_bin  # noqa: E402
 from kiro_crew.security import (  # noqa: E402
@@ -150,8 +152,10 @@ def _home() -> pathlib.Path:
 
 
 def tool(name: str) -> str:
-    found = shutil.which(name) or str(_home() / ".local/bin" / name)
-    if pathlib.Path(found).exists():
+    # The doctor's own lookup, so a tool deps.py reports green is found here too
+    # (on Windows that includes ffprobe.exe in ~/.local/bin).
+    found = which_any(name, user_bin_dirs(_home()))
+    if found and pathlib.Path(found).exists():
         return found
     # The doctor accepts an imageio-provided ffmpeg, so this must too --
     # otherwise deps.py reports green and narration dies on the next line.
@@ -368,6 +372,10 @@ def main() -> int:
     ap.add_argument("--aws-profile", default="")
     ap.add_argument("--aws-region", default="")
     args = ap.parse_args()
+    # Every output below goes through safe_open_output, which refuses on a host
+    # without directory descriptors. Refuse here, before any speech call is made
+    # or any clip is published.
+    require_output_support()
 
     spec = read_json_input(args.script)
     gap = float(spec.get("gap", 0.4))

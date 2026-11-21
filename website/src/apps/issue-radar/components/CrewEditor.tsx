@@ -58,9 +58,10 @@ import { useAvailableModels } from '../../../hooks/useAvailableModels'
 import { isPricedMultiplier } from '../../../providers/modelList'
 import CrewGhost, { djb2, ghostVariantCount } from './CrewGhost'
 import { issueRadarApi, type Crew, type CrewPatch, type CrewSpec } from '../api'
-import { repoScopeKey } from '../lib/links'
+import { isGitlab, repoScopeKey } from '../lib/links'
 import { useIssueRadar } from '../context'
 import { useImeGuard } from '../../../hooks/useImeGuard'
+import { RadioChipGroup, radioChip } from '../../../components/RadioChipGroup'
 
 /** Backstop wake, in seconds. A CONSTANT, not state: see the file header.
  *  Mirrors `crew_runtime_session.DEFAULT_IDLE_SECS`, the `idle_secs` every
@@ -552,7 +553,8 @@ export default function CrewEditor({ open, onClose, crew }: CrewEditorProps) {
         extra_prompt: draft.extraPrompt,
         labels: draft.labels,
         auto_resolve_conflicts: draft.autoResolveConflicts,
-        auto_merge: draft.autoMerge,
+        // Saved as the locked switch shows it: off on GitLab (see `forgeArmsAutoMerge`).
+        auto_merge: isGitlab(active) ? false : draft.autoMerge,
         unattended: draft.unattended,
         max_open: draft.maxOpen,
         worktree_root: draft.worktreeRoot,
@@ -593,11 +595,19 @@ export default function CrewEditor({ open, onClose, crew }: CrewEditorProps) {
     ? t('apps.issueRadar.views.crews.editor.aria_edit', { name: crew?.name ?? '' })
     : t('apps.issueRadar.views.crews.editor.aria_create')
 
+  // The same per-forge check PrActionsBar uses for its auto-merge control. On GitLab
+  // `merge_when_pipeline_succeeds` is a merge, so the backend never lets a crew arm
+  // it whatever this toggle holds (`may_arm_auto_merge`). The toggle shows off and
+  // locked there rather than promising something the crew is never told. A new crew
+  // is saved off; an edit leaves the stored value alone.
+  const forgeArmsAutoMerge = !isGitlab(active)
+
   const toggles: Array<{
     key: 'autoResolveConflicts' | 'autoMerge' | 'unattended'
     label: string
     hint: string
     testId: string
+    locked?: boolean
   }> = [
     {
       key: 'autoResolveConflicts',
@@ -608,8 +618,11 @@ export default function CrewEditor({ open, onClose, crew }: CrewEditorProps) {
     {
       key: 'autoMerge',
       label: t('apps.issueRadar.views.crews.editor.automerge_label'),
-      hint: t('apps.issueRadar.views.crews.editor.automerge_hint'),
+      hint: forgeArmsAutoMerge
+        ? t('apps.issueRadar.views.crews.editor.automerge_hint')
+        : t('apps.issueRadar.views.crews.editor.automerge_gitlab_hint'),
       testId: 'crew-editor-auto-merge',
+      locked: !forgeArmsAutoMerge,
     },
     {
       key: 'unattended',
@@ -684,16 +697,15 @@ export default function CrewEditor({ open, onClose, crew }: CrewEditorProps) {
               <CrewGhost seed={seed || 'crew'} variant={draft.variant} size={78} />
             </div>
             <div className="min-w-0 flex-1">
-              <div
-                role="group"
-                aria-label={t('apps.issueRadar.views.crews.editor.face_strip_label')}
+              <RadioChipGroup
+                ariaLabel={t('apps.issueRadar.views.crews.editor.face_strip_label')}
                 className="flex flex-wrap gap-1.5"
               >
                 {Array.from({ length: ghostVariantCount }, (_, i) => (
                   <button
                     key={i}
                     type="button"
-                    aria-pressed={shownVariant === i}
+                    {...radioChip(shownVariant === i)}
                     aria-label={t('apps.issueRadar.views.crews.editor.face_variant', {
                       index: i + 1,
                     })}
@@ -708,7 +720,7 @@ export default function CrewEditor({ open, onClose, crew }: CrewEditorProps) {
                     <CrewGhost seed={seed || 'crew'} variant={i} size={40} />
                   </button>
                 ))}
-              </div>
+              </RadioChipGroup>
               <p className="mt-2 text-[12px] leading-relaxed text-muted">
                 {t('apps.issueRadar.views.crews.editor.face_hint')}
               </p>
@@ -968,8 +980,9 @@ export default function CrewEditor({ open, onClose, crew }: CrewEditorProps) {
                 </span>
                 <span className="pt-0.5" data-testid={row.testId}>
                   <Toggle
-                    checked={draft[row.key]}
+                    checked={row.locked ? false : draft[row.key]}
                     onChange={v => patch(row.key, v)}
+                    disabled={row.locked}
                     label={row.label}
                   />
                 </span>

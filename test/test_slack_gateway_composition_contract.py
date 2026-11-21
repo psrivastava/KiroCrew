@@ -197,11 +197,15 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
             "function",
             "(handoff: '_ClaimHandoff', job: 'CronJob', fn: 'Callable[..., Any]', *args: 'Any') -> 'Any'",
         ),
-        ("_annotate_model_fallback", "function", "(text: 'str', provider: 'Any') -> 'str'"),
+        (
+            "_annotate_model_fallback",
+            "function",
+            "(text: 'str', provider: 'Any', *, stop_reason: 'str | None' = None) -> 'str'",
+        ),
         (
             "_cron_stream_with_posttoken_resume",
             "async function",
-            "(client: 'Any', message: 'str', *, job_name: 'str', **stream_kwargs: 'Any') -> 'tuple[str, float | None]'",
+            "(client: 'Any', message: 'str', *, job_name: 'str', directive_refusals: 'list[str]', on_resume: 'Callable[[], None] | None' = None, **stream_kwargs: 'Any') -> 'tuple[str, float | None]'",
         ),
     ),
     "cron_verdict": (
@@ -244,6 +248,7 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
             "(self, origin_key: 'str', text: 'str', *, actor_key: 'str') -> 'bool'",
         ),
         ("_cron_job_is_silent", "method", "(self, parent_key: 'str') -> 'bool'"),
+        ("_cron_dm_user", "method", "(self, job: 'CronJob') -> 'str'"),
     ),
     "mcp_broker": (
         ("_init_mcp_discovery", "method", "(self) -> 'None'"),
@@ -252,10 +257,25 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
             "method",
             "(self, approvals: 'LaunchApprovals') -> 'None'",
         ),
+        ("_publish_paused_share_note", "async method", "(self) -> 'None'"),
+        ("_schedule_paused_share_note", "method", "(self) -> 'None'"),
         (
             "_init_mcp_gateway",
             "async method",
             "(self, stub_servers: 'frozenset[str] | None' = None) -> 'None'",
+        ),
+        (
+            "_mark_mcp_broker_ready",
+            "method",
+            "(self, manager: 'GatewayManager', approvals: 'LaunchApprovals', "
+            "socket_path: 'Path', stubs: 'frozenset[str]', sharing: 'bool') -> 'None'",
+        ),
+        ("_mcp_gateway_start_retry_delay", "method", "(self, attempt: 'int') -> 'float'"),
+        (
+            "_retry_mcp_gateway_start",
+            "async method",
+            "(self, manager: 'GatewayManager', approvals: 'LaunchApprovals', "
+            "socket_path: 'Path', stubs: 'frozenset[str]', sharing: 'bool') -> 'None'",
         ),
         ("_mcp_resolve_refresh_secs", "method", "(self) -> 'float'"),
         (
@@ -280,10 +300,14 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         ("_wire_mcp_gateway_dashboard", "method", "(self) -> 'None'"),
     ),
     "memory_lifecycle": (
-        ("_initialize_memory_worker", "method", "(self) -> 'bool'"),
+        ("_initialize_memory_worker", "method", "(self, dashboard_state: 'Any' = None) -> 'bool'"),
         ("_stop_memory_startup", "method", "(self) -> 'None'"),
         ("_start_memory_after_ready", "method", "(self) -> 'None'"),
-        ("_schedule_memory_preparation", "method", "(self) -> \"'asyncio.Task[None] | None'\""),
+        (
+            "_schedule_memory_preparation",
+            "method",
+            "(self, dashboard_state: 'Any' = None) -> \"'asyncio.Task[None] | None'\"",
+        ),
         ("_wait_for_memory_preparation", "async method", "(self) -> 'bool'"),
         ("_repair_member_memory_once", "method", "(self) -> 'None'"),
         ("_repair_member_memory", "async method", "(self) -> 'None'"),
@@ -327,23 +351,16 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         (
             "_drain_update_callback_work",
             "async method",
-            "(self, *, timeout: 'float | None') -> 'bool'",
-        ),
-        (
-            "_prepare_auto_update_apply",
-            "async method",
-            "(self, *, mandatory: 'bool', mandatory_key: 'str' = '') -> 'bool'",
+            "(self, *, timeout: 'float | None', include_turns: 'bool' = True) -> 'bool'",
         ),
         ("_finish_auto_update_apply", "async method", "(self) -> 'None'"),
         ("_wheel_apply_module", "staticmethod", "() -> 'Any'"),
-        ("_dashboard_policy_applies", "staticmethod", "() -> \"list['asyncio.Task[Any]']\""),
         (
             "_settle_update_work",
             "async method",
             "(self, update_task: \"'asyncio.Task[None] | None'\") -> 'None'",
         ),
         ("_run_update_checks", "async method", "(self) -> 'None'"),
-        ("_retry_pending_update_restart", "async method", "(self) -> 'bool'"),
         ("_check_for_updates", "async method", "(self) -> 'None'"),
         (
             "_auto_update_effect",
@@ -352,24 +369,13 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         ),
         ("_publish_provider_update_state", "method", "(self, result: 'object') -> 'None'"),
         ("_check_for_updates_via_provider", "async method", "(self, provider: 'object') -> 'None'"),
-        (
-            "_restart_after_update_claimed",
-            "async method",
-            "(self, launcher: 'str | None', exe: 'str | None') -> 'None'",
-        ),
         ("_check_for_updates_legacy", "async method", "(self) -> 'None'"),
-        (
-            "_restart_after_update_body",
-            "async method",
-            "(self, respawn: 'Callable[[], str]') -> 'None'",
-        ),
     ),
     "update_apply": (
-        ("_auto_apply_update", "async method", "(self, *, mandatory: 'bool' = False) -> 'None'"),
         (
             "_auto_apply_wheel_update",
             "async method",
-            "(self, channel: 'str', version: 'str', *, mandatory: 'bool' = False, mandatory_key: 'str' = '') -> 'None'",
+            "(self, channel: 'str', version: 'str', *, mandatory: 'bool' = False) -> 'None'",
         ),
         (
             "_notice_wheel_update_once",
@@ -387,6 +393,11 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
             "_fire_dashboard_nudge",
             "async method",
             "(self, loop: 'NudgeLoop', wake_message: 'str | None' = None) -> 'bool | MonitorDispatchResult'",
+        ),
+        (
+            "_start_dashboard_wake_turn",
+            "async method",
+            "(self, loop: 'NudgeLoop', slot: 'Any', wake_message: 'str | None', tagged: 'str', visible: 'str', trigger_text: 'str | None', fired_generation: 'int') -> 'MonitorDispatchResult'",
         ),
         (
             "_work_ledger_wake_loop",
@@ -461,7 +472,7 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         (
             "_interactive_approval",
             "method",
-            "(self, source: 'str', slot_resolver: 'Callable[[str], str] | None' = None, nudge_key: 'str' = '', *, raise_when_unreachable: 'bool' = False) -> 'ToolApprovalCallback'",
+            "(self, source: 'str', slot_resolver: 'Callable[[str], str] | None' = None, nudge_key: 'str' = '', *, raise_when_unreachable: 'bool' = False, requester: 'str' = '', on_host_decision: 'Callable[[str, str], None] | None' = None, follows_approval_mode: 'bool' = False) -> 'ToolApprovalCallback'",
         ),
         (
             "_heartbeat_approval",
@@ -470,7 +481,11 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         ),
     ),
     "service_boot": (
-        ("_auto_open_dashboard", "async method", "(self, dashboard_url: 'str') -> 'None'"),
+        (
+            "_auto_open_dashboard",
+            "async method",
+            "(self, dashboard_url: 'str', *, print_link: 'bool') -> 'None'",
+        ),
         ("_init_services", "async method", "(self) -> 'None'"),
         (
             "_notify_consolidation_abandoned",
@@ -490,7 +505,7 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         (
             "_persist_turn_row",
             "async function",
-            "(client: 'Any', session_key: 'str', *, provider: 'str', surface: 'str', agent_fallback: 'Callable[[], str]', t0: 'float', usage: 'AgentTurnUsage | None' = None) -> 'None'",
+            "(client: 'Any', session_key: 'str', *, provider: 'str', surface: 'str', agent_fallback: 'Callable[[], str]', t0: 'float', trigger: 'str' = 'other', usage: 'AgentTurnUsage | None' = None) -> 'None'",
         ),
         ("_HEARTBEAT_KEEP_INJECTION", "value", "'str'"),
     ),
@@ -529,7 +544,9 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
             "async method",
             "(self, watchdog: 'asyncio.Future | None' = None) -> 'None'",
         ),
+        ("_park_if_force_exit_claimed", "async method", "(self) -> 'None'"),
         ("_MARKER_WRITE_WAIT_SECS", "value", "'float'"),
+        ("_FORCE_EXIT_DEADLINE_SECS", "value", "'float'"),
     ),
     "process_entry": (
         ("_live_session_work_dirs", "function", "(sessions: 'Any') -> 'list[str]'"),
@@ -559,6 +576,12 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
     "cron_fire": (
         ("_init_cron", "async method", "(self, *, arm: 'bool' = True) -> 'None'"),
         ("_cron_capture", "async method", "(self, job: 'CronJob') -> '_CronCapture'"),
+        ("_record_bound_script_failure", "async method", "(self, job: 'CronJob') -> 'None'"),
+        (
+            "_alert_cron_timeout",
+            "async method",
+            "(self, job: 'CronJob', detail: 'str') -> 'None'",
+        ),
         (
             "_resolve_cron_agent",
             "method",
@@ -567,12 +590,18 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         (
             "_acquire_with_model_fallback",
             "async method",
-            "(self, job: 'CronJob', cron_execution: 'ExecutionContext', key: 'str', agent_id: 'str | None', cwd: 'str | None' = None, crew_agent: 'str | None' = None, *, execution: 'ExecutionContext | None' = None, replace_execution: 'bool' = False) -> \"'tuple[LLMProvider, bool, bool, bool]'\"",
+            "(self, job: 'CronJob', cron_execution: 'ExecutionContext', key: 'str', agent_id: 'str | None', cwd: 'str | None' = None, crew_agent: 'str | None' = None, *, execution: 'ExecutionContext | None' = None, replace_execution: 'bool' = False) -> \"'tuple[LLMProvider, bool, bool, bool, Any]'\"",
         ),
         (
             "_retained_session_agent_mismatch",
             "method",
             "(self, job: 'CronJob', key: 'str', agent: 'str | None') -> 'str | None'",
+        ),
+        ("_cron_key_work_pending", "async method", "(self, key: 'str') -> 'bool'"),
+        (
+            "_cron_batch_kind_defers",
+            "async method",
+            "(self, job: 'CronJob', key: 'str', provider: 'Any', *, reprojected: 'bool') -> 'bool'",
         ),
         ("_announce_cron_quarantine", "method", "(self) -> 'None'"),
         ("_start_cron_after_memory_ready", "async method", "(self) -> 'None'"),
@@ -609,6 +638,13 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
     ),
     "cron_failure": (
         (
+            "_failure_alert_due",
+            "function",
+            "(job: 'CronJob', streak: 'int', *, denied: 'bool' = False,"
+            " auth_expiry: 'bool' = False) -> 'bool'",
+        ),
+        ("_log_held_alert", "function", "(job: 'CronJob') -> 'None'"),
+        (
             "_failure_alert_is_duplicate",
             "method",
             "(self, job: 'CronJob', failure_hash: 'str') -> 'bool'",
@@ -625,14 +661,25 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
             "(self, job: 'CronJob', failure_hash: 'str', *, channel_delivered: 'bool', slack_failed: 'bool') -> 'None'",
         ),
         (
+            "_alert_cron_auto_paused",
+            "async method",
+            "(self, job: 'CronJob', streak: 'int', reason: 'str') -> 'None'",
+        ),
+        (
             "_alert_cron_failure",
             "async method",
-            "(self, job: 'CronJob', detail: 'str', *, denied: 'bool' = False) -> 'None'",
+            "(self, job: 'CronJob', detail: 'str', *, denied: 'bool' = False, "
+            "exit_code: 'int | None' = None) -> 'None'",
+        ),
+        (
+            "_alert_cron_interrupted",
+            "async method",
+            "(self, job: 'CronJob', detail: 'str') -> 'None'",
         ),
         (
             "_cron_single_failure",
             "async method",
-            "(self, job: 'CronJob', exc: 'Exception', session_key: 'str', _gate_counted: 'bool', _job_owns_failure: 'bool', _hand_over_streak: 'bool') -> 'None'",
+            "(self, job: 'CronJob', exc: 'Exception', session_key: 'str', _gate_counted: 'bool', _job_owns_failure: 'bool', _hand_over_streak: 'bool', *, _auth_expiry: 'bool' = False) -> 'None'",
         ),
     ),
     "orchestrator_init": (
@@ -658,6 +705,11 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
             "async function",
             "(manager: 'Any', batch_id: 'str') -> 'bool'",
         ),
+        (
+            "_subagent_nested_live",
+            "async function",
+            "(manager: 'Any', batch_id: 'str') -> 'bool'",
+        ),
         ("_WORKFLOW_STEP_PREFIXES", "value", "'tuple'"),
         ("_spawn_parent_slot", "function", "(parent_key: 'str', workflow_service: 'Any') -> 'str'"),
         ("_subagent_coalescer", "method", "(self) -> \"'SubagentEventCoalescer'\""),
@@ -676,7 +728,7 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         (
             "_subagent_wave_digest",
             "method",
-            "(self, info: 'SubagentInfo', *, report: '_SubagentReport', _flush_only: 'bool', _batch_id: 'str', _batch_total: 'int', _no_batch_pending: 'bool', _injection_slot_name: 'str') -> '_WaveDigest | None'",
+            "(self, info: 'SubagentInfo', *, report: '_SubagentReport', _flush_only: 'bool', _batch_id: 'str', _batch_total: 'int', _no_batch_pending: 'bool', _injection_slot_name: 'str', _nested_live: 'bool' = False) -> '_WaveDigest | None'",
         ),
     ),
     "subagent_injection": (
@@ -690,31 +742,86 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         (
             "_route_subagent_to_tab",
             "async method",
-            "(self, info: 'SubagentInfo', *, announce: 'str', body: 'str', title: 'str', sub_meta: 'dict[str, Any]', _flush_only: 'bool', _injection_slot: 'Any', _injection_slot_name: 'str', parent_key: 'str') -> 'None'",
+            "(self, info: 'SubagentInfo', *, announce: 'str', body: 'str', title: 'str', sub_meta: 'dict[str, Any]', carried: 'tuple[str, ...]', _flush_only: 'bool', _injection_slot: 'Any', _injection_slot_name: 'str', parent_key: 'str') -> 'None'",
         ),
         (
             "_inject_subagent_into_channel_parent",
             "async method",
-            "(self, info: 'SubagentInfo', *, announce: 'str', body: 'str', title: 'str', parent_key: 'str') -> 'None'",
+            "(self, info: 'SubagentInfo', *, announce: 'str', body: 'str', title: 'str', carried: 'tuple[str, ...]', parent_key: 'str') -> 'None'",
         ),
         (
             "_finish_subagent_cron_or_notify",
             "async method",
-            "(self, info: 'SubagentInfo', *, announce: 'str', body: 'str', title: 'str', parent_key: 'str') -> 'None'",
+            "(self, info: 'SubagentInfo', *, announce: 'str', body: 'str', title: 'str', carried: 'tuple[str, ...]', parent_key: 'str', injection_counted: 'bool' = False) -> 'None'",
         ),
+        (
+            "_park_inline",
+            "method",
+            "(self, token: 'Any', info: 'SubagentInfo', *, route: 'str', announce: 'str', body: 'str', title: 'str', carried: 'tuple[str, ...]', parent_key: 'str', sub_meta: 'dict[str, Any] | None' = None) -> 'None'",
+        ),
+        (
+            "_settle_inline",
+            "method",
+            "(self, token: 'Any', landed: 'bool', child_ids: 'list[str]') -> 'None'",
+        ),
+        (
+            "_finish_parked",
+            "async method",
+            "(self, completion: '_ParkedCompletion', *, counted: 'bool') -> 'None'",
+        ),
+        (
+            "_route_parked_in_tab",
+            "async method",
+            "(self, completion: '_ParkedCompletion', *, counted: 'bool') -> 'None'",
+        ),
+        (
+            "_parent_tab",
+            "async method",
+            "(self, parent_key: 'str') -> 'tuple[str, Any, str]'",
+        ),
+        (
+            "_route_completion",
+            "async method",
+            "(self, info: 'SubagentInfo', *, announce: 'str', body: 'str', title: 'str', sub_meta: 'dict[str, Any]', carried: 'tuple[str, ...]', flush_only: 'bool', parent_key: 'str', slot_name: 'str', slot: 'Any', event_slot: 'str', injection_counted: 'bool' = False) -> 'str'",
+        ),
+        (
+            "_reset_cron_parent_when_idle",
+            "async method",
+            "(self, info: 'SubagentInfo', parent_key: 'str') -> 'None'",
+        ),
+        (
+            "_route_cron_parent_to_tab",
+            "async method",
+            "(self, info: 'SubagentInfo', *, parent_key: 'str', injection_counted: 'bool' = False, **route_kwargs: 'Any') -> 'None'",
+        ),
+        ("_drop_cron_injection", "method", "(self, parent_key: 'str') -> 'None'"),
     ),
     "runtime_charge": (
         ("_apply_gate_verdict", "function", "(job: 'CronJob', tally: '_GateTally') -> 'bool'"),
+        (
+            "_cron_auth_expiry",
+            "function",
+            "(job: 'CronJob', exc: 'BaseException') -> 'bool'",
+        ),
         (
             "_cron_failure_attribution",
             "function",
             "(job: 'CronJob', _run_provider: 'object | None') -> 'tuple[bool, bool]'",
         ),
-        ("_charge_failure", "function", "(job: 'CronJob', _hand_over_streak: 'bool') -> 'None'"),
+        (
+            "_charge_failure",
+            "function",
+            "(job: 'CronJob', _hand_over_streak: 'bool', *, auth_expiry: 'bool' = False) -> 'None'",
+        ),
+        (
+            "_streak_after_charge",
+            "function",
+            "(job: 'CronJob', charges: 'bool', _hand_over_streak: 'bool') -> 'int'",
+        ),
         (
             "_inject_with_retry",
             "async method",
-            "(self, info: 'SubagentInfo', client, msg: 'str', parent_key: 'str', label: 'str') -> 'str | None'",
+            "(self, info: 'SubagentInfo', client, msg: 'str', parent_key: 'str', label: 'str', *, delivery: 'dict[str, Any] | None' = None) -> 'str | None'",
         ),
     ),
     "channel_boot": (
@@ -1114,26 +1221,6 @@ def test_an_owner_imports_the_facade_and_its_siblings_only_for_type_checking() -
     assert offenders == []
 
 
-def test_every_owner_with_a_coroutine_is_in_the_config_dir_guard() -> None:
-    """``test_no_config_dir_in_async`` scans the files it lists, so an owner that
-    gains an ``async def`` must be listed there, or its coroutines escape the guard."""
-    guard = _SRC.parent / "test" / "test_no_config_dir_in_async.py"
-    listed: set[str] = set()
-    for node in ast.parse(guard.read_text(encoding="utf-8")).body:
-        if isinstance(node, ast.Assign) and any(
-            isinstance(t, ast.Name) and t.id == "_ASYNC_CHECKED_FILES" for t in node.targets
-        ):
-            listed = {elt.value for elt in node.value.elts if isinstance(elt, ast.Constant)}
-    assert listed, "_ASYNC_CHECKED_FILES not found; this check went stale"
-    with_coroutines = {
-        f"slack/gateway_runtime/{name}"
-        for name, tree in _owner_trees()
-        if any(isinstance(n, ast.AsyncFunctionDef) for n in ast.walk(tree))
-    }
-    assert with_coroutines, "no owner defines a coroutine; this check went stale"
-    assert sorted(with_coroutines - listed) == []
-
-
 def test_a_second_facade_import_recomposes_the_owners_onto_it(tmp_path: Path) -> None:
     """A test that purges the facade and imports it again gets owners that run on
     the NEW namespace, and the orchestrator's qualnames are not prefixed twice."""
@@ -1198,7 +1285,7 @@ def test_a_fresh_facade_import_loads_every_owner(tmp_path: Path) -> None:
 #: guards at its new home (``slack-gateway.md``, Composition).
 _GUARDED_TOKEN_HOMES: dict[str, frozenset[str]] = {
     "persist_token_record": frozenset({"cron_turn", "gateway", "heartbeat_turns"}),
-    ".read_messages": frozenset({"cron_delivery", "nudge_wiring"}),
+    ".read_messages": frozenset({"nudge_wiring"}),
     "begin_turn": frozenset({"nudge_channel_fire"}),
     "os._exit": frozenset({"exit_path"}),
     "save_conversation_turn_off_loop": frozenset(
@@ -1207,10 +1294,8 @@ _GUARDED_TOKEN_HOMES: dict[str, frozenset[str]] = {
     "session_store_for_turn": frozenset(
         {"gateway", "heartbeat_turns", "nudge_channel_fire", "subagent_injection"}
     ),
-    "create_subprocess_": frozenset({"gateway", "install_repair", "update_apply"}),
-    "isolated_python_argv": frozenset({"install_repair", "update_apply"}),
-    "respawn_executable": frozenset({"update_apply", "update_schedule"}),
-    "reexec_python_module": frozenset({"update_schedule"}),
+    "create_subprocess_": frozenset({"gateway", "install_repair"}),
+    "isolated_python_argv": frozenset({"install_repair"}),
     "_running_script_ids.add": frozenset({"cron_exec"}),
     "caused_by_this_session": frozenset({"runtime_charge"}),
     "note_shared_death": frozenset({"runtime_charge"}),
@@ -1225,7 +1310,6 @@ _GUARDED_TOKEN_HOMES: dict[str, frozenset[str]] = {
     "autonudge_state": frozenset({"nudge_wiring"}),
     "_run_chat": frozenset(
         {
-            "cron_fire",
             "gateway",
             "nudge_dashboard_fire",
             "result_egress",

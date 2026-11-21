@@ -1,12 +1,11 @@
-"""A row cache shares the string cache's context and keeps link restoration distinct."""
+"""A row cache shares the string cache's context, and never memoizes an OAuth row."""
 
 import json
 
 import pytest
 
 from kiro_crew.dashboard import chat_utils as cu
-from kiro_crew.dashboard import wire_render
-from kiro_crew.security import exfil
+from kiro_crew.dashboard import mcp_oauth_provenance, wire_render
 
 
 @pytest.fixture(autouse=True)
@@ -25,8 +24,8 @@ def test_row_context_follows_the_string_cache_context(monkeypatch):
     original_render = cu._prepare_messages_scoped
     calls = []
 
-    def key(text, *base):
-        (digest, length), size = original_key(text, *base)
+    def key(text, *base, **snapshot):
+        (digest, length), size = original_key(text, *base, **snapshot)
         return (digest + bytes([version["value"]]), length), size
 
     def render(*args, **kwargs):
@@ -42,37 +41,40 @@ def test_row_context_follows_the_string_cache_context(monkeypatch):
     assert calls == [0, 1]
 
 
-def test_policy_exemption_does_not_hide_workspace_restore_change(monkeypatch):
-    """The union of policy and workspace hosts does not identify restoration scope."""
+def test_a_policy_exemption_does_not_hide_a_workspace_allowance(monkeypatch):
+    """The platform's exempt hosts and the workspace's allowed hosts are keyed apart.
+
+    The same host moving from one to the other draws no card either way, yet the
+    second render must miss the memo: only an allowance's use is audited.
+    """
+    from kiro_crew.security import blocked_links, exfil
+
     host = "tenant.example.com"
-    scoped = {"hosts": frozenset()}
-    monkeypatch.setattr(cu, "_exempt_exact_hosts", lambda: frozenset({host}))
-    monkeypatch.setattr(exfil, "_exempt_exact_hosts", lambda: frozenset({host}))
-    monkeypatch.setattr(cu, "allowed_hosts_for", lambda _: scoped["hosts"])
-    url = f"https://{host}/view?q=hello"
-    rows = [{"role": "assistant", "content": "blocked", "meta": {"marker": 1}}]
-    original = cu.with_allowed_links_restored
-
-    def restored(row):
-        if row.get("meta", {}).get("marker") and host in cu.current_scoped_exempt_hosts():
-            return {**row, "content": url}
-        return original(row)
-
-    # Isolate the documented restoration dependency from blocked-link record parsing.
-    monkeypatch.setattr(cu, "with_allowed_links_restored", restored)
-    first = wire_render.prepare_messages_json(rows, False, live_child="", workspace="/ws")
-    scoped["hosts"] = frozenset({host})
-    expected = json.dumps(cu._prepare_messages(rows, False, live_child="", workspace="/ws"))
-    assert expected != first
-    assert (
-        wire_render.prepare_messages_json(rows, False, live_child="", workspace="/ws") == expected
+    url = f"https://{host}/c?d=" + "x" * 260
+    policy = {"hosts": frozenset({host})}
+    allowed = {"hosts": frozenset()}
+    monkeypatch.setattr(exfil, "_exempt_exact_hosts", lambda: policy["hosts"])
+    monkeypatch.setattr(cu, "allowed_hosts_for", lambda _ws: allowed["hosts"])
+    audited: list[str] = []
+    monkeypatch.setattr(
+        blocked_links, "_emit_allowed_host_used_event", lambda h, _rules: audited.append(h)
     )
+    rows = [{"role": "assistant", "content": url, "ts": "1"}]
+    first = wire_render.prepare_messages_json(rows, False, live_child="", workspace="/ws")
+    policy["hosts"] = frozenset()
+    allowed["hosts"] = frozenset({host})
+    second = wire_render.prepare_messages_json(rows, False, live_child="", workspace="/ws")
+    assert first == second
+    assert cu.BLOCKED_LINKS_KEY not in second
+    assert audited == [host]
 
 
 def test_oauth_endpoint_revocation_is_checked_on_every_read(monkeypatch):
     approved = {"value": True}
     monkeypatch.setattr(cu, "oauth_url_contains_credential", lambda _: not approved["value"])
     url = "https://auth.example.com/authorize?state=opaque"
+    # A banner child "c" sent, so the endpoint approval is what decides the link.
+    mcp_oauth_provenance.record_emitted("c", url)
     rows = [{"role": "mcp_oauth", "content": "", "meta": {"oauth_url": url, "child": "c"}}]
     first = wire_render.prepare_messages_json(rows, False, live_child="c")
     assert url in first

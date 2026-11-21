@@ -16,6 +16,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from spawn_test_helpers import unblocked_signals
+
 from kiro_crew.testing.wait import wait_until
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -88,16 +90,17 @@ class TestE2eScheduling(unittest.TestCase):
     def start(self, commands, **kwargs):
         env = dict(os.environ)
         env.pop("PYTEST_ADDOPTS", None)
-        proc = subprocess.Popen(
-            self.drive(commands, **kwargs),
-            cwd=self.root,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            start_new_session=True,
-        )
+        with unblocked_signals():
+            proc = subprocess.Popen(
+                self.drive(commands, **kwargs),
+                cwd=self.root,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                start_new_session=True,
+            )
 
         def cleanup():
             if proc.poll() is None:
@@ -175,7 +178,9 @@ class TestE2eScheduling(unittest.TestCase):
     def test_lane_timeout_is_failure_and_sibling_still_finishes(self):
         proc = self.start(
             {
-                "a": self.drive({"a": self.command("a", gated=True, descendant=True)}, timeout=5),
+                "a": self.drive(
+                    {"a": self.command("a", gated=True, descendant=True)}, timeout=3, grace=0.5
+                ),
                 "b": self.command("b", gated=True),
             }
         )
@@ -305,12 +310,19 @@ finally:
         self.assertEqual(proc.returncode, 0, output)
 
     def test_drain_preserves_direct_popen_exit_status(self):
+        # The child's shutdown outlasts the drain's rescan interval with its
+        # handler already gone, as interpreter finalization does on a slow
+        # runner, so a repeated SIGTERM would replace status 23 with -15.
         probe = """
 import pathlib, runpy, subprocess, sys, time
 m = runpy.run_path(sys.argv[1])
 ready = pathlib.Path('ready')
 code = '''import pathlib, signal, sys, time
-signal.signal(signal.SIGTERM, lambda *_: sys.exit(23))
+def stop(*_):
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    time.sleep(.3)
+    sys.exit(23)
+signal.signal(signal.SIGTERM, stop)
 pathlib.Path('ready').touch()
 time.sleep(60)
 '''
@@ -326,12 +338,12 @@ def spawn(*args, **kwargs):
     return child
 subprocess.Popen = spawn
 try:
-    result = m['_supervise']({'child': [sys.executable, '-c', code]}, timeout=.1, grace=.5)
+    result = m['_supervise']({'child': [sys.executable, '-c', code]}, timeout=.1, grace=5)
     print('result=', result, 'status=', children[0].returncode, flush=True)
 finally:
     for child in children:
         if child.poll() is None:
-            child.terminate()
+            child.kill()
         child.wait(timeout=5)
 """
         proc = self.start({"probe": [sys.executable, "-c", probe, str(HELPER)]})
@@ -406,7 +418,15 @@ raise SystemExit(m['main']())
 
         jobs = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())["jobs"]
         job = jobs["e2e"]
-        self.assertEqual(job["timeout-minutes"], 25)
+        # 30 on CodeBuild, the smallest budget whose derived Playwright ceiling
+        # reaches the 1500 s cap; 40 on a non-fleet runner, where the slowest
+        # observed fork run took 23.9 of 25 minutes and a green run was one slow
+        # dependency install from a cancellation with no failing test.
+        self.assertEqual(
+            job["timeout-minutes"],
+            "${{ startsWith(needs.changes.outputs.linux_runner_large, "
+            "'codebuild-') && 30 || 40 }}",
+        )
         steps = job["steps"]
         parallel = next(
             s for s in steps if s.get("run") == "exec python scripts/ci_e2e_parallel.py"
@@ -482,14 +502,17 @@ raise SystemExit(m['main']())
         self.assertIn("I18N_BASE_REF", base["env"])
         self.assertNotIn("continue-on-error", base)
         self.assertNotIn("--no-vs-base", render["run"])
-        # The render needs the browser the E2E job provisions the same way: an
-        # exact version key, so a restore-key prefix cannot hand it a different
-        # Chromium revision than @playwright/test expects.
-        install = next(s for s in steps if s.get("run") == "npx playwright install chromium")
-        cache = next(s for s in steps if str(s.get("uses", "")).startswith("actions/cache@"))
-        self.assertLess(steps.index(cache), steps.index(install))
+        # The render needs the browser the E2E job provisions the same way: the
+        # exact revision @playwright/test pins, downloaded before the render.
+        # The install ends on `npx playwright install chromium`; a host guard for
+        # images Playwright has no entry for (ubuntu 26.04) may precede it.
+        install = next(
+            s
+            for s in steps
+            if str(s.get("run", "")).rstrip().splitlines()[-1:]
+            == ["npx playwright install chromium"]
+        )
         self.assertLess(steps.index(install), steps.index(render))
-        self.assertNotIn("restore-keys", cache["with"])
         self.assertEqual(install["timeout-minutes"], 6)
         # The gate runs nowhere else in the workflow: one job owns it.
         owners = [

@@ -6,10 +6,12 @@ import { useAppSelector } from '../../store'
 import { useRemoteCrewChat } from '../../hooks/usePreviewFlag'
 import { api } from '../../api/client'
 import { crewGroupsFor, useInstanceSessions } from '../../hooks/useInstanceSessions'
+import { slackRowHidden } from '../../lib/crewMode'
+import { fmtList } from '../../i18n/format'
 import { i18nT } from '../../i18n/t'
 import { isInstancesDisabledError } from '../../utils/instancesDisabled'
 import { useSelectInstance } from '../../hooks/useSelectInstance'
-import { useDebouncedSessionSearch } from './search'
+import { useDebouncedSessionSearchState } from './search'
 import type { Slot } from './types'
 import { sessionRowIdentity } from './rowIdentity'
 
@@ -34,9 +36,14 @@ export function useSessionSources({ historyFilter, slotTitleDigest, localSlots }
   // so gating the render would gate the rows but not the wire. The SAME switch as
   // "New chat on crew": a chat started on a crew must have a group to return to.
   const instanceSessionsEnabled = useRemoteCrewChat()
-  const historySearchResults = useDebouncedSessionSearch(
-    historyFilter, s => s, slotTitleDigest, hasWarmInstances,
+  const { result: historySearch, failed: historySearchFailed } = useDebouncedSessionSearchState(
+    historyFilter, (rows, scan) => ({ rows, scan }), slotTitleDigest, hasWarmInstances,
   )
+  // Both are fields of one state value, so each keeps its identity until the
+  // next response lands: no memo needed for downstream dependency arrays.
+  const historySearchResults = historySearch?.rows ?? null
+  // Set only when THIS machine's scan window left older sessions out of the search.
+  const historySearchScan = historySearch?.scan ?? null
   // Shared ['instances'] cache + shared select-and-maybe-reconnect semantics for
   // activating a remote row. THE ONLY `['instances']` observer in this component:
   // the merged-sessions hook takes this list as a parameter rather than opening a
@@ -109,7 +116,7 @@ export function useSessionSources({ historyFilter, slotTitleDigest, localSlots }
     if (instanceSessions.failed.length > 0) {
       return say(
         i18nT('pages.chatSidebar.sessions_from_instance_unavailable', {
-          names: instanceSessions.failed.join(', '),
+          names: fmtList(instanceSessions.failed, { style: 'narrow' }),
         }),
         instanceSessions.failure,
       )
@@ -150,9 +157,11 @@ export function useSessionSources({ historyFilter, slotTitleDigest, localSlots }
       // leaves a crew member out because its root's Crew panel lists it; a peer's
       // root opens in the crew window, which has no such panel, and the panel reads
       // this gateway's slots and routes, so for a peer's crew member this list is
-      // the only way in. The rows keep their `crew_root` stamp for the marks.
+      // the only way in. The rows keep their `crew_root` stamp for the marks. A
+      // peer's Slack conversation its own `slack.show_in_session_list` leaves out
+      // is left out here too, unless it waits on the person (`slackRowHidden`).
       const peers = (instanceSessions.rows as unknown as Slot[])
-        .filter(row => !seen.has(sessionRowIdentity(row)))
+        .filter(row => !seen.has(sessionRowIdentity(row)) && !slackRowHidden(row))
       return peers.length === 0 ? local : [...local, ...peers]
     },
     [localSlots, instanceSessions.rows],
@@ -177,7 +186,7 @@ export function useSessionSources({ historyFilter, slotTitleDigest, localSlots }
   // adopt (see `adoptPeerSession` in ChatSidebar).
   const { selectInstance } = useSelectInstance(instancesList)
   return {
-    historySearchResults, instancesList, instanceSessions, remoteSessionsError, allRows, allLiveSlots,
-    selectInstance, crewGroups,
+    historySearchResults, historySearchFailed, historySearchScan, instancesList, instanceSessions, remoteSessionsError,
+    allRows, allLiveSlots, selectInstance, crewGroups,
   }
 }

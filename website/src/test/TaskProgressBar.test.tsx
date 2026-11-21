@@ -7,6 +7,7 @@ import TaskProgressBar from '../pages/chat/TaskProgressBar'
 import dashboardReducer, { sseTodoUpdate, sseSlots } from '../store/dashboardSlice'
 import type { ChatSlot, TodoList } from '../types'
 import { api, ApiError } from '../api/client'
+import { i18next } from '../i18n/all'
 
 vi.mock('../api/client', async () => {
   const actual = await vi.importActual<typeof import('../api/client')>('../api/client')
@@ -60,6 +61,13 @@ describe('TaskProgressBar', () => {
   it('shows the server-derived count as "N of M"', () => {
     renderBar([slot('slot-1', todo([['a', true], ['b', false], ['c', false]]))])
     expect(screen.getByTestId('todo-count').textContent).toBe('1 of 3')
+  })
+
+  it('renders the count as one catalog sentence, not "N" + "of" + "M"', async () => {
+    // en-XA brackets every catalog value, so a count glued from fragments reads `1 [of] 3`.
+    await act(async () => { await i18next.changeLanguage('en-XA') })
+    renderBar([slot('slot-1', todo([['a', true], ['b', false], ['c', false]]))])
+    expect(screen.getByTestId('todo-count').textContent).toMatch(/^\[1 [^[\]]* 3[^[\]]*\]$/)
   })
 
   it('shows the first incomplete task as the current task', () => {
@@ -315,6 +323,20 @@ describe('TaskProgressBar row ticking', () => {
     expect(screen.getByTestId('todo-hint').textContent).toMatch(/read-only/i)
   })
 
+  it('a list the harness keeps itself shows read-only rows that name the agent, not a remote machine', async () => {
+    const kept = { ...todo([['Run the tests', true], ['Fixing the build', false]], ''), read_only: true }
+    renderBar([slot('slot-1', kept)])
+    await userEvent.click(screen.getByTestId('todo-pill'))
+    expect(screen.getAllByTestId('todo-row')).toHaveLength(2)
+    expect(screen.queryByTestId('todo-row-toggle')).toBeNull()
+    const hint = screen.getByTestId('todo-hint').textContent
+    expect(hint).toMatch(/agent keeps this list itself/)
+    expect(hint).not.toMatch(/remote machine/)
+    expect(screen.getByTestId('todo-count').textContent).toBe('1 of 2')
+    await userEvent.click(screen.getAllByTestId('todo-row')[1])
+    expect(api.setTodoTask).not.toHaveBeenCalled()
+  })
+
   it('shows a refused PATCH through ErrorNotice instead of a silent unchanged row', async () => {
     vi.mocked(api.setTodoTask).mockRejectedValue(new Error('403: the calling session is gone'))
     renderBar([slot('slot-1', todo([['a', false]]))])
@@ -333,6 +355,7 @@ describe('TaskProgressBar row ticking', () => {
     ['todo_task_stale', 409, /different task now/],
     ['todo_task_not_found', 404, /not in the list any more/],
     ['relay_archive_read_only', 409, /remote machine running this session/],
+    ['todo_read_only', 409, /agent keeps this list itself/],
   ])('renders the gateway refusal %s in plain words, server text on the tooltip', async (code, status, plain) => {
     const serverText = `server said ${code}`
     vi.mocked(api.setTodoTask).mockRejectedValue(

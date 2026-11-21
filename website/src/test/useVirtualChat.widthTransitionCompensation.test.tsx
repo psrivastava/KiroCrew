@@ -51,12 +51,16 @@ function makeScroller(initial: Geom) {
   })
   Object.defineProperty(el, 'scrollHeight', { configurable: true, get: () => state.scrollHeight })
   Object.defineProperty(el, 'clientHeight', { configurable: true, get: () => state.clientHeight })
+  // The column's width, which a case changes to model the pane narrowing.
+  let width = 390
+  Object.defineProperty(el, 'clientWidth', { configurable: true, get: () => width })
   ;(el as unknown as { scrollTo: (o: { top: number }) => void }).scrollTo = (o) => { scrollTo(o.top) }
   el.getBoundingClientRect = () =>
-    ({ top: 0, bottom: 400, left: 0, right: 390, width: 390, height: 400, x: 0, y: 0, toJSON: () => ({}) }) as DOMRect
+    ({ top: 0, bottom: 400, left: 0, right: width, width, height: 400, x: 0, y: 0, toJSON: () => ({}) }) as DOMRect
   /** Move scrollTop by `d` from OUTSIDE the hook: the reader, or the engine. */
   const nudge = (d: number) => scrollTo(state.scrollTop + d)
-  return { el, state, nudge }
+  const setWidth = (w: number) => { width = w }
+  return { el, state, nudge, setWidth }
 }
 
 /** A row whose height and viewport position both move; a negative `top` is above the fold. */
@@ -132,7 +136,7 @@ describe('useVirtualChat: above-fold compensation during a width transition', ()
    */
   function setup(opts: { streamingIndex?: number } = {}, following = false) {
     const parkedAt = following ? 4600 : 2000
-    const { el, state, nudge } = makeScroller({ scrollTop: parkedAt, scrollHeight: 5000, clientHeight: 400 })
+    const { el, state, nudge, setWidth } = makeScroller({ scrollTop: parkedAt, scrollHeight: 5000, clientHeight: 400 })
     const ref: RefObject<HTMLDivElement | null> = { current: el }
     const items = mkItems(N)
     const gate = { open: true }
@@ -155,7 +159,7 @@ describe('useVirtualChat: above-fold compensation during a width transition', ()
       view.result.current.measureRef(12)(visibleRow)
     })
     expect(persisted(OLD_SCOPE, 'm3')).toBe(250)
-    return { el, state, nudge, view, props, gate, above, aboveRow, visible, visibleRow }
+    return { el, state, nudge, setWidth, view, props, gate, above, aboveRow, visible, visibleRow }
   }
 
   /** The row above the reader re-wraps to `h`; with no native anchor, nothing else moves. */
@@ -190,6 +194,65 @@ describe('useVirtualChat: above-fold compensation during a width transition', ()
     // The old width's measurement is untouched by every one of those fires.
     expect(persisted(OLD_SCOPE, 'm3')).toBe(250)
     expect(persisted(NEW_SCOPE, 'm3')).toBeUndefined()
+  })
+
+  it('keeps a reader scroll that lands after the column changed width but before that width is classified', () => {
+    // The column narrows and the row above the reader re-wraps; its fire has
+    // not run yet. The reader's wheel lands first: its scroll event finds the
+    // column at a width no fire has classified. A record frozen at that event
+    // would put the reader's own 100px into the next fire's residual, and the
+    // fire would write it back -- the scroll undone. The record is re-read for
+    // the reader's input instead, so their position stands.
+    const { el, state, nudge, setWidth, gate, above, aboveRow, visible } = setup()
+    const startedAt = state.scrollTop
+    gate.open = false
+    setWidth(300)
+    rewrap(state, above, visible, 270)
+    act(() => { el.dispatchEvent(new WheelEvent('wheel', { deltaY: 100, bubbles: true })) })
+    nudge(100)
+    act(() => { el.dispatchEvent(new Event('scroll')) })
+    act(() => { fire?.([{ target: aboveRow }]) })
+    expect(state.scrollTop).toBe(startedAt + 100)
+  })
+
+  it('keeps a momentum scroll that outlasts its input and runs into a width change', () => {
+    // A touch fling: one hardware input, then scroll events with no further
+    // input, each within the settle window of the last. By the time the column
+    // narrows the input stamp has lapsed, but the gesture has not: the
+    // momentum is still the reader's, so its frame is re-recorded and the
+    // next fire must not hand the travel back.
+    const { el, state, nudge, setWidth, gate, above, aboveRow, visible } = setup()
+    const startedAt = state.scrollTop
+    act(() => { el.dispatchEvent(new WheelEvent('wheel', { deltaY: 40, bubbles: true })) })
+    for (let i = 0; i < 4; i++) {
+      vi.advanceTimersByTime(100)
+      nudge(25)
+      act(() => { el.dispatchEvent(new Event('scroll')) })
+    }
+    gate.open = false
+    setWidth(300)
+    rewrap(state, above, visible, 270)
+    vi.advanceTimersByTime(100)
+    nudge(100)
+    act(() => { el.dispatchEvent(new Event('scroll')) })
+    act(() => { fire?.([{ target: aboveRow }]) })
+    expect(state.scrollTop).toBe(startedAt + 200)
+  })
+
+  it('freezes the record for a scroll at an unclassified width that no reader input caused', () => {
+    // The engine's own scroll (anchoring under the re-wrap) at a width no fire
+    // has seen leaves the record at the classified frame, so the fire measures
+    // the re-wrap from it and pays it.
+    const { el, state, nudge, setWidth, gate, above, aboveRow, visible } = setup()
+    const startedAt = state.scrollTop
+    gate.open = false
+    setWidth(300)
+    rewrap(state, above, visible, 270)
+    vi.advanceTimersByTime(1000)
+    act(() => { el.dispatchEvent(new Event('scroll')) })
+    nudge(0)
+    act(() => { fire?.([{ target: aboveRow }]) })
+    expect(state.scrollTop).toBe(startedAt + 20)
   })
 
   it('credits every row of one batch that sat above the fold BEFORE the reflow, even when siblings pushed it past the fold', () => {
@@ -575,6 +638,135 @@ describe('useVirtualChat: above-fold compensation during a width transition', ()
     expect(state.scrollTop).toBe(startedAt + 40)
     expect(persisted(OLD_SCOPE, 'm3')).toBe(250)
   })
+
+  it('keeps a straddler held by its bottom as the reader row through the scroll event of its own write', () => {
+    // The column widens: the straddling reply shrinks, and holding its bottom
+    // brings its top inside the fold. The write's own scroll event re-reads
+    // the frame; the question above the reply now straddles the fold instead.
+    // The column then narrows back while still unsettled: the reply grows
+    // again and must keep its bottom, so the row under it stays put.
+    const { el, state, view, gate } = setup()
+    const question = { top: -400, h: 100 }
+    const reply = { top: -300, h: 500 }
+    const next = { top: 220, h: 100 }
+    const questionRow = makeRow(question)
+    const replyRow = makeRow(reply)
+    const nextRow = makeRow(next)
+    act(() => {
+      view.result.current.measureRef(9)(questionRow)
+      view.result.current.measureRef(10)(replyRow)
+      view.result.current.measureRef(13)(nextRow)
+    })
+    gate.open = false
+    // Wider: the reply shrinks to 150 and, with no native anchor, the row
+    // under it rises by 350. The hold writes its top down to 50.
+    reply.h = 150; next.top -= 350; state.scrollHeight -= 350
+    act(() => { fire?.([{ target: replyRow }]) })
+    expect([reply.top, next.top, question.top]).toEqual([50, 220, -50])
+    act(() => { vi.advanceTimersByTime(1000) })
+    act(() => { el.dispatchEvent(new Event('scroll')) })
+    // Narrower again: the reply grows to 300 and pushes the row under it down.
+    reply.h = 300; next.top += 150; state.scrollHeight += 150
+    act(() => { fire?.([{ target: replyRow }]) })
+    expect(next.top).toBe(220)
+    expect(reply.top + reply.h).toBe(200)
+  })
+
+  it('lets that hold go when a scroll no reader caused takes the row off screen', () => {
+    const { el, state, view, gate, nudge } = setup()
+    const question = { top: -400, h: 100 }
+    const reply = { top: -300, h: 500 }
+    const questionRow = makeRow(question)
+    const replyRow = makeRow(reply)
+    act(() => {
+      view.result.current.measureRef(9)(questionRow)
+      view.result.current.measureRef(10)(replyRow)
+    })
+    gate.open = false
+    reply.h = 150; state.scrollHeight -= 350
+    act(() => { fire?.([{ target: replyRow }]) })
+    expect(reply.top).toBe(50)
+    act(() => { vi.advanceTimersByTime(1000) })
+    // A jump with no reader input moves the reply well above the fold.
+    nudge(1000)
+    act(() => { el.dispatchEvent(new Event('scroll')) })
+    expect(reply.top + reply.h).toBeLessThan(0)
+    const jumpedTo = state.scrollTop
+    // The reply re-wraps off screen: nothing the reader sees moves, so no write.
+    reply.h = 300; state.scrollHeight += 150
+    act(() => { fire?.([{ target: replyRow }]) })
+    expect(state.scrollTop).toBe(jumpedTo)
+  })
+
+  it('lets that hold go once the width settles: a later in-place growth keeps the row top', () => {
+    const { el, state, view, gate } = setup()
+    const question = { top: -400, h: 100 }
+    const reply = { top: -300, h: 500 }
+    const lower = { top: 380, h: 100 }
+    const questionRow = makeRow(question)
+    const replyRow = makeRow(reply)
+    const lowerRow = makeRow(lower)
+    act(() => {
+      view.result.current.measureRef(9)(questionRow)
+      view.result.current.measureRef(10)(replyRow)
+      view.result.current.measureRef(14)(lowerRow)
+    })
+    gate.open = false
+    reply.h = 150; lower.top -= 350; state.scrollHeight -= 350
+    act(() => { fire?.([{ target: replyRow }]) })
+    expect(reply.top).toBe(50)
+    act(() => { vi.advanceTimersByTime(1000) })
+    act(() => { el.dispatchEvent(new Event('scroll')) })
+    // A row below the reader re-wraps before the settle: that fire writes
+    // nothing and raises no scroll event, and the hold stays carried.
+    lower.h = 120; state.scrollHeight += 20
+    act(() => { fire?.([{ target: lowerRow }]) })
+    // The width settles with no further scroll; then the reply grows in place
+    // (a block renders) while its top is on screen.
+    gate.open = true
+    const settledAt = state.scrollTop
+    reply.h = 250; state.scrollHeight += 100
+    act(() => { fire?.([{ target: replyRow }]) })
+    expect(state.scrollTop).toBe(settledAt)
+    expect(reply.top).toBe(50)
+  })
+
+  it('keeps a straddler held by its bottom mounted when a scroll recompute runs before the fire that pays a reflow', () => {
+    // Under load a scroll's frame callback can run between a reflow and the
+    // fire that pays it: scrollTop still holds the reflow's displacement, and
+    // the window mapped through it walks past the reader's rows. The held
+    // reply must stay mounted, or the next fire takes the row below it as the
+    // reader's and misses the re-wrap of everything between (probe on
+    // chat-form-switch-anchor.spec.ts, 1400 -> 382: row 32 landed 33px low).
+    const { el, state, view, gate, nudge, setWidth } = setup()
+    const reply = { top: -300, h: 500 }
+    const next = { top: 220, h: 100 }
+    const replyRow = makeRow(reply)
+    const nextRow = makeRow(next)
+    // The reader's rows sit inside the committed window (20-29 at this
+    // scrollTop); the setup's own rows 3 and 12 leave.
+    act(() => {
+      view.result.current.measureRef(3)(null)
+      view.result.current.measureRef(12)(null)
+      view.result.current.measureRef(20)(replyRow)
+      view.result.current.measureRef(23)(nextRow)
+    })
+    const mounted = () => view.result.current.virtualItems.map((v) => v.index)
+    expect(mounted()).toContain(20)
+    gate.open = false
+    reply.h = 150; next.top -= 350; state.scrollHeight -= 350
+    act(() => { fire?.([{ target: replyRow }]) })
+    expect(reply.top).toBe(50)
+    act(() => { vi.advanceTimersByTime(1000) })
+    // The column narrows again, and its reflow drags scrollTop far down
+    // before this layout's fire has paid it back. No reader input.
+    setWidth(200)
+    nudge(2500)
+    act(() => { el.dispatchEvent(new Event('scroll')) })
+    // The scroll's frame callback: the window recompute.
+    act(() => { vi.advanceTimersByTime(16) })
+    expect(mounted()).toContain(20)
+  })
 })
 
 /**
@@ -786,13 +978,15 @@ describe('useVirtualChat: the reader is anchored across a cold width-scope swap'
     act(() => { el.dispatchEvent(new Event('scroll')) })
     expect(rowTop(READ)).toBe(40)
     expect(hook.current!.virtualItems[0].index).toBe(start)
-    // The user's wheel.
-    state.scrollTop += 400
+    // The user's wheel, far enough that the window start walks down past the
+    // re-wrapped rows. The recompute reads mounted rows at their DOM heights,
+    // so a wheel that keeps the reader's rows inside the overscan (400px)
+    // unmounts nothing; this one leaves the re-wrapped rows above it.
+    state.scrollTop += 1100
     const readerBefore = rowTop(READ + 1)
-    expect(readerBefore).toBe(-110)
+    expect(readerBefore).toBe(-810)
     act(() => { el.dispatchEvent(new Event('scroll')) })
-    // The window start walked down through the stale tree and unmounted the
-    // re-wrapped rows...
+    // The window start walked down and unmounted the re-wrapped rows...
     const s2 = hook.current!.virtualItems[0].index
     expect(s2).toBeGreaterThan(start)
     expect(s2).toBeLessThanOrEqual(READ)

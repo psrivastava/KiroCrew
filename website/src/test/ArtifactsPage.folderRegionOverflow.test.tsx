@@ -32,6 +32,9 @@ import { renderWithProviders } from './helpers'
 import { api } from '../api/client'
 
 vi.mock('../api/client')
+// The library browse layout this suite pins (root gallery, folder cards) ships
+// on a phone; a desktop opens on Home with the side list instead.
+vi.mock('../hooks/useIsMobile', () => ({ useIsMobile: () => true }))
 vi.mock('@virtuoso.dev/masonry', () => ({ VirtuosoMasonry: () => <div data-testid="masonry" /> }))
 
 const artifact = (i: number) => ({
@@ -98,7 +101,8 @@ describe('ArtifactsPage folder region does not scroll horizontally', () => {
 
   it('lays the folder gutter out as grid gap, not as a per-card margin', async () => {
     await renderVirtualized()
-    const cards = screen.getAllByRole('button', { name: /open folder/i })
+    // Each card is the container its open button is laid over.
+    const cards = screen.getAllByRole('button', { name: /open folder/i }).map(b => b.parentElement as HTMLElement)
     const grid = cards[0].parentElement as HTMLElement
     // Every folder card is a direct grid child and the grid owns the gutter…
     expect(grid.className).toMatch(/\bgrid\b/)

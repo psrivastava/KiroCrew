@@ -4,11 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
+import subprocess
 
 import pytest
+from redaction_structured_cases import github_classic
 
 from kiro_crew import platform_compat
+from kiro_crew.testing.wait import await_until
+
+# A synthetic GitHub token the redactor removes; an AWS key ID or a bare 40-character
+# run stays visible.
+_SECRET = github_classic(seed=200)
 
 
 class TestTokenMint:
@@ -115,6 +123,10 @@ class TestTokenMint:
         # part of the remote command.
         assert "-n" in argv
         assert argv.index("-n") < argv.index("cd-1")
+        # -T overrides a user's `RequestTTY yes`, whose "Pseudo-terminal will
+        # not be allocated" warning otherwise leads the mint's failure text.
+        assert "-T" in argv
+        assert argv.index("-T") < argv.index("cd-1")
         # Default fail-fast connect bound is preserved for callers that
         # don't thread a budget (e.g. run_remote_kirocrew).
         assert "ConnectTimeout=10" in argv
@@ -127,6 +139,17 @@ class TestTokenMint:
         # Sub-second values clamp up to ssh's integer floor of 1.
         argv = _build_ssh_argv("cd-1", "echo hi", connect_timeout_secs=0.2)
         assert "ConnectTimeout=1" in argv
+
+    def test_ssh_argv_drops_config_forwards(self):
+        # A `LocalForward` in the user's ssh_config for this host would make the
+        # one-shot ssh bind that port too. If the port is free it holds it,
+        # waits for the connections riding it after the command exits, and is
+        # killed at the timeout with all of them. The one-shot never needs one.
+        from kiro_crew.instances.token_mint import _build_ssh_argv
+
+        argv = _build_ssh_argv("cd-1", "echo hi")
+        at = argv.index("ClearAllForwardings=yes")
+        assert argv[at - 1] == "-o" and at < argv.index("cd-1")
 
     def test_mint_success_and_no_token_in_logs(self, monkeypatch, caplog):
         from kiro_crew.instances import token_mint as tm
@@ -383,6 +406,210 @@ class TestTokenMint:
         assert "short-run-word" in msg
 
 
+@pytest.mark.skipif(platform_compat.IS_WINDOWS, reason="runs the remote prelude in a POSIX sh")
+class TestTokenMintHomePointer:
+    """The prelude follows the default run dir's gateway-<port>.home to a non-default data home."""
+
+    PORT = 5477
+
+    def _home_with_marker(self, home, rel):
+        data_home = home / rel
+        launcher = data_home / "kirocrew"
+        launcher.parent.mkdir(parents=True, exist_ok=True)
+        launcher.write_text(f'#!/bin/sh\necho "{rel} $KIROCREW_HOME $*"\n')
+        launcher.chmod(0o755)
+        marker = data_home / "run" / f"gateway-{self.PORT}.bin"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(f"{launcher}\n")
+        return data_home
+
+    def _plant_marker(self, home, rel):
+        """Give the *rel* data home a marker naming a script that touches X."""
+        plant = home / "plant"
+        plant.write_text(f"#!/bin/sh\ntouch {home}/X\n")
+        plant.chmod(0o755)
+        marker = home / rel / "run" / f"gateway-{self.PORT}.bin"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(f"{plant}\n")
+        return home / rel
+
+    def _launcher(self, path, mode=0o755):
+        path.write_text('#!/bin/sh\necho "launcher $KIROCREW_HOME $*"\n')
+        path.chmod(mode)
+        return path
+
+    def _mint(self, home, *flags, shell="/bin/sh", **env):
+        from kiro_crew.instances.token_mint import build_remote_token_command
+
+        cmd = build_remote_token_command("", ttl="20h", port=self.PORT)
+        return subprocess.run(
+            [shell, *flags, "-c", cmd],
+            env={"HOME": str(home), "PATH": "/usr/bin:/bin", **env},
+            capture_output=True,
+            encoding="utf-8",
+            timeout=30,
+            cwd=home,
+        )
+
+    def _point(self, home, content):
+        from kiro_crew.config.paths import CONFIG_DIR_NAME
+
+        pointer = home / CONFIG_DIR_NAME / "run" / f"gateway-{self.PORT}.home"
+        pointer.parent.mkdir(parents=True, exist_ok=True)
+        pointer.write_text(content)
+
+    @pytest.mark.parametrize("suffix", ["", " "], ids=["plain", "trailing-space"])
+    def test_execs_the_pointers_launcher_with_kirocrew_home_set(self, tmp_path, suffix):
+        from kiro_crew.config.paths import CONFIG_DIR_NAME
+
+        self._home_with_marker(tmp_path, CONFIG_DIR_NAME)
+        wrapped = self._plant_marker(tmp_path, f".kiro/crew-wrapped{suffix}")
+        launcher = self._launcher(tmp_path / f"launcher{suffix}")
+        self._point(tmp_path, f"{wrapped}\n{launcher}\n")
+
+        out = self._mint(tmp_path).stdout
+
+        assert out == f"launcher {wrapped} token --ttl 20h --port 5477\n"
+        assert not (tmp_path / "X").exists()
+
+    def test_an_exported_kirocrew_home_wins_over_the_pointer(self, tmp_path):
+        wrapped = self._home_with_marker(tmp_path, ".kiro/crew-wrapped")
+        other = self._home_with_marker(tmp_path, "other")
+        self._point(tmp_path, f"{wrapped}\n{wrapped / 'kirocrew'}\n")
+
+        out = self._mint(tmp_path, KIROCREW_HOME=str(other)).stdout
+
+        assert out == f"other {other} token --ttl 20h --port 5477\n"
+
+    def test_execs_the_pointers_launcher_under_set_u_with_no_kirocrew_home(self, tmp_path):
+        from kiro_crew.config.paths import CONFIG_DIR_NAME
+
+        self._home_with_marker(tmp_path, CONFIG_DIR_NAME)
+        wrapped = self._plant_marker(tmp_path, ".kiro/crew-wrapped")
+        launcher = self._launcher(tmp_path / "launcher")
+        self._point(tmp_path, f"{wrapped}\n{launcher}\n")
+
+        proc = self._mint(tmp_path, "-u")
+
+        assert proc.stdout == f"launcher {wrapped} token --ttl 20h --port 5477\n"
+        assert proc.stderr == ""
+
+    def test_runs_the_default_home_marker_under_set_u_with_no_pointer(self, tmp_path):
+        from kiro_crew.config.paths import CONFIG_DIR_NAME
+
+        self._home_with_marker(tmp_path, CONFIG_DIR_NAME)
+
+        proc = self._mint(tmp_path, "-u")
+
+        assert proc.stdout == f"{CONFIG_DIR_NAME}  token --ttl 20h --port 5477\n"
+        assert proc.stderr == ""
+
+    @pytest.mark.skipif(
+        os.getuid() == 0 if hasattr(os, "getuid") else True, reason="root reads a mode-000 file"
+    )
+    @pytest.mark.parametrize("flags", [(), ("-u",)], ids=["plain", "set-u"])
+    @pytest.mark.parametrize(
+        "shell",
+        [
+            "/bin/sh",
+            pytest.param(
+                "/bin/zsh",
+                marks=pytest.mark.skipif(not os.path.exists("/bin/zsh"), reason="no zsh"),
+            ),
+        ],
+        ids=["sh", "zsh"],
+    )
+    def test_runs_the_default_home_marker_quietly_when_the_pointer_cannot_be_opened(
+        self, tmp_path, shell, flags
+    ):
+        from kiro_crew.config.paths import CONFIG_DIR_NAME
+
+        self._home_with_marker(tmp_path, CONFIG_DIR_NAME)
+        wrapped = self._plant_marker(tmp_path, ".kiro/crew-wrapped")
+        launcher = self._launcher(tmp_path / "launcher")
+        self._point(tmp_path, f"{wrapped}\n{launcher}\n")
+        pointer = tmp_path / CONFIG_DIR_NAME / "run" / f"gateway-{self.PORT}.home"
+        pointer.chmod(0o000)
+        try:
+            proc = self._mint(
+                tmp_path, *flags, shell=shell, **{"__kh": str(wrapped), "__kp": str(launcher)}
+            )
+        finally:
+            pointer.chmod(0o644)
+
+        assert proc.stdout == f"{CONFIG_DIR_NAME}  token --ttl 20h --port 5477\n"
+        assert proc.stderr == ""
+
+    @pytest.mark.parametrize(
+        ("pointer", "marked"),
+        [
+            (None, True),
+            ("{w}\n", True),
+            ("{w}\n\n", True),
+            ("{w}\n{exe}\n", False),
+            ("{w}\n{noexe}\n", True),
+            ("{w}\n$(touch {tmp}/X)\n", True),
+            ("$(touch {tmp}/X)\n{exe}\n", True),
+            ("; touch {tmp}/X\n{exe}\n", True),
+        ],
+        ids=[
+            "no-pointer",
+            "no-launcher-line",
+            "empty-launcher-line",
+            "home-without-marker",
+            "launcher-not-executable",
+            "launcher-command-substitution",
+            "home-command-substitution",
+            "home-command-separator",
+        ],
+    )
+    def test_runs_the_default_home_marker_unless_the_pointer_names_a_launcher_for_a_marked_home(
+        self, tmp_path, pointer, marked
+    ):
+        from kiro_crew.config.paths import CONFIG_DIR_NAME
+
+        self._home_with_marker(tmp_path, CONFIG_DIR_NAME)
+        wrapped = tmp_path / ".kiro" / "crew-wrapped"
+        (wrapped / "run").mkdir(parents=True)
+        if marked:
+            self._plant_marker(tmp_path, ".kiro/crew-wrapped")
+        exe = self._launcher(tmp_path / "launcher")
+        noexe = self._launcher(tmp_path / "noexe", mode=0o644)
+        if pointer is not None:
+            self._point(tmp_path, pointer.format(w=wrapped, exe=exe, noexe=noexe, tmp=tmp_path))
+
+        proc = self._mint(tmp_path)
+
+        assert proc.stdout == f"{CONFIG_DIR_NAME}  token --ttl 20h --port 5477\n"
+        assert proc.stderr == ""
+        assert not (tmp_path / "X").exists()
+
+
+class TestRunMarkerClauseRestart:
+    def test_restart_through_the_pointer_targets_the_port_not_the_service_unit(self):
+        from kiro_crew.instances.token_mint import build_candidate_command
+
+        cmd = build_candidate_command("restart", marker_port=7879)
+
+        assert 'KIROCREW_HOME="$__kh" exec "$__kp" restart --port 7879;' in cmd
+        assert 'exec "$__kb" restart;' in cmd
+
+    def test_the_idle_gated_restart_through_the_pointer_targets_the_port_too(self):
+        from kiro_crew.instances.token_mint import build_candidate_command
+
+        cmd = build_candidate_command("restart --when-idle --max-wait 0", marker_port=7879)
+
+        assert 'exec "$__kp" restart --port 7879 --when-idle --max-wait 0;' in cmd
+        assert 'exec "$__kb" restart --when-idle --max-wait 0;' in cmd
+
+    def test_token_through_the_pointer_gains_no_port_flag(self):
+        from kiro_crew.instances.token_mint import _run_marker_clause
+
+        clause = _run_marker_clause("token --ttl 20h --port 7879", 7879)
+
+        assert 'exec "$__kp" token --ttl 20h --port 7879;' in clause
+
+
 class TestTokenMintGeneric:
     def test_ttl_to_seconds(self):
         from kiro_crew.instances.token_mint import TokenMintError, ttl_to_seconds
@@ -529,7 +756,7 @@ class TestTokenMintGeneric:
             returncode = 255
 
             async def communicate(self):
-                return b"", b"WSSH error AKIAIOSFODNN7EXAMPLE banner"
+                return b"", f"WSSH error {_SECRET} banner".encode()
 
         async def fake_exec(*a, **k):
             return FakeProc()
@@ -537,27 +764,18 @@ class TestTokenMintGeneric:
         monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
         rc, err = asyncio.run(tm.run_remote_kirocrew("cd-1", "restart"))
         assert rc == 255
-        assert "AKIAIOSFODNN7EXAMPLE" not in err
+        assert _SECRET not in err
         assert "[REDACTED: credential]" in err
 
-    def test_run_remote_kirocrew_redacts_urls_before_credentials(self, monkeypatch):
-        """Pin the ORDER of the redaction passes, not just the redaction.
-
-        The exfiltration-URL pass keys on the token-bearing URL shape, so
-        running the credential pass first substitutes a placeholder into the
-        query string and disarms it — the suspicious destination host then
-        survives into the returned tail. Each pass is green in isolation, so
-        only an input carrying a suspicious URL whose query string also carries
-        a credential distinguishes the two orders. This test fails if the
-        composition is ever reversed again.
-        """
+    def test_run_remote_kirocrew_masks_only_the_url_credential(self, monkeypatch):
+        """A URL in the tail is never replaced whole: only its credential value goes."""
         from kiro_crew.instances import token_mint as tm
 
         class FakeProc:
             returncode = 255
 
             async def communicate(self):
-                return b"", b"banner https://evil.example.com/x?token=AKIAIOSFODNN7EXAMPLE end"
+                return b"", f"banner https://evil.example.com/x?token={_SECRET} end".encode()
 
         async def fake_exec(*a, **k):
             return FakeProc()
@@ -565,24 +783,15 @@ class TestTokenMintGeneric:
         monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
         rc, err = asyncio.run(tm.run_remote_kirocrew("cd-1", "restart"))
         assert rc == 255
-        # The URL pass must fire: the destination must be suppressed, not just
-        # the credential inside it. Under the reversed (credentials-first)
-        # order the URL survives as https://evil.example.com/x?token=[...].
-        assert "https://evil.example.com" not in err
-        assert "[REDACTED: suspicious URL" in err
-        assert "AKIAIOSFODNN7EXAMPLE" not in err
+        assert "https://evil.example.com/x?token=[REDACTED: credential] end" in err
+        assert _SECRET not in err
 
-    def test_stdout_tail_url_pass_not_disarmed_by_token_prescrub(self, monkeypatch):
-        """The stdout-tail site has a second disarm path — its own
-        ``_TOKEN_RE`` pre-scrub. Substituting ``token=<redacted>`` into a URL's
-        query string before the exfiltration-URL pass destroys the token-bearing
-        shape that pass keys on, so a suspicious destination would survive into
-        the raised TokenMintError even with the composed helper in place. Pins
-        that the generic redactors see the window before the token scrubs.
-        """
+    def test_stdout_tail_masks_only_the_url_credential(self, monkeypatch):
+        """The stdout-tail site has its own ``_TOKEN_RE`` pre-scrub as well; with it
+        the URL in the raised TokenMintError still keeps everything but the value."""
         from kiro_crew.instances import token_mint as tm
 
-        stdout = b"fail: see https://evil.example.com/x?token=AKIAIOSFODNN7EXAMPLE now"
+        stdout = f"fail: see https://evil.example.com/x?token={_SECRET} now".encode()
 
         class FakeProc:
             returncode = 1
@@ -597,9 +806,8 @@ class TestTokenMintGeneric:
         with pytest.raises(tm.TokenMintError) as excinfo:
             asyncio.run(tm.mint_remote_token("cd-1", ttl="20h"))
         msg = str(excinfo.value)
-        assert "https://evil.example.com" not in msg
-        assert "[REDACTED: suspicious URL" in msg
-        assert "AKIAIOSFODNN7EXAMPLE" not in msg
+        assert "https://evil.example.com/x?token=" in msg
+        assert _SECRET not in msg
 
     class _HangProc:
         """First ``communicate`` times out; the reap (a SECOND communicate)
@@ -647,6 +855,48 @@ class TestTokenMintGeneric:
         monkeypatch.setattr(platform_compat, "kill_process_tree_async", _tree)
         with pytest.raises(tm.TokenMintError, match="timed out minting"):
             asyncio.run(tm.mint_remote_token("cd-1", ttl="20h"))
+        assert killed == [(proc.pid, platform_compat.SIGKILL)]
+        assert proc.kill_calls == 1
+        assert proc.communicate_calls == 2
+        assert proc.wait_calls == 0
+
+    def test_a_cancelled_mint_kills_and_reaps_the_ssh_child(self, monkeypatch):
+        """Cancelling the mint mid-wait kills and reaps ssh, then re-raises."""
+        from kiro_crew.instances import token_mint as tm
+
+        proc = self._HangProc()
+        waiting = asyncio.Event()
+
+        async def _parked_communicate():
+            proc.communicate_calls += 1
+            if proc.communicate_calls == 1:
+                waiting.set()
+                await asyncio.Event().wait()
+            proc.returncode = -9
+            return b"", b""
+
+        proc.communicate = _parked_communicate
+
+        async def fake_exec(*a, **k):
+            return proc
+
+        killed: list[tuple[int, int]] = []
+
+        async def _tree(pid, sig):
+            killed.append((pid, sig))
+            return True
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(platform_compat, "kill_process_tree_async", _tree)
+
+        async def _cancel_mid_mint() -> None:
+            task = asyncio.create_task(tm.mint_remote_token("cd-1"))
+            await await_until(waiting, what="the mint parked in communicate()")
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await await_until(task, what="the cancelled mint")
+
+        asyncio.run(_cancel_mid_mint())
         assert killed == [(proc.pid, platform_compat.SIGKILL)]
         assert proc.kill_calls == 1
         assert proc.communicate_calls == 2

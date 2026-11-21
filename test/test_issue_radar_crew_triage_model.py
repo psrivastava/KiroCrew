@@ -17,11 +17,12 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
 from unittest import mock
+
+import pytest
 
 import kiro_crew
 from kiro_crew.apps.builtins.issue_radar.backend import crew_model as cm
@@ -495,7 +496,8 @@ class TestAPersonsPickWins(_Isolated):
 #: gateway's own write, which must stamp ``_model_runtime_pick_gen`` so the crew
 #: does not read it as a pick. "crew": the crew's own switch.
 PICK_GEN_WRITERS: dict[tuple[str, str], tuple[str, int]] = {
-    ("dashboard/chat_api/slot_model.py", "api_chat_slot_model"): ("pick", 3),
+    # The model route's transaction; the in-turn /model <id> on KAS shares it.
+    ("dashboard/chat_api/slot_model.py", "switch_slot_model"): ("pick", 3),
     ("dashboard/chat_api/slot_model.py", "api_chat_slots_model"): ("pick", 1),
     # Settings' "follow the default" press: a person's choice for their own chats.
     # A crew's slot is app-owned, so the press never counts or clears it.
@@ -503,8 +505,12 @@ PICK_GEN_WRITERS: dict[tuple[str, str], tuple[str, int]] = {
     ("dashboard/session_control_parts/session_create.py", "create_session"): ("pick", 1),
     # A person's harness pick for a crewmate clears its DM chat's model pick.
     ("dashboard/agent_admin/crew_update.py", "_reload"): ("pick", 1),
+    # A person's save of a Bot's model clears its own chat's model pick.
+    ("dashboard/bot_chat_follow.py", "_clear_open"): ("pick", 1),
     ("dashboard/session_control_parts/model_switch.py", "apply_pending_model_pick"): ("pick", 1),
     ("dashboard/server_runtime/config_watch.py", "_switch_provider"): ("runtime", 1),
+    # A code channel's session starts on the Slack Code default model a person set.
+    ("slack/code_channels/binding.py", "create_bound_session"): ("pick", 1),
     ("apps/builtins/issue_radar/backend/crew_model.py", "apply_turn_model"): ("crew", 1),
 }
 
@@ -682,10 +688,18 @@ class TestStoreField(unittest.TestCase):
 class TestStoredHold(unittest.TestCase):
     """The hold on the crew record: set compare-and-set, released by a model edit."""
 
+    @pytest.fixture(autouse=True)
+    def _per_test_dirs(self, tmp_path):
+        """Hand ``setUp`` pytest's per-test directory for the radar store root.
+
+        Background writers (the crew-log fold, the store's ``mkdir`` on read) can
+        re-create a self-removed directory after cleanup; pytest owns ``tmp_path``.
+        """
+        self._tmp_path = tmp_path
+
     def setUp(self) -> None:
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.root = Path(tmp.name)
+        self.root = self._tmp_path / "radar-root"
+        self.root.mkdir()
         self.crew = cs.create_crew(
             "o", "r", {"name": "Leo", "model": WORK, "triage_model": TRIAGE}, self.root
         )

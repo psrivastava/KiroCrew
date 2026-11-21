@@ -470,6 +470,25 @@ class TestTheFetchCommandDoesNotOverclaim:
         )
         assert declared.effective_refresh_interval() == 0
 
+    @pytest.mark.parametrize("status", [pd.REFRESH_REJECTED, pd.REFRESH_UNREACHABLE])
+    def test_a_failed_fetch_is_reported_on_stderr(self, capsys, monkeypatch, status):
+        """A config-management run that shows only stderr must see why it exited 1."""
+        from kiro_crew import cli_commands
+        from kiro_crew.platform import policy_distribution as dist_mod
+
+        monkeypatch.setattr(
+            dist_mod,
+            "refresh_now",
+            lambda *, force=False: pd.RefreshOutcome(status, detail="boom"),
+        )
+        with pytest.raises(SystemExit) as exc:
+            cli_commands._policy_fetch(force=False)
+        assert exc.value.code == 1
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "boom" in captured.err
+        assert "The ceiling already in effect is unchanged." in captured.err
+
 
 class TestTheEnvironmentChannelMayOwnTheAddress:
     """The ordinary two-channel split: whatever provisions the host owns the address (and
@@ -490,6 +509,21 @@ class TestTheEnvironmentChannelMayOwnTheAddress:
         with pytest.raises(PlatformCompositionError) as caught:
             governance.PolicyDistribution.from_dict({"refresh_interval_secs": 900})
         assert pd.POLICY_URL_ENV in str(caught.value), "the message must name the way out"
+
+    def test_settings_without_a_source_are_fine_in_a_cache_only_child(self, monkeypatch):
+        """A cache-only child is given no source by design: it adopts the gateway's cache."""
+        monkeypatch.delenv(pd.POLICY_URL_ENV, raising=False)
+        monkeypatch.setenv(pd.POLICY_CACHE_ONLY_ENV, "1")
+        parsed = governance.PolicyDistribution.from_dict({"max_cache_age_secs": 86400})
+        assert parsed.max_cache_age_secs == 86400
+
+    @pytest.mark.parametrize("value", ["0", "false", "no"])
+    def test_a_false_cache_only_value_keeps_the_refusal(self, monkeypatch, value):
+        """Only a value that turns cache-only mode on may lift the refusal."""
+        monkeypatch.delenv(pd.POLICY_URL_ENV, raising=False)
+        monkeypatch.setenv(pd.POLICY_CACHE_ONLY_ENV, value)
+        with pytest.raises(PlatformCompositionError):
+            governance.PolicyDistribution.from_dict({"max_cache_age_secs": 600})
 
     def test_a_source_less_declaration_reaches_the_engine_not_just_the_parser(self, monkeypatch):
         """``from_dict`` accepts such a block; discarding it for having no source would
@@ -941,6 +975,33 @@ class TestABootOnlySourceIsNotRefetched:
         with pytest.raises(Exception) as excinfo:
             pd._fetch_file(pd.FetchRequest(url=doc.as_uri()))
         assert "writ" in str(excinfo.value).lower()
+
+    def test_the_off_posix_refusal_names_windows_and_https(self, monkeypatch, tmp_path):
+        """The off-POSIX refusal names the platform, not a writable file or a root-owned path."""
+        monkeypatch.setattr(platform_compat, "IS_POSIX", False)
+        doc = tmp_path / "policy.json"
+        doc.write_text(json.dumps(_doc("central")))
+        os.chmod(doc, 0o444)
+
+        with pytest.raises(PlatformCompositionError) as excinfo:
+            pd._fetch_file(pd.FetchRequest(url=doc.as_uri()))
+        message = str(excinfo.value)
+        assert "refused on Windows" in message
+        assert "https" in message
+        assert "root-owned path" not in message
+        assert "is writable by" not in message
+
+    def test_the_windows_message_rides_the_write_check_not_a_separate_gate(
+        self, monkeypatch, tmp_path, readonly_chain
+    ):
+        """Off POSIX the refusal comes from the write predicates alone, so stubbing
+        them (as the size and digest tests do) still reaches the read."""
+        monkeypatch.setattr(platform_compat, "IS_POSIX", False)
+        doc = tmp_path / "policy.json"
+        doc.write_text(json.dumps(_doc("central")))
+
+        fetched = pd._fetch_file(pd.FetchRequest(url=doc.as_uri()))
+        assert fetched.body == doc.read_bytes()
 
 
 class TestA304RevalidatesAgainstTheTrustRoot:

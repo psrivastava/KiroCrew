@@ -70,9 +70,9 @@ class TestCreateSingleLockedSave:
         resp = await api_crons_create(request)
         assert resp.status == 200
 
-        # Exactly one save — the one inside the locked _persist_add_locked. The
-        # pre-fix handler did a SECOND, unlocked save to flush the mutated
-        # fields (save_calls["n"] would be 2), which is the data-loss window.
+        # Exactly one save — the one inside the locked _persist_add_locked. A
+        # SECOND, unlocked save to flush the mutated fields (save_calls["n"] == 2)
+        # would open a data-loss window.
         assert save_calls["n"] == 1
 
         # And the job is persisted fully-formed (fields set under the lock).
@@ -97,9 +97,7 @@ class TestCreateSingleLockedSave:
 
         crons._save = _counting_save  # type: ignore[method-assign]
 
-        request = _create_request(
-            {"name": "plain", "message": "ping", "every": 3600}, crons
-        )
+        request = _create_request({"name": "plain", "message": "ping", "every": 3600}, crons)
         resp = await api_crons_create(request)
         assert resp.status == 200
         assert save_calls["n"] == 1
@@ -134,9 +132,7 @@ class TestConcurrentCreatesNoDataLoss:
             crons,
         )
 
-        resp_a, resp_b = await asyncio.gather(
-            api_crons_create(req_a), api_crons_create(req_b)
-        )
+        resp_a, resp_b = await asyncio.gather(api_crons_create(req_a), api_crons_create(req_b))
         assert resp_a.status == 200
         assert resp_b.status == 200
 

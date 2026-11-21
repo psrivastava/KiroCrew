@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from kiro_crew.config.fields import _meta, _safe_int, field_default
+from kiro_crew.config.sections_defaults import _report_clamp
 
 #: Bounds of a context-threshold percentage, and the single statement of the range.
 #: The floor is 1, not 0, because a 0% threshold means "always over" and would fire the
@@ -280,7 +281,7 @@ def _coerce_whatsapp_groups(raw: object) -> list[dict]:
         return []
     out: list[dict] = []
     seen: set[str] = set()
-    for entry in raw:
+    for index, entry in enumerate(raw):
         if not isinstance(entry, dict):
             continue
         jid = str(entry.get("jid", "")).strip()
@@ -294,6 +295,9 @@ def _coerce_whatsapp_groups(raw: object) -> list[dict]:
             cooldown = int(entry.get("cooldown_s", _WHATSAPP_GROUP_COOLDOWN_DEFAULT))
         except (TypeError, ValueError):
             cooldown = _WHATSAPP_GROUP_COOLDOWN_DEFAULT
+        if cooldown < 0:
+            # Keyed by list position: a group id does not belong in a log line.
+            _report_clamp(WhatsAppConfig, f"groups[{index}].cooldown_s", entry["cooldown_s"], 0)
         coerced: dict = {
             "jid": jid,
             "name": str(entry.get("name", "")).strip(),
@@ -562,6 +566,17 @@ class WhatsAppConfig:
             "folder name, created when these settings are saved and marked with "
             "the channel's brand mark. A configured folder that no longer exists "
             "leaves conversations unfiled until the next save recreates it.",
+            tags=["whatsapp"],
+        ),
+    )
+    auto_reply_to_voice: bool = field(
+        default=False,
+        metadata=_meta(
+            "Reply to Voice Notes by Voice",
+            "Answer a voice note with a voice note as well as the text, spoken "
+            "with the voice_reply settings. Needs voice_reply.provider 'polly', "
+            "which writes the Ogg/Opus a WhatsApp voice note plays; other "
+            "providers are skipped. Off by default: Polly is a billed AWS service.",
             tags=["whatsapp"],
         ),
     )

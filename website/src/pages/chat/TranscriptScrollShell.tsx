@@ -17,9 +17,11 @@
  * dockClearance geometry stays with the page, which supplies the floating
  * dock's clearance padding via `scrollerStyle`.
  */
-import React, { useCallback, useLayoutEffect, useState } from 'react'
+import React, { useCallback, useEffect, useLayoutEffect, useState } from 'react'
 import { Loader } from 'lucide-react'
 import { i18nT } from '../../i18n/t'
+import { afterSlide, forgetAfterSlide, holdReadingPosition, markSlideSettling, onReleaseReadingPosition, slideHeld, watchPanelSlide } from '../../utils/panelSlide'
+import { attachUserScrollIntent } from '../../utils/searchScroll'
 
 /** Inherited custom property carrying the scroller's usable width in px, so a
  *  descendant that may outgrow the reading column (a top-level assistant table,
@@ -32,28 +34,192 @@ import { i18nT } from '../../i18n/t'
  *  that contained it would centre the sheet on itself and clip its backdrop. */
 export const PANE_WIDTH_PROPERTY = '--chat-pane-width'
 
+/** The only reader of PANE_WIDTH_PROPERTY: a table the reader widened past the
+ *  reading column (`.markdown-table[data-expanded]`, content-fit.css). */
+const PANE_WIDTH_READER = '.markdown-table[data-expanded]'
+
+/** With no reader mounted, how long the width must hold still before it is
+ *  published. Longer than three frames, so a panel's open or close tween
+ *  (one resize per frame) publishes once, after it ends; shorter than the
+ *  hosts' 200ms width-bucket settle, so the published width is in place
+ *  before a new height-cache scope asks for it (`canMeasure`). */
+export const PANE_WIDTH_REST_MS = 50
+
 /** Publish the scroller's `clientWidth` as PANE_WIDTH_PROPERTY on itself.
  *  `clientWidth` nets out the reserved scrollbar gutter, so it is the width a
  *  child can actually paint into. The measure farm renders inside this same
- *  element, so off-screen rows inherit the identical width. Undebounced: the
- *  tables must reflow with the pane, like the prose column does; the hosts'
- *  own 200ms-settled width buckets scope the height cache, not layout. */
+ *  element, so off-screen rows inherit the identical width. Undebounced while
+ *  a widened table is mounted: it must reflow with the pane, like the prose
+ *  column does; the hosts' own 200ms-settled width buckets scope the height
+ *  cache, not layout. */
 function usePaneWidthProperty(scrollerRef: React.RefObject<HTMLDivElement | null>): void {
   useLayoutEffect(() => {
     const el = scrollerRef.current
     if (!el) return
-    const publish = () => { el.style.setProperty(PANE_WIDTH_PROPERTY, `${el.clientWidth}px`) }
+    let resting: ReturnType<typeof setTimeout> | undefined
+    const publish = () => {
+      clearTimeout(resting)
+      resting = undefined
+      el.style.setProperty(PANE_WIDTH_PROPERTY, `${el.clientWidth}px`)
+    }
     publish()
     if (typeof ResizeObserver === 'undefined') return
-    const observer = new ResizeObserver(publish)
+    const observer = new ResizeObserver(() => {
+      // While a side panel slides (panelSlide), only the final width is
+      // published: each change restyles the whole transcript.
+      if (slideHeld()) { clearTimeout(resting); afterSlide(publish); return }
+      // The property is inherited, so each publish restyles every element
+      // under the scroller, and a panel that opens or closes with a click
+      // resizes the scroller on every frame of its tween. With no widened
+      // table mounted nothing on screen reads the value, so it waits until
+      // the width rests.
+      if (el.querySelector(PANE_WIDTH_READER)) { publish(); return }
+      clearTimeout(resting)
+      resting = setTimeout(publish, PANE_WIDTH_REST_MS)
+    })
     observer.observe(el)
-    return () => observer.disconnect()
+    return () => {
+      observer.disconnect()
+      clearTimeout(resting)
+      forgetAfterSlide(publish)
+    }
+  }, [scrollerRef])
+}
+
+/** The blocks a reading position is anchored to: leaves only (a block holding
+ *  another is skipped), so the anchor is the line the reader sees, not the top
+ *  of a long reply that reflows under it. */
+const anchorBlockSelector = ['p', 'li', 'tr', 'pre', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote', 'img'].join(', ')
+/** Where in the viewport the anchored line is, as a share of its height. */
+const ANCHOR_LINE = 0.3
+/** Within this of the bottom, the transcript follows the bottom instead. */
+const ANCHOR_AT_BOTTOM_PX = 4
+/** How long after a slide ends the anchor still holds: the pane width, the
+ *  tables and the virtualizer's settled heights land in this window. */
+const ANCHOR_AFTER_SLIDE_MS = 600
+
+function pickSlideAnchor(el: HTMLElement): { node: Element; want: number } | null {
+  const top = el.getBoundingClientRect().top
+  const line = top + el.clientHeight * ANCHOR_LINE
+  for (const b of el.querySelectorAll(anchorBlockSelector)) {
+    if (b.querySelector(anchorBlockSelector)) continue
+    const r = b.getBoundingClientRect()
+    if (r.height === 0 || r.bottom <= line) continue
+    return { node: b, want: r.top - top }
+  }
+  return null
+}
+
+/**
+ * Keep the line the reader is looking at in place while a side panel slides
+ * (utils/panelSlide). The column changes width on every frame, so every block
+ * above that line rewraps (tables most of all) and, with the scroll offset
+ * left alone, the text under the reader's eyes moved up and down with the
+ * drag. Not at the bottom only: there the transcript follows the bottom.
+ *
+ * The correction runs in a ResizeObserver on the scroller, after the frame's
+ * layout and before its paint, so the reflowed frame is drawn already
+ * corrected; a scroll offset change needs no new layout. After the slide it
+ * holds a little longer, frame by frame, while the held width work lands. The
+ * reader's own scroll input ends it at once (`attachUserScrollIntent`: a
+ * wheel the page's swipe did not cancel, a scrollbar press, a scrolling key, a
+ * touch).
+ */
+function useSlideAnchor(scrollerRef: React.RefObject<HTMLDivElement | null>): void {
+  useEffect(() => {
+    const el = scrollerRef.current
+    if (!el || typeof ResizeObserver === 'undefined') return
+    let anchor: { node: Element; want: number } | null = null
+    // At the bottom: the transcript stays pinned there. The follow logic pins
+    // too, but on its own schedule; when the slide lands, the held width
+    // rewraps the rows in that same commit, and a pin a frame later let one
+    // frame paint the transcript a message's height off (Ray's 120fps
+    // recording: a single-frame flash at the top, the bottom pinned).
+    let bottom = false
+    let raf = 0
+    let until = 0
+    const correct = () => {
+      if (bottom) {
+        const top = el.scrollHeight - el.clientHeight
+        if (Math.abs(el.scrollTop - top) >= 0.5) el.scrollTop = top
+        return
+      }
+      if (!anchor || !anchor.node.isConnected) return
+      const d = anchor.node.getBoundingClientRect().top - el.getBoundingClientRect().top - anchor.want
+      if (Math.abs(d) >= 0.5) el.scrollTop += d
+    }
+    const ro = new ResizeObserver(correct)
+    // The browser's own scroll anchoring picks its own node and would pull
+    // against this one every frame: off while this anchor holds
+    // (`data-slide-anchor`, chat-transcript.css; the follow logic writes the
+    // inline value, so a stylesheet rule wins over it).
+    const drop = () => {
+      anchor = null
+      bottom = false
+      el.removeAttribute('data-slide-anchor')
+      holdReadingPosition(el, false)
+      onReleaseReadingPosition(el, null)
+      markSlideSettling(el, false)
+      ro.disconnect()
+      if (raf) cancelAnimationFrame(raf)
+      raf = 0
+    }
+    // The reader's own input (a wheel the page's swipe did not claim, a
+    // scrollbar press, a scrolling key, a touch) ends the hold at once: the
+    // next correction would undo their scroll.
+    // A downward input (a trackpad's momentum tail) agrees with the bottom pin, so it keeps it.
+    const detachIntent = attachUserScrollIntent(el, (dir) => {
+      if (bottom && dir === 'down') return
+      if (anchor || bottom) drop()
+    })
+    const unwatch = watchPanelSlide((sliding, retired) => {
+      if (sliding) {
+        drop()
+        if (el.scrollHeight - el.scrollTop - el.clientHeight <= ANCHOR_AT_BOTTOM_PX) {
+          bottom = true
+          onReleaseReadingPosition(el, drop)
+        } else {
+          anchor = pickSlideAnchor(el)
+          if (!anchor) return
+          el.setAttribute('data-slide-anchor', '')
+          holdReadingPosition(el, true, drop)
+        }
+        markSlideSettling(el, true)
+        // The scroller resizes on every frame of the slide; its children (the
+        // rows, the virtualizer's spacers) also change height when it rests
+        // and the held width lands, with the scroller's own size unchanged.
+        // A ResizeObserver runs after layout and before paint, so the
+        // corrected position is the one painted.
+        ro.observe(el)
+        for (const child of el.children) ro.observe(child)
+        return
+      }
+      // Dropped rather than landed (a session switch): the scroller may show
+      // another session now, whose own restore owns the position.
+      if (retired) { drop(); return }
+      if (!anchor && !bottom) return
+      until = performance.now() + ANCHOR_AFTER_SLIDE_MS
+      const tick = () => {
+        correct()
+        if (performance.now() < until) raf = requestAnimationFrame(tick)
+        else drop()
+      }
+      correct()
+      raf = requestAnimationFrame(tick)
+    })
+    return () => {
+      unwatch()
+      drop()
+      detachIntent()
+    }
   }, [scrollerRef])
 }
 
 const WIDTH_BUCKET_STEP = 16
 const WIDTH_SETTLE_MS = 200
 const bucketWidth = (px: number) => Math.round(px / WIDTH_BUCKET_STEP) * WIDTH_BUCKET_STEP
+const publishedBucket = (el: HTMLElement) =>
+  bucketWidth(Number.parseFloat(el.style.getPropertyValue(PANE_WIDTH_PROPERTY)))
 
 /** One width scope for both transcript hosts. Layout stays live during a drag,
  * but a height may enter the settled cache only when BOTH the pane and its
@@ -73,9 +239,17 @@ export function useTranscriptWidth() {
     measure()
     if (typeof ResizeObserver === 'undefined') return
     let timer: ReturnType<typeof setTimeout> | undefined
+    // Settle only on a width the table width has been published at, so the
+    // swap commit can measure and its reseed holds the reader. WebKit can lay
+    // out a new width before any observer callback reports and publishes it,
+    // and a held panel slide publishes at its end with no callback after it.
+    const settle = () => {
+      if (publishedBucket(scroller) === bucketWidth(scroller.clientWidth)) measure()
+      else timer = setTimeout(settle, WIDTH_SETTLE_MS)
+    }
     const observer = new ResizeObserver(() => {
       clearTimeout(timer)
-      timer = setTimeout(measure, WIDTH_SETTLE_MS)
+      timer = setTimeout(settle, WIDTH_SETTLE_MS)
     })
     observer.observe(scroller)
     return () => {
@@ -83,11 +257,17 @@ export function useTranscriptWidth() {
       clearTimeout(timer)
     }
   }, [scroller])
+  // The pane can move on between the settle and the commit (a sidebar sliding
+  // back in): move to the width the rows show before this commit paints.
+  useLayoutEffect(() => {
+    if (!scroller) return
+    const pane = bucketWidth(scroller.clientWidth)
+    if (pane !== widthBucket && publishedBucket(scroller) === pane) setWidthBucket(pane)
+  }, [scroller, widthBucket])
   // No bound element means no settled scope to measure against.
   const canMeasure = useCallback(() => {
     if (!scroller || scroller.clientWidth <= 0) return false
-    const published = Number.parseFloat(scroller.style.getPropertyValue(PANE_WIDTH_PROPERTY))
-    return bucketWidth(scroller.clientWidth) === widthBucket && bucketWidth(published) === widthBucket
+    return bucketWidth(scroller.clientWidth) === widthBucket && publishedBucket(scroller) === widthBucket
   }, [scroller, widthBucket])
   return { widthBucket, canMeasure, bindScroller }
 }
@@ -145,6 +325,7 @@ export default function TranscriptScrollShell({
   children: React.ReactNode
 }) {
   usePaneWidthProperty(scrollerRef)
+  useSlideAnchor(scrollerRef)
   useLayoutEffect(() => {
     if (!onScrollerElement) return
     onScrollerElement(scrollerRef.current)

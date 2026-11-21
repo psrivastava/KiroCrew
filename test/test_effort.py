@@ -99,8 +99,57 @@ class TestModelSupportsEffort:
         # On the claude_code path the value reaching here is the FOLDED Sonnet
         # provider id (translated at the factory boundary), which IS capable.
         assert model_supports_effort("global.anthropic.claude-sonnet-4-6[1m]") is True
-        # A model the registry does NOT list still uses the substring heuristic.
+        # A Haiku id with no readable version stays refused.
         assert model_supports_effort("some-haiku-thing") is False
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "claude-haiku-5.5",
+            "CLAUDE-HAIKU-5.5",
+            "haiku-5.5",
+            "global.anthropic.claude-haiku-5-5[1m]",
+            "anthropic.claude-haiku-5-5-20261001-v1:0",
+            "claude-haiku-5.6",
+            "claude-haiku-6",
+            "claude-haiku-6.0",
+        ],
+    )
+    def test_haiku_5_5_and_later_supports_effort(self, model: str):
+        # kiro-cli accepts /effort on claude-haiku-5.5 (all five levels), so the
+        # picker must offer the control for it and later Haiku.
+        assert model_supports_effort(model) is True
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "claude-haiku-4.5",
+            "haiku-4.5",
+            "anthropic.claude-haiku-4-5-20251001-v1:0",
+            "claude-3-5-haiku-20241022",
+            "claude-3-haiku-20240307",
+            "claude-haiku-5",
+            "claude-haiku-5.4",
+            "claude-haiku",
+            "haiku",
+        ],
+    )
+    def test_haiku_before_5_5_still_refuses_effort(self, model: str):
+        # kiro-cli answers "Effort configuration is currently not available on
+        # claude-haiku-4.5"; an older or unversioned Haiku keeps the slider hidden
+        # even though the claude_code registry folds claude-haiku-4.5 onto an
+        # effort-capable Sonnet.
+        assert model_supports_effort(model) is False
+
+    def test_haiku_5_5_resolves_a_persisted_level(self):
+        assert (
+            resolve_effort_for_model("claude-haiku-5.5", defaults={"claude-haiku-5.5": "xhigh"})
+            == "xhigh"
+        )
+        assert (
+            resolve_effort_for_model("claude-haiku-4.5", defaults={"claude-haiku-4.5": "xhigh"})
+            is None
+        )
 
 
 class TestEffortSettingsKey:
@@ -232,14 +281,14 @@ class TestCliOverlay:
         assert _clear_cli_overlay_effort(tmp_path, "claude-opus-4.7") is True
 
         _write_cli_overlay(tmp_path, "claude-opus-4.7", "max")
-        real_read_text = Path.read_text
+        real_open = Path.open
 
-        def _flaky_read(self, *args, **kwargs):
+        def _flaky_open(self, *args, **kwargs):
             if self.name == "cli.json":
                 raise OSError("sharing violation")
-            return real_read_text(self, *args, **kwargs)
+            return real_open(self, *args, **kwargs)
 
-        monkeypatch.setattr(Path, "read_text", _flaky_read)
+        monkeypatch.setattr(Path, "open", _flaky_open)
         assert _clear_cli_overlay_effort(tmp_path, "claude-opus-4.7") is False
         monkeypatch.undo()
         assert _read_cli_overlay(tmp_path) == {"claude-opus-4.7": "max"}
@@ -465,8 +514,7 @@ class TestFactoryDropWarning:
     def test_explicit_override_warns_every_time(self, caplog, tmp_path):
         # A caller's own request being dropped is the event this gate exists
         # to surface — an explicit override never dedupes, so a config-default
-        # drop cannot burn the key and silence a later per-slot request
-        # (Design review on this PR).
+        # drop cannot burn the key and silence a later per-slot request.
         cfg = KiroCrewConfig()
         cfg.agent.provider = "acp"
         with patch("kiro_crew.providers.acp.AcpProvider") as mock_provider:
@@ -617,10 +665,12 @@ class TestPoolEffortPostClaim:
         pooled.change_effort = AsyncMock(return_value=True)
         pooled.is_process_alive = MagicMock(return_value=True)
         pooled.cwd = ""
+        pooled.kas_memory_mode = ""
 
         factory = MagicMock(return_value=pooled)
         mgr = SessionManager(cfg, factory)
         mgr._drain_and_claim = AsyncMock(return_value=pooled)
+        mgr._schedule_replenish = MagicMock()
 
         provider, is_new, resumed = await mgr.get_or_create(
             "slot-1",
@@ -656,10 +706,12 @@ class TestPoolEffortPostClaim:
         pooled.change_effort = AsyncMock(return_value=False)
         pooled.is_process_alive = MagicMock(return_value=True)
         pooled.cwd = ""
+        pooled.kas_memory_mode = ""
 
         factory = MagicMock(return_value=pooled)
         mgr = SessionManager(cfg, factory)
         mgr._drain_and_claim = AsyncMock(return_value=pooled)
+        mgr._schedule_replenish = MagicMock()
 
         with caplog.at_level(logging.WARNING):
             provider, is_new, resumed = await mgr.get_or_create(
@@ -700,10 +752,12 @@ class TestPoolEffortPostClaim:
         pooled.change_effort = AsyncMock(side_effect=RuntimeError("KAS effort unsupported"))
         pooled.is_process_alive = MagicMock(return_value=True)
         pooled.cwd = ""
+        pooled.kas_memory_mode = ""
 
         factory = MagicMock(return_value=pooled)
         mgr = SessionManager(cfg, factory)
         mgr._drain_and_claim = AsyncMock(return_value=pooled)
+        mgr._schedule_replenish = MagicMock()
 
         with caplog.at_level(logging.WARNING):
             provider, is_new, resumed = await mgr.get_or_create(

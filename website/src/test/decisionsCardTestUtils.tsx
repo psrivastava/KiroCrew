@@ -13,15 +13,17 @@ import { FeaturePreviewsSection } from '../pages/settings/FeaturePreviewsSection
 /** Rendered through the whole section, because that is where the card ships. */
 export function renderSection() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(
+  const view = render(
     <QueryClientProvider client={client}>
       <MemoryRouter><FeaturePreviewsSection /></MemoryRouter>
     </QueryClientProvider>,
   )
+  // The client too, so a test can play a live policy change through its reads.
+  return Object.assign(view, { client })
 }
 
 /** The card's own switch. Named in full so "Decisions" cannot match another row. */
-export const decisionsSwitch = () => screen.getByRole('switch', { name: 'Decisions (Jev)' })
+export const decisionsSwitch = () => screen.getByRole('switch', { name: 'Decisions' })
 
 export const ENDPOINT = 'https://api.typesafe.ai/v1/systemone'
 
@@ -39,12 +41,14 @@ export const pointsOf = (
   memoryText = false,
   judgeProvider = 'auto',
   nudgeEvidence = false,
+  browser = true,
 ) => {
   const granted: Record<string, boolean> = {
     tool_args: toolArgs,
     compaction,
     memory_text: memoryText,
     nudge_evidence: nudgeEvidence,
+    browser,
   }
   const status = (scope: string | null) =>
     !enabled ? 'off' : scope && !granted[scope] ? 'needs_scope' : 'active'
@@ -75,6 +79,9 @@ export const pointsOf = (
       lane: judgeLane,
       status: judgeLane === 'jev' ? status('nudge_evidence') : 'active',
     },
+    // The browser point. Its outline scope is the one the gateway reports granted when
+    // the keystone does not mention it, so the fixture's default is `true`.
+    { id: 'browser.step', needs_scope: 'browser', status: status('browser') },
   ]
 }
 
@@ -96,12 +103,17 @@ export const consentOf = (enabled: boolean, overrides: Partial<DecisionsConsentD
   memory_text: false,
   // The wake judge's evidence scope, false on the same terms.
   nudge_evidence: false,
+  // The browser point's two scopes: both on by default once consent stands.
+  browser: true,
+  browser_images: true,
   points: pointsOf(
     enabled,
     overrides.tool_args === true,
     overrides.compaction === true,
     overrides.memory_text === true,
     overrides.nudge_evidence === true,
+    false,
+    overrides.browser !== false,
   ),
   ...overrides,
 })
@@ -117,11 +129,13 @@ export const openPoint = (name: string) => pointRow(name).click()
 
 /** The accessible name of each scope's consent switch, as the card labels it. */
 export const SCOPE_SWITCH: Record<string, string> = {
-  tool_args: 'Also send tool-call arguments so Jev can flag risky calls',
-  compaction: 'Also send the conversation and tool-call inputs so Jev can score compaction',
+  tool_args: 'Also send tool-call arguments so the decision model can flag risky calls',
+  compaction: 'Also send the conversation and tool-call inputs so the decision model can score compaction',
   memory_text:
-    'Also send snippets of recalled memories so Jev can drop the ones that do not help',
-  nudge_evidence: 'Also send what a watching loop has found so Jev can skip a turn',
+    'Also send snippets of recalled memories so the decision model can drop the ones that do not help',
+  nudge_evidence: 'Also send what a watching loop has found so the decision model can skip a turn',
+  browser: "Send outlines of the agent's browser tab",
+  browser_images: "Also send screenshots of the agent's browser tab",
 }
 
 /** The tool-argument consent switch, on `tool.risk`'s own panel. */
@@ -132,7 +146,8 @@ export const toolArgsSwitch = () => screen.getByRole('switch', { name: SCOPE_SWI
  * drawn, the keystone (or a rejection), and the config's bucket.
  *
  * `decisions_enabled: true` is the ungoverned default every case assumes —
- * a case that wants the withdrawn state passes `governed: false` and gets no card.
+ * a case that wants the withdrawn state passes `decisions_enabled: false` and gets the
+ * administrator's notice in place of the card's controls.
  */
 export function stubGateway(
   consent: DecisionsConsentData | (Partial<DecisionsConsentData> & { enabled: boolean }) | Error,
@@ -172,3 +187,20 @@ export function stubGateway(
     vi.spyOn(api, 'getDecisionsConsent').mockResolvedValue(full)
   }
 }
+
+/**
+ * The hosted provider configured and allowed, so the picker opens its entry and draws
+ * the API key field inside it (`DecisionsHostedKeyField`).
+ */
+export const stubHostedProvider = (overrides: Record<string, unknown> = {}) =>
+  vi.spyOn(api, 'getDecisionsProvider').mockResolvedValue({
+    presets: [],
+    active: 'jev',
+    configured_endpoint: 'https://api.typesafe.ai/v1/systemone',
+    loopback: false,
+    hosted_permitted: true,
+    local_permitted: true,
+    sagemaker_available: true,
+    sagemaker_permitted: true,
+    ...overrides,
+  } as never)

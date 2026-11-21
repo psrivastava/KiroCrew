@@ -5,6 +5,7 @@ the session queue before a prompt starts.
 """
 
 import asyncio
+import logging
 from unittest.mock import AsyncMock, call
 
 import pytest
@@ -19,16 +20,11 @@ from kiro_crew.acp.types import JsonRpcMessage
 
 @pytest.mark.asyncio
 async def test_pre_turn_drain_counts_discarded_frames_without_logging_content(caplog):
-    """The pre-turn drain destroys leftover frames; it must SAY how many, and
-    nothing else.
+    """The pre-turn drain logs how many leftover frames it dropped, and nothing else.
 
-    A dropped frame is invisible to every layer above: the abandoned turn's
-    output vanishes with nothing to show it existed, and a turn that loses its
-    terminal this way reaches the dashboard as an empty response with no
-    attributable cause. So the drain reports a COUNT — and only a count. Frame
-    text, tool arguments, tool results and even frame SIZE are all excluded:
-    a size leaks response length, and the kiro-cli data dir this material comes
-    from is fenced precisely because it holds credentials.
+    A dropped frame is invisible above, so the count is the only trace. No text,
+    arguments, results or size: size leaks response length, and the source data
+    dir is fenced because it holds credentials.
     """
     import contextlib
     import logging
@@ -73,31 +69,33 @@ async def test_pre_turn_drain_counts_discarded_frames_without_logging_content(ca
         assert _secret not in _drain_lines[0], f"{_secret!r} leaked into the drain warning"
 
 
-async def _drain_warning_lines(handle, caplog):
-    """Run one prompt through the pre-turn drain and return its warning lines."""
+async def _drain_records(handle, caplog, level=logging.WARNING):
+    """Run one prompt through the pre-turn drain and return the captured records."""
     import contextlib
-    import logging
 
-    with caplog.at_level(logging.WARNING, logger="kiro_crew.acp.session_handle"):
+    with caplog.at_level(level, logger="kiro_crew.acp.session_handle"):
         gen = handle.prompt("hi", timeout=0.2)
         with contextlib.suppress(StopAsyncIteration, asyncio.TimeoutError, Exception):
             await _bounded(gen.__anext__(), what="the first prompt event")
         await gen.aclose()
+    return caplog.records
+
+
+async def _drain_warning_lines(handle, caplog):
+    """Run one prompt through the pre-turn drain and return its warning lines."""
     return [
-        rec.getMessage() for rec in caplog.records if "pre-turn drain discarded" in rec.getMessage()
+        rec.getMessage()
+        for rec in await _drain_records(handle, caplog)
+        if "pre-turn drain discarded" in rec.getMessage()
     ]
 
 
 @pytest.mark.asyncio
 async def test_pre_turn_drain_names_a_discarded_terminal(caplog):
-    """A discarded response carrying a non-empty stopReason IS the abandoned
-    turn's terminal, and the warning must SAY so instead of hedging.
+    """A discarded response with a non-empty stopReason is named as the terminal.
 
-    The structural fact: a JSON-RPC response has ``method is None``, so a
-    leftover prompt response can never reach the drain's permission branch —
-    it always lands in the discard arm. Whether the terminal was among the
-    discards is therefore decidable, and "possibly including that turn's
-    terminal" was speculation about data already in hand.
+    A JSON-RPC response has ``method is None``, so it always lands in the discard
+    arm and the warning can say for certain whether the terminal was dropped.
     """
     rt, _, _ = _make_runtime()
     q = _register(rt, "sA")
@@ -137,14 +135,10 @@ async def test_pre_turn_drain_names_a_discarded_terminal(caplog):
 
 @pytest.mark.asyncio
 async def test_pre_turn_drain_states_the_zero_terminal_case(caplog):
-    """When NO discarded frame was a terminal the warning says '0 of them' —
-    the reassuring reading an operator could not get from the old hedge.
+    """When no discarded frame was a terminal the warning says '0 of them'.
 
-    The set here also pins the classification guards: a response with an empty
-    result dict, a response whose result is not a dict, and a REQUEST that
-    (malformed) carries a result with a stopReason must all count as zero —
-    only a response (``method is None``, ``id`` set) with a non-empty
-    ``stopReason`` is a terminal.
+    Only a response (``method is None``, ``id`` set) with a non-empty ``stopReason``
+    counts; empty or non-dict results and a malformed request do not.
     """
     rt, _, _ = _make_runtime()
     q = _register(rt, "sA")
@@ -250,16 +244,11 @@ async def test_pre_turn_drain_classifies_alongside_an_answered_permission_reques
 
 @pytest.mark.asyncio
 async def test_pre_turn_drain_survives_a_non_string_stop_reason(caplog):
-    """A JSON-valid response whose stopReason is not a string must neither
-    crash the drain nor count as a terminal.
+    """A non-string stopReason neither crashes the drain nor counts as a terminal.
 
-    The hazard is structural: the drain runs AFTER ``_turn_done.clear()`` and
-    BEFORE the BaseException guard that restores it, so an exception escaping
-    here leaves the handle permanently turn-active — every later prompt on it
-    is rejected. A truthy non-str stopReason (``[]``/``{}``) fed to a frozenset
-    membership test raises ``TypeError: unhashable type``; the classification
-    must type-guard the leaf exactly as ``_dispatch.py``'s wire-stopReason
-    reader does.
+    The drain runs after ``_turn_done.clear()`` and before the guard that restores
+    it, so a ``TypeError: unhashable type`` here would leave the handle turn-active
+    for good. The leaf is type-guarded as in ``_dispatch.py``.
     """
     rt, _, _ = _make_runtime()
     q = _register(rt, "sA")
@@ -285,15 +274,10 @@ async def test_pre_turn_drain_survives_a_non_string_stop_reason(caplog):
 
 @pytest.mark.asyncio
 async def test_pre_turn_drain_counts_an_error_response_terminal(caplog):
-    """An abandoned turn that ended in an ERROR response was still terminated —
-    ``_run_turn`` treats an error response as the turn's terminal — so the
-    tally must count it, or the warning positively asserts none of the
-    discards was terminal-shaped where the old text only hedged. An error
-    terminal has no stopReason to name, the error payload must never leak,
-    and the warning must NOT attribute the frame to "that turn": a late error
-    response to a concurrently timed-out command call (send_command / compact /
-    set_config_option, re-injected by _wait_for_response's finally) is
-    indistinguishable here, so the line states the shape, not the owner."""
+    """An error response counts as a terminal, as ``_run_turn`` treats it.
+
+    The payload never leaks, and the line names the shape, not "that turn": a late
+    error to a timed-out command call looks the same here."""
     rt, _, _ = _make_runtime()
     q = _register(rt, "sA")
     handle = AcpSessionHandle("sA", q["sA"], rt)
@@ -320,24 +304,12 @@ async def test_pre_turn_drain_counts_an_error_response_terminal(caplog):
 
 @pytest.mark.asyncio
 async def test_pre_turn_drain_keeps_a_response_a_live_waiter_is_owed(caplog):
-    """A response whose req_id is STILL registered in ``_awaited_responses``
-    has a live consumer inside ``_wait_for_response``, so the drain must hand
-    it back rather than destroy it.
+    """A response still registered in ``_awaited_responses`` is handed back, not dropped.
 
-    The abandoned TURN's own frames are owed to nobody: ``_run_turn`` refuses
-    to start while ``_turn_done`` is clear, and ``_turn_done`` is set in its
-    own ``finally``, so by the time the drain runs that turn's generator has
-    already exited. Discarding those is correct. A command/config call
-    (``send_command`` / ``compact`` / ``set_config_option``) is different: it
-    does not touch ``_turn_done``, so its ``_wait_for_response`` can be in
-    flight when the next turn starts — and for a oneshot the response IS the
-    terminal. Dropping it strands that caller until its own timeout (60s for
-    ``send_command``), which then reports failure for a call the backend
-    answered.
-
-    ``_awaited_responses`` is the discriminator that tells the two apart, and
-    the dispatch loop already routes on exactly it; the drain was the one queue
-    consumer that did not.
+    The abandoned turn's frames are owed to nobody, but a command call
+    (``send_command`` / ``compact`` / ``set_config_option``) does not touch
+    ``_turn_done`` and can still be waiting; dropping its answer strands it until
+    its timeout (60s for ``send_command``).
     """
     rt, _, _ = _make_runtime()
     q = _register(rt, "sA")
@@ -371,11 +343,8 @@ async def test_pre_turn_drain_keeps_a_response_a_live_waiter_is_owed(caplog):
 async def test_pre_turn_drain_drops_a_response_no_waiter_is_owed(caplog):
     """The retention is scoped to a REGISTERED waiter, not to every response.
 
-    A command call that already timed out has discarded its req_id in
-    ``_wait_for_response``'s ``finally``, so its late answer is owed to nobody
-    and must still drain — otherwise the retention leaks a stray frame into
-    every following turn. This is the mutant that would survive a bare
-    "keep all responses" rule.
+    A timed-out command call has dropped its req_id, so its late answer must
+    drain or it leaks into every following turn.
     """
     rt, _, _ = _make_runtime()
     q = _register(rt, "sA")
@@ -396,15 +365,10 @@ async def test_pre_turn_drain_drops_a_response_no_waiter_is_owed(caplog):
 
 @pytest.mark.asyncio
 async def test_pre_turn_drain_answers_a_permission_request_whose_id_collides():
-    """The retention must not swallow a server→client REQUEST that happens to
-    carry the same integer id as an awaited response.
+    """A server→client request sharing an awaited response's id is still answered.
 
-    The two id spaces are independent: our client→server ids come from
-    ``AcpRuntime._next_id`` (starts at 1) and the backend mints its own request
-    ids, so a numeric collision is ordinary rather than exotic. A retained
-    permission request is never answered, which strands the backend's oneshot —
-    the exact hang the drain exists to prevent. ``method is None`` is what keeps
-    the retention to responses only.
+    The id spaces are independent (``AcpRuntime._next_id`` vs the backend's), so
+    collisions are ordinary; ``method is None`` limits retention to responses.
     """
     rt, _, _ = _make_runtime()
     q = _register(rt, "sA")
@@ -431,17 +395,10 @@ async def test_pre_turn_drain_answers_a_permission_request_whose_id_collides():
 
 @pytest.mark.asyncio
 async def test_pre_turn_drain_keeps_an_owed_frame_when_cancelled_mid_drain():
-    """A cancellation part-way through the drain must not lose a response
-    already collected for a live waiter.
+    """A cancellation mid-drain still returns a response collected for a live waiter.
 
-    The permission arm re-raises ``CancelledError`` so the prompt aborts, which
-    is exactly when a retained frame is easiest to lose: everything read before
-    the cancellation point is held in a local list, and a re-injection reached
-    only on the loop's normal exit would never run. The frames go back from a
-    ``finally``, so the abort still pays the waiter what it is owed.
-
-    The queue order is the point: the owed response is read FIRST, so it is
-    already collected when the stranded permission request triggers the abort.
+    Frames go back from a ``finally``. The owed response is queued first, so it is
+    already collected when the permission request triggers the abort.
     """
     rt, _, _ = _make_runtime()
     q = _register(rt, "sA")
@@ -471,14 +428,8 @@ async def test_pre_turn_drain_keeps_an_owed_frame_when_cancelled_mid_drain():
 async def test_pre_turn_drain_hands_back_an_owed_frame_before_awaiting_a_reject():
     """A retained frame is never held across an await.
 
-    ``reject_tool`` writes to the child's stdin and that write is not bounded
-    short: a backend that already delivered a command response but has stopped
-    reading its own stdin applies backpressure that blocks it. An owed waiter
-    carries a 60s deadline, so a frame parked in the retain list for the length
-    of that write can expire and the call reports "" for a response the backend
-    delivered. The await is also the yield point at which the waiting
-    ``_wait_for_response`` gets scheduled, so handing the frame back BEFORE it
-    is what actually pays the waiter.
+    ``reject_tool``'s stdin write can block on backpressure past the waiter's 60s
+    deadline, and the await is where ``_wait_for_response`` gets scheduled.
     """
     rt, _, _ = _make_runtime()
     q = _register(rt, "sA")
@@ -565,6 +516,124 @@ async def test_pre_turn_drain_dedupes_stop_reasons_in_the_warning(caplog):
     assert len(_drain_lines) == 1, f"expected one drain warning, got {_drain_lines}"
     assert "3 of them" in _drain_lines[0]
     assert _drain_lines[0].count("cancelled") == 1, _drain_lines[0]
+
+
+def _update(kind: object, **extra: object) -> JsonRpcMessage:
+    """A ``session/update`` notification for session ``sA`` of the given kind."""
+    return JsonRpcMessage.from_dict(
+        {
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"sessionId": "sA", "update": {"sessionUpdate": kind, **extra}},
+        }
+    )
+
+
+def _notice(method: str, **params: object) -> JsonRpcMessage:
+    """A backend extension notification (no ``id``)."""
+    return JsonRpcMessage.from_dict({"jsonrpc": "2.0", "method": method, "params": params})
+
+
+async def _drain_lines_at_debug(handle, caplog):
+    """Run one prompt through the pre-turn drain; return (warning lines, state lines)."""
+    lines = [
+        (rec.levelno, rec.getMessage())
+        for rec in await _drain_records(handle, caplog, logging.DEBUG)
+    ]
+    return (
+        [m for lvl, m in lines if "pre-turn drain discarded" in m and lvl >= logging.WARNING],
+        [m for lvl, m in lines if "between-turn state notification" in m],
+    )
+
+
+@pytest.mark.asyncio
+async def test_pre_turn_drain_logs_startup_state_notifications_at_debug(caplog):
+    """The frames KAS sends after ``session/new`` answers raise no WARNING.
+
+    They are what a fresh session's first prompt finds on its queue: MCP
+    status, tool lists, commands, config, context usage, a display error, and the
+    sessions list every queue receives. They report state, so they are counted at
+    DEBUG.
+    """
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    rt.send_request = AsyncMock(return_value=9)
+
+    for frame in (
+        _notice("_kiro/mcp/status", sessionId="sA", servers=[]),
+        _notice("_kiro/tools/didChange", sessionId="sA", tags=[]),
+        _notice("_kiro/sessions/changed", upserted=[], deleted=[]),
+        _update("available_commands_update", availableCommands=[]),
+        _update("config_option_update", configOptions=[]),
+        _update("session_info_update", _meta={"kiro": {"kind": "context_usage"}}),
+        _update("session_info_update", _meta={"kiro": {"kind": "display_error"}}),
+    ):
+        q["sA"].put_nowait(frame)
+
+    warnings, state = await _drain_lines_at_debug(handle, caplog)
+    assert warnings == [], f"state notifications raised the lost-frame warning: {warnings}"
+    assert len(state) == 1, state
+    assert "dropped 7 between-turn state notification(s)" in state[0], state[0]
+    levels = {r.levelno for r in caplog.records if "between-turn state" in r.getMessage()}
+    assert levels == {logging.DEBUG}, levels
+    assert handle._queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_pre_turn_drain_still_warns_for_turn_frames_beside_state(caplog):
+    """Every frame the allowlist does not name stays in the WARNING count.
+
+    Turn content, a usage update, an unknown kind and a malformed kind on
+    ``session/update``, the same content on kiro-cli's ``_kiro.dev/session/update``
+    spelling, a steer, a sign-in link no turn holds, a usage report with credits,
+    KAS's turn-scoped ``session_info_update`` kinds, and a request on an allowed
+    kind are all counted; a non-string kind must not crash the drain.
+    """
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    rt.send_request = AsyncMock(return_value=9)
+
+    for frame in (
+        _notice("_kiro/mcp/status", sessionId="sA", servers=[]),
+        _update("agent_message_chunk", content={"type": "text", "text": "SECRETALPHA"}),
+        _update("usage_update", used=1),
+        _update("some_future_update"),
+        _update(["agent_message_chunk"]),
+        _notice(
+            "_kiro.dev/session/update",
+            sessionId="sA",
+            update={"sessionUpdate": "tool_call_chunk", "toolCallId": "t1"},
+        ),
+        _notice("_kiro.dev/mcp/oauth_request", sessionId="sA", serverName="srv", url="u"),
+        _update("steering_queued"),
+        _notice(
+            "_kiro.dev/metadata",
+            sessionId="sA",
+            meteringUsage=[{"unit": "credit", "value": 0.5}],
+        ),
+        _update("session_info_update", _meta={"kiro": {"kind": "turn_completion"}}),
+        _update("session_info_update", _meta={"kiro": {"kind": "steering_queued"}}),
+        _update("session_info_update", _meta={"kiro": {"kind": ["context_usage"]}}),
+        JsonRpcMessage.from_dict(
+            {
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "session/update",
+                "params": {"update": {"sessionUpdate": "available_commands_update"}},
+            }
+        ),
+        _update("session_info_update", _meta={"kiro": {"kind": "context_usage"}}),
+    ):
+        q["sA"].put_nowait(frame)
+
+    warnings, state = await _drain_lines_at_debug(handle, caplog)
+    assert len(warnings) == 1, warnings
+    assert "discarded 12 leftover frame(s)" in warnings[0], warnings[0]
+    assert "SECRETALPHA" not in warnings[0]
+    assert len(state) == 1 and "dropped 2 between-turn" in state[0], state
+    assert handle.is_turn_active is False, "the drain left the handle turn-active"
 
 
 @pytest.mark.asyncio

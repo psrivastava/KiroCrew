@@ -2,7 +2,7 @@
  * The find_ui index generator (`scripts/lib/ui-index.mjs`): marker scanning,
  * label resolution and index assembly on synthetic sources, plus golden
  * assertions on the committed index. The full freshness check
- * (`npm run gen:ui -- --check`) runs once in frontend-lint and in the build, not
+ * (`npm run gen:ui -- --check`) runs once in frontend-ratchets and in the build, not
  * here.
  */
 import { describe, expect, it, afterEach } from 'vitest'
@@ -295,6 +295,13 @@ const FORWARDING_PROVEN = [
   // two-press clear forwards its ref to its <button>, and both clear-all
   // call sites register their location.
   'NotificationClearButton',
+  // Proven in src/pages/ChatPage.views.test.tsx: the chat header's
+  // TipClickable forwards its ref to the Clickable it renders, so the
+  // side-panel toggle is the one element registered as chat.side-panel-open.
+  'TipClickable',
+  // Proven in src/test/sidePanelLeadingTab.test.tsx: a `segments` entry's
+  // marker lands, registered, on that leading tab's chip and on no other.
+  'SidePanel',
 ]
 
 describe('a marker must register the element it sits on', () => {
@@ -536,7 +543,6 @@ function baseInputs(over: Record<string, unknown> = {}) {
     catalogs: { en: EN, 'zh-CN': ZH },
     locales: ['en', 'zh-CN'],
     productName: 'Kiro Crew',
-    inputDigest: 'sha256:test',
     routes: ROUTES,
     conditions: UI_CONDITIONS,
     revealStates: UI_REVEAL_STATES,
@@ -576,6 +582,18 @@ describe('index assembly', () => {
     expect(byId['settings.tab.chat'].placements[0].requires).toEqual(want)
     expect(byId['settings.sub.chat.sub'].placements[0].requires).toEqual(want)
     expect(byId['setting:chat.a-setting'].placements[0].requires).toEqual(want)
+  })
+
+  it('gives one setting its own preview requirement on an ungated tab', () => {
+    const { index, errors } = build({
+      settingPreview: { 'chat.a-setting': 'mc-preview-x' },
+      previewEnablers: { 'mc-preview-x': 'chat.a-setting' },
+    })
+    expect(errors).toEqual([])
+    const byId = Object.fromEntries(index.locations.map(l => [l.id, l]))
+    expect(byId['settings.tab.chat'].placements[0].requires).toEqual([])
+    expect(byId['setting:chat.a-setting'].placements[0].requires)
+      .toEqual([{ kind: 'preview_flag', flag: 'mc-preview-x', location: 'setting:chat.a-setting' }])
   })
 
   it('derives a chain through a registered parent', () => {
@@ -1426,6 +1444,17 @@ describe('the committed index', () => {
     expect(byId.get('setting:developer.session-environments')!.placements[0].requires).toEqual([])
   })
 
+  it('keeps Display > Explore behind the Explore preview, and not its own switch', () => {
+    const want = [{ kind: 'preview_flag', flag: 'mc-preview-explore', location: 'setting:developer.explore' }]
+    expect(byId.get('setting:display.explore')!.placements[0].requires).toEqual(want)
+    expect(byId.get('setting:developer.explore')!.placements[0].requires).toEqual([])
+  })
+
+  it('shows Start New Chats in conductor mode with no prerequisite, and no conductor mode preview switch', () => {
+    expect(byId.get('setting:chat.start-new-chats-in-conductor-mode')!.placements[0].requires).toEqual([])
+    expect(byId.has('setting:developer.conductor-mode')).toBe(false)
+  })
+
   it('shows Mates with no prerequisite', () => {
     expect(byId.get('page.members')!.placements[0].requires).toEqual([])
   })
@@ -1474,9 +1503,9 @@ describe('the committed index', () => {
     const crews = byId.get('tab.capabilities.crews') as { alias_keys?: string[]; placements: { route: string }[] }
     expect(crews.placements[0].route).toBe('/capabilities?tab=crews')
     expect(crews.alias_keys).toContain('components.commandPalette.providers.pagesProvider.kirocrew_agents')
-    // "Tasks" keeps the Task Runner page's own gate.
+    // "Tasks" keeps the Task Runner page's own gate, its on/off setting.
     const projects = byId.get('page.projects')!
-    expect(projects.placements[0].requires).toEqual([{ kind: 'condition', id: 'app_enabled' }])
+    expect(projects.placements[0].requires).toEqual([{ kind: 'condition', id: 'page_switched_on' }])
   })
 
   it('names an explicit tab for every Customize location, so a remembered tab cannot answer instead', () => {
@@ -1499,16 +1528,16 @@ describe('the committed index', () => {
     expect(at('schedule.add-job').placements[0]).toMatchObject({ route: '/schedule', parent_ids: ['page.schedule'], requires: [{ kind: 'condition', id: 'has_schedules' }] })
     expect(en[at('schedule.add-job').label_key]).toBe('Add Job')
     expect(zh[at('schedule.add-job').label_key]).toBe('添加任务')
-    // Artifacts: import hangs under the desktop caret menu.
+    // Artifacts: import hangs under the quick-create row's more-ways-to-add menu.
     expect(at('artifacts.import').placements[0]).toMatchObject({ route: '/artifacts', parent_ids: ['page.artifacts', 'artifacts.add-menu'], entry_kind: 'menu' })
-    // MCP: Connections opens on Services, so the MCP Servers sub-tab is in the path.
+    // MCP: the add buttons are on Customize → MCP Servers, Servers view.
     for (const id of ['mcp.add-custom', 'mcp.add-server']) {
       expect(at(id).placements[0]).toMatchObject({
-        route: '/capabilities?tab=mcp',
-        parent_ids: ['page.capabilities', 'tab.capabilities.mcp', 'connections.mcp-servers-tab'],
+        route: '/capabilities?tab=mcp-servers',
+        parent_ids: ['page.capabilities', 'tab.capabilities.mcp-servers', 'mcp.servers-view'],
       })
     }
-    expect(zh[at('connections.mcp-servers-tab').label_key]).toBe('MCP 服务器')
+    expect(zh[at('mcp.servers-view').label_key]).toBe('服务器')
     expect((at('mcp.add-custom') as { guide_ref?: unknown }).guide_ref).toEqual({ action_id: 'mcp.open_add' })
     expect((at('mcp.add-server') as { guide_ref?: unknown }).guide_ref).toBeUndefined()
     // Search Everywhere: shell chrome, on every page.

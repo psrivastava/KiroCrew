@@ -437,6 +437,20 @@ async def _create_shared_session_impl(
     shared_runtime: AcpRuntime = runtime
 
     cwd = info.cwd or str(getattr(self._manager._sessions, "_pool_cwd", ""))
+    # Imported here: a rebound ``_impl`` resolves globals in ``kiro_crew.subagent``.
+    from kiro_crew.agent_sdk.kas_default_model import serve_kiro_cli_default_model
+
+    async def _serve_cli_default(handle: Any) -> None:
+        # After the bind, which publishes ownership before any cancellable await.
+        # A shared sub-agent carries no model pin (``_sharing_plan_impl``), so on
+        # KAS it starts on kiro-cli's chat.defaultModel unless Crew pins its agent one.
+        start_agent = agent or getattr(shared_runtime, "_agent", "") or None
+        await serve_kiro_cli_default_model(
+            shared_runtime,
+            handle,
+            cwd,
+            lambda: self._manager._sessions._cfg.acp_effective_model(start_agent, None),
+        )
 
     async def _late_adopter(handle: Any) -> bool:
         # A late session/new answer arrived. Keep the session only when this
@@ -454,6 +468,7 @@ async def _create_shared_session_impl(
             info, session_key, shared_runtime, handle
         )
         info._late_start_provider = provider
+        await _serve_cli_default(handle)
         return True
 
     handle = await runtime.create_session(
@@ -470,7 +485,9 @@ async def _create_shared_session_impl(
         on_gate_queued=_on_gate_queued,
         late_adopter=_late_adopter,
     )
-    return await self._manager._bind_shared_handle(info, session_key, runtime, handle)
+    provider = await self._manager._bind_shared_handle(info, session_key, runtime, handle)
+    await _serve_cli_default(handle)
+    return provider
 
 
 async def _await_late_start_impl(
@@ -561,7 +578,9 @@ async def _bind_shared_handle_impl(
     # A subagent's provider never rekeys either, and its whole point is that
     # it is NOT its parent: without the key its re-claim carries none and
     # gatewayd drops it, leaving this session unable to re-bind its token.
-    provider = AcpSessionProvider(handle, runtime, session_key=session_key)
+    provider = AcpSessionProvider(
+        handle, runtime, session_key=session_key, kas_memory_mode=handle.kas_memory_mode
+    )
     provider.memory_mode = info.memory_mode
     # The handle exists now. Publish ownership before any cancellable await so
     # force-reap always takes the shared-session branch and destroys this handle
@@ -572,36 +591,31 @@ async def _bind_shared_handle_impl(
     # Capture cleanup identity before persistence or later setup can fail,
     # otherwise the live handle becomes an untracked ghost.
     cleanup_session_id = str(handle.session_id or "")
-    # The backend that actually served this session, read from the provider
-    # rather than fixed at kiro's label -- this path creates a session on
-    # whatever backend the parent runs, so a constant here can only be right
-    # for one of them.
-    #
-    # This is NOT what the continuation reads. ``_run_inner_impl`` re-captures
-    # the label from the same provider immediately after session acquisition,
-    # and that value is what reaches ``state.json`` and the corrected identity
-    # record -- so a run that gets that far was always labelled correctly, on
-    # every backend. What this write owns is the window BEFORE that re-capture:
-    # a run cancelled in it leaves the identity record claiming kiro for a
-    # session some other host holds, and the tombstone prune then takes
-    # ``_cleanup_session_files_sync``'s kiro branch, unlinks a path that was
-    # never going to exist, and reports cleanup SUCCEEDED -- where the label it
-    # should have carried reports "no cleanup route for this provider" and keeps
-    # the retry metadata. Fail-closed is the behaviour that constant was quietly
-    # spending.
-    #
-    # ``_provider_label_of`` resolves it through ``PROVIDER_LABEL_BY_BACKEND``,
-    # so a harness added later is one table row rather than one more branch here
-    # (harness-parity H13).
+    # The backend that actually served this session (the parent's, whichever it
+    # is), never a fixed kiro label. ``_run_inner_impl`` re-captures it right
+    # after session acquisition; this write covers a run cancelled before that.
+    # A wrong kiro label there makes the tombstone prune take
+    # ``_cleanup_session_files_sync``'s kiro branch and report cleanup SUCCEEDED,
+    # instead of failing closed with the retry metadata kept. Resolved through
+    # ``PROVIDER_LABEL_BY_BACKEND`` (harness-parity H13).
     cleanup_provider = self._manager._provider_label_of(provider)
+    # Imported here: a rebound ``_impl`` resolves globals in ``kiro_crew.subagent``.
+    from kiro_crew.agent_sdk.codex_transcripts import is_codex_provider_label, recorded_codex_home
+
+    # The runtime's extra_env can move the store, and the prune has no session to ask.
+    cleanup_codex_home = (
+        recorded_codex_home(provider) if is_codex_provider_label(cleanup_provider) else ""
+    )
     setattr(info, "_session_id", cleanup_session_id)
     setattr(info, "_session_provider", cleanup_provider)
+    setattr(info, "_session_codex_home", cleanup_codex_home)
     self._publish_identity(
         info.id,
         session_id=cleanup_session_id,
         provider=cleanup_provider,
         keep=info.keep,
         conversation_key=session_key if info.keep else "",
+        codex_home=cleanup_codex_home,
     )
     try:
         await self._remember_identity_off_loop(
@@ -610,6 +624,7 @@ async def _bind_shared_handle_impl(
             provider=cleanup_provider,
             keep=info.keep,
             conversation_key=session_key if info.keep else "",
+            codex_home=cleanup_codex_home,
         )
     except (OSError, ValueError, RecursionError):
         logger.debug(

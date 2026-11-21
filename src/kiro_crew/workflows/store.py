@@ -23,8 +23,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import stat
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -32,6 +34,7 @@ from kiro_crew import platform_compat, windows_acl
 from kiro_crew.atomic_write import on_event_loop, replace_with_retry
 from kiro_crew.config.paths import config_dir
 from kiro_crew.execution_context import execution_from_record
+from kiro_crew.owner_only_files import OWNER_ONLY_FILE_MODE
 from kiro_crew.pinned_fs import fd_real_path
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
@@ -81,16 +84,56 @@ def default_workflow_library_dir() -> Path:
     return config_dir() / WORKFLOW_LIBRARY_DIR_NAME
 
 
+def _start_order(item: tuple[float, dict]) -> tuple[float, float]:
+    """Load order: when the run was admitted, then when its file was last written.
+
+    The registry lists runs newest first by insertion order, so loading by file
+    mtime alone would put a long run that finished last above newer runs. The
+    admission time is saved on the record, so it survives the rewrite that demotes
+    an interrupted run. A record from before it was saved falls back to its first
+    event's timestamp (read as an epoch, so every timestamp form compares on one
+    scale), and a record with neither ranks by its write time.
+    """
+    mtime, obj = item
+    admitted = obj.get("admitted_at")
+    if isinstance(admitted, (int, float)) and not isinstance(admitted, bool):
+        try:
+            if math.isfinite(admitted) and admitted > 0:
+                return (float(admitted), mtime)
+        except OverflowError:  # an integer too large for a float is no time at all
+            pass
+    events = obj.get("events")
+    first = events[0] if isinstance(events, list) and events else None
+    ts = first.get("ts") if isinstance(first, dict) else None
+    start = mtime
+    if isinstance(ts, str):
+        try:
+            parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            start = parsed.timestamp()
+        except (ValueError, OverflowError, OSError):
+            start = mtime
+    return (start, mtime)
+
+
 def _redact(obj):
     """Recursively redact credentials / exfiltration URLs in a JSON-able value
-    before it touches disk (defense-in-depth, mirrors the broadcast/persist rule)."""
+    before it touches disk (defense-in-depth, mirrors the broadcast/persist rule).
+
+    A non-finite float becomes ``None``, so the file stays strict JSON. A file that
+    already holds a bare ``Infinity`` still loads: ``json.load`` accepts the token,
+    and the response redactor nulls it on the way out. A tuple is walked like a
+    list, as ``json.dump`` writes it as one."""
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return None
     if isinstance(obj, str):
         s, _ = redact_exfiltration_urls(obj)
         s, _ = redact_credentials(s)
         return s
     if isinstance(obj, dict):
         return {k: _redact(v) for k, v in obj.items()}
-    if isinstance(obj, list):
+    if isinstance(obj, (list, tuple)):
         return [_redact(v) for v in obj]
     return obj
 
@@ -190,7 +233,7 @@ class WorkflowRunStore:
             # Lock the temp file down while it is still empty, so the run record
             # never sits in a file other local users can read. The rename keeps
             # the temp file's permissions, so the published file is owner-only.
-            tmp.touch()
+            tmp.touch(mode=OWNER_ONLY_FILE_MODE)
             self._restrict_run_file(tmp)
             tmp.write_text(payload, encoding="utf-8")
             replace_with_retry(tmp, path)
@@ -210,7 +253,7 @@ class WorkflowRunStore:
             logger.debug("workflow store: delete failed for %s", run_id, exc_info=True)
 
     def load_all(self) -> list[dict]:
-        """Return every persisted run's JSON, oldest file first (by mtime).
+        """Return every persisted run's JSON, oldest first (see ``_start_order``).
 
         Bad/corrupt files are skipped individually. Inventory access failures
         propagate so startup cannot mistake an unreadable store for an empty
@@ -291,5 +334,5 @@ class WorkflowRunStore:
                         ],
                         type(exc).__name__,
                     )
-        out.sort(key=lambda t: t[0])
+        out.sort(key=_start_order)
         return [obj for _, obj in out]

@@ -8,6 +8,7 @@ validation modules.
 from __future__ import annotations
 
 import difflib
+import hashlib
 import logging
 from dataclasses import fields, is_dataclass
 from pathlib import Path
@@ -36,7 +37,7 @@ CONFIG_RESERVED_TOP_KEYS: frozenset = frozenset({"meta", "agent_template_pane", 
 # round-trip instead of being silently dropped.
 #
 # INVARIANT: this set must equal the top-level keys to_dict() emits (guarded by
-# test_config_extra_sections_roundtrip's parity test). It is the *emitted* set,
+# test_known_sections_equals_emitted_sections). It is the *emitted* set,
 # not merely the *parsed* set: a section this core parses into a field must ALSO
 # be emitted by to_dict() to be listed here — otherwise it would be excluded
 # from _extra_sections capture yet dropped by to_dict(), losing it on save().
@@ -67,6 +68,7 @@ _KNOWN_CONFIG_SECTIONS: frozenset = frozenset(
         "memory_stores",
         "default_memory_store",
         "apps",
+        "templates",
         "stt",
         "computer_use",
         "aws",
@@ -81,6 +83,7 @@ _KNOWN_CONFIG_SECTIONS: frozenset = frozenset(
         "messaging",
         "cron_history",
         "decisions",
+        "browser",
         "knowledge",
         "heartbeat",
         "monitoring",
@@ -92,6 +95,7 @@ _KNOWN_CONFIG_SECTIONS: frozenset = frozenset(
         "timezone",
         "auto_update",
         "registries",
+        "market_registries",
         "connections_ui",
     }
 )
@@ -125,13 +129,15 @@ _SECTION_KEYS_EMITTED_ELSEWHERE: dict = {
 # Section keys this build deliberately does NOT round-trip. Capture must skip
 # them, because preserving them defeats the decision that removed them.
 #
-# Two reasons land here, and the distinction matters when adding an entry:
-#   * RENAMED — the reader still accepts the old spelling but save() settles on
-#     the canonical one. Pinning the old spelling would make the migration never
-#     finish.
-#   * RETIRED — the feature behind the key is gone. Re-persisting the key would
-#     keep offering a setting with nothing behind it (see
-#     TestSttRemovedFieldsAreInert).
+# Two reasons land here, each in its own map, and an entry must pick one:
+#   * RENAMED (_SECTION_KEYS_RENAMED) — the reader still accepts the old
+#     spelling but save() settles on the canonical one. Pinning the old spelling
+#     would make the migration never finish. Only save() may drop one, because
+#     it writes the canonical key in its place.
+#   * RETIRED (_SECTION_KEYS_RETIRED) — the feature behind the key is gone.
+#     Re-persisting the key would keep offering a setting with nothing behind it
+#     (see TestSttRemovedFieldsAreInert). A raw write drops one too
+#     (drop_retired_section_keys).
 #
 # The failure direction of THIS map is deliberate: forgetting an entry PRESERVES
 # a key that could have been dropped, which is cosmetic. The reverse — dropping a
@@ -140,21 +146,28 @@ _SECTION_KEYS_EMITTED_ELSEWHERE: dict = {
 # down here. (_SECTION_KEYS_EMITTED_ELSEWHERE above does NOT share this safety:
 # forgetting a conditionally-emitted key there resurrects a cleared value, and
 # the default-config drift guard cannot see a key that is empty by default.)
-_SECTION_KEYS_DELIBERATELY_DROPPED: dict = {
+_SECTION_KEYS_RENAMED: dict = {
     # RENAMED: agent.dangerously_skip_permissions is also read as the camelCase
     # `dangerouslySkipPermissions` (the spelling other agent tools use) and the
     # legacy `yolo`; save() writes only the canonical snake_case. Preserving the
     # older spellings would leave two of them in the file at once, so a user who
     # turns the canonical grant OFF could still have an old `yolo: true` sitting
     # beside it — a contradiction in the one key that controls standing,
-    # unattended auto-approval. See sections._read_dangerously_skip_permissions.
+    # unattended auto-approval. See sections_agent._read_skip_permissions.
+    "agent": frozenset({"dangerouslySkipPermissions", "yolo"}),
+    # RENAMED: knowledge.auto_add_documents was auto_ingest_doc_links;
+    # sections._read_auto_add_documents still reads the old spelling.
+    "knowledge": frozenset({"auto_ingest_doc_links"}),
+}
+_SECTION_KEYS_RETIRED: dict = {
     # RETIRED: agent.conductor_skill toggled a generated always-on
     # `conductor/SKILL.md` delegation guide (the dashboard "Orchestrator Mode"
     # switch). Crew routing goes through the `select_crew` / `route_crew` MCP
     # tools, so the flag has nothing behind it and is dropped on save.
-    "agent": frozenset({"dangerouslySkipPermissions", "yolo", "conductor_skill"}),
-    # RENAMED: knowledge.auto_add_documents was auto_ingest_doc_links;
-    # sections._read_auto_add_documents still reads the old spelling.
+    # RETIRED: agent.subagent_cpu_cost_cores priced a subagent start in CPU
+    # cores. CPU never sizes subagent concurrency (memory does), so nothing read
+    # it, and every saved config carried its 1.0 default.
+    "agent": frozenset({"conductor_skill", "subagent_cpu_cost_cores"}),
     # RETIRED: auto_discover_folder, auto_discover_dirname,
     # auto_ingest_chunk_budget, auto_register_project_docs and max_sources all
     # configured the automatic folder-registration paths, which are gone, so
@@ -164,7 +177,6 @@ _SECTION_KEYS_DELIBERATELY_DROPPED: dict = {
     # folder_ingest_chunk_budget) as a correction.
     "knowledge": frozenset(
         {
-            "auto_ingest_doc_links",
             "auto_discover_folder",
             "auto_discover_dirname",
             "auto_ingest_chunk_budget",
@@ -174,6 +186,37 @@ _SECTION_KEYS_DELIBERATELY_DROPPED: dict = {
     ),
     # RETIRED: the out-of-band installs the removed local STT providers needed.
     "stt": frozenset({"whisper_path", "mlx_model", "parakeet_model", "device"}),
+    # RETIRED: the built-in browser panel toggle and the browser CLI live-view
+    # port pin went with the agent browser they configured; the browser tool has
+    # one driver now. Named once at load (warn_retired_section_keys) so an
+    # operator who set them learns the setting is gone, then dropped on save.
+    "dashboard": frozenset({"use_builtin_browser", "browser_view_port"}),
+    # RETIRED: the Settings -> Browser first-run step list it hid is gone (the
+    # gateway installs the engine on its own). Only pre-release builds wrote it,
+    # so it is dropped on save without a load-time warning.
+    "browser": frozenset({"first_run_dismissed"}),
+}
+#: Retired ENTRIES of a map-valued section key, as ``{(section, key): names}``.
+#: The loader already reads only the names it knows, so ``save()`` drops these;
+#: a raw write keeps the rest of the map as stored, so it drops these here
+#: (``drop_retired_section_keys``).
+_MAP_ENTRIES_RETIRED: dict = {
+    # RETIRED: the layout_harness preview switch gated nothing;
+    # /developer/layout-editor opens with no switch.
+    ("dashboard", "feature_previews"): frozenset({"layout_harness"}),
+}
+_SECTION_KEYS_DELIBERATELY_DROPPED: dict = {
+    section: _SECTION_KEYS_RENAMED.get(section, frozenset())
+    | _SECTION_KEYS_RETIRED.get(section, frozenset())
+    for section in _SECTION_KEYS_RENAMED.keys() | _SECTION_KEYS_RETIRED.keys()
+}
+
+#: The subset of ``_SECTION_KEYS_RETIRED`` worth ONE load-time warning: keys an
+#: operator set by hand whose feature is gone. Each maps to the default the last
+#: build that modelled it wrote into every config it saved, so a key still at
+#: that value is Kiro Crew's own and is dropped without a notice.
+_RETIRED_SECTION_KEYS_WARNED: dict = {
+    "dashboard": {"use_builtin_browser": True, "browser_view_port": 0},
 }
 
 
@@ -184,7 +227,18 @@ _SECTION_KEYS_DELIBERATELY_DROPPED: dict = {
 #: dropped on save just as ``agent.<key>`` was. Captured one level deeper, as
 #: ``{section: {record_name: {key: value}}}``. ``hooks`` is NOT here: it is
 #: emitted raw (``"hooks": self.hooks``) and round-trips whole.
-_RECORD_MAP_SECTIONS: frozenset = frozenset({"agents", "workspaces", "memory_stores", "apps"})
+_RECORD_MAP_SECTIONS: frozenset = frozenset(
+    {"agents", "workspaces", "memory_stores", "apps", "templates"}
+)
+
+#: Digests of the ``(section, key list)`` pairs :func:`capture_extra_section_keys` has
+#: logged in this process. The gateway rebuilds the config several times a second from
+#: an unchanged file, so each distinct set of unmodelled keys is named once, not on
+#: every load. A config write can carry any key names, so an entry is a 16-byte digest
+#: and the count is bounded: when full the memory is cleared, which costs at most one
+#: repeat of a line that is still true.
+_LOGGED_EXTRA_KEY_SETS_MAX = 256
+_logged_extra_key_sets: set[bytes] = set()
 
 
 def _unknown_keys_of(raw: dict, obj: object, recognized_extra: frozenset) -> dict:
@@ -224,19 +278,29 @@ def capture_extra_section_keys(data: dict, cfg: object) -> dict:
     clobber a live value.
     """
     captured = _collect_extra_section_keys(data, cfg)
+    # A key set is remembered only when its line is written, so turning DEBUG on
+    # later still shows it.
+    if not logger.isEnabledFor(logging.DEBUG):
+        return captured
     for section, unknown in captured.items():
-        if section in _RECORD_MAP_SECTIONS:
-            logger.debug(
-                "config: preserving unmodelled %s record key(s) on round-trip: %s",
-                section,
-                ", ".join(f"{n}.{k}" for n, ks in sorted(unknown.items()) for k in ks),
-            )
-        else:
-            logger.debug(
-                "config: preserving unmodelled %s key(s) on round-trip: %s",
-                section,
-                ", ".join(sorted(unknown)),
-            )
+        record_map = section in _RECORD_MAP_SECTIONS
+        names = (
+            ", ".join(f"{n}.{k}" for n, ks in sorted(unknown.items()) for k in ks)
+            if record_map
+            else ", ".join(sorted(unknown))
+        )
+        seen = hashlib.sha256(f"{section}\0{names}".encode("utf-8", "replace")).digest()[:16]
+        if seen in _logged_extra_key_sets:
+            continue
+        if len(_logged_extra_key_sets) >= _LOGGED_EXTRA_KEY_SETS_MAX:
+            _logged_extra_key_sets.clear()
+        _logged_extra_key_sets.add(seen)
+        logger.debug(
+            "config: preserving unmodelled %s %s on round-trip: %s",
+            section,
+            "record key(s)" if record_map else "key(s)",
+            names,
+        )
     return captured
 
 
@@ -274,6 +338,64 @@ def warn_misspelled_section_keys(data: dict, cfg: object) -> None:
             "not in effect: %s",
             "; ".join(hints),
         )
+
+
+def warn_retired_section_keys(data: dict) -> None:
+    """One WARNING naming retired keys the operator changed from their old default.
+
+    The keys are inert (nothing reads them) and the next ``save()`` drops them
+    (:data:`_SECTION_KEYS_DELIBERATELY_DROPPED`); this line is the only notice
+    an operator who set one gets. Silent when none is present, and for a key
+    still at the default an older build wrote into every config it saved.
+    """
+    found: list[str] = []
+    for section, defaults in sorted(_RETIRED_SECTION_KEYS_WARNED.items()):
+        raw = data.get(section)
+        if not isinstance(raw, dict):
+            continue
+        found.extend(
+            f"{section}.{key}"
+            for key, written_default in sorted(defaults.items())
+            if key in raw and raw[key] != written_default
+        )
+    if found:
+        logger.warning(
+            "Config: %s no longer exist and are ignored; they are dropped from "
+            "config.json on the next save",
+            ", ".join(found),
+        )
+
+
+def drop_retired_section_keys(data: dict) -> bool:
+    """Remove the retired keys from a raw config document, in place.
+
+    ``save()`` drops them because it rebuilds the document from the model; a
+    write that edits the raw dict under ``update_config_locked`` (a dashboard
+    save, ``kirocrew config set``) does not, so without this the keys outlived
+    every such save. Only :data:`_SECTION_KEYS_RETIRED` and
+    :data:`_MAP_ENTRIES_RETIRED` are touched: a RENAMED
+    spelling is still read as the live value when the canonical key is absent,
+    so a raw write must keep it. Returns whether anything was removed.
+    """
+    removed = False
+    for section, keys in _SECTION_KEYS_RETIRED.items():
+        raw = data.get(section)
+        if not isinstance(raw, dict):
+            continue
+        for key in keys:
+            if key in raw:
+                del raw[key]
+                removed = True
+    for (section, key), names in _MAP_ENTRIES_RETIRED.items():
+        raw = data.get(section)
+        entries = raw.get(key) if isinstance(raw, dict) else None
+        if not isinstance(entries, dict):
+            continue
+        for name in names:
+            if name in entries:
+                del entries[name]
+                removed = True
+    return removed
 
 
 def _misspelling_hints(prefix: str, keys: dict, obj: object) -> list[str]:
@@ -391,25 +513,118 @@ def _deep_merge(base: dict, overlay: dict) -> dict:
     return result
 
 
-def _subtract_overlay(merged: dict, overlay: dict) -> dict:
+#: Renamed keys a reader still accepts, per section: each canonical key and its
+#: older spellings, in the order the reader tries them
+#: (``sections_agent._read_skip_permissions``,
+#: ``memory_sections._read_auto_add_documents``).
+_RENAMED_KEY_SPELLINGS: dict[str, dict[str, tuple[str, ...]]] = {
+    "agent": {"dangerously_skip_permissions": ("dangerouslySkipPermissions", "yolo")},
+    "knowledge": {"auto_add_documents": ("auto_ingest_doc_links",)},
+}
+
+#: Renamed keys whose reader skips any spelling that is not a real bool and
+#: moves on to the next one.
+_RENAMED_KEYS_READ_AS_REAL_BOOL: frozenset[tuple[str, str]] = frozenset(
+    {("agent", "dangerously_skip_permissions")}
+)
+
+
+def _reader_uses(body: dict, spelling: str, real_bool: bool) -> bool:
+    """True when a reader would take *spelling*'s value from *body*."""
+    return spelling in body and (not real_bool or isinstance(body[spelling], bool))
+
+
+def _canonical_renamed_keys(doc: dict) -> dict:
+    """*doc* with each older spelling of a renamed key under its current name.
+
+    ``save()`` emits only the current name, in the form the reader produced, so
+    :func:`_subtract_overlay` can match a renamed key only when the overlay and
+    the stored base carry it the same way. The spelling the reader would use
+    wins, as at load: the first one present, or for a key in
+    :data:`_RENAMED_KEYS_READ_AS_REAL_BOOL` the first one holding a real bool.
+    An older spelling's value is converted as its reader converts it. A current
+    name the reader would use is left alone.
+    """
+    result = dict(doc)
+    for section, renames in _RENAMED_KEY_SPELLINGS.items():
+        body = result.get(section)
+        if not isinstance(body, dict):
+            continue
+        body = dict(body)
+        for canonical, older in renames.items():
+            real_bool = (section, canonical) in _RENAMED_KEYS_READ_AS_REAL_BOOL
+            if _reader_uses(body, canonical, real_bool):
+                continue
+            for spelling in older:
+                if _reader_uses(body, spelling, real_bool):
+                    # The real-bool reader returns the value as is; the other
+                    # reader returns ``bool(value)``.
+                    body[canonical] = body[spelling] if real_bool else bool(body[spelling])
+                    break
+        result[section] = body
+    return result
+
+
+def _restore_stored_renamed_spellings(saved: dict, stored: dict, overlay: dict) -> None:
+    """Put back, under its own spelling, a renamed key the base file stores.
+
+    :func:`_subtract_overlay` drops a renamed key's current name from *saved*
+    when the overlay owns it and *stored* (``config.json``) holds it only under
+    an older spelling. The base value is written back under the spelling the
+    base used, never under the current name: the current name would outrank an
+    older spelling the overlay still uses and flip what loads.
+    """
+    for section, renames in _RENAMED_KEY_SPELLINGS.items():
+        ov_body = overlay.get(section)
+        base_body = stored.get(section)
+        if not isinstance(ov_body, dict) or not isinstance(base_body, dict):
+            continue
+        out = saved.get(section)
+        for canonical, older in renames.items():
+            real_bool = (section, canonical) in _RENAMED_KEYS_READ_AS_REAL_BOOL
+            if canonical not in ov_body or (
+                isinstance(out, dict) and _reader_uses(out, canonical, real_bool)
+            ):
+                continue
+            for spelling in (canonical, *older):
+                if _reader_uses(base_body, spelling, real_bool):
+                    if not isinstance(out, dict):
+                        out = saved[section] = {}
+                    out[spelling] = base_body[spelling]
+                    break
+
+
+def _subtract_overlay(merged: dict, overlay: dict, base: dict | None = None) -> dict:
     """Remove leaf values from *merged* that are owned by the overlay.
 
     For nested dicts, recurse. For leaf keys present in both overlay and
     merged with the same value, remove from the result so they only live
     in config.local.json.
+
+    *base* is what ``config.json`` itself stores. A leaf it holds is the base
+    file's own value, so an overlay-owned leaf goes back to that stored value
+    instead of being removed: the overlay wins at load either way, and dropping
+    the overlay later still finds the base value underneath.
     """
     result = dict(merged)
     for key, ov_value in overlay.items():
         if key not in result:
             continue
+        base_value = base.get(key) if isinstance(base, dict) else None
+        stored = isinstance(base, dict) and key in base
         if isinstance(ov_value, dict) and isinstance(result[key], dict):
-            cleaned = _subtract_overlay(result[key], ov_value)
+            cleaned = _subtract_overlay(
+                result[key], ov_value, base_value if isinstance(base_value, dict) else None
+            )
             if cleaned:
                 result[key] = cleaned
             else:
                 del result[key]
         elif result[key] == ov_value:
-            del result[key]
+            if stored:
+                result[key] = base_value
+            else:
+                del result[key]
     return result
 
 
@@ -495,6 +710,16 @@ def tailnet_effective_allowed_logins(
 #: The operator's fix is to correct the file and restart the gateway, which is
 #: the same ceremony every other boot-time config decision already requires.
 _OBSERVED_DEGRADED_SECTIONS: set[str] = set()
+
+
+def observed_degraded_sections() -> frozenset[str]:
+    """Every degradation this process has observed, read-only (see above).
+
+    For a gate whose config snapshot can come from a path that does not carry
+    ``degraded_sections`` along (a live reload that copies fields onto a cached
+    config): the sticky record is the one answer every path agrees on.
+    """
+    return frozenset(_OBSERVED_DEGRADED_SECTIONS)
 
 
 def reset_degraded_observations() -> None:

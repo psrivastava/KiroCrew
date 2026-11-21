@@ -233,7 +233,7 @@ def _tool_definitions() -> list[dict[str, Any]]:
         {
             "name": "dashboard_save",
             "description": (
-                "SAVE a draft of your crewmate's Dashboard page. dashboard_apply "
+                "SAVE a draft of your Bot's Dashboard page. dashboard_apply "
                 "puts it live separately. A page has three declarations; this saves all "
                 "three at once: a "
                 "`model` naming the fields the page holds and where each value "
@@ -260,7 +260,7 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "version you were on -- a template version brings the template "
                 "page back."
                 " A page you write as `view.html` is RUN once by the gateway over a "
-                "SYNTHETIC copy of your crewmate's current data (the same shape with "
+                "SYNTHETIC copy of your Bot's current data (the same shape with "
                 "invented values, so a page never sees the record; a key is kept only if "
                 "your page spells it out or the dashboard type catalog lists it), and the "
                 "reply carries a `verification` block: `passed`, `failed` with each script "
@@ -319,6 +319,32 @@ def _tool_definitions() -> list[dict[str, Any]]:
                             "define its own complete design in view.html."
                         ),
                     },
+                    "widgets": {
+                        "type": "array",
+                        "maxItems": 4,
+                        "items": {"type": "object"},
+                        "description": (
+                            "Optional phone home-screen widgets for this page, shown "
+                            "to the Bot's owner only. Leave it out to keep the stored "
+                            "widgets; pass [] to remove them. Up to 4 widgets, each "
+                            '`{"id", "title", "sizes", "blocks", "tap"}`: `id` is '
+                            "lowercase letters, digits and '-' (at most 32, unique, "
+                            "never `status`); `title` 1-40 characters; `sizes` a subset "
+                            "of `small`, `medium`, `large`; `tap` only "
+                            '`{"open": "bot"}` (the default); 1-6 `blocks`, most '
+                            "important first (small draws 2, medium 4). A block's "
+                            "`type` is `title` (`text` or `field`), `metric` (`label`, "
+                            "`field`, `format`, `unit`, `warn_at`, `bad_at`, "
+                            "`higher_is_worse`), `list` (`label`, `field`, `item_text`, "
+                            "`item_detail`, `max_items` 1-5), `progress` (`label`, "
+                            "`field`, `total` or `total_field`), `sparkline` (`label`, "
+                            "`field`, `point`, `max_points` 2-48) or `status` (`label`, "
+                            "`field`, `tones` mapping values to ok/warn/bad/idle). "
+                            "`field` names a field of this `model.types`; a widget "
+                            "holds no HTML and no values, and the phone shows every "
+                            "string as plain text. The dashboard skill has an example."
+                        ),
+                    },
                 },
                 "required": ["model", "view"],
             },
@@ -327,7 +353,7 @@ def _tool_definitions() -> list[dict[str, Any]]:
             "name": "dashboard_templates",
             "description": (
                 "List or SEARCH the dashboard pages this gateway can give your "
-                "crewmate, and say which one it is on now. Pass `query` to "
+                "Bot, and say which one it is on now. Pass `query` to "
                 "search; it matches a template's name and description AND the "
                 "fold paths its fields read, so asking for `cost` finds the page "
                 "that shows a usage number whether or not its author used that "
@@ -360,10 +386,7 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "argument. A preview is OPTIONAL, never a step before applying: use "
                 "it only when the person asks to look first. dashboard_apply with "
                 "the `template_id` puts it live. A page you composed yourself is "
-                "saved with dashboard_save, not previewed here. While the person has "
-                "locked the layout (your [DASHBOARD] block says LOCKED), you can "
-                "still preview a page for them to look at, but do not apply it: "
-                "ask them to unlock it first."
+                "saved with dashboard_save, not previewed here."
             ),
             "inputSchema": {
                 "type": "object",
@@ -384,14 +407,12 @@ def _tool_definitions() -> list[dict[str, Any]]:
         {
             "name": "dashboard_apply",
             "description": (
-                "Put a page live on your crewmate's Dashboard, now, as a new "
+                "Put a page live on your Bot's Dashboard, now, as a new "
                 "version -- there is no preview step. Pass a `template_id` from "
                 "dashboard_templates to use a shipped or operator page, or pass "
                 "nothing to put live the page you saved with dashboard_save. Every "
                 "earlier version stays on disk, so dashboard_rollback goes back in "
-                "one call. Tell the person what you changed. Refused with "
-                "`dashboard_locked` while the page is locked (your [DASHBOARD] "
-                "block says LOCKED)."
+                "one call. Tell the person what you changed."
             ),
             "inputSchema": {
                 "type": "object",
@@ -410,16 +431,14 @@ def _tool_definitions() -> list[dict[str, Any]]:
         {
             "name": "dashboard_rollback",
             "description": (
-                "Go BACK to an earlier version of your crewmate's page -- the "
+                "Go BACK to an earlier version of your Bot's page -- the "
                 "answer to the person saying 'go back'. A version can be a template "
                 "page or a page you saved with dashboard_save, and the one you "
                 "restore is the one that draws. dashboard_fields lists the "
                 "versions you can still reach; a version the store has dropped is "
                 "refused, so read that list rather than guessing. A rollback moves "
                 "FORWARD: restoring version 1 over version 2 writes version 3, so "
-                "nothing is lost and you can roll back again. Refused with "
-                "`dashboard_locked` while the page is locked (your [DASHBOARD] "
-                "block says LOCKED)."
+                "nothing is lost and you can roll back again."
             ),
             "inputSchema": {
                 "type": "object",
@@ -608,6 +627,16 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
                     "`view` and a `theme`, and all three are saved together"
                 )
             page[key] = part
+        # Optional fourth: forwarded only when sent, so a save without it keeps the
+        # stored widgets exactly as it did before widgets existed.
+        widgets = args.get("widgets")
+        if widgets is not None:
+            if not isinstance(widgets, list):
+                return (
+                    "Error: `widgets` must be a list of widgets -- leave it out to "
+                    "keep the stored ones, or pass [] to remove them"
+                )
+            page["widgets"] = widgets
         sk, err = _strict_session_key()
         if err:
             return err
@@ -678,7 +707,7 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             else f"template `{d.get('template_id')}`"
         )
         return redact(
-            f"LIVE: your crewmate's page is now version {d.get('instance_version')}, "
+            f"LIVE: your Bot's page is now version {d.get('instance_version')}, "
             f"{shown}. dashboard_rollback goes back to any earlier version." + _guide_tail(d)
         )
 
@@ -733,9 +762,7 @@ _ERROR_LABELS = {
 
 
 #: What the agent is told the page ran over, when it ran over anything.
-_SYNTHETIC = (
-    "a synthetic copy of your crewmate's current data (the same shape with invented values)"
-)
+_SYNTHETIC = "a synthetic copy of your Bot's current data (the same shape with invented values)"
 
 
 def _error_lines(verification: dict[str, Any]) -> list[str]:
@@ -769,7 +796,7 @@ def _render_verification(verification: Any) -> list[str]:
     if not isinstance(verification, dict):
         return []
     status = verification.get("status")
-    ran_over = _SYNTHETIC if verification.get("data") == "synthetic" else "your crewmate's data"
+    ran_over = _SYNTHETIC if verification.get("data") == "synthetic" else "your Bot's data"
     if status == "passed":
         lines = [
             f"verification: passed -- the page ran once over {ran_over} and raised no script errors."
@@ -842,7 +869,7 @@ def _render_saved(
             lines.extend(f"  - {line}" for line in warned if isinstance(line, str))
     lines.append("")
     lines.append(
-        "Next: call dashboard_apply with no arguments to put it on your crewmate's "
+        "Next: call dashboard_apply with no arguments to put it on your Bot's "
         "Dashboard as a new version."
     )
     return "\n".join(lines)
@@ -875,7 +902,7 @@ def _render_templates(payload: dict[str, Any]) -> str:
     lines.append(
         f"{len(rows)} dashboard template{'' if len(rows) == 1 else 's'}"
         + (f" matching {query!r}" if query else "")
-        + (f"; your crewmate is on `{current}`." if current else ".")
+        + (f"; your Bot is on `{current}`." if current else ".")
     )
     for row in rows:
         if not isinstance(row, dict):

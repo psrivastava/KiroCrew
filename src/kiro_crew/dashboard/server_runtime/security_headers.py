@@ -28,6 +28,7 @@ if TYPE_CHECKING:
         _VENDOR_PREFLIGHT_MAX_AGE_SECS,
         _WORKER_ASSET_MARKER,
         _WORKER_CACHE_CONTROL,
+        _app_frame_src_extra,
         _cookie_port_from_host,
         frame_ancestors_value,
         token_embed_parent_port,
@@ -99,8 +100,21 @@ def _extra_frame_ancestors(
     Empty (default ``'self'`` + ``X-Frame-Options`` posture) for any request
     without such a token. See docs/system-specs/modules/security.md.
     """
-    if request is None:
+    port = _embed_parent_port(request, app)
+    if port is None:
         return []
+    return parent_port_frame_ancestors(port)
+
+
+def _embed_parent_port(
+    request: "web.Request | None", app: "web.Application | None" = None
+) -> int | None:
+    """The validated ``embed_parent_port`` claim of the request's signed token, or ``None``.
+
+    The reader behind :func:`_extra_frame_ancestors`; see there for the order.
+    """
+    if request is None:
+        return None
     # Prefer the claim the auth middleware validated and stashed on the request:
     # it is set BEFORE the link→session exchange revokes the link nonce, so the
     # first ``?token=`` framed document (whose header the browser enforces) still
@@ -129,7 +143,16 @@ def _extra_frame_ancestors(
             cookie_port = _cookie_port_from_host(request, port_fallback)
             token = request.cookies.get(f"mc_token_{cookie_port}", "")
         port = token_embed_parent_port(token)
-    if port is None:
+    return port
+
+
+def parent_port_frame_ancestors(port: int) -> list[str]:
+    """The loopback origins of an embedding parent dashboard on ``port``.
+
+    Also used by a document whose request carries no dashboard credential (the
+    app frame), which recovers the port from its own signed URL instead.
+    """
+    if not 1 <= port <= 65535:
         return []
     # A CSP host-source admits only letters, digits and hyphens in the host, so a
     # bracketed IPv6 literal cannot be expressed: `http://[::1]:<port>` is refused by
@@ -197,10 +220,19 @@ def _apply_security_headers(
 
     state = app.get("state")
     instances_mgr = getattr(state, "instances_manager", None) if state else None
-    # Loopback preview origins are always framable (Web Preview panel); the
-    # *.localhost tunnel wildcard is added only when instances mode is active.
-    frame_src_extra = _LOOPBACK_FRAME_SRC + (
-        _INSTANCES_FRAME_SRC_EXTRA if instances_mgr is not None else ""
+    # Loopback preview origins are always framable (Web Preview panel), and so are
+    # app web origins (apps/app_web_origin.py), which are also connectable for an
+    # app's no-cors reachability probe on its frame; the *.localhost tunnel
+    # wildcard is added only when instances mode is active.
+    from kiro_crew.apps.app_web_origin import APP_WEB_ORIGIN_CSP_SOURCE
+
+    frame_src_extra = (
+        _LOOPBACK_FRAME_SRC
+        + APP_WEB_ORIGIN_CSP_SOURCE
+        + (_INSTANCES_FRAME_SRC_EXTRA if instances_mgr is not None else "")
+        # Origins enabled, trusted apps declare in ui.frameSources: a cached
+        # string, republished on app lifecycle changes (apps/frame_sources.py).
+        + _app_frame_src_extra()
     )
     # frame-ancestors: ``'self'`` plus the EXACT parent origin carried in the
     # request token's embed_parent_port claim (see _extra_frame_ancestors) — never
@@ -216,7 +248,7 @@ def _apply_security_headers(
     resp.headers.setdefault(
         "Content-Security-Policy",
         _BASE_CSP.format(
-            connect_src_extra=_LOOPBACK_FRAME_SRC,
+            connect_src_extra=_LOOPBACK_FRAME_SRC + APP_WEB_ORIGIN_CSP_SOURCE,
             frame_src_extra=frame_src_extra,
             frame_ancestors=frame_ancestors,
         ),

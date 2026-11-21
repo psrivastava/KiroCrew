@@ -1,7 +1,7 @@
 """The backend half of the contributed-command conformance suite.
 
 Reads the SAME fixture as
-``website/src/apps/command-bar/contributedCommands.conformance.test.ts``. The point is
+``website/src/components/commandBar/contributedCommands.conformance.test.ts``. The point is
 not extra coverage -- both sides already have their own unit tests -- but that the two
 hand-written rulebooks cannot disagree about a verdict without a build failing. They
 drifted twice while this contract was being written (the title cap and the per-app
@@ -23,7 +23,7 @@ import pytest
 from kiro_crew.apps.manifest import AppManifest
 
 FIXTURE = pathlib.Path(__file__).parent / "fixtures" / "contributed_commands_conformance.json"
-CASES = json.loads(FIXTURE.read_text())["cases"]
+CASES = json.loads(FIXTURE.read_text(encoding="utf-8"))["cases"]
 
 
 def _contributes(case: dict) -> dict:

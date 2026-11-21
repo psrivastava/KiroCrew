@@ -19,6 +19,7 @@ import { MemoryRouter } from 'react-router-dom'
 
 import { FeaturePreviewIntroButton, type FeaturePreviewIntro } from '../components/FeaturePreviewIntroDialog'
 import { FeaturePreviewsSection } from '../pages/settings/FeaturePreviewsSection'
+import { crewModeEnabled } from '../lib/crewMode'
 import { api } from '../api/client'
 
 const INTRO: FeaturePreviewIntro = {
@@ -87,6 +88,24 @@ describe('FeaturePreviewIntroButton', () => {
     // Wraps: next from the last returns to the first.
     fireEvent.click(within(dialog).getByRole('button', { name: 'Next capture' }))
     expect(within(dialog).getByRole('img', { name: 'First capture' })).toBeInTheDocument()
+  })
+
+  it('keeps the capture dots to one Tab stop and pages them with the arrows', () => {
+    render(<Harness intro={INTRO} />)
+    fireEvent.click(screen.getByRole('button', { name: 'See what Sample preview looks like' }))
+    const dialog = screen.getByRole('dialog')
+    const dots = within(dialog).getAllByRole('tab')
+    expect(dots.filter(d => d.getAttribute('tabindex') === '0')).toEqual([dots[0]])
+
+    fireEvent.keyDown(dots[0], { key: 'ArrowRight' })
+    expect(within(dialog).getByRole('img', { name: 'Second capture' })).toBeInTheDocument()
+    expect(dots[1]).toHaveFocus()
+    expect(dots[1]).toHaveAttribute('aria-selected', 'true')
+    expect(dots.filter(d => d.getAttribute('tabindex') === '0')).toEqual([dots[1]])
+
+    fireEvent.keyDown(dots[1], { key: 'Home' })
+    expect(within(dialog).getByRole('img', { name: 'First capture' })).toBeInTheDocument()
+    expect(dots[0]).toHaveFocus()
   })
 
   it("the dialog's switch is the card's switch", () => {
@@ -186,6 +205,12 @@ describe('FeaturePreviewsSection — See-what-it-looks-like per card', () => {
     // Fail-open while the schema is in flight, then gone once it says no KAS.
     await waitFor(() => expect(screen.queryByTestId('kas-bundle-card')).toBeNull())
     expect(screen.queryByRole('switch', { name: /Run KAS on .*own engine/ })).toBeNull()
+  })
+
+  it('lists no conductor mode switch: conductor mode is on with no preview turned on', () => {
+    renderSection()
+    expect(screen.queryByRole('switch', { name: 'Conductor mode' })).toBeNull()
+    expect(crewModeEnabled()).toBe(true)
   })
 
   it('the button stays offered while the flag is on, beside the ingress link', () => {

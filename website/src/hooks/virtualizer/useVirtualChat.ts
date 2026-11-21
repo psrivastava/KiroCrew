@@ -113,7 +113,7 @@ import { useFollowState, usePinning, useFollowPlacementPins } from './followPoli
 import { useWindowState, useWindowOperations, useCoverageWatchdog, useWindowEdgeTriggers, useTailAppendMount } from './windowRange'
 import { useShiftCapture, useShiftCompensation } from './shiftCompensation'
 import { useReadingPositionEntry, useVisibilityReplacement, useReadingPositionRestore } from './readingPosition'
-import { useHeightOwner, useRowMeasurement, useMeasurementScopeReseed } from './measurement'
+import { useHeightOwner, useRowMeasurement, useMeasurementScopeReseed, type FiredAnchor } from './measurement'
 import { useStreamingSettleGrace, useGeometrySync } from './geometryScheduling'
 
 // The hook's public helpers, defined where their rules live and re-exported
@@ -306,7 +306,7 @@ export function useVirtualChat<T>(
   const heights = useHeightOwner({
     sessionId, heightScopeKey, itemCount, estimatedHeight, itemsRef, getKeyRef, windowRange, shift,
   })
-  const { heightIndexRef, heightIndex, getH, offsetIndex, heightCommit, totalHeight, offsetBefore, offsetAfter } = heights
+  const { heightIndexRef, heightIndex, getH, offsetIndex, heightCommit, totalHeight, offsetBefore, offsetAfter, paintedHeightsRef } = heights
 
   // Keep the tracked scroller element in sync after every commit, so the
   // observer effects below re-attach the moment the node appears (or changes).
@@ -314,14 +314,19 @@ export function useVirtualChat<T>(
     syncScrollerEl()
   })
 
-  const ops = useWindowOperations({ overscan, getH, scrollerRef, leadingOffset, itemsRef, heightIndexRef, view, follow })
+  // The reader's row the last ResizeObserver fire measured: measurement owns
+  // it, and the window recompute keeps that row mounted (see FiredAnchor).
+  const firedAnchorRef = useRef<FiredAnchor | null>(null)
+  const ops = useWindowOperations({
+    overscan, getH, scrollerRef, leadingOffset, itemsRef, heightIndexRef, elIndexRef, paintedHeightsRef, firedAnchorRef, view, follow,
+  })
   const pinning = usePinning({
     followOutput, overscan, scrollerRef, itemsRef, runActiveRef, getH, setWindowRange, follow, reading,
   })
   const sync = useGeometrySync({ itemsRef, eagerFirstMeasureRef, heightIndexRef, shift, follow, pinning, ops })
   const measurement = useRowMeasurement({
     itemsRef, getKeyRef, streamingIndexRef, eagerFirstMeasureRef, elIndexRef, resizeObserverRef,
-    trailingRef, heightIndexRef, canMeasure, windowRangeRef, scrollerRef, grace, sync, follow,
+    trailingRef, heightIndexRef, canMeasure, windowRangeRef, scrollerRef, grace, sync, follow, firedAnchorRef,
   })
 
   // Layout effects, pre-paint: the shift compensation's consumers, then
@@ -340,7 +345,7 @@ export function useVirtualChat<T>(
   })
   useScrollListener({ scrollerEl, bottomThreshold, setIsAtBottom, itemsRef, getKeyRef, follow, pinning, reading, measurement, ops })
   useCoverageWatchdog({ scrollerEl, leadingOffset, itemsRef, heightIndexRef, windowRangeRef, ops, follow, pinning })
-  useResizeObserver({ scrollerRef, scrollerEl, elIndexRef, trailingRef, resizeObserverRef, measurement, compensation, sync, pinning, ops })
+  useResizeObserver({ scrollerRef, scrollerEl, elIndexRef, trailingRef, resizeObserverRef, measurement, compensation, sync, pinning, reading, ops })
   useWindowEdgeTriggers({
     windowRange, itemCount, overscan, prefetchStartIndex, sessionId, scrollerRef, scrollerEl,
     topSentinelRef, bottomSentinelRef, onTopReachedRef, itemsRef, setWindowRange, ops,

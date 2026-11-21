@@ -1,15 +1,11 @@
 """A closed fargate forward names its cause and a real remedy.
 
-The SSM tunnel child prints every session-close notice to STDOUT and its own
-diagnostics to a rolling log file, and it exits 0 whether AWS closed the session
-cleanly, a transport drop ended it, or it never started. So the exit code cannot
-separate those and stderr carries none of them. These pins hold the two halves of
-the fix together: stdout is captured concurrently and bounded, and only an
-anchored close shape is allowed to name a cause.
+The SSM tunnel child prints close notices to stdout and exits 0 however the session
+ended, so neither the exit code nor stderr can tell the causes apart. Stdout is captured
+concurrently and bounded, and only an anchored close shape may name a cause.
 
-The wording guards are as load-bearing as the classification. A message that
-states a duration, promises traffic keeps a session alive, or offers a reconnect
-is wrong even when the classification is right.
+The wording guards matter as much: a message that states a duration, promises traffic
+keeps a session alive, or offers a reconnect is wrong even when the cause is right.
 """
 
 from __future__ import annotations
@@ -24,6 +20,7 @@ from kiro_crew.instances.ssh_tunnel_manager import (
     _SshTunnel,
     _ssm_close_reason,
 )
+from kiro_crew.testing.synthetic_credentials import github_classic
 from kiro_crew.testing.wait import finished
 
 # The exact literals session-manager-plugin writes to stdout, from its source:
@@ -189,8 +186,9 @@ class TestStdoutCaptureHygiene:
         the reason text back to nobody, so there is no return value to observe
         it through.
         """
-        raw = f"SessionId: {SESSION_ID} : closed AKIAIOSFODNN7EXAMPLE\n"
-        assert "AKIAIOSFODNN7EXAMPLE" not in _sanitize_ssm_stdout(raw)
+        secret = github_classic(seed=132)  # a bare 40-character run is no credential
+        raw = f"SessionId: {SESSION_ID} : closed {secret}\n"
+        assert secret not in _sanitize_ssm_stdout(raw)
         # The notice is still classifiable with the credential gone.
         assert _ssm_close_reason(raw) == "closed"
 
@@ -245,6 +243,9 @@ class _FakeStream:
             raise OSError("pipe went away")
         chunk, self._payload = self._payload[:n], self._payload[n:]
         return chunk
+
+    def at_eof(self) -> bool:
+        return not self._payload
 
 
 class _FakeProc:
@@ -312,11 +313,8 @@ class TestMonitorPath:
 class TestDeliberateStopSkipsTheDrain:
     """A stop() we initiate must not pay the stdout drain's timeout.
 
-    The drain exists to classify why AWS closed a forward. On a teardown WE
-    initiate there is no such cause to name, so stop() retires the drain with
-    ``_finish_stdout_drain(timeout=0)`` — cancel without awaiting EOF — otherwise
-    every deliberate stop waits up to the drain timeout for a notice nothing will
-    read.
+    The drain classifies why AWS closed a forward; our own teardown has no such cause, so
+    stop() cancels it with ``_finish_stdout_drain(timeout=0)`` without awaiting EOF.
     """
 
     def test_zero_timeout_cancels_without_awaiting_eof(self):

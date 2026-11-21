@@ -144,7 +144,7 @@ def _read_mcp_json_unlocked(*, strict: bool = False) -> dict[str, Any]:
         return {}
     try:
         return loads_mcp_config(_mcp_json_path().read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
         if strict:
             raise
         logger.warning("Failed to read mcp.json: %s", exc)
@@ -155,6 +155,32 @@ def _write_mcp_json_unlocked(data: dict[str, Any]) -> None:
     """Write mcp.json without acquiring a lock (caller must hold lock)."""
     _mcp_json_path().parent.mkdir(parents=True, exist_ok=True)
     atomic_write(_mcp_json_path(), json.dumps(data, indent=2) + "\n")
+
+
+def _sync_app_tool_refs(data: dict[str, Any], app_name: str) -> None:
+    """Make ``tools`` expose exactly the ``{app_name}:*`` servers declared in ``data``.
+
+    kiro-cli connects every server in ``mcpServers`` but gives the agent tools only from
+    the servers ``tools`` references. The agent rebuild adds that ``@{app}:{server}`` ref
+    (``agent_materialization/mcp_sources.py``); the lifecycle writers here must do the
+    same, or an app enabled after the last rebuild has its server running in the main
+    agent with none of its tools callable until the next rebuild. A ref whose server this
+    write removed goes too, so ``tools`` never names a server that is gone. Refs of other
+    apps and of the owner's own servers are left alone. Mutates ``data`` in place; the
+    caller holds ``_mcp_lock`` and writes the file.
+    """
+    servers = data.get("mcpServers")
+    servers = servers if isinstance(servers, dict) else {}
+    prefix = f"@{app_name}:"
+    present = [f"@{k}" for k in servers if k.startswith(f"{app_name}:")]
+    tools = data.get("tools")
+    tools = list(tools) if isinstance(tools, list) else []
+    kept = [t for t in tools if not (isinstance(t, str) and t.startswith(prefix)) or t in present]
+    for ref in present:
+        if ref not in kept:
+            kept.append(ref)
+    if kept != tools:
+        data["tools"] = kept
 
 
 def _read_mcp_json() -> dict[str, Any]:

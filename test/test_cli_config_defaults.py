@@ -383,9 +383,7 @@ def test_invalid_utf8_in_the_overlay_does_not_break_adopt(home, capsys):
     assert "autocompact_pct" not in _stored(home)["session"]
 
 
-# --------------------------------------------------------------------------
 # A coerced value: inert bytes that cost a warning on every load.
-# --------------------------------------------------------------------------
 
 
 @pytest.fixture
@@ -416,6 +414,18 @@ def test_a_coerced_value_cannot_be_kept(retired, capsys):
     _run(_args(keep=True), retired)
     out = capsys.readouterr().out
     assert "cannot be kept" in out
+    saved = json.loads((retired / "config.json").read_text(encoding="utf-8"))
+    assert saved["stt"]["provider"] == "whisper"
+    with patch("kiro_crew.config.loader.config_dir", return_value=retired):
+        assert SD.acked_superseded() == {}
+
+
+def test_a_named_coerced_key_that_cannot_be_kept_is_refused_on_stderr(retired, capsys):
+    """Naming the key asks for it by name, so its refusal is an error line, not output."""
+    _run(_args(keys=["stt.provider"], keep=True), retired)
+    out, err = capsys.readouterr()
+    assert "stt.provider ('whisper') cannot be kept" in err
+    assert "cannot be kept" not in out
     saved = json.loads((retired / "config.json").read_text(encoding="utf-8"))
     assert saved["stt"]["provider"] == "whisper"
     with patch("kiro_crew.config.loader.config_dir", return_value=retired):

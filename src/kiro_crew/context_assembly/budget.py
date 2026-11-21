@@ -72,7 +72,15 @@ _LESSON_EXPERIENCE_CAP = _budget(0.05)  # learned experience (on-demand tier)  =
 _SEMANTIC_MEMORY_CAP = _budget(0.077)  # semantic memory (vector)             = 7.7%
 _EPISODIC_MEMORY_CAP = _budget(0.077)  # episodic memory (vector)             = 7.7%
 _SKILLS_CAP = _budget(0.15)  # skills top-K block (lazy-loaded)     = 15%
-_STEERING_CAP = _budget(0.10)  # steering resource files              = 10%
+# Bound on the ``[FOLDER STEERING ...]`` section (its only reader). Window-
+# INDEPENDENT and NOT a share of ``_CONTEXT_BUDGET_BASE``, for the same reason as
+# the rule allowance above: every document it carries is an every-session
+# standing rule, and on a harness that does not load ``.kiro/steering`` itself
+# this section is the only path the global and project trees have to the model.
+# A 10% share of the pinned base (3,300) held about one small file. Derived like
+# the two startup allowances above: the steering share (10%) of the 165_000
+# reference base a 1M-window session had before the base was pinned.
+_STEERING_CAP = 16_500
 _PER_MESSAGE_CAP = 8_000  # truncate individual messages on fallback path
 # Historical char cap for the episodic-memory block injected on new sessions
 # (build_message). Bounds the top-8 episodic fragments; scaled down with the
@@ -272,15 +280,17 @@ def window_for_provider_client(client: object) -> int | None:
 
     Prefers a real usage-reported window via the provider's public
     :meth:`LLMProvider.context_window_tokens` accessor (0 until the backend has
-    run a turn); otherwise derives it from the resolved model id on the inner
-    ACP client (``client.client._model``) via :func:`resolve_model_window`.
-    Returns ``None`` (⇒ 1M reference) for a client that exposes neither — a
-    fail-safe that never shrinks the budget on missing data. Never raises: a
-    mis-shaped/None client yields ``None``.
+    run a turn). Otherwise it derives the window from the resolved model id on
+    the inner ACP client (``client.client._model``), or from the provider's
+    public :attr:`LLMProvider.served_model` property when there is no inner
+    client. Returns ``None`` (⇒ 1M reference) when none of those sources has a
+    usable model or window. Never raises: a mis-shaped/None client yields
+    ``None``.
 
-    Note: at a fresh (``is_new``) session — the only path that reads the budget —
-    no turn has completed, so the live window is 0 and the model-id path is what
-    actually resolves the window. The live-window branch covers later rebuilds.
+    At a fresh (``is_new``) session — the only path that reads the budget — no
+    turn has completed, so the live window is 0 and a model-id fallback resolves
+    the window. Providers with an inner ACP client use its configured model;
+    session providers expose the backend-resolved id through ``served_model``.
     """
     # Prefer the provider ABC's public accessor (per-backend dispatch, safe 0
     # default) over reaching into private attrs — a new backend that reports its
@@ -296,7 +306,13 @@ def window_for_provider_client(client: object) -> int | None:
             return live
     inner = getattr(client, "client", None)
     if inner is None:
-        return None
+        try:
+            model = getattr(client, "served_model", "")
+        except Exception:
+            return None
+        if not isinstance(model, str) or not model:
+            return None
+        return resolve_model_window(model)
     model = getattr(inner, "_model", "") or ""
     return resolve_model_window(model)
 
@@ -315,17 +331,26 @@ class ContextParts:
     so the blocks do not use up its pool either.
     """
 
-    __slots__ = ("authored", "parts", "protected")
+    __slots__ = ("authored", "held_chars", "parts", "protected")
 
     def __init__(self) -> None:
         self.parts: list[str] = []
         self.protected: set[int] = set()
         self.authored: set[int] = set()
+        self.held_chars = 0
 
     def append_required(self, text: str) -> None:
         # User rules, preferences and steering are not disposable background.
         self.protected.add(len(self.parts))
         self.parts.append(text)
+
+    def charge_held(self, text: str) -> None:
+        """Charge a protected block the session head carries instead of this message.
+
+        The model still reads it, so it keeps its protected charge and memory
+        admission is the same as when the block was in the message.
+        """
+        self.held_chars += len(text)
 
     def append_authored(self, text: str) -> None:
         """Append a protected block sized by its own startup allowance, not the pool."""

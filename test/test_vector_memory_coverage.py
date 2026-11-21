@@ -1,24 +1,16 @@
 """Coverage-focused tests for the less-travelled paths of ``vector_memory``.
 
-The store's happy paths are already covered by ``test_vector_memory.py`` and the
-topic files its docstring names. This module targets the branches that only fire
-on legacy/degraded input: the legacy markdown migration, the export/import round
-trip, episodic promotion, the keyword fallback, the embedding backfill sweeps,
-and the many "value on disk is not what the writer promised" recovery paths.
-
-Everything runs against a fresh SQLite file under ``tmp_path`` with a
-deterministic in-process embedder — no network, no model download, no FAISS
-requirement.
-
-The module's "Additional coverage" section -- further vector-space lifecycle,
-lesson-dedup and ranking cases -- is in ``test_vector_memory_coverage_vector_space.py``;
-the store and embedder builders both modules use are in
+Branches that fire on legacy or degraded input: markdown migration, export/import,
+promotion, keyword fallback, backfill sweeps and on-disk recovery. A fresh SQLite file
+and a deterministic embedder; no network or FAISS. More cases are in
+``test_vector_memory_coverage_vector_space.py``; builders in
 ``vector_memory_coverage_helpers.py``.
 """
 
 from __future__ import annotations
 
 import base64
+import gc
 import json
 import struct
 import time
@@ -232,7 +224,11 @@ class TestRetireStaleEpisodicTextFallback:
 
 
 class TestSqliteVectorSearchEdges:
-    def test_rows_with_a_different_width_are_skipped(self, tmp_path: Path) -> None:
+    def test_rows_with_a_different_width_are_skipped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # One fake vector for every text trips FAISS's near-duplicate check.
+        monkeypatch.setattr(vm, "_HAS_FAISS", False)
         store = _store(tmp_path)
         store.embed_fn = _fixed_embed()
         assert store.write_episodic("A memory embedded at the store's native width")
@@ -244,7 +240,11 @@ class TestSqliteVectorSearchEdges:
         store.db.commit()
         assert store.search_episodic(query_embedding=[0.5] * _DIM, limit=5) == []
 
-    def test_tag_filter_excludes_non_matching_rows(self, tmp_path: Path) -> None:
+    def test_tag_filter_excludes_non_matching_rows(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # One fake vector for every text trips FAISS's near-duplicate check.
+        monkeypatch.setattr(vm, "_HAS_FAISS", False)
         store = _store(tmp_path)
         store.embed_fn = _fixed_embed()
         assert store.write_episodic("A note that belongs to the ops rotation", tags=["ops"])
@@ -276,7 +276,11 @@ class TestEpisodicContext:
         assert "release train ships every Thursday" in context
         assert context.startswith("[Episodic Memory")
 
-    def test_cap_truncates_the_result_list(self, tmp_path: Path) -> None:
+    def test_cap_truncates_the_result_list(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # One fake vector for every text trips FAISS's near-duplicate check.
+        monkeypatch.setattr(vm, "_HAS_FAISS", False)
         store = _store(tmp_path)
         store.embed_fn = _fixed_embed()
         for i in range(3):
@@ -531,13 +535,14 @@ class TestLessonDedup:
         assert store.write_lesson("Rotate the signing key whenever a maintainer departs")
         assert len(store.get_lessons()) == 2
 
-    def test_a_space_change_mid_scan_drops_the_lazy_backfills(self, tmp_path: Path) -> None:
-        """Lazy backfills embedded before a model swap must not be committed.
+    def test_a_space_change_during_a_write_leaves_stored_lessons_unembedded(
+        self, tmp_path: Path
+    ) -> None:
+        """A model swap landing during a write must not leave a vector behind.
 
-        The dedup scan embeds legacy lessons inline, so a swap can land between
-        two entries. The blob from before the swap belongs to the old vector
-        space and has to be left NULL for the post-activation sweep instead of
-        being written behind reconcile's back.
+        The write embeds only its own rule. Stored legacy lessons stay NULL for the
+        post-activation sweep, and the submitted rule's vector, embedded before the
+        swap, is dropped rather than committed into the old space.
         """
         store = _store(tmp_path)
         assert store.write_lesson("Prefer allowlists over denylists for network egress")
@@ -547,22 +552,18 @@ class TestLessonDedup:
 
         calls: list[str] = []
 
-        def _swap_on_the_last_backfill(text: str) -> list[float] | None:
+        def _swap_after_the_embed(text: str) -> list[float] | None:
             calls.append(text)
-            # 1 = the new rule, 2 = first lazy backfill, 3 = second lazy backfill.
-            if len(calls) == 3:
-                store.begin_space_change()
-            # Distinct one-hot vectors so nothing trips the >0.85 semantic dedup.
+            store.begin_space_change()
             vec = [0.0] * _DIM
-            vec[len(calls) % _DIM] = 1.0
+            vec[0] = 1.0
             return vec
 
-        store.embed_fn = _swap_on_the_last_backfill
+        store.embed_fn = _swap_after_the_embed
         assert store.write_lesson("Verify the changelog headings render on mobile widths")
 
-        assert len(calls) == 3
-        # Neither legacy lesson kept a vector from the superseded space.
-        assert all(_raw_semantic_embedding(store, k) is None for k in keys)
+        assert calls == ["Verify the changelog headings render on mobile widths"]
+        assert all(_raw_semantic_embedding(store, e["key"]) is None for e in store.get_lessons())
 
 
 class TestFaissAbsent:
@@ -624,13 +625,9 @@ class TestCosineSimDimensionGuard:
 
 class TestStoredSimilarityScorer:
     """The scorer built by `_stored_similarity_scorer`
-    backs the two threshold callers (semantic dedup, contradiction detection)
-    as well as the two ranking callers, so it must (1) reject a mismatched
-    dimension the same way `_cosine_sim` now does, (2) return the raw
-    (possibly negative) cosine value rather than clamping at 0.0 -- a
-    threshold caller comparing against a band that may include non-positive
-    bounds needs the true value, and (3) agree with `_cosine_sim` to float64
-    precision, not the ~1e-7 the numpy path's old float32 accumulation gave.
+    backs threshold and ranking callers, so it must reject a mismatched dimension like
+    `_cosine_sim`, return the raw (possibly negative) cosine for threshold bands, and
+    agree with `_cosine_sim` to float64 precision.
     """
 
     def _row(self, vec: list) -> dict:
@@ -679,7 +676,11 @@ class TestEpisodicPromotion:
         assert store.promote_episodic_patterns() == 0
 
     @pytest.mark.skipif(not vm._HAS_NUMPY, reason="clustering needs numpy")
-    def test_a_repeated_pattern_becomes_a_semantic_fact(self, tmp_path: Path) -> None:
+    def test_a_repeated_pattern_becomes_a_semantic_fact(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # One fake vector for every text trips FAISS's near-duplicate check.
+        monkeypatch.setattr(vm, "_HAS_FAISS", False)
         store = _store(tmp_path)
         store.embed_fn = _fixed_embed()
         for i in range(5):
@@ -695,7 +696,11 @@ class TestEpisodicPromotion:
         assert _episodic_texts(store) == []
 
     @pytest.mark.skipif(not vm._HAS_NUMPY, reason="clustering needs numpy")
-    def test_a_cluster_with_no_inferrable_key_is_left_alone(self, tmp_path: Path) -> None:
+    def test_a_cluster_with_no_inferrable_key_is_left_alone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # One fake vector for every text trips FAISS's near-duplicate check.
+        monkeypatch.setattr(vm, "_HAS_FAISS", False)
         store = _store(tmp_path)
         store.embed_fn = _fixed_embed()
         for i in range(5):
@@ -707,7 +712,11 @@ class TestEpisodicPromotion:
         assert len(_episodic_texts(store)) == 5
 
     @pytest.mark.skipif(not vm._HAS_NUMPY, reason="clustering needs numpy")
-    def test_a_cluster_below_the_threshold_is_left_alone(self, tmp_path: Path) -> None:
+    def test_a_cluster_below_the_threshold_is_left_alone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # One fake vector for every text trips FAISS's near-duplicate check.
+        monkeypatch.setattr(vm, "_HAS_FAISS", False)
         store = _store(tmp_path)
         store.embed_fn = _fixed_embed()
         for i in range(2):
@@ -969,6 +978,53 @@ class TestMigrateFromMarkdown:
         counts = store.migrate_from_markdown()
         assert counts["semantic"] == 2
         assert counts["skipped"] == 2
+        assert len(store.get_lessons()) == 2
+
+    def test_a_too_deeply_nested_lessons_line_is_skipped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A line nested past the recursion limit costs only itself, not the migration."""
+        home = self._home(tmp_path, monkeypatch)
+        (home / "lessons.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps({"rule": "Always pin the release tag before publishing"}),
+                    "[" * 15000,
+                    json.dumps({"rule": "Never bind a debug server to a public address"}),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        store = _store(tmp_path)
+        # Keep a cyclic-GC pass (and any finalizer it runs) out of the deep parse.
+        gc.collect()
+        was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            counts = store.migrate_from_markdown()
+        finally:
+            if was_enabled:
+                gc.enable()
+            gc.collect()
+        assert counts["semantic"] == 2
+        assert counts["skipped"] == 1
+        assert len(store.get_lessons()) == 2
+
+    def test_a_lessons_line_that_is_not_utf8_is_skipped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One undecodable byte costs only its own line, not the migration."""
+        home = self._home(tmp_path, monkeypatch)
+        (home / "lessons.jsonl").write_bytes(
+            (json.dumps({"rule": "Always pin the release tag before publishing"}) + "\n").encode()
+            + b'{"rule": "bad \xff byte"}\n'
+            + (json.dumps({"rule": "Never bind a debug server to a public address"}) + "\n").encode()
+        )
+        store = _store(tmp_path)
+        counts = store.migrate_from_markdown()
+        assert counts["semantic"] == 2
+        assert counts["skipped"] == 1
         assert len(store.get_lessons()) == 2
 
     def test_preferences_md(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

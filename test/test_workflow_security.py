@@ -19,6 +19,8 @@ from typing import AsyncIterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from named_cases_helpers import named_cases
+from redaction_structured_cases import github_classic
 
 from kiro_crew.llm_helpers import (
     ToolApprovalPolicy,
@@ -43,6 +45,9 @@ class FakeEvent:
     # Mirrors LLMEvent's diff-content-block path (default ""): the edit gate
     # reads it on every permission frame, not only behind an edit tool_kind.
     diff_path: str = ""
+    # Mirrors LLMEvent's Side Chat refusal (default ""): _resolve_permission
+    # reads it on every permission frame, under any policy.
+    side_read_only_refusal: str = ""
 
 
 class FakeProvider:
@@ -74,11 +79,15 @@ class FakeProvider:
 
 
 class TestExtractToolInputStrings:
-    def test_empty_string(self):
-        assert _extract_tool_input_strings("") == []
-
-    def test_none_coerced(self):
-        # In practice tool_input is "" not None, but defend anyway
+    @pytest.mark.parametrize(
+        (),
+        [
+            *named_cases("test_empty_string"),
+            # In practice tool_input is "" not None, but defend anyway
+            *named_cases("test_none_coerced"),
+        ],
+    )
+    def test_an_empty_string_yields_no_strings(self):
         assert _extract_tool_input_strings("") == []
 
     def test_plain_string_not_json(self):
@@ -495,10 +504,11 @@ class TestAgentExecRedaction:
         """Credential-like patterns in agent output are redacted."""
         from kiro_crew.workflows.agent_exec import build_agent_fn
 
+        secret = github_classic()
         fake_sessions = MagicMock()
         fake_provider = FakeProvider(
             [
-                FakeEvent(kind="text_chunk", title="", text="key=AKIAIOSFODNN7EXAMPLE"),
+                FakeEvent(kind="text_chunk", title="", text=f"key={secret}"),
                 FakeEvent(kind="complete", title=""),
             ]
         )
@@ -507,8 +517,8 @@ class TestAgentExecRedaction:
 
         agent_fn = build_agent_fn(fake_sessions, run_id="test-run")
         result = await agent_fn("show me creds", {})
-        # The AWS key should be redacted
-        assert "AKIAIOSFODNN7EXAMPLE" not in result
+        # The credential should be redacted
+        assert secret not in result
 
     @pytest.mark.asyncio
     async def test_safe_output_unchanged(self):

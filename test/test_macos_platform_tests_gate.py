@@ -147,21 +147,21 @@ class TestThePullRequestPathInstantiatesNoMacRunner:
 class TestTheMovedLaneIsTheSameLane:
     """A move that quietly drops shards or canaries is a deletion with a receipt."""
 
-    def test_the_full_suite_still_runs_in_six_shards(self) -> None:
+    def test_the_full_suite_still_runs_in_eight_shards(self) -> None:
         job = _load("platform-tests.yml")["jobs"]["backend-test-macos"]
         assert job["runs-on"] == "macos-15", "macos-latest moves under us; pin the label"
-        assert job["strategy"]["matrix"]["group"] == [1, 2, 3, 4, 5, 6]
-        assert job["env"]["SHARD_COUNT"] == 6
-        # 6 shards on a max-parallel of 4: two waves, 4 then 2, and the cap is
-        # per JOB, so each shard drops to about 25 minutes while the lane's wall
+        assert job["strategy"]["matrix"]["group"] == [1, 2, 3, 4, 5, 6, 7, 8]
+        assert job["env"]["SHARD_COUNT"] == 8
+        # 8 shards on a max-parallel of 4: two waves, 4 then 4, and the cap is
+        # per JOB, so each shard drops to about 21-26 minutes while the lane's wall
         # time stays about the same (test_workflow_matrix_max_parallel.py pins
         # the 4).
         assert job["strategy"]["max-parallel"] == 4
-        # 40 is a spend guard as much as a hang guard -- a runaway macOS shard costs
+        # 60 is a spend guard as much as a hang guard -- a runaway macOS shard costs
         # about ten times a Linux one -- so suite growth is absorbed by the shard
-        # COUNT and this number stays put. The cap only means something while the
-        # slowest shard sits inside it with room to spare.
-        assert job["timeout-minutes"] == 40
+        # COUNT, and the cap leaves room for a slow macOS runner. The cap only
+        # means something while the slowest shard sits inside it with room to spare.
+        assert job["timeout-minutes"] == 60
         runs = "\n".join(str(step.get("run", "")) for step in job["steps"])
         # The file-sharding plugin, the same one backend-test and
         # backend-test-windows use: only the owning shard IMPORTS a file, where
@@ -251,7 +251,7 @@ class TestTheMovedLaneIsTheSameLane:
         assert run.index("set -o pipefail") < run.index("pytest "), run
 
     def test_the_shard_log_is_uploaded_even_when_the_shard_is_cancelled(self) -> None:
-        # A shard killed at the 40-minute cap is `cancelled`, and its ids are the
+        # A shard killed at the 60-minute cap is `cancelled`, and its ids are the
         # ones a human most needs. `if: failure()` would drop exactly that case.
         steps = _load("platform-tests.yml")["jobs"]["backend-test-macos"]["steps"]
         upload = next(

@@ -42,11 +42,13 @@
 
 import { parseCssColor, relativeLuminance } from './iconContrast'
 import { TAILWIND_RUNTIME_PATH as TAILWIND_RUNTIME_PATH_ROOT } from './vendorPaths'
-import { withBase } from './basePath'
+import { BASE_PATH, withBase } from './basePath'
 /** The runtime's served path under this build's base (the bare path in the stock build). */
 const TAILWIND_RUNTIME_PATH = withBase(TAILWIND_RUNTIME_PATH_ROOT)
 import { sanitizeCssValue } from './cssSanitize'
 import { SWIPE_GESTURE_IDLE_MS } from './trackpadGesture'
+import { HEIGHT_REPORTER_BODY } from './widgetHeightReporter'
+import { FRAGMENT_SCROLL_BODY } from './widgetFragmentScroll'
 
 /** The sandbox grants for every frame that holds an agent-written page: saved
  * artifacts (`ArtifactBody`), library thumbnails (`ArtifactThumbs`), a teammate's
@@ -132,32 +134,6 @@ function withScriptNonce(policy: string, nonce: string): string {
   return policy.replace(inline, `script-src 'nonce-${nonce}' `)
 }
 
-/** Sub-threshold height jitter (px) the in-iframe reporter ignores. Animated
- * widgets (canvas, CSS transitions) reflow the body by a pixel or two every
- * frame; reporting those would flood the parent with postMessages. */
-const HEIGHT_REPORT_EPSILON_PX = 2
-/** A smaller height must hold this long (ms) before the iframe reports a
- * shrink. A reload / Tailwind JIT reflow / animation frame briefly reports a
- * smaller height before the content settles; an animated widget that bounces
- * between a low and high value keeps cancelling this timer, so the shrink
- * never fires and the reporter goes quiet on the high value. */
-const HEIGHT_REPORT_SHRINK_MS = 200
-/** How long the document may stay taller than the frame's viewport, with the
- * viewport height unchanged, before the reporter gives the frame back its own
- * vertical scroll. A self-sizing host grows the frame to a reported height
- * within a frame or two, and every viewport resize restarts this window, so
- * only a frame held at a fixed height (expanded view, popout, thumbnail)
- * outlasts it. */
-const HEIGHT_REPORT_FIT_GRACE_MS = 300
-/** How far (px) the rounded-up content height may exceed the frame's viewport
- * and still count as fitting. A frame's CSS height is a whole pixel, but its
- * viewport can come out up to a pixel shorter once the engine snaps it to
- * device pixels at a fractional display scale, and clientHeight rounds that
- * value either way. Without this slack a self-sizing frame sized to its exact
- * report reads as too short, gets its scrollbar back, and the loop the
- * overflow handling exists to break resumes. */
-const HEIGHT_REPORT_FIT_SLACK_PX = 1
-
 /** How long the loading indicator waits before uncovering the widget anyway.
  * This is a HANG backstop, not a compile budget: the indicator normally clears
  * the moment the Tailwind runtime injects its compiled <style>. Keeping it long
@@ -180,219 +156,25 @@ const TW_ERROR_EVENT = 'mc-tw-error'
 const TW_ERROR_INLINE_HANDLER =
   `window.__mcTwError=1;window.dispatchEvent(new Event('${TW_ERROR_EVENT}'))`
 
-/** Body of the height-reporter script. Defined as a string literal — the only
- * interpolation is the numeric tuning constants above (never LLM/user
- * content; the LLM `html` never reaches here). Set as a script element via
- * textContent below; the iframe re-parses and executes it via the standard
- * <script> mechanism.
- *
- * The reporter is deliberately quiet: it coalesces ResizeObserver bursts into
- * one measurement per animation frame, ignores sub-pixel jitter, applies
- * growth eagerly, and defers/cancels shrinks. The net effect is that a
- * continuously animating widget (lava lamp, starry night) reports its height
- * once and then stops posting, instead of feeding a per-frame resize loop back
- * to the parent. The one deliberate exception is the window `load` re-report
- * below: quietness must never extend across a load event the parent can
- * observe, because parent surfaces treat post-load silence as the frame no
- * longer showing this document.
- *
- * It also hides the frame's own vertical scrollbar while the frame holds the
- * whole document. A classic (space-taking) scrollbar is the one thing that
- * feeds the frame's size back into the content's height: a frame that is a
- * fraction of a pixel short of its content shows a scrollbar, the narrower
- * viewport re-wraps the text taller, the frame grows, the scrollbar goes, the
- * text re-wraps shorter, the frame shrinks, and the cycle repeats every half
- * second. With the vertical overflow hidden while everything fits, the width
- * the content lays out at does not depend on the frame's height, so the
- * height settles. Once the document stays taller than a viewport that is not
- * resizing (see HEIGHT_REPORT_FIT_GRACE_MS) the scroll comes back, so a
- * fixed-height frame keeps scrolling its content. */
-const HEIGHT_REPORTER_BODY = `(function(){
-  var EPS = ${HEIGHT_REPORT_EPSILON_PX};
-  var SHRINK_MS = ${HEIGHT_REPORT_SHRINK_MS};
-  var FIT_GRACE_MS = ${HEIGHT_REPORT_FIT_GRACE_MS};
-  var FIT_SLACK = ${HEIGHT_REPORT_FIT_SLACK_PX};
-  var lastSent = -1;      // last height actually posted to the parent
-  var shrinkTimer = null;
-  var rafId = 0;
-  var raf = window.requestAnimationFrame || function(cb){ return setTimeout(cb, 16); };
-  var unraf = window.cancelAnimationFrame || clearTimeout;
-  var root = document.documentElement;
-  // The document's own inline overflow-y, restored whenever the frame scrolls.
-  var authoredOverflowY = root.style.overflowY;
-  var clipped = false;
-  // Set when the grace window hands the scroll back; holds until the viewport
-  // changes height.
-  var released = false;
-  var fitTimer = null;
-  var viewH = root.clientHeight;
-  function send(h){
-    lastSent = h;
-    parent.postMessage({type:'mc-widget-height', height:h}, '*');
-  }
-  function measure(){
-    // The bottom of body's margin box, from the top of the document, rounded
-    // UP to a whole pixel. A frame sized to a rounded-down height is short of
-    // its content by a fraction of a pixel, which is enough to overflow.
-    //
-    // Measured on body, NOT documentElement: documentElement.scrollHeight is at
-    // least the iframe's own viewport height, so once the iframe grows it can
-    // never report smaller, ratcheting the frame taller and taller (capped at
-    // MAX_HEIGHT) and never shrinking back to the actual content. body is
-    // content-sized (no height), so its box tracks the real content and can
-    // shrink. The larger of its box and its scrollHeight covers content that
-    // overflows the box (absolutely positioned children, a fixed body height);
-    // its top offset covers its own margin, a child margin collapsed through
-    // its top edge, and any padding on html.
-    var b = document.body;
-    var r = b.getBoundingClientRect();
-    var top = r.top + (window.scrollY || 0);
-    var marginBottom = parseFloat(window.getComputedStyle(b).marginBottom) || 0;
-    return Math.ceil(top + Math.max(r.height, b.scrollHeight) + marginBottom);
-  }
-  function setClipped(on){
-    if (on === clipped) return;
-    clipped = on;
-    root.style.overflowY = on ? 'hidden' : authoredOverflowY;
-  }
-  function fits(h){
-    // clientHeight on the root element is the viewport height less any
-    // scrollbar, so a horizontal scrollbar never counts as room.
-    return h <= root.clientHeight + FIT_SLACK;
-  }
-  function fit(h){
-    if (fits(h)){
-      if (fitTimer){ clearTimeout(fitTimer); fitTimer = null; }
-      // Once the scroll is back, a fit while the scrollbar shows is not a fit
-      // at full width: content that keeps its aspect ratio gets shorter when
-      // the scrollbar narrows it, and clipping again would widen it past the
-      // viewport and toggle the scrollbar forever. Only a viewport resize
-      // (see the resize handler) clears the latch.
-      if (!released) setClipped(true);
-      return;
-    }
-    if (!clipped || fitTimer) return;
-    // Taller than the frame. A self-sizing host is about to grow it; give the
-    // scroll back only if the viewport has not resized by the time this fires.
-    fitTimer = setTimeout(function(){
-      fitTimer = null;
-      if (!fits(measure())){ released = true; setClipped(false); }
-    }, FIT_GRACE_MS);
-  }
-  function evaluate(){
-    rafId = 0;
-    var h = measure();
-    fit(h);
-    if (lastSent < 0){ send(h); return; }            // first measurement
-    if (Math.abs(h - lastSent) <= EPS){              // within deadband — ignore jitter
-      if (shrinkTimer){ clearTimeout(shrinkTimer); shrinkTimer = null; }
-      return;
-    }
-    if (h > lastSent){
-      // Growth applies eagerly so genuine expansion (streaming text, opening a
-      // section) isn't laggy. Cancel any pending shrink: an animated widget
-      // that oscillates low<->high bounces back here every frame, so the shrink
-      // below never commits and we stop posting once locked to the high value.
-      if (shrinkTimer){ clearTimeout(shrinkTimer); shrinkTimer = null; }
-      send(h);
-    } else {
-      // Shrink: defer until the smaller height has held for SHRINK_MS. Reset on
-      // every tick so a continuously oscillating widget never fires it.
-      if (shrinkTimer) clearTimeout(shrinkTimer);
-      shrinkTimer = setTimeout(function(){
-        shrinkTimer = null;
-        var cur = measure();
-        if (cur < lastSent && Math.abs(cur - lastSent) > EPS) send(cur);
-      }, SHRINK_MS);
-    }
-  }
-  function schedule(){
-    // Coalesce a burst of ResizeObserver callbacks (an animation can fire many
-    // per frame) into a single measurement per frame.
-    //
-    // Cancel-and-reschedule rather than an early return on a pending handle:
-    // requestAnimationFrame may return a handle whose callback never runs (a
-    // frame queued for a page the browser then puts in the back/forward cache is
-    // dropped), and latching on such a handle would stop this widget's height
-    // tracking permanently. Same defect and same fix as CliPanel's theme
-    // scheduler. NOTE this block lives inside a template literal, so it must
-    // carry neither a backtick nor a dollar-brace interpolation opener -- both
-    // terminate the literal, and the resulting parse error points here rather
-    // than at the string, which is why this warning is worth the two lines.
-    if (rafId) unraf(rafId);
-    rafId = raf(evaluate);
-  }
-  new ResizeObserver(schedule).observe(document.body);
-  window.addEventListener('resize', function(){
-    // A frame that changes height is being sized by its host: restart the
-    // grace window so a frame catching up with a growth never gets its
-    // scrollbar back. A height-only resize leaves body's box unchanged, so the
-    // ResizeObserver above does not see it; re-measure here to re-check fit.
-    var h = root.clientHeight;
-    if (h !== viewH){
-      viewH = h;
-      released = false;
-      if (fitTimer){ clearTimeout(fitTimer); fitTimer = null; }
-    }
-    schedule();
-  });
-  window.addEventListener('load', function(){
-    // Re-report UNCONDITIONALLY after load, bypassing the deadband. The parent
-    // surface re-arms its silence window on EVERY iframe load event (an engine
-    // renavigation onto a spent single-use url fires load with no reporter
-    // behind it, and silence within the grace window is its only signal -- see
-    // DOC_REPORT_GRACE_MS in ArtifactBody). A first measurement that raced
-    // ahead of the load event -- layout settles before images and fonts finish
-    // -- would otherwise be the LAST post this document ever makes: the parent
-    // discards it at load, the deadband swallows this re-check because the
-    // height is unchanged, and three seconds later a healthy, rendering
-    // document is flagged as no longer showing. Resetting lastSent routes the
-    // scheduled measurement through the first-measurement path, so every load
-    // the parent can observe is followed by a report.
-    setTimeout(function(){ lastSent = -1; schedule(); }, 100);
-  });
-  // Start without a vertical scrollbar, so a frame still growing to its first
-  // report never flashes one; fit() hands the scroll back if it stays short.
-  setClipped(true);
-  schedule();
-  document.addEventListener('click', function(e){
- // NOTE: this isTrusted check runs INSIDE the sandboxed iframe
-    // and is NOT the security trust boundary. LLM-emitted <script> in this same
-    // document can call parent.postMessage({type:'mc-widget-action',...})
-    // directly and skip this handler entirely. The real protection is on the
-    // parent side: a widget action only PRE-FILLS the composer (it never
-    // auto-submits a user-role turn). Do not treat this guard as authoritative.
-    if (!e.isTrusted) return;
-    var el = e.target.closest('[data-action]');
-    if (!el) return;
-    e.preventDefault();
-    var action = el.dataset.action;
-    var payload = {};
-    try { payload = JSON.parse(el.dataset.payload || '{}'); } catch(x){}
-    var inputs = document.querySelectorAll('input,select,textarea');
-    var formData = {};
-    inputs.forEach(function(inp){
-      var n = inp.name || inp.id || inp.getAttribute('data-field');
-      if (!n) return;
-      if (inp.type === 'checkbox') formData[n] = inp.checked;
-      else if (inp.type === 'radio') { if (inp.checked) formData[n] = inp.value; }
-      else formData[n] = inp.value;
-    });
-    if (Object.keys(formData).length) payload.formData = formData;
-    parent.postMessage({type:'mc-widget-action', action:action, payload:payload}, '*');
-  });
-})();`
+/** The attribute that marks the frame's colour scheme on <body>: `data-mode="dark"`
+ * or `data-mode="light"`. An attribute and not a class, because the body shares the
+ * page's class namespace: a page that styles its own `.light` or `.dark` element (a
+ * status dot, a dark chip) would style the body too, in whichever theme matches the
+ * name, and lay the whole page out inside that rule. Mirrored by the gateway's
+ * `dashboard_frame.MODE_ATTRIBUTE`, so an offline run marks its body the same way. */
+export const FRAME_MODE_ATTRIBUTE = 'data-mode'
 
-/** Tailwind v4 browser build: dark mode is driven by a `.dark` class on <body>
- * (set below) via a custom variant — NOT the v3 `tailwind.config` global, which
- * v4 removed. The @tailwindcss/browser runtime auto-injects preflight + theme +
+/** Tailwind v4 browser build: dark mode is driven by the body's `data-mode`
+ * attribute (set below) via a custom variant — NOT the v3 `tailwind.config` global,
+ * which v4 removed. The @tailwindcss/browser runtime auto-injects preflight + theme +
  * utilities on load (verified via headless render: base reset AND utilities apply
  * without an explicit `@import "tailwindcss"`), so this block only registers the
  * dark variant. Injected as a `<style type="text/tailwindcss">` block the runtime
  * compiles on load; it must precede the runtime script so the variant registers
- * before first paint. */
+ * before first paint. Kept a plain literal: the gateway pins its own copy to this
+ * text (`dashboard_snapshot_look.TAILWIND_DIRECTIVES`). */
 const TAILWIND_V4_DIRECTIVES =
-  '@custom-variant dark (&:where(.dark, .dark *));'
+  '@custom-variant dark (&:where([data-mode=dark], [data-mode=dark] *));'
 
 /** Highlight + bubble CSS for anchored comments rendered inside the iframe. */
 const COMMENT_HIGHLIGHT_CSS =
@@ -640,27 +422,36 @@ const FRAME_TOUCH_RELAY_BODY = `(function(){
  * path, so one inside a shadow root (a web component) counts, not just its host.
  * Whether a scroller has room is the host's own rule (`room`, a copy of
  * lib/trackpadGesture `hasScrollRoomX`), right-to-left scrollers included. Every other run is posted, event by event, as
- * `{type: 'mc-frame-wheel', dx, dy, mode, t}`, where `t` is when the wheel
+ * `{type: 'mc-frame-wheel', dx, dy, mode, t, inv}`, where `t` is when the wheel
  * happened, as `performance.timeOrigin + timeStamp` (epoch ms): the host's
  * own receive time would squeeze a burst queued behind a stall into a few
- * ms, and read slow fingers as a flick. A leftward-scrolling event of such
- * a run (`deltaX < 0`, the fingers moving right) is also cancelled here: the
- * host can drive only its panel's close from this frame, which is that
- * direction, and a parent cannot cancel the browser's history swipe for a
- * wheel that landed in a frame.
+ * ms, and read slow fingers as a flick. `inv` is the wheel's own
+ * `webkitDirectionInvertedFromDevice` (WebKit only, else null), which the host
+ * needs to read the raw `dx` as the fingers. An event of such a run whose
+ * fingers move right is also cancelled here: the host can drive only its
+ * panel's close from this frame, which is that direction, and a parent cannot
+ * cancel the browser's history swipe for a wheel that landed in a frame. With
+ * Natural scrolling on that is `deltaX < 0`, with it off `deltaX > 0`
+ * (`sign`, a copy of lib/trackpadGesture `fingerSign`).
  *
  * Disarmed until the host says it is listening: the frame posts
  * `{type: 'mc-frame-wheel-hello'}` when it starts, and relays (and cancels)
- * only after the parent answers `{type: 'mc-frame-wheel-armed', on: true}`. The
+ * only after the parent answers `{type: 'mc-frame-wheel-armed', on: true}`,
+ * which also carries `natural`, the desktop shell's Natural scrolling (or
+ * null) for a wheel that does not say. The
  * host sends `on: false` when its swipe stops listening (a phone-width window,
  * a creation surface), so the frame then leaves every wheel to the browser
  * instead of cancelling a run nobody will act on. Only the parent may arm it. */
 const FRAME_WHEEL_RELAY_BODY = `(function(){
-  var armed=false;
+  var armed=false,natural=null;
   window.addEventListener('message',function(e){
     var d=e.data;
-    if(e.source===parent&&d&&d.type==='mc-frame-wheel-armed')armed=d.on===true;
+    if(e.source===parent&&d&&d.type==='mc-frame-wheel-armed'){armed=d.on===true;natural=typeof d.natural==='boolean'?d.natural:null;}
   });
+  function sign(inv){
+    var on=typeof inv==='boolean'?inv:natural;
+    return on===false?-1:1;
+  }
   parent.postMessage({type:'mc-frame-wheel-hello'},'*');
   function room(sl,m,rtl,dx){
     if(m<=1)return false;
@@ -691,9 +482,28 @@ const FRAME_WHEEL_RELAY_BODY = `(function(){
       else axis=Math.abs(dx)>Math.abs(dy)&&!scrolls(e,dx)?'x':'own';
     }
     if(axis!=='x'||e.ctrlKey)return;
-    parent.postMessage({type:'mc-frame-wheel',dx:dx,dy:dy,mode:e.deltaMode,t:performance.timeOrigin+e.timeStamp},'*');
-    if(dx<0&&Math.abs(dx)>Math.abs(dy))e.preventDefault();
+    var inv=typeof e.webkitDirectionInvertedFromDevice==='boolean'?e.webkitDirectionInvertedFromDevice:null;
+    parent.postMessage({type:'mc-frame-wheel',dx:dx,dy:dy,mode:e.deltaMode,t:performance.timeOrigin+e.timeStamp,inv:inv},'*');
+    if(sign(inv)*dx<0&&Math.abs(dx)>Math.abs(dy))e.preventDefault();
   },{passive:false,capture:true});
+})();`
+
+/** What the host posts into a frame built with `aliveReply`, and what the
+ *  frame posts back. See FRAME_ALIVE_REPLY_BODY. */
+export const FRAME_PING_MESSAGE_TYPE = 'mc-frame-ping'
+export const FRAME_ALIVE_MESSAGE_TYPE = 'mc-frame-alive'
+
+/** Answers the host's ping, so the host can tell this document from whatever
+ * else the frame holds after the browser reloads it on its own. A sandbox-doc
+ * URL is single-use, so such a reload gets the gateway's 404, which has no
+ * script and cannot answer (see `useFrameAliveRecovery`). Replies only to the
+ * parent, and carries nothing but its type. */
+const FRAME_ALIVE_REPLY_BODY = `(function(){
+  window.addEventListener('message',function(e){
+    var d=e.data;
+    if(e.source!==parent||!d||d.type!=='${FRAME_PING_MESSAGE_TYPE}')return;
+    try{parent.postMessage({type:'${FRAME_ALIVE_MESSAGE_TYPE}'},'*');}catch(_){}
+  });
 })();`
 
 /** A static page's links do nothing when clicked. Installed (with the nonce) ahead
@@ -929,7 +739,8 @@ const LINK_BRIDGE_SHIM_BODY = `(function(){
  * writes, holding the widget in an `AGENT_PAGE_SANDBOX` frame, so React and
  * `useFrameLinkBridge` are not there to answer the frame's open message. This
  * script is: the same checks (the message comes from the frame, the URL is an
- * absolute `http(s)` URL with no user name or password, the person just clicked
+ * `http(s)` URL with no user name or password, a dashboard path resolving
+ * against the dashboard as `webUrlOf` resolves it, the person just clicked
  * with the frame focused), then a `noopener,noreferrer` open, once per click,
  * when the click is tied to the frame: focus came into it from the tab, and no
  * click or key in the tab itself (a Tab into the frame) is still live. Otherwise
@@ -985,21 +796,26 @@ const POPOUT_LINK_BRIDGE_BODY = `(function(){
     var d = e.data;
     if (!d || typeof d !== 'object' || d.type !== T || typeof d.url !== 'string') return;
     if (!d.url) return;
+    // A dashboard path (/schedule) resolves against the dashboard, as in chat, and
+    // a dashboard URL takes its base, as the dashboard's window.open adds it (rebaseUrl).
     var u;
-    try { u = new URL(d.url); } catch (_) { return; }
+    try { u = new URL(d.url, ORIGIN); } catch (_) { return; }
     if (u.protocol !== 'http:' && u.protocol !== 'https:') return;
     if (u.username || u.password) return;
+    if (BASE && u.origin === ORIGIN && u.pathname !== BASE && u.pathname.indexOf(BASE + '/') !== 0) u.pathname = BASE + u.pathname;
     if (!clicked()) return;
     if (entered && Date.now() - last >= LIFE) go(f, u.href);
     else offer(u.href, u.host);
   });
 })();`
 
-/** The popped-out widget tab's link bridge: fixed first-party text and the
- * button's localized *label*, in which `%HOST%` stands for the link's host. No
- * widget content. */
-export function popoutLinkBridgeScript(label: string): string {
-  return `var LABEL = ${JSON.stringify(label).replace(/</g, '\\u003c')};\n${POPOUT_LINK_BRIDGE_BODY}`
+/** The popped-out widget tab's link bridge: fixed first-party text, the
+ * button's localized *label*, in which `%HOST%` stands for the link's host, and
+ * the *origin* and *base* of the dashboard that builds the tab. No widget
+ * content. */
+export function popoutLinkBridgeScript(label: string, origin: string = window.location.origin, base: string = BASE_PATH): string {
+  const literal = (s: string) => JSON.stringify(s).replace(/</g, '\\u003c')
+  return `var LABEL = ${literal(label)}, ORIGIN = ${literal(origin)}, BASE = ${literal(base)};\n${POPOUT_LINK_BRIDGE_BODY}`
 }
 
 /** In-iframe comment bridge. Vanilla JS string — no LLM/user
@@ -1533,6 +1349,27 @@ interface BuildSrcdocOptions {
    * FRAME_WHEEL_RELAY_BODY), for a host whose desktop trackpad swipe must be
    * able to run over the frame. Off by default. */
   relayWheel?: boolean
+  /** Answer the host's ping (see FRAME_ALIVE_REPLY_BODY), for a host that
+   * re-mints a frame whose document stopped answering. Off by default. */
+  aliveReply?: boolean
+  /** The Tailwind runtime's own text, written inline instead of the same-origin
+   *  `<script src>`, for a document opened away from the dashboard (a saved file).
+   *  Unset by default, so no rendered surface changes. */
+  inlineRuntime?: string
+}
+
+/** *js* with every casing of `</script` written `<\/script`, so it cannot end the
+ *  inline element it is serialized into. A plain scan, not a pattern. */
+export function escapeScriptClose(js: string): string {
+  const close = '</script'
+  const lower = js.toLowerCase()
+  let out = ''
+  let from = 0
+  for (let at = lower.indexOf(close); at !== -1; at = lower.indexOf(close, at + close.length)) {
+    out += js.slice(from, at) + '<\\/' + js.slice(at + 2, at + close.length)
+    from = at + close.length
+  }
+  return out + js.slice(from)
 }
 
 /** Build the srcdoc HTML for a sandboxed widget iframe. The LLM `html`
@@ -1553,10 +1390,12 @@ export function buildSrcdoc({
   pageScripts = true,
   relayTouches = false,
   relayWheel = false,
+  aliveReply = false,
+  inlineRuntime,
 }: BuildSrcdocOptions): string {
   // A widget hardcoded for a light canvas renders on a light canvas even when
   // the dashboard is dark -- see resolveWidgetTheme. Resolved once here so the
-  // DOM and SSR paths, the :root vars, color-scheme and the body class agree.
+  // DOM and SSR paths, the :root vars, color-scheme and the body's mode attribute agree.
   const { themeVars, mode } = resolveWidgetTheme(html, requestedThemeVars, requestedMode)
 
   // SSR / unit-test fallback: when there's no DOM (Node.js, vitest before
@@ -1638,10 +1477,19 @@ export function buildSrcdoc({
   // environments that lack a running dev server. Using a non-fetching placeholder
   // avoids the network dial entirely — the iframe's browser loads the script from
   // the serialized HTML string, never from a live DOM node in our process.
-  const tailwindPlaceholder = doc.createElement('meta')
-  tailwindPlaceholder.setAttribute('name', 'x-script-placeholder')
-  tailwindPlaceholder.setAttribute('data-src', scriptOrigin + TAILWIND_RUNTIME_PATH)
-  head.appendChild(tailwindPlaceholder)
+  if (inlineRuntime !== undefined) {
+    // A document that will be opened away from the dashboard (a saved file) cannot
+    // load the runtime by URL, so the caller hands in its text and it is written
+    // here, in the same place and under the same nonce as the script it replaces.
+    const runtime = hostScript()
+    runtime.textContent = escapeScriptClose(inlineRuntime)
+    head.appendChild(runtime)
+  } else {
+    const tailwindPlaceholder = doc.createElement('meta')
+    tailwindPlaceholder.setAttribute('name', 'x-script-placeholder')
+    tailwindPlaceholder.setAttribute('data-src', scriptOrigin + TAILWIND_RUNTIME_PATH)
+    head.appendChild(tailwindPlaceholder)
+  }
 
   // Loading overlay: shown while Tailwind JIT compiles, hidden once ready or
   // after a timeout. Only injected when showLoadingOverlay is set.
@@ -1671,8 +1519,9 @@ export function buildSrcdoc({
     head.appendChild(overlayStyle)
   }
 
-  // <body class="dark|light">
-  body.className = mode
+  // <body data-mode="dark|light">, the attribute the dark variant above reads. The
+  // body gets no class: see FRAME_MODE_ATTRIBUTE.
+  body.setAttribute(FRAME_MODE_ATTRIBUTE, mode)
 
   // Clipboard write-fallback shim. Installed BEFORE the LLM html below so an
   // on-load attempt sees the wrapper too; without user activation its fallback
@@ -1718,6 +1567,11 @@ export function buildSrcdoc({
     const wheelRelay = hostScript()
     wheelRelay.textContent = FRAME_WHEEL_RELAY_BODY
     body.appendChild(wheelRelay)
+  }
+  if (aliveReply) {
+    const reply = hostScript()
+    reply.textContent = FRAME_ALIVE_REPLY_BODY
+    body.appendChild(reply)
   }
 
   // Parse LLM html into a document fragment via the typed DOM API. The
@@ -1779,6 +1633,11 @@ export function buildSrcdoc({
     const reporter = hostScript()
     reporter.textContent = HEIGHT_REPORTER_BODY
     body.appendChild(reporter)
+    // A self-sized frame cannot scroll to its own fragment links; this asks the
+    // host to (lib/widgetFragmentScroll.ts).
+    const fragmentScroll = hostScript()
+    fragmentScroll.textContent = FRAGMENT_SCROLL_BODY
+    body.appendChild(fragmentScroll)
   }
 
   // Unsafe-centering guard: keeps the top of flex/grid-centered artifact
@@ -1867,7 +1726,7 @@ function buildSrcdocSSR({ html, themeVars, mode, includeHeightReporter }: BuildS
     // document unthemed — and painted white — until the script lands.
     `<style>${styleCss}</style>` +
     `<script src="${TAILWIND_RUNTIME_PATH}" crossorigin="anonymous" onerror="${TW_ERROR_INLINE_HANDLER}"><\/script>` +
-    `</head><body class="${mode}">` +
+    `</head><body ${FRAME_MODE_ATTRIBUTE}="${mode}">` +
     `<!-- SSR fallback: LLM body omitted -->` +
     // NO clipboard shim here. This SSR builder is unreachable in production
     // (buildSrcdoc only enters it when there is no DOM — i.e. pre-jsdom unit

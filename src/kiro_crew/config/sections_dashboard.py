@@ -27,6 +27,53 @@ EXTERNAL_TERMINAL_APPS: tuple[str, ...] = (
     "xfce4-terminal",
 )
 
+# The local editors the Markdown panel's "Open in <editor>" row can target
+# (``dashboard.remote_editor.editor``). Each id is the URL scheme of an editor
+# that keeps the ``vscode-remote`` authority, so the row's link is
+# ``<id>://vscode-remote/ssh-remote+<host><absolute path>:1``. The dashboard's own list,
+# with each editor's name, is ``REMOTE_EDITORS`` in
+# ``website/src/utils/remoteEditorUrl.ts``; keep the two equal.
+REMOTE_EDITOR_IDS: tuple[str, ...] = ("vscode", "kiro")
+# ``dashboard.remote_editor.host``: a DNS name or ``~/.ssh/config`` alias, the
+# grammar the desktop app's editor-link check takes (``HOSTNAME_RE`` in
+# ``website/electron/validation.js``). Nothing that adds URL structure after
+# ``ssh-remote+``, and no leading ``-`` the editor's ssh could read as an option.
+# One DNS label, then any number of `.label`; written out so the module defines
+# no private helper name the `sections` facade would have to re-export.
+REMOTE_EDITOR_HOST_PATTERN = (
+    r"^(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*)?$"
+)
+
+# The dashboard's feature-preview switches (Settings > Developer > Feature
+# previews) stored under ``dashboard.feature_previews``, by name. Each name is a
+# ``mc-preview-<name>`` key in ``website/src/utils/previewFlags.ts`` with its
+# hyphens written as underscores (config paths are snake_case); that file keeps
+# the browser's copy as a cache of this section, and
+# test_feature_previews_config.py pins the two lists equal.
+FEATURE_PREVIEW_FLAGS: tuple[str, ...] = (
+    # Has server behavior: kiro_crew.apps.browser_sdk.preview_on gates ctx.browser
+    # and every permissions.browser verb.
+    "app_browser_sdk",
+    "artifact_deploy",
+    "bridge_approvals",
+    "chat_runtime_sharing",
+    # Has server behavior: kiro_crew.connected_computers.flag gates enrollment,
+    # the connector socket, the chat choice and every start on it.
+    "connected_computers",
+    "crew_oauth",
+    "dashboard_stale_fields",
+    "dashboard_stale_wake",
+    "explore",
+    "folder_conductor",
+    "remote_crew_chat",
+    "session_environments",
+    "session_harness",
+    "visual_refresh",
+    "webhooks",
+    "worker_grill",
+)
+
 
 @dataclass
 class JiraAuthEntry:
@@ -130,6 +177,26 @@ VERBOSITY_LEVELS: tuple[str, ...] = ("default", "concise", "answer_only")
 LEGACY_VERBOSITY_ALIASES: dict[str, str] = {"ultra": "answer_only"}
 
 
+#: The ``dashboard.preferred_language`` codes a writer may store, each with the
+#: English name the reply rule spells out. The codes are the dashboard's own UI
+#: languages (``website/src/i18n/languages.ts``) so the picker can reuse their
+#: endonyms; ``""`` (auto) is not listed here and means "the user's language".
+PREFERRED_LANGUAGES: dict[str, str] = {
+    "en": "English",
+    "zh-CN": "Simplified Chinese",
+    "hi": "Hindi",
+    "es": "Spanish",
+    "fr": "French",
+    "bn": "Bengali",
+    "pt": "Portuguese",
+    "ru": "Russian",
+    "de": "German",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "it": "Italian",
+}
+
+
 @overload
 def normalize_verbosity(raw: str) -> str: ...
 
@@ -171,8 +238,9 @@ class DashboardConfig:
         default_factory=SharedCrewConfig,
         metadata=_meta(
             "Shared Crew",
-            "Fair admission and per-person limits for a shared Crew. Not active in "
-            "this build yet: nothing reads these settings, so changing one does nothing.",
+            "Fair admission, per-person limits and the direct tailnet link for a "
+            "shared Crew. Read only while Shared Crew is turned on in Feature "
+            "Previews; otherwise every value reads as its default.",
             restart=True,
         ),
     )
@@ -193,11 +261,32 @@ class DashboardConfig:
             "and 60 per gateway hour. Live status and native decisions work without it.",
         ),
     )
+    audit_secret_reads: bool = field(
+        default=False,
+        metadata=_meta(
+            "Audit secret reads",
+            "Write a security log row when the gateway reads a vault secret: the secret's "
+            "name, the module that read it and the function that asked (unknown when the "
+            "read runs on a worker thread with no calling code of its own), never the value. "
+            "Repeat reads of one secret by one caller share a row per 10 minutes, which "
+            "counts them. Off by default. Takes effect on the next read; no restart (within "
+            "30 seconds in the MCP gateway process).",
+        ),
+    )
+    turn_cache_estimate: bool = field(
+        default=False,
+        metadata=_meta(
+            "Estimate cache rebuilds",
+            'Mark a reply in its footer as "Cache likely rebuilt" when the backend reports '
+            "no cache counts and the turn started after a pause longer than the model keeps "
+            "the conversation cached. Backends that report cache counts are unaffected.",
+        ),
+    )
     crewmate_threads: bool = field(
         default=False,
         metadata=_meta(
-            "Reply threads on mate chat messages",
-            "Let any message in a mate's chat carry its own reply thread, "
+            "Reply threads on Bot chat messages",
+            "Let any message in a Bot's chat carry its own reply thread, "
             "opened in the side panel while the main chat stays visible. Off by "
             "default: the thread routes answer not-found, no thread frame is sent, "
             "and the dashboard draws no Reply in thread control. Takes effect on "
@@ -207,14 +296,36 @@ class DashboardConfig:
     crewmates_in_agent_picker: bool = field(
         default=False,
         metadata=_meta(
-            "Mates in the chat agent picker",
-            "List mates in the chat composer's agent picker, beside the agent "
-            "templates, so a chat can be switched onto a mate (and its own "
+            "Bots in the chat agent picker",
+            "List Bots in the chat composer's agent picker, beside the agent "
+            "templates, so a chat can be switched onto a Bot (and its own "
             "workspace and memory) without opening it from the Crew page. Off by "
-            "default: the picker lists templates plus any mate no listed "
+            "default: the picker lists templates plus any Bot no listed "
             "template already covers; the default agent stays even when covered, "
             "unless a template shares its name. Takes effect when the dashboard is "
             "reloaded; no gateway restart.",
+        ),
+    )
+    feature_previews: dict = field(
+        default_factory=dict,
+        metadata=_meta(
+            "Feature previews",
+            "Which unreleased dashboard features are turned on under Settings > "
+            "Developer > Feature previews, by name, each true or false. Kept here "
+            "so a switch stays as set on every browser, device and dashboard "
+            "address of this gateway. A name that is absent reads as off. Takes "
+            "effect on the next dashboard read; no restart.",
+            properties={
+                name: {
+                    "type": "boolean",
+                    "default": False,
+                    "x-meta": {
+                        "label": f"Feature preview: {name}",
+                        "help": f"Turn on the '{name}' feature preview.",
+                    },
+                }
+                for name in FEATURE_PREVIEW_FLAGS
+            },
         ),
     )
     qr_session_until_restart: bool = field(
@@ -374,7 +485,7 @@ class DashboardConfig:
             "Raise it on a host that does heavy subprocess work (long builds, "
             "test suites, many child reaps), which can wedge the loop briefly "
             "without being genuinely dead. Clamped to 10s..300s. The desktop app's "
-            "liveness probe kills at roughly 20s independently, so a value "
+            "liveness probe kills after about a minute independently, so a value "
             "above that only takes effect for a headless gateway — the desktop "
             "probe wins first and the stack dump is lost.",
             restart=True,
@@ -429,6 +540,15 @@ class DashboardConfig:
             enum=["persistent", "incognito", "temporary"],
         ),
     )
+    new_chat_crew_mode: bool = field(
+        default=False,
+        metadata=_meta(
+            "Start new chats in conductor mode",
+            "Open each new dashboard chat with conductor mode already on. It can "
+            "still be turned off before the first message. Applies only where "
+            "conductor mode is offered: a Persistent chat on the default agent.",
+        ),
+    )
     widget_density: str = field(
         default="more",
         metadata=_meta(
@@ -439,41 +559,22 @@ class DashboardConfig:
             enum=["more", "less"],
         ),
     )
-    use_builtin_browser: bool = field(
-        default=True,
-        metadata=_meta(
-            "Use Built-in Browser",
-            "When on, the browser tool opens pages in Kiro Crew's built-in panel "
-            "(desktop app only). When off, the agent browses via playwright-cli.",
-        ),
-    )
     browser_local_origins: list[str] = field(
         default_factory=list,
         metadata=_meta(
-            "Built-in Browser Local Origins",
-            "Loopback origins the browser tool may open in the built-in panel, "
+            "Local Preview Origins",
+            "Loopback origins the browser tool and the side panel's Preview tab may open, "
             "each written host:port with host localhost, 127.0.0.1 or [::1] "
-            "(e.g. localhost:5173 for a Vite dev server). Empty (the default) "
-            "keeps every loopback, private and link-local address refused. The "
-            "port is required and matched exactly, so one entry opens one dev "
+            "(e.g. localhost:5173 for a Vite dev server). The tab is for previewing "
+            "your own dev server; the agent never drives it, and an outside address "
+            "is answered with 'Open this in your Chrome, or ask Kiro'. Empty (the "
+            "default) keeps every loopback, private and link-local address refused. "
+            "The port is required and matched exactly, so one entry opens one dev "
             "server and never the rest of the machine; the gateway's own port is "
-            "refused even when listed. Entries in any other shape are dropped. "
-            "The agent cannot set this while its sandbox is on: config.json is "
-            "read-only inside the sandbox.",
-        ),
-    )
-    browser_view_port: int = field(
-        default=0,
-        metadata=_meta(
-            "Browser Live-View Port",
-            "Pin the browser live-view server (playwright-cli show) to this "
-            "loopback port. 0 (the default) picks a fresh OS-assigned ephemeral "
-            "port on every start. Set a fixed port when the dashboard is viewed "
-            "remotely through an SSH tunnel that forwards a fixed set of ports, "
-            "so the Browser panel can always reach the view. The server binds "
-            "loopback-only either way. A value outside 1-65535 is treated as "
-            "unset. A changed pin applies the next time the view server "
-            "(re)starts; an already-running server keeps its current port.",
+            "refused even when listed. Entries in any other shape are dropped; at "
+            "most 32 are kept. Edited on Settings -> Browser -> Local preview, or by "
+            "the Preview tab's own Allow button. The agent cannot set this while its "
+            "sandbox is on: config.json is read-only inside the sandbox.",
         ),
     )
     verbosity: str = field(
@@ -494,6 +595,21 @@ class DashboardConfig:
             "irreversible-action confirmations always appear but stay brief, "
             "and ordered multi-step instructions stay complete.",
             enum=list(VERBOSITY_LEVELS),
+        ),
+    )
+    preferred_language: str = field(
+        default="",
+        metadata=_meta(
+            "Preferred Reply Language",
+            "Language the agent replies in, as one of the dashboard's language "
+            "codes (e.g. 'zh-CN'). Empty (the default) replies in the language "
+            "of the user's message. A set language holds even when a message "
+            "mixes languages, until the user asks for another one in chat. "
+            "Code, commands and identifiers stay as they are, and text written "
+            "for other readers (commit messages, PR text, code comments, public "
+            "posts) keeps the project's own language. Separate from 'language', "
+            "which sets only the dashboard UI.",
+            enum=["", *PREFERRED_LANGUAGES],
         ),
     )
     link_previews: bool = field(
@@ -614,6 +730,18 @@ class DashboardConfig:
             "closed, and show it each time the panel opens. A panel opened for "
             "something specific, such as a file, still shows that. Works only "
             "while session summaries are on.",
+        ),
+    )
+    auto_open_conductor_board: bool = field(
+        default=True,
+        metadata=_meta(
+            "Auto-open the Board in the side panel",
+            "Open the right side panel on the Board tab the first time you open a "
+            "conductor mode chat. With this off, a conductor mode chat opens like "
+            "any other chat: its panel stays closed unless Keep the side panel "
+            "open is on, and the Board is still the panel's first tab. Turning "
+            "conductor mode on in a chat still opens the Board. This setting "
+            "does not apply on a phone.",
         ),
     )
     # Default TRUE: the chip strip shipped unconditionally before this switch
@@ -777,6 +905,42 @@ class DashboardConfig:
             },
         ),
     )
+    remote_editor: dict = field(
+        default_factory=lambda: {"editor": "", "host": ""},
+        metadata=_meta(
+            "Remote editor",
+            "Open a file shown in the side panel in your local editor over your "
+            "own SSH session, for a gateway on another machine. Off by default.",
+            # Declared like dashboard.terminal.*, so Settings controls reference
+            # these by configKey and `kirocrew config set` accepts them. Both
+            # values reach a clickable link, so the branding endpoint drops any
+            # value outside this enum and pattern before the browser sees it.
+            properties={
+                "editor": {
+                    "type": "string",
+                    "default": "",
+                    "enum": ["", *REMOTE_EDITOR_IDS],
+                    "x-meta": {
+                        "label": "Editor",
+                        "help": "The local editor to open remote files in. Empty = off.",
+                    },
+                },
+                "host": {
+                    "type": "string",
+                    "default": "",
+                    "maxLength": 253,
+                    "pattern": REMOTE_EDITOR_HOST_PATTERN,
+                    "x-meta": {
+                        "label": "SSH host",
+                        "help": (
+                            "How your machine reaches the gateway over SSH: a hostname "
+                            "or a ~/.ssh/config alias, with no port or path."
+                        ),
+                    },
+                },
+            },
+        ),
+    )
     default_project: str = field(
         default="",
         metadata=_meta(
@@ -816,9 +980,29 @@ class DashboardConfig:
         default="",
         metadata=_meta(
             "Theme Mode",
-            "Dashboard color mode preference: 'dark', 'light', or 'system'. "
-            "Empty = unset (frontend falls back to localStorage or 'system').",
-            enum=["", "dark", "light", "system"],
+            "Dashboard color mode preference: 'dark', 'light', 'system', or "
+            "'schedule' (light from theme_schedule_light, dark from "
+            "theme_schedule_dark). Empty = unset (frontend falls back to "
+            "localStorage or 'system').",
+            enum=["", "dark", "light", "system", "schedule"],
+        ),
+    )
+    theme_schedule_light: str = field(
+        default="",
+        metadata=_meta(
+            "Theme Schedule Light",
+            "24-hour HH:MM at which the 'schedule' theme mode turns light, read in "
+            "the time zone of the device showing the dashboard. Empty = never set "
+            "(07:00).",
+        ),
+    )
+    theme_schedule_dark: str = field(
+        default="",
+        metadata=_meta(
+            "Theme Schedule Dark",
+            "24-hour HH:MM at which the 'schedule' theme mode turns dark, read in "
+            "the time zone of the device showing the dashboard. Empty = never set "
+            "(19:00).",
         ),
     )
     sso_login_flags: str = field(
@@ -838,6 +1022,16 @@ class DashboardConfig:
             "Theme Color",
             "Dashboard color theme slug (e.g. 'kiro', 'emerald', 'monokai'). "
             "Empty = unset (frontend falls back to localStorage or 'kiro').",
+        ),
+    )
+    instance_label: str = field(
+        default="",
+        metadata=_meta(
+            "Instance Label",
+            "A short name for this gateway (e.g. 'pod-a', 'Lab box'), shown in the "
+            "browser tab title and favicon and sent as the origin of a session "
+            "transferred to another instance. Empty = unset (the tab title and "
+            "icon stay as they are and a transfer names the host).",
         ),
     )
     language: str = field(
@@ -865,6 +1059,25 @@ class DashboardConfig:
             "Show the unread dot on a sidebar session card when the agent finished "
             "and you have not read the result. Folder and aggregate unread counts "
             "are not affected.",
+        ),
+    )
+    command_bar_enabled: bool = field(
+        default=True,
+        metadata=_meta(
+            "Command Bar Enabled",
+            "Open the Command Bar launcher on the quick-search shortcut (Cmd+K or "
+            "Ctrl+K). Off opens the search palette instead, which also searches "
+            "knowledge, skills and prompts.",
+        ),
+    )
+    channels_enabled: bool = field(
+        default=False,
+        metadata=_meta(
+            "Channels Enabled",
+            "Show Channels, where several agents work a problem together in one shared "
+            "room, in the sidebar and in Search Everywhere. Off by default; off only "
+            "hides the sidebar row and the search result, so the channels you made "
+            "and the Channels page itself are kept.",
         ),
     )
     # Literal enum rather than FOLDER_SORT_MODES: that constant lives in
@@ -910,13 +1123,29 @@ class DashboardConfig:
             ],
         ),
     )
+    # Default FALSE: unfiled sessions below the folders is the layout every
+    # install has drawn. A config that never mentions the key must render it.
+    unfiled_sessions_above_folders: bool = field(
+        default=False,
+        metadata=_meta(
+            "Unfiled sessions above folders",
+            "Where the chat sidebar draws sessions that are not filed in any folder: "
+            "above the folder list when on, below it when off. Applies to the list "
+            "view's folder tree and to each board column; flat view draws no folders "
+            "and is unaffected. In the list view, dropping a session on the unfiled "
+            "area removes it from its folder either way. New sessions start unfiled, "
+            "so with many folders turning this on keeps the ones still to sort on "
+            "screen instead of below the last folder.",
+        ),
+    )
     update_nudge: dict = field(
         default_factory=dict,
         metadata=_meta(
             "Update Nudge",
             "Per-version state for the proactive update popup. Written by the "
-            "dashboard when the user snoozes or skips a release; a record only "
-            "suppresses the popup for the version it names. Validated as one "
+            "dashboard when the user snoozes or skips a release; a snooze only "
+            "suppresses the popup for the version it names, and every skipped "
+            "version stays in skipped_versions. Validated as one "
             "atomic record by the PATCH allowlist (dashboard.update_nudge); "
             "no Settings control reads it, so it carries no schema properties.",
         ),
@@ -962,14 +1191,37 @@ class DashboardConfig:
             "opt-out, and a ping sent before the offer makes the offer meaningless.",
         ),
     )
+    privacy_ack_version: int = field(
+        default=0,
+        metadata=_meta(
+            "Privacy Notice Version Acknowledged",
+            "The version of the Privacy chapter text, the one saying local metric "
+            "recording is on, that the user last acknowledged (0 = none). When the "
+            "dashboard's notice version is higher, the chapter is shown once more "
+            "at the next dashboard load, but only while local recording is on. "
+            "Written by the Privacy chapter and by kirocrew telemetry enable.",
+        ),
+    )
+    kiro_telemetry_ack_version: int = field(
+        default=0,
+        metadata=_meta(
+            "Kiro Telemetry Notice Version Acknowledged",
+            "The privacy notice version the user acknowledged while its text named "
+            "the built-in Kiro telemetry destination (0 = none). Product usage "
+            "metrics go to that destination only once this is at least the version "
+            "that names it, or a start with no dashboard printed the line naming it "
+            "on a terminal. Written by the Privacy chapter and by kirocrew telemetry "
+            "enable.",
+        ),
+    )
     crewmates_onboarded: bool = field(
         default=False,
         metadata=_meta(
-            "Mates Onboarded",
-            "Whether the user has finished or dismissed the first-run Meet Mates "
-            "flow (the four-step introduction that creates the first mate). "
+            "Bots Onboarded",
+            "Whether the user has finished or dismissed the first-run Meet Bots "
+            "flow (the four-step introduction that creates the first Bot). "
             "Server-backed like the other first-run flags so a second machine does "
-            "not replay it. Also set when the flow is re-run from the Mates page.",
+            "not replay it. Also set when the flow is re-run from the Bots page.",
         ),
     )
     user_role: str = field(
@@ -1026,11 +1278,38 @@ class DashboardConfig:
             "oldest-first to fit; the running release is never evicted. 0 = no cap.",
         ),
     )
+    milestones_enabled: bool = field(
+        default=True,
+        metadata=_meta(
+            "Milestones Enabled",
+            "Show the milestones indicator, panel, new-chat feature cards and quiet "
+            "notices. Off hides them; counting continues, so turning it back on shows "
+            "true progress.",
+        ),
+    )
     folder_suggestions_enabled: bool = field(
         default=True,
         metadata=_meta(
             "Folder Suggestions Enabled",
             "Offer to file a newly-titled, unfiled chat session into a matching folder.",
+        ),
+    )
+    folder_suggestions_auto_apply: bool = field(
+        default=False,
+        metadata=_meta(
+            "Folder Suggestions Auto Apply",
+            "While folder suggestions are on, file the session into the suggested "
+            "folder instead of asking first; the card then says where it went, with "
+            "an undo. Ignored while folder suggestions are off.",
+        ),
+    )
+    project_tags_enabled: bool = field(
+        default=True,
+        metadata=_meta(
+            "Project Tags Enabled",
+            "Tag a new chat session with the last folder name of its project path, "
+            "such as my-app. Off creates and adds no project tag; tags already on a "
+            "session stay.",
         ),
     )
     topic_tags_enabled: bool = field(

@@ -12,14 +12,18 @@ published into it.
 
 from __future__ import annotations
 
+import contextlib
+from typing import Any, AsyncIterator
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from slack_wire_helpers import SlackWire, slack_wire
 
 _CHANNEL = "C0123ABC"
 _OWNER_DM = "D0OWNER"
 _NEW_TS = "1700000000.000100"
 _THREAD_TS = "1699999999.000200"
+_REPORT = "💓 *Heartbeat*\n\nall green"
 
 
 @pytest.fixture()
@@ -54,13 +58,26 @@ def orchestrator(sel_mock, tracked):
     return orch
 
 
+@contextlib.asynccontextmanager
+async def _on_the_wire(orch: Any, monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[SlackWire]:
+    """Swap the stub for a real Slack client whose owner DM opens as ``_OWNER_DM``."""
+    async with slack_wire(monkeypatch) as wire:
+        wire.respond("conversations.open", {"channel": {"id": _OWNER_DM}})
+        orch.slack = wire.client
+        yield wire
+
+
+def _posted(wire: SlackWire) -> list[tuple[Any, Any, Any]]:
+    return [(p.get("channel"), p.get("text"), p.get("thread_ts")) for p in wire.posts()]
+
+
 class TestChannelOnlyDelivery:
     """``slack:<channel>`` posts to the channel instead of DMing the owner."""
 
     @pytest.mark.asyncio()
     async def test_posts_to_named_channel_not_owner_dm(self, orchestrator):
         await orchestrator._deliver_result(
-            "💓 Heartbeat", "pipeline check", "all green", f"slack:{_CHANNEL}"
+            "Heartbeat", "pipeline check", "all green", f"slack:{_CHANNEL}"
         )
         orchestrator.slack.open_dm.assert_not_called()
         orchestrator.slack.post_message.assert_awaited_once()
@@ -75,7 +92,7 @@ class TestChannelOnlyDelivery:
         """A split report must not become N top-level channel messages."""
         long_text = "green " * 2000  # > SLACK_MSG_LIMIT, so render_for_slack splits
         await orchestrator._deliver_result(
-            "💓 Heartbeat", "pipeline check", long_text, f"slack:{_CHANNEL}"
+            "Heartbeat", "pipeline check", long_text, f"slack:{_CHANNEL}"
         )
         calls = orchestrator.slack.post_message.await_args_list
         assert len(calls) > 1, "expected the report to split into several parts"
@@ -86,7 +103,7 @@ class TestChannelOnlyDelivery:
     @pytest.mark.asyncio()
     async def test_delivery_is_audited(self, orchestrator, sel_mock):
         await orchestrator._deliver_result(
-            "💓 Heartbeat", "pipeline check", "all green", f"slack:{_CHANNEL}"
+            "Heartbeat", "pipeline check", "all green", f"slack:{_CHANNEL}"
         )
         sel_mock.log_api_access.assert_called_once()
         kwargs = sel_mock.log_api_access.call_args.kwargs
@@ -97,7 +114,7 @@ class TestChannelOnlyDelivery:
     @pytest.mark.asyncio()
     async def test_dashboard_notification_still_fires(self, orchestrator):
         await orchestrator._deliver_result(
-            "💓 Heartbeat", "pipeline check", "all green", f"slack:{_CHANNEL}"
+            "Heartbeat", "pipeline check", "all green", f"slack:{_CHANNEL}"
         )
         orchestrator.dashboard_state.notify.assert_called_once()
         assert orchestrator.dashboard_state.notify.call_args.args[0] == "heartbeat"
@@ -109,7 +126,7 @@ class TestThreadDeliveryUnchanged:
     @pytest.mark.asyncio()
     async def test_thread_ts_is_used_for_every_part(self, orchestrator):
         await orchestrator._deliver_result(
-            "💓 Heartbeat", "pipeline check", "green " * 2000, f"slack:{_CHANNEL}:{_THREAD_TS}"
+            "Heartbeat", "pipeline check", "green " * 2000, f"slack:{_CHANNEL}:{_THREAD_TS}"
         )
         calls = orchestrator.slack.post_message.await_args_list
         assert len(calls) > 1
@@ -121,11 +138,11 @@ class TestMalformedTagFallsBackToDm:
     """A tag with no channel id must not post to channel ``""``."""
 
     @pytest.mark.asyncio()
-    async def test_empty_channel_dms_the_owner(self, orchestrator, sel_mock):
-        await orchestrator._deliver_result("💓 Heartbeat", "pipeline check", "all green", "slack:")
-        orchestrator.slack.open_dm.assert_awaited_once()
-        orchestrator.slack.post_message.assert_awaited_once()
-        assert orchestrator.slack.post_message.await_args.args[0] == _OWNER_DM
+    async def test_empty_channel_dms_the_owner(self, orchestrator, sel_mock, monkeypatch):
+        async with _on_the_wire(orchestrator, monkeypatch) as wire:
+            await orchestrator._deliver_result("Heartbeat", "pipeline check", "all green", "slack:")
+        assert [c.get("users") for c in wire.sent("conversations.open")] == ["U0OWNER"]
+        assert _posted(wire) == [(_OWNER_DM, _REPORT, None)]
 
     @pytest.mark.asyncio()
     async def test_empty_channel_denial_is_still_audited(self, orchestrator, sel_mock):
@@ -137,7 +154,7 @@ class TestMalformedTagFallsBackToDm:
         decision that cannot be reconstructed from the audit trail is the gap here,
         not the fallback itself, which was always correct.
         """
-        await orchestrator._deliver_result("💓 Heartbeat", "pipeline check", "all green", "slack:")
+        await orchestrator._deliver_result("Heartbeat", "pipeline check", "all green", "slack:")
         kwargs = sel_mock.log_api_access.call_args.kwargs
         assert kwargs["outcome"] == "denied"
         assert kwargs["operation"] == "heartbeat_channel_deliver"
@@ -149,34 +166,34 @@ class TestUngovernedTargetIsRefused:
     """The tag is agent-writable, so the target clears the allowlist or it does not post."""
 
     @pytest.mark.asyncio()
-    async def test_untracked_channel_falls_back_to_owner_dm(self, orchestrator, sel_mock):
-        await orchestrator._deliver_result(
-            "💓 Heartbeat", "pipeline check", "all green", "slack:C0OTHERTEAM"
-        )
-        orchestrator.slack.post_message.assert_awaited_once()
-        assert orchestrator.slack.post_message.await_args.args[0] == _OWNER_DM
+    async def test_untracked_channel_falls_back_to_owner_dm(
+        self, orchestrator, sel_mock, monkeypatch
+    ):
+        async with _on_the_wire(orchestrator, monkeypatch) as wire:
+            await orchestrator._deliver_result(
+                "Heartbeat", "pipeline check", "all green", "slack:C0OTHERTEAM"
+            )
+        # Exactly one post, and it lands in the owner's DM, never the untracked channel.
+        assert _posted(wire) == [(_OWNER_DM, _REPORT, None)]
         assert sel_mock.log_api_access.call_args.kwargs["outcome"] == "denied"
 
     @pytest.mark.asyncio()
-    async def test_user_id_target_is_refused(self, orchestrator, sel_mock):
+    async def test_user_id_target_is_refused(self, orchestrator, sel_mock, monkeypatch):
         """A ``U...`` id is not a channel id; Slack would resolve it to an IM."""
-        await orchestrator._deliver_result(
-            "💓 Heartbeat", "pipeline check", "all green", "slack:U0VICTIM99"
-        )
-        orchestrator.slack.post_message.assert_awaited_once()
-        assert orchestrator.slack.post_message.await_args.args[0] == _OWNER_DM
+        async with _on_the_wire(orchestrator, monkeypatch) as wire:
+            await orchestrator._deliver_result(
+                "Heartbeat", "pipeline check", "all green", "slack:U0VICTIM99"
+            )
+        assert _posted(wire) == [(_OWNER_DM, _REPORT, None)]
+        assert [c.get("users") for c in wire.sent("conversations.open")] == ["U0OWNER"]
         assert sel_mock.log_api_access.call_args.kwargs["outcome"] == "denied"
 
     @pytest.mark.asyncio()
-    async def test_owner_dm_origin_thread_still_replies(self, orchestrator, sel_mock):
+    async def test_owner_dm_origin_thread_still_replies(self, orchestrator, sel_mock, monkeypatch):
         """A DM channel is never tracked, so the owner's own DM is admitted by identity."""
-        await orchestrator._deliver_result(
-            "💓 Heartbeat", "pipeline check", "all green", f"slack:{_OWNER_DM}:{_THREAD_TS}"
-        )
-        orchestrator.slack.post_message.assert_awaited_once()
-        assert orchestrator.slack.post_message.await_args.args == (
-            _OWNER_DM,
-            orchestrator.slack.post_message.await_args.args[1],
-            _THREAD_TS,
-        )
+        async with _on_the_wire(orchestrator, monkeypatch) as wire:
+            await orchestrator._deliver_result(
+                "Heartbeat", "pipeline check", "all green", f"slack:{_OWNER_DM}:{_THREAD_TS}"
+            )
+        assert _posted(wire) == [(_OWNER_DM, _REPORT, _THREAD_TS)]
         assert sel_mock.log_api_access.call_args.kwargs["outcome"] == "approved"

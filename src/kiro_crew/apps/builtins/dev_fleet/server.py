@@ -24,7 +24,7 @@ Routes (as seen by the backend after prefix stripping by gateway):
   POST /api/pod/provision {name}  -> start async build, returns {run_id}
   POST /api/rebase  {name}
   GET  /api/health            -> {"status": "ok", "start_id": ...}  (restart handshake; proxied)
-  GET  /health                -> same body, HMAC-exempt (gateway-internal liveness poll only)
+  GET  /health                -> {"status": "ok"}, HMAC-exempt (gateway-internal liveness poll only)
 """
 
 from __future__ import annotations
@@ -208,14 +208,15 @@ async def dev_fleet_cleanup(app: web.Application) -> None:
 def create_app() -> web.Application:
     """Build the aiohttp Application with all routes and lifecycle hooks."""
     app = web.Application(middlewares=[http_api.hmac_proxy_middleware])
-    app.router.add_get("/health", http_api.api_health)
+    app.router.add_get("/health", http_api.api_liveness)
     # The dashboard reaches this backend ONLY through the gateway proxy, which
     # matches /apps/dev-fleet/api/{path} and forwards to /api/{path}
     # (handle_app_api_proxy). The bare /health above is reachable only by the
     # gateway's own in-process liveness poll (127.0.0.1:<port>/health, and it is
-    # the one path the HMAC middleware exempts). So the restart-identity
-    # handshake MUST poll a PROXIED path -- expose the same handler
-    # under /api/health, which the browser reaches at /apps/dev-fleet/api/health.
+    # the one path the HMAC middleware exempts), and it answers liveness alone.
+    # So the restart-identity handshake MUST poll a PROXIED path -- the identity
+    # handler is registered under /api/health, which the browser reaches at
+    # /apps/dev-fleet/api/health.
     app.router.add_get("/api/health", http_api.api_health)
     app.router.add_get("/api/fleet", http_api.api_dev_fleet_fleet)
     app.router.add_get("/api/worktree", http_api.api_dev_fleet_worktree)
@@ -261,18 +262,18 @@ def main() -> int:
     boot_platform(KiroCrewConfig.load())
     # This process is the SANDBOXED backend: the live-target pointer is masked from
     # it, so every pointer-derived read goes to the gateway's broker route. The
-    # bound port arrives from apps/backend.py; the app secret is the same material
-    # the HMAC middleware verifies proxied requests with. Installed before the app
-    # is built so the first fleet refresh already reads through the broker.
-    # Without a port (a foreground gateway that had not bound when it spawned us,
-    # or a hand-launched backend) the provider still installs and reports the
-    # outage on each read: silently answering "nothing is live" is the one thing
-    # the removal guards must never be told.
-    bound = os.environ.get("KIROCREW_BOUND_PORT", "")
+    # gateway origin arrives from apps/backend.py; the app secret is the same
+    # material the HMAC middleware verifies proxied requests with. Installed before
+    # the app is built so the first fleet refresh already reads through the broker.
+    # Without an origin (a gateway bound to a specific interface, or a
+    # hand-launched backend) the provider still installs and reports the outage on
+    # each read: silently answering "nothing is live" is the one thing the removal
+    # guards must never be told.
+    origin = os.environ.get("KIROCREW_GATEWAY_ORIGIN", "")
     broker: pointer_broker.GatewayPointerBroker | None = None
-    if bound.isdigit():
+    if origin:
         broker = pointer_broker.GatewayPointerBroker(
-            port=int(bound), app_secret=http_api._load_app_secret()
+            origin=origin, app_secret=http_api._load_app_secret()
         )
         live.install_pointer_provider(broker)
         live.install_removal_lease_client(
@@ -283,7 +284,7 @@ def main() -> int:
             )
         )
     else:
-        reason = "the Dev Fleet backend was started without KIROCREW_BOUND_PORT"
+        reason = "the Dev Fleet backend was started without KIROCREW_GATEWAY_ORIGIN"
         live.install_pointer_provider(pointer_broker.unconfigured_provider(reason))
         live.install_removal_lease_client(pointer_broker.unconfigured_lease_client(reason))
     app = create_app()

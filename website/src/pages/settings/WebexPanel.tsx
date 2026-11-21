@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback, useRef, useId } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { ExternalLink, Check, AlertTriangle, Lock } from 'lucide-react'
 import { WebexIcon } from '../../components/WebexIcon'
@@ -117,6 +117,10 @@ export function WebexPanel() {
   const [botToken, setBotToken] = useState('')
   const [botClear, setBotClear] = useState(false)
   const [formKey, setFormKey] = useState(0) // bump to remount the secret field after save
+  // The save's onSuccess reads the token field as it is when it lands, not as
+  // it was when the request started.
+  const secretRef = useRef({ botToken, botClear })
+  useEffect(() => { secretRef.current = { botToken, botClear } }, [botToken, botClear])
   const [saved, setSaved] = useState(false)
   const [restartHint, setRestartHint] = useState(false)
   const [verifyWarning, setVerifyWarning] = useState('')
@@ -127,10 +131,13 @@ export function WebexPanel() {
   // nothing to diagnose.
   const [saveError, setSaveError] = useState('')
   const [thresholdError, setThresholdError] = useState('')
+  const thresholdErrorId = useId()
+  // Which threshold the error is about, so only that field is marked invalid.
+  const [thresholdErrorField, setThresholdErrorField] = useState<'soft' | 'hard'>('soft')
 
-  // Sync the local draft when server config arrives. Guarded so only the
-  // initial load and post-save invalidation reseed it — a background refetch
-  // must not discard in-progress edits (including a just-pasted token).
+  // Sync the local draft when server config first arrives. Only the initial
+  // load seeds it: a background refetch or a save's invalidation must not
+  // discard in-progress edits (including a just-pasted token).
   const syncArmed = useRef(true)
   useEffect(() => {
     if (data && syncArmed.current) {
@@ -161,8 +168,22 @@ export function WebexPanel() {
       setRestartHint(!!res.restart_required)
       setVerifyWarning(res.verify_warning || '')
       setTokenVerified(!!vars.bot_token && !res.verify_warning)
-      syncArmed.current = true
-      setFormKey(k => k + 1)
+      // Not re-arming the draft sync: the server took the values we sent, and
+      // a reseed would overwrite any field edited while the save was in
+      // flight. Only the token just sent is cleared, and only while the field
+      // still holds what was sent.
+      const s = secretRef.current
+      const nextToken = vars.bot_token && s.botToken.trim() === vars.bot_token ? '' : s.botToken
+      setBotToken(nextToken)
+      if (vars.bot_token_clear) setBotClear(false)
+      // Collapse the token field back to its stored preview only when no newer
+      // edit is pending in it; a remount would hide it.
+      if (!nextToken && !(s.botClear && !vars.bot_token_clear)) setFormKey(k => k + 1)
+      // A blank folder name was saved as the channel's own name: show that,
+      // unless the field was cleared after a named folder was sent.
+      setDraft(d => (d && d.session_folder_on && !d.session_folder.trim() && vars.session_folder === CHANNEL_NAME
+        ? { ...d, session_folder: vars.session_folder }
+        : d))
       setTimeout(() => setSaved(false), 6000)
       qc.invalidateQueries({ queryKey: ['webex-config'] })
     },
@@ -182,14 +203,16 @@ export function WebexPanel() {
     const soft = Number(draft.soft_threshold_pct)
     const hard = Number(draft.hard_threshold_pct)
     const bad = [
-      [soft, i18nT('pages.settings.webexPanel.soft_threshold_must_be_1_to_100')] as const,
-      [hard, i18nT('pages.settings.webexPanel.hard_threshold_must_be_1_to_100')] as const,
+      [soft, i18nT('pages.settings.webexPanel.soft_threshold_must_be_1_to_100'), 'soft'] as const,
+      [hard, i18nT('pages.settings.webexPanel.hard_threshold_must_be_1_to_100'), 'hard'] as const,
     ].find(([v]) => !Number.isInteger(v) || v < 1 || v > 100)
     if (bad) {
+      setThresholdErrorField(bad[2])
       setThresholdError(bad[1])
       return
     }
     if (soft > hard) {
+      setThresholdErrorField('soft')
       setThresholdError(i18nT('pages.settings.webexPanel.soft_threshold_must_not_exceed_hard'))
       return
     }
@@ -291,6 +314,9 @@ export function WebexPanel() {
             isSet={data.bot_token_set}
             preview={data.bot_token_preview}
             readOnly={ro}
+            // A value still pending (typed during a save) stays in the editor,
+            // even once the refetch reports a stored credential.
+            editing={botToken ? true : undefined}
             value={botToken}
             onChange={setBotToken}
             cleared={botClear}
@@ -305,14 +331,14 @@ export function WebexPanel() {
         <SettingsCard index={2}>
           <SettingsToggle
             label={i18nT('pages.settings.webexPanel.enable_webex_channel')}
-            description={i18nT('pages.settings.webexPanel.start_the_channel_at_gateway_boot_when_a_token_i')}
+            hint={i18nT('pages.settings.webexPanel.start_the_channel_at_gateway_boot_when_a_token_i')}
             checked={draft.enabled}
             onChange={v => upd({ enabled: v })}
             disabled={ro}
           />
           <TagListEditor
             label={i18nT('pages.settings.webexPanel.allowed_emails')}
-            description={i18nT('pages.settings.webexPanel.webex_account_emails_permitted_to_dm_the_bot_emp')}
+            description={i18nT('pages.settings.channels.empty_allows_nobody')} hint={i18nT('pages.settings.webexPanel.webex_account_emails_permitted_to_dm_the_bot_emp')}
             values={draft.allowed_emails}
             placeholder={i18nT('pages.settings.webexPanel.you_example_com')}
             onChange={v => upd({ allowed_emails: v })}
@@ -323,10 +349,10 @@ export function WebexPanel() {
               space is readable by every member, including people the email
               allow-list excludes. Off by default, and the room allow-list is
               deny-all, so the switch alone grants nothing. */}
-          <div className="border-t border-border mt-4 pt-4">
+          <div className="border-t border-border mt-3 pt-3">
             <SettingsToggle
               label={i18nT('pages.settings.webexPanel.allow_group_spaces')}
-              description={i18nT('pages.settings.webexPanel.allow_group_spaces_desc')}
+              description={i18nT('pages.settings.webexPanel.allow_group_spaces_desc_summary')} hint={i18nT('pages.settings.webexPanel.allow_group_spaces_desc')}
               checked={draft.allow_group_rooms}
               onChange={v => upd({ allow_group_rooms: v })}
               disabled={ro}
@@ -335,7 +361,7 @@ export function WebexPanel() {
               <div className="mt-4">
                 <TagListEditor
                   label={i18nT('pages.settings.webexPanel.allowed_room_ids')}
-                  description={i18nT('pages.settings.webexPanel.allowed_room_ids_desc')}
+                  description={i18nT('pages.settings.webexPanel.allowed_room_ids_desc_summary')} hint={i18nT('pages.settings.webexPanel.allowed_room_ids_desc')}
                   values={draft.allowed_room_ids}
                   placeholder={i18nT('pages.settings.webexPanel.room_id_placeholder')}
                   onChange={v => upd({ allowed_room_ids: v })}
@@ -356,10 +382,10 @@ export function WebexPanel() {
           </div>
           {/* Optional per-channel session filing. Off by default: Webex
               conversations stay unfiled in the sidebar, as before. */}
-          <div className="border-t border-border mt-4 pt-4">
+          <div className="border-t border-border mt-3 pt-3">
             <SettingsToggle
               label={i18nT('pages.settings.botChannelPanel.file_sessions_in_folder')}
-              description={i18nT('pages.settings.botChannelPanel.file_sessions_in_folder_desc', { channel: CHANNEL_NAME })}
+              hint={i18nT('pages.settings.botChannelPanel.file_sessions_in_folder_desc', { channel: CHANNEL_NAME })}
               checked={draft.session_folder_on}
               onChange={v => upd({ session_folder_on: v })}
               disabled={ro}
@@ -368,7 +394,7 @@ export function WebexPanel() {
               <div className="mt-4">
                 <SettingsInput
                   label={i18nT('pages.settings.botChannelPanel.session_folder_name')}
-                  description={i18nT('pages.settings.botChannelPanel.session_folder_name_desc')}
+                  hint={i18nT('pages.settings.botChannelPanel.session_folder_name_desc')}
                   value={draft.session_folder}
                   onChange={v => upd({ session_folder: v })}
                   placeholder={CHANNEL_NAME}
@@ -393,7 +419,7 @@ export function WebexPanel() {
         <SettingsCard index={3}>
           <SettingsToggle
             label={i18nT('pages.settings.webexPanel.reply_in_thread')}
-            description={i18nT('pages.settings.webexPanel.reply_in_thread_desc')}
+            hint={i18nT('pages.settings.webexPanel.reply_in_thread_desc')}
             checked={draft.reply_in_thread}
             onChange={v => upd({ reply_in_thread: v })}
             disabled={ro}
@@ -405,6 +431,7 @@ export function WebexPanel() {
             onChange={v => upd({ soft_threshold_pct: v })}
             placeholder="80"
             disabled={ro}
+            invalidMessageId={thresholdError && thresholdErrorField === 'soft' ? thresholdErrorId : undefined}
           />
           <SettingsInput
             label={i18nT('pages.settings.webexPanel.hard_context_threshold')}
@@ -413,12 +440,13 @@ export function WebexPanel() {
             onChange={v => upd({ hard_threshold_pct: v })}
             placeholder="95"
             disabled={ro}
+            invalidMessageId={thresholdError && thresholdErrorField === 'hard' ? thresholdErrorId : undefined}
           />
         </SettingsCard>
       </SettingsSection>
 
       {/* ── Save (hidden on read-only remote sessions) ── */}
-      {!ro && <div className="flex items-center gap-3 mt-1 mb-4">
+      {!ro && <div className="flex flex-row-reverse flex-wrap items-center gap-3 mt-3 mb-4 max-w-[720px]">
         <Btn primary onClick={handleSave} disabled={saveMut.isPending}>
           {saveMut.isPending ? i18nT('pages.settings.webexPanel.saving') : i18nT('pages.settings.webexPanel.save_webex_settings')}
         </Btn>
@@ -435,8 +463,8 @@ export function WebexPanel() {
         {/* Client-side validation hint (the thresholds never left the browser) —
             not an error surface, so it stays plain text rather than ErrorNotice. */}
         {thresholdError && (
-          <span className="inline-flex items-center gap-1.5 text-[12px] text-danger">
-            <AlertTriangle size={14} /> {thresholdError}
+          <span id={thresholdErrorId} role="alert" className="inline-flex items-center gap-1.5 text-[12px] text-danger">
+            <AlertTriangle size={14} aria-hidden="true" /> {thresholdError}
           </span>
         )}
         {/* No hand-off: `botToken` (SecretField draft, never persisted) and the

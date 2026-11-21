@@ -44,6 +44,16 @@ _BASE_BOT_SCOPES = [
     "reactions:write",
     "users:read",
 ]
+#: Granted only with ``slack.code_channels``: agents.conversations.* plus the
+#: session identity override and the channel canvas.
+_CODE_CHANNEL_SCOPES = [
+    "canvases:write",
+    "channels:write.invites",
+    "chat:write.customize",
+    "code_channels:manage",
+    "groups:write.invites",
+    "pins:write",
+]
 
 _BASE_BOT_EVENTS = [
     "app_home_opened",
@@ -54,6 +64,18 @@ _BASE_BOT_EVENTS = [
     "message.groups",
     "message.im",
 ]
+#: A code channel shows Slack's Stop button only when the app subscribes to it,
+#: and its dashboard badge follows the channel's archive state and name.
+_CODE_CHANNEL_EVENTS = [
+    "agent_session_stopped",
+    "channel_archive",
+    "channel_rename",
+    "channel_unarchive",
+    "group_archive",
+    "group_rename",
+    "group_unarchive",
+]
+
 _AGENT_SESSION_SCOPES = ["assistant:write"]
 
 _AGENT_SESSION_EVENTS = ["agent_session_stopped", "agent_session_title_changed"]
@@ -122,6 +144,8 @@ class TestManifestGrantsNothingMore:
     def test_bot_scopes_are_exactly_the_reviewed_set(self) -> None:
         for combo in _COMBOS:
             want = set(_BASE_BOT_SCOPES)
+            if slack_manifest.CODE_CHANNELS in combo:
+                want |= set(_CODE_CHANNEL_SCOPES)
             if slack_manifest.AGENT_SESSIONS in combo:
                 want |= set(_AGENT_SESSION_SCOPES)
             assert sorted(_bot_scopes(_manifest(combo))) == sorted(want), combo
@@ -129,6 +153,8 @@ class TestManifestGrantsNothingMore:
     def test_bot_events_are_exactly_the_reviewed_set(self) -> None:
         for combo in _COMBOS:
             want = set(_BASE_BOT_EVENTS)
+            if slack_manifest.CODE_CHANNELS in combo:
+                want |= set(_CODE_CHANNEL_EVENTS)
             if slack_manifest.AGENT_SESSIONS in combo:
                 want |= set(_AGENT_SESSION_EVENTS)
             events = _bot_events(_manifest(combo))
@@ -145,6 +171,11 @@ class TestManifestGrantsNothingMore:
             else:
                 assert "agent_view" not in feats, combo
             assert "assistant_view" not in feats, combo
+            if slack_manifest.CODE_CHANNELS in combo:
+                # Socket Mode delivers channel commands: no slash_command_url.
+                assert feats["code_channels"] == {"enabled": True}, combo
+            else:
+                assert "code_channels" not in feats, combo
 
     def test_user_token_scopes_are_exactly_the_reviewed_set(self) -> None:
         # The gateway itself runs on the bot token and calls nothing with a
@@ -166,3 +197,38 @@ class TestManifestGrantsNothingMore:
             "search:read",
             "users:read",
         ]
+
+
+class TestCodeChannelMessageDelivery:
+    """Docs: https://docs.slack.dev/ai/slack-code/#scopes and #enabling-code-channels."""
+
+    def test_message_session_is_not_added_because_channels_and_groups_already_cover_it(
+        self,
+    ) -> None:
+        # message.channels / message.groups deliver code-channel messages too, and
+        # every other channel feature (tracked channels, mentions, threads) needs
+        # them, so they can never be dropped for message.session: adding it would
+        # widen the subscription list for no message it does not already deliver.
+        for combo in _COMBOS:
+            events = set(_bot_events(_manifest(combo)))
+            assert {"message.channels", "message.groups"} <= events, combo
+            assert "message.session" not in events, combo
+
+    def test_context_bar_click_is_not_a_bot_event_subscription(self) -> None:
+        # Slack's App Manifest editor refuses the whole manifest over it: "Scopes
+        # could not be verified for `code_channel_action` as it is not a valid bot
+        # user event type". Slack's events reference lists no such event.
+        on = [combo for combo in _COMBOS if slack_manifest.CODE_CHANNELS in combo]
+        assert on
+        for combo in on:
+            assert "code_channel_action" not in _bot_events(_manifest(combo)), combo
+
+    def test_no_slash_command_url_because_socket_mode_routes_agent_commands(self) -> None:
+        # Socket Mode delivers runtime-registered agent commands without a URL, and
+        # Kiro Crew runs no HTTP events endpoint to point one at.
+        for combo in _COMBOS:
+            manifest = _manifest(combo)
+            assert manifest["settings"]["socket_mode_enabled"] is True, combo
+            code = (manifest.get("features") or {}).get("code_channels")
+            if code is not None:
+                assert code == {"enabled": True}, combo

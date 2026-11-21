@@ -1,10 +1,10 @@
 ---
 title: Crewmate guides, change cards and Mate, a first crewmate
-status: accepted
+status: implemented
 author: buluoray
 created: 2026-10-08
-last-audited: 2026-10-08
-audited-at: 4f9c5697b9
+last-audited: 2026-11-20
+audited-at: cdb601611f
 doc-pr: 18326
 implementation-prs: [18301, 18317]
 tracking-issues: [18300, 18315]
@@ -14,8 +14,11 @@ superseded-by: []
 
 # RFC: Crewmate guides, change cards and Mate, a first crewmate
 
-- Status: accepted — the product owner's decision of 2026-10-08 after the team
-  review; maintainer acceptance is being requested on the doc PR.
+- Status: implemented — the product owner's decision of 2026-10-08 after the team
+  review, doc PR [#18326](https://github.com/kirodotdev/KiroCrew/pull/18326) merged.
+  Built by #18301 and #18317: at `1d08e941b3` the `kirocrew-guide` server is
+  `src/kiro_crew/mcp_guide.py` and Mate is created by
+  `src/kiro_crew/agent_materialization/first_crewmate.py`.
 - Author: buluoray
 - Amends sections of [rfc-crewmates-launch.md](rfc-crewmates-launch.md),
   [rfc-crewmate-greeting.md](rfc-crewmate-greeting.md) and
@@ -118,6 +121,12 @@ crewmate is compared with a session, and that it can help set up Kiro Crew, fix
 problems in it, or show the user around. It asks what the user wants to call
 it, never the user's own name. This changes rfc-crewmate-greeting §6 for Mate's
 first welcome only. Other crewmates keep one greeting mechanism per create path.
+(Amended 2026-10-29: the welcome no longer offers to set up Kiro Crew, fix
+problems in it or show the user around. It asks for its name first, explains
+what a mate is and tours its Profile, Schedules and Goals tabs. The owner,
+Zezhen Xu, decided this on
+[#25476](https://github.com/kirodotdev/KiroCrew/pull/25476#issuecomment-6485903226);
+see [the decision entry](../decisions/2026-10-29-the-first-mate-welcome-introduces-mates-and-tours-their-tabs.md).)
 
 **Renaming itself.** When the user answers, Mate renames itself through
 `rename_self` on `kirocrew-guide`. The tool renames only the caller's own

@@ -34,6 +34,7 @@ import itertools
 import json
 import logging
 import threading
+import time
 import weakref
 from datetime import datetime, timezone
 from typing import Any
@@ -42,6 +43,10 @@ logger = logging.getLogger(__name__)
 
 #: How long a burst of log growth is coalesced before the list is read again.
 _SETTLE_SECONDS = 0.4
+
+#: How long the feed waits before reading a thread's list again when a card is past
+#: its expiry but still open, or the append that dropped the last one has not committed.
+_EXPIRY_RETRY_SECONDS = 60.0
 
 _state_ref: "weakref.ReferenceType[Any] | None" = None
 _registered = False
@@ -64,6 +69,9 @@ _held_goals: dict[str, dict[str, Any]] = {}
 #: Per thread slot key, the session it last logged into, so a growth that lands
 #: after the turn's teardown cleared the live client still finds its thread.
 _sessions: dict[str, str] = {}
+#: Per thread slot key, the timer that reads its waiting list again when its soonest
+#: open change card expires (:func:`_arm_card_expiry`).
+_expiry_timers: "dict[str, asyncio.TimerHandle]" = {}
 
 
 def _digest(data: Any) -> str:
@@ -158,8 +166,10 @@ def _sid(slot: Any) -> str:
 def _crewmate_slots(state: Any) -> list[Any]:
     from kiro_crew import members as members_mod
 
+    # Read once per scan: each read of the facade goes through MirroredModule.__getattr__.
+    dm_mode = members_mod.DM_SLOT_MODE
     slots = getattr(state, "_slots", None) or {}
-    return [s for s in list(slots.values()) if getattr(s, "mode", "") == members_mod.DM_SLOT_MODE]
+    return [s for s in list(slots.values()) if getattr(s, "mode", "") == dm_mode]
 
 
 def _record(
@@ -234,7 +244,61 @@ def record_waiting(state: Any, slot: Any, *, cards: bool = True) -> bool:
     from kiro_crew.dashboard import member_waiting
 
     items, total = member_waiting.waiting_list(state, slot.key, cards=cards)
-    return _record(slot.key, "waiting", _sid(slot), {"items": items, "total": total})
+    data = {"items": items, "total": total}
+    sid = _sid(slot)
+    appended = _record(slot.key, "waiting", sid, data)
+    if cards:
+        _arm_card_expiry(state, slot.key, data if sid else None)
+    return appended
+
+
+def _arm_card_expiry(state: Any, slot_key: str, recorded: "dict[str, Any] | None") -> None:
+    """Read *slot_key*'s waiting list again once its soonest open change card expires.
+
+    A card expires by the clock alone, which writes nothing to the thread's log, so
+    neither the growth signal nor :func:`question_retired` would ever take it off the
+    list. One timer per thread, replaced on every record; none without a serving loop.
+    A card already past its expiry (a step still in flight holds it open), or a list
+    whose last card just left and whose snapshot *recorded* has not committed, is
+    read again after :data:`_EXPIRY_RETRY_SECONDS`: a rejected append grows no log,
+    so nothing else would retry it. *recorded* is None for a thread with no session,
+    which records afresh on its first growth.
+    shortcut: a timer does not outlive the gateway, so a card that expires after a
+    restart, on a thread idle since, stays listed until the thread next grows; arm
+    these at start-up if that case shows up.
+    """
+    from kiro_crew.dashboard import change_cards
+
+    loop = getattr(state, "serving_loop", None)
+    if loop is None:
+        return
+    try:
+        cards = change_cards.card_store_for(state).pending(slot_key)
+    except Exception:
+        logger.debug("Bot feed: card expiry not armed for %s", slot_key, exc_info=True)
+        return
+    ends = [
+        float(card["expires_at"])
+        for card in cards
+        if card.get("status") in (change_cards.STATUS_PENDING, change_cards.STATUS_FAILED)
+        and isinstance(card.get("expires_at"), (int, float))
+    ]
+    old = _expiry_timers.pop(slot_key, None)
+    if old is not None:
+        old.cancel()
+    now = time.time()
+    key = (slot_key, "waiting")
+    with _lock:
+        unsettled = recorded is not None and (
+            key in _inflight or _last.get(key) != _digest(recorded)
+        )
+    if ends and min(ends) > now:
+        delay = min(ends) - now + _SETTLE_SECONDS
+    elif ends or (old is not None and unsettled):
+        delay = _EXPIRY_RETRY_SECONDS
+    else:
+        return
+    _expiry_timers[slot_key] = loop.call_later(delay, _retired, slot_key)
 
 
 async def _warm_cards(state: Any) -> bool:
@@ -250,7 +314,7 @@ async def _warm_cards(state: Any) -> bool:
     try:
         await change_cards.card_store_for(state).warm()
     except Exception:
-        logger.debug("crewmate feed: change-card store not warmed", exc_info=True)
+        logger.debug("Bot feed: change-card store not warmed", exc_info=True)
         return False
     return True
 
@@ -280,19 +344,22 @@ def _on_log_growth(session_id: str) -> None:
     try:
         loop.call_soon_threadsafe(_grew, session_id)
     except RuntimeError:
-        logger.debug("crewmate feed: growth for %s after the loop closed", session_id)
+        logger.debug("Bot feed: growth for %s after the loop closed", session_id)
 
 
 def _grew(session_id: str) -> None:
     global _timer
+    # A session already pending this window was scanned; a new session id scans.
+    if session_id in _pending:
+        return
+    if _timer is None:
+        _timer = asyncio.get_running_loop().call_later(_SETTLE_SECONDS, _settle)
     _pending.add(session_id)
     state = _state()
     if state is not None:
         # Learn which thread this session is now, before a teardown can clear it.
         for slot in _crewmate_slots(state):
             _sid(slot)
-    if _timer is None:
-        _timer = asyncio.get_running_loop().call_later(_SETTLE_SECONDS, _settle)
 
 
 def question_retired(slot_key: str) -> None:
@@ -308,20 +375,27 @@ def question_retired(slot_key: str) -> None:
     try:
         loop.call_soon_threadsafe(_retired, slot_key)
     except RuntimeError:
-        logger.debug("crewmate feed: question retired on %s after the loop closed", slot_key)
+        logger.debug("Bot feed: question retired on %s after the loop closed", slot_key)
 
 
 def _retired(slot_key: str) -> None:
     global _timer
+    from kiro_crew import members as members_mod
+
     state = _state()
     if state is None:
         return
-    for slot in _crewmate_slots(state):
-        if slot.key == slot_key and _sid(slot):
-            _pending.add(_sid(slot))
-            if _timer is None:
-                _timer = asyncio.get_running_loop().call_later(_SETTLE_SECONDS, _settle)
-            return
+    slot = (getattr(state, "_slots", None) or {}).get(slot_key)
+    if slot is None or getattr(slot, "mode", "") != members_mod.DM_SLOT_MODE:
+        # A closed thread has no list to read again; its expiry timer goes with it.
+        _expiry_timers.pop(slot_key, None)
+        return
+    sid = _sid(slot)
+    if not sid:
+        return
+    if _timer is None:
+        _timer = asyncio.get_running_loop().call_later(_SETTLE_SECONDS, _settle)
+    _pending.add(sid)
 
 
 def _settle() -> None:
@@ -367,7 +441,7 @@ async def _settle_grown(state: Any, grown: set[str]) -> None:
                 _keep.add(task)
                 task.add_done_callback(_keep.discard)
         except Exception:
-            logger.debug("crewmate feed: waiting list for %s not recorded", slot.key, exc_info=True)
+            logger.debug("Bot feed: waiting list for %s not recorded", slot.key, exc_info=True)
 
 
 #: Per thread, the session its snapshots were last recorded into.
@@ -437,7 +511,7 @@ async def _record_current_goal(slot: Any, *, since: "str | None" = None) -> None
         # tries again rather than trusting the snapshot from before.
         with _lock:
             _stale_goals.add(getattr(slot, "agent", ""))
-        logger.debug("crewmate feed: goal for %s not recorded", slot.key, exc_info=True)
+        logger.debug("Bot feed: goal for %s not recorded", slot.key, exc_info=True)
 
 
 def _on_goal_written(slug: str, member: str, rec: dict[str, Any]) -> None:
@@ -450,7 +524,7 @@ def _on_goal_written(slug: str, member: str, rec: dict[str, Any]) -> None:
     try:
         loop.call_soon_threadsafe(_goal_written, member, snapshot)
     except RuntimeError:
-        logger.debug("crewmate feed: goal write for %s after the loop closed", slug)
+        logger.debug("Bot feed: goal write for %s after the loop closed", slug)
 
 
 def _goal_written(member: str, rec: dict[str, Any]) -> None:
@@ -471,7 +545,7 @@ def _goal_written(member: str, rec: dict[str, Any]) -> None:
             # wins, until the thread's next growth names one.
             record_goal(slot, rec)
         except Exception:
-            logger.debug("crewmate feed: goal for %s not recorded", slot.key, exc_info=True)
+            logger.debug("Bot feed: goal for %s not recorded", slot.key, exc_info=True)
 
 
 def start(state: Any) -> None:

@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from redaction_structured_cases import github_classic
 
 from kiro_crew.platform import update_provider
 from kiro_crew.platform.governance import UpdatePins
@@ -24,6 +25,8 @@ from kiro_crew.platform.update_provider import (
     _trusted_path_env,
     resolve_provider,
 )
+
+_KEY = github_classic(seed=20)  # a token the credential plan redacts
 
 #: A pid NO supported OS can allocate, so a mock carrying it cannot make a real
 #: process the target of a real signal. Every mock subprocess in this file uses
@@ -774,7 +777,7 @@ class TestCommandProviderNoShellAndTimeout:
         try:
             with caplog.at_level(logging.ERROR):
                 await self._apply_with_stderr(
-                    b"fetch rejected SSO-COOKIE=abc123 key=AKIAIOSFODNN7EXAMPLE"
+                    f"fetch rejected SSO-COOKIE=abc123 key={_KEY}".encode()
                 )
         finally:
             reset_context()
@@ -783,7 +786,7 @@ class TestCommandProviderNoShellAndTimeout:
         # The companion's extra reach -- the whole point of routing via context.
         assert "SSO-COOKIE" not in logged
         # ...without losing the baseline pass underneath it.
-        assert "AKIAIOSFODNN7EXAMPLE" not in logged
+        assert _KEY not in logged
 
     @pytest.mark.asyncio
     async def test_apply_failure_withholds_stderr_when_composition_fails(
@@ -1203,7 +1206,7 @@ class TestWheelUpdateCommandPropagatesDownloadFailure:
         bin_dir = tmp_path / "bin"
         bin_dir.mkdir()
         fake_curl = bin_dir / "curl"
-        fake_curl.write_text("#!/bin/sh\nexit 6\n")
+        fake_curl.write_text("#!/bin/sh\nexit 6\n", encoding="utf-8")
         fake_curl.chmod(0o755)
 
         with patch(
@@ -1700,7 +1703,7 @@ class TestInstallerNeverLandsOnDisk:
         bin_dir = tmp_path / "bin"
         bin_dir.mkdir()
         fake_curl = bin_dir / "curl"
-        fake_curl.write_text("#!/bin/sh\nexit 6\n")
+        fake_curl.write_text("#!/bin/sh\nexit 6\n", encoding="utf-8")
         fake_curl.chmod(0o755)
 
         with patch(
@@ -1740,7 +1743,7 @@ class TestPosixOnlyMarkerIsNotForgotten:
         import pathlib as _pathlib
         import re
 
-        lines = _pathlib.Path(__file__).read_text().splitlines()
+        lines = _pathlib.Path(__file__).read_text(encoding="utf-8").splitlines()
         # (line index, name) for every test function, plus the class it sits in.
         current_class = ""
         tests: list[tuple[int, str, str]] = []
@@ -1860,9 +1863,10 @@ class TestRedactionHappensBeforeTruncation:
 
     @pytest.mark.asyncio
     async def test_a_credential_straddling_the_cap_is_not_leaked(self, caplog) -> None:
-        # An AWS-key-shaped secret positioned so the 500-char cap would bisect it.
-        secret = "AKIAIOSFODNN7EXAMPLE"
-        padding = "x" * (500 - len(secret) // 2)
+        # A credential positioned so the 500-char cap would bisect it.
+        secret = _KEY
+        # A blank before it: a token glued to a letter is no token.
+        padding = "x" * (500 - len(secret) // 2 - 1) + " "
         stderr = (padding + secret + " trailing").encode()
 
         provider = CommandProvider(check_command="c", apply_command="a")

@@ -28,6 +28,7 @@ if TYPE_CHECKING:
         _dashboard_state,
         _orch_cfg,
         _owner_id,
+        _removes_in_flight,
         _tracking_channels,
         apply_config_duration,
         clear_trusted_sessions,
@@ -212,8 +213,12 @@ def enable_yolo_with_ttl(ttl_secs: int) -> None:
 
 
 def is_yolo_mode() -> bool:
-    """Return whether YOLO mode is currently active."""
-    return safety_override().is_active()
+    """Return whether YOLO mode is currently active for Slack.
+
+    ``gateway --approval yolo``'s grant is the dashboard's only (``is_cli_launch``).
+    """
+    so = safety_override()
+    return so.is_active() and so.is_cli_launch is not True
 
 
 def is_slack_session_trusted(session_key: str) -> bool:
@@ -246,11 +251,42 @@ def is_allowed_user(user_id: str) -> bool:
     """Check if user_id is the owner.
 
     Multi-user access is disabled for security — only the owner
-    (KIROCREW_OWNER_ID) is authorized to interact via Slack.
+    (KIROCREW_OWNER_ID) is authorized to interact via Slack. A shared user
+    (``slack.shared_access``) is admitted only where a site asks
+    :func:`is_shared_user` on purpose, never here.
     """
     if not user_id:
         return False
     return is_owner(user_id)
+
+
+def is_shared_user(user_id: str) -> bool:
+    """Whether *user_id* is admitted only as a shared user (never the owner).
+
+    The owner-only gates refuse exactly these people; see
+    :mod:`kiro_crew.slack.shared_access`.
+    """
+    if not user_id or is_owner(user_id):
+        return False
+    from kiro_crew.slack import shared_access
+
+    return shared_access.is_shared_user(slack_cfg(), user_id, owner=False)
+
+
+def is_shared_listed(user_id: str) -> bool:
+    """Whether the owner-only gates must treat *user_id* as a shared user (never the owner).
+
+    True while the switch is on and the id is listed, and also for anyone admitted
+    as a shared user earlier in this process. Unlike :func:`is_shared_user` it needs
+    no fresh Slack confirmation, and a removal or a switch-off does not clear it, so
+    neither a confirmation ageing out nor the owner removing the person while their
+    message is in flight lets that message past a gate that refuses shared users.
+    """
+    if not user_id or is_owner(user_id):
+        return False
+    from kiro_crew.slack import shared_access
+
+    return shared_access.listed(slack_cfg(), user_id) or shared_access.was_shared(user_id)
 
 
 def set_tracking_channels(channel_ids: set[str]) -> None:
@@ -271,5 +307,7 @@ def is_open_channel(channel_id: str) -> bool:
 
 
 def is_tracked_channel(channel_id: str) -> bool:
-    """Check if *channel_id* is in the tracking set."""
-    return bool(channel_id and channel_id in _tracking_channels)
+    """Check if *channel_id* is in the tracking set and no remove of it is still saving."""
+    return bool(
+        channel_id and channel_id in _tracking_channels and channel_id not in _removes_in_flight
+    )

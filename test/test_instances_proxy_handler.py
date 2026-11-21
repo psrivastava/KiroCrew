@@ -8,6 +8,7 @@ import types
 
 import pytest
 from instances_helpers import _body, _enable, _FakeReq, _State
+from redaction_structured_cases import ALNUM, synth
 
 
 class TestProxyHandlerPolicy:
@@ -40,11 +41,8 @@ class TestProxyHandlerPolicy:
     ):
         """A browser that drops mid-stream must not produce a SECOND write.
 
-        The pump caught `ConnectionResetError` and then fell through to
-        `write_eof()` on the very transport that had just refused a write — the
-        second exception escaped the handler and crashed the request. The
-        handler now returns from the except block, so exactly one write is
-        attempted after the reset: none.
+        After `ConnectionResetError` the handler returns; a `write_eof()` on the dead
+        transport would raise again and crash the request.
         """
         from kiro_crew.dashboard.handlers_instances import api_instances_proxy
 
@@ -260,11 +258,8 @@ class TestProxyHandlerPolicy:
     def test_encoded_traversal_cannot_reach_the_control_plane(self, raw):
         """Every encoding depth resolves to the SAME refusal.
 
-        The denylist shape this replaced inspected a half-decoded string while
-        the peer resolved the fully-decoded one, so `%252e%252e` arrived as
-        `%2e%2e`, matched no rule, and normalized back into `api/instances`.
-        Decoding to a fixed point before vetting is what closes the class —
-        so this is parametrized over depth rather than pinned to one payload.
+        The path is decoded to a fixed point before vetting, since the peer resolves the
+        fully-decoded form (`%252e%252e` -> `..`). Parametrized over depth for that reason.
         """
         from kiro_crew.dashboard.handlers_instances import _proxy_canonical_path
 
@@ -360,7 +355,10 @@ class TestProxyRedactsPeerReplies:
     the read-path redaction point: a credential the peer emits never reaches
     the browser, in a JSON body or in an SSE frame."""
 
-    SECRET = "AKIAIOSFODNN7EXAMPLE"
+    # A synthetic Google API key by its published format; it starts with "A" so
+    # ``\u0041`` can spell its first character. A bare 40-character AWS-shaped
+    # run is no credential by itself.
+    SECRET = "AIza" + synth(35, ALNUM, 11)
 
     def _req(self, tmp_path, monkeypatch, *, path, chunks, content_type):
         _enable(tmp_path, monkeypatch)
@@ -537,7 +535,7 @@ class TestRedactSseEvent:
     """The browser joins an event's data lines before parsing, so redaction
     must see the joined payload, whatever the line ending."""
 
-    SECRET = "AKIA" + "IOSFODNN7EXAMPLE"
+    SECRET = "AIza" + synth(35, ALNUM, 11)
 
     def test_secret_split_over_data_lines_behind_an_escape_is_redacted(self):
         from kiro_crew.dashboard.handlers_instances import _redact_sse_event

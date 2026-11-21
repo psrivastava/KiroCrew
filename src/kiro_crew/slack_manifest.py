@@ -3,7 +3,8 @@
 Three callers need the same bytes and MUST not disagree about them:
 
 * ``cli_setup`` (``kirocrew manifest``) prints the manifest or the deep link,
-* the dashboard's ``GET /api/slack/manifest`` serves both to Settings → Slack,
+* the dashboard's ``GET /api/slack/manifest`` serves both to Settings → Messaging
+  Channels → Slack,
 * ``security._kirocrew_slack_app_link_alias`` decides whether a deep link is
   ours by rebuilding the expected payload and comparing.
 
@@ -17,7 +18,7 @@ payload themselves. Sharing the procedure — not just the template file — is 
 makes that drift impossible.
 
 The manifest is TOGGLE-AWARE: template lines ending in ``#@<feature>`` render
-only when that Slack Code switch is on. The set of switches
+only when that Slack Code switch is on (``#@a|b`` = either). The set of switches
 is finite (:data:`FEATURES`), so the validator rebuilds every combination
 (:func:`feature_sets`) instead of loosening its pattern, and
 :func:`requirements` / :func:`diff_requirements` give the settings page the
@@ -49,6 +50,29 @@ DEFAULT_ALIAS = "kirocrew"
 
 #: Prefix of every alias-named slash command.
 SLASH_COMMAND_PREFIX = "kirocrew-"
+
+#: A command name the bundled manifest can register, with its ``/``:
+#: ``/kirocrew`` or ``/kirocrew-<alias>`` (:func:`slash_command`). Slack delivers
+#: only commands this app registered, so the gateway answers every name of this
+#: shape whatever ``slack.command`` says. The alias class is what
+#: :func:`slash_command` emits, so a matched name is safe to echo.
+MANIFEST_COMMAND_RE = re.compile(
+    rf"/(?:{re.escape(DEFAULT_ALIAS)}|{re.escape(SLASH_COMMAND_PREFIX)}[a-z0-9_-]+)"
+)
+
+
+def is_app_command(command: str, *names: object) -> bool:
+    """Whether *command* (``/name``, as Slack sends it) is this app's own.
+
+    It is when it matches :data:`MANIFEST_COMMAND_RE`, or equals ``/<name>``
+    for one of *names*: the live ``slack.command`` and the name the gateway
+    shows. Checking the live config keeps a custom command answered after the
+    shown name changed to another registered one.
+    """
+    if MANIFEST_COMMAND_RE.fullmatch(command):
+        return True
+    return any(isinstance(n, str) and n and command == f"/{n}" for n in names)
+
 
 #: Slack's limit on a slash command, leading ``/`` included.
 SLASH_COMMAND_MAX = 32
@@ -97,6 +121,8 @@ def slash_command(alias: str) -> str:
 #: Slack Code switch: the app is a Slack agent (``features.agent_view``): threads
 #: run as agent sessions with a live status, a title and Slack's native Stop.
 AGENT_SESSIONS = "agent_sessions"
+#: Slack Code switch: the app may open code channels (``features.code_channels``).
+CODE_CHANNELS = "code_channels"
 #: The Slack Code switch REGISTRY: switch name -> the bot scope it cannot run
 #: without. The name is also the switch's ``slack.<name>`` config key and the
 #: template's ``#@<name>`` gate. Registering a switch is one entry here, its
@@ -106,12 +132,13 @@ AGENT_SESSIONS = "agent_sessions"
 #: page's update panel all follow from this mapping.
 FEATURE_SCOPES: dict[str, str] = {
     AGENT_SESSIONS: "assistant:write",
+    CODE_CHANNELS: "code_channels:manage",
 }
 #: Every registered switch, in a fixed (display) order.
 FEATURES: tuple[str, ...] = tuple(FEATURE_SCOPES)
 
-#: A gated template line: ``<content>  #@flag`` at line end.
-_GATE_RE = re.compile(r"\s+#@(?P<flag>[a-z_]+)\s*$")
+#: A gated template line: ``<content>  #@flag`` or ``#@flag1|flag2`` at line end.
+_GATE_RE = re.compile(r"\s+#@(?P<flags>[a-z_]+(?:\|[a-z_]+)*)\s*$")
 
 
 def normalize_features(features: Iterable[str] | None) -> frozenset[str]:
@@ -149,7 +176,7 @@ def template(features: Iterable[str] | None = None) -> str:
         gate = _GATE_RE.search(line)
         if gate is None:
             out.append(line)
-        elif gate["flag"] in enabled:
+        elif enabled.intersection(gate["flags"].split("|")):
             out.append(line[: gate.start()])
     return "\n".join(out) + "\n"
 
@@ -230,7 +257,7 @@ class ManifestRequirements:
 
     bot_scopes: frozenset[str] = field(default_factory=frozenset)
     bot_events: frozenset[str] = field(default_factory=frozenset)
-    #: ``features.*`` blocks the manifest declares (``agent_view``…).
+    #: ``features.*`` blocks the manifest declares (``code_channels``…).
     features: frozenset[str] = field(default_factory=frozenset)
 
 

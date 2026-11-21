@@ -22,9 +22,9 @@ sys.modules[_spec.name] = gate
 _spec.loader.exec_module(gate)
 
 # The ceiling only moves down. Raising it is the change this test exists to stop.
-X_CAPTURE_CEILING = 4
+X_CAPTURE_CEILING = 3
 KIRO_KAS_PAIR_CEILING = 0
-X_REGISTRATION_PENDING_CEILING = 9
+X_REGISTRATION_PENDING_CEILING = 6
 
 
 def test_tree_passes() -> None:
@@ -132,6 +132,33 @@ def test_pi_in_steering_request_without_its_capture_fails() -> None:
     assert (name, "pi") in gaps
     assert (name, "pi") not in gate.X_CAPTURE_ALLOWLIST
     assert (name, "pi") not in gate.check_x_captures(sets, gate.set_comments())
+
+
+def test_claude_steering_request_needs_its_replayed_capture() -> None:
+    """claude's STEERING_REQUEST membership fails without its capture or its replay."""
+    sets, comments = gate.live_sets(), gate.set_comments()
+    name, rel = "ACP_BACKENDS_STEERING_REQUEST", "claude/steering-live.jsonl"
+    assert "claude" in sets[name]
+    assert f"acp_frames/{rel}" in comments[name]
+    assert (name, "claude") not in gate.X_CAPTURE_ALLOWLIST
+    assert (name, "claude") not in gate.check_x_captures(sets, comments)
+
+    def real(path):
+        return gate.read_capture(gate.REPO_ROOT, path)
+
+    def gone(path):
+        return None if path == rel else real(path)
+
+    def unreplayed(path):
+        got = real(path)
+        return (dict(got[0], replayed=False), got[1]) if path == rel else got
+
+    assert "does not exist" in gate.check_x_captures(sets, comments, gone)[(name, "claude")]
+    assert (
+        "no test replays it" in gate.check_x_captures(sets, comments, unreplayed)[(name, "claude")]
+    )
+    uncited = comments[name].replace("acp_frames/claude/", "acp_frames/opencode/")
+    assert (name, "claude") in gate.check_x_captures(sets, dict(comments, **{name: uncited}))
 
 
 def test_kas_citing_a_kiro_capture_fails() -> None:
@@ -345,6 +372,70 @@ def test_the_worker_kit_capture_shows_the_crewmate_prompt_and_limit_applied() ->
     assert tags == ["read"]  # the crewmate file excluded ``shell`` from the base
 
 
+def test_codex_worker_kit_is_proven_by_its_own_capture() -> None:
+    """The codex worker capture is cited, passes, and is off the allowlist."""
+    name, rel = "ACP_BACKENDS_MATE_WORKER_KIT", "codex/worker-kit-live.jsonl"
+    comments = gate.set_comments()
+    assert (name, "codex") not in gate.X_CAPTURE_ALLOWLIST
+    assert f"acp_frames/{rel}" in comments[name]
+    assert (name, "codex") not in gate.check_x_captures(gate.live_sets(), comments)
+    assert (name, "codex") in gate.check_x_captures(
+        gate.live_sets(), {**comments, name: comments[name].replace(rel, "codex/absent.jsonl")}
+    )
+
+
+def test_the_codex_worker_capture_shows_the_crewmates_server_and_prompt_applied() -> None:
+    """The crewmate's server, called once and answered, and the reply its prompt asked for."""
+    rel = "codex/worker-kit-live.jsonl"
+    (call,) = _updates(rel, "tool_call")
+    assert call["rawInput"] == {"server": "pixel-probe", "tool": "probe_codeword", "arguments": {}}
+    assert len(_methods(rel, "session/request_permission")) == 1
+    done = _updates(rel, "tool_call_update")[-1]
+    assert done["rawOutput"]["result"]["content"][0]["text"] == "kumquat-17"
+    reply = [
+        u["content"]["text"] for u in _updates(rel, "agent_message_chunk") if u.get("messageId")
+    ]
+    assert reply == ["kumquat-17"]
+    (title,) = [u["title"] for u in _updates(rel, "session_info_update") if u.get("title")]
+    assert title.startswith("[AGENT SYSTEM PROMPT] You are the worker.")
+
+
+def test_pi_worker_kit_is_proven_by_its_own_capture() -> None:
+    """The pi worker capture is cited, passes, and is off the allowlist, for the kit
+    set and for the prompt channel it rests on."""
+    rel = "pi/worker-kit-live.jsonl"
+    comments = gate.set_comments()
+    for name in ("ACP_BACKENDS_MATE_WORKER_KIT", "ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT"):
+        assert (name, "pi") not in gate.X_CAPTURE_ALLOWLIST
+        assert f"acp_frames/{rel}" in comments[name]
+    name = "ACP_BACKENDS_MATE_WORKER_KIT"
+    assert (name, "pi") not in gate.check_x_captures(gate.live_sets(), comments)
+    assert (name, "pi") in gate.check_x_captures(
+        gate.live_sets(), {**comments, name: comments[name].replace(rel, "pi/absent.jsonl")}
+    )
+
+
+def test_the_pi_worker_capture_shows_the_bots_server_and_prompt_applied() -> None:
+    """The Bot's server, reached through the per-session handoff, called once through
+    the gate and answered, and the reply the Bot's prompt asked for."""
+    rel = "pi/worker-kit-live.jsonl"
+    (call,) = _updates(rel, "tool_call")
+    assert call["title"] == "mcp__pixel_probe__probe_codeword"
+    (ask,) = _methods(rel, "session/request_permission")
+    assert '"mcp":{"server":"pixel-probe","tool":"probe_codeword"}' in (
+        ask["params"]["toolCall"]["rawInput"]["message"]
+    )
+    done = _updates(rel, "tool_call_update")[-1]
+    assert done["status"] == "completed"
+    assert done["rawOutput"]["details"] == {"server": "pixel-probe", "tool": "probe_codeword"}
+    assert done["rawOutput"]["content"][0]["text"] == "kumquat-17"
+    reply = [u["content"]["text"] for u in _updates(rel, "agent_message_chunk")]
+    assert reply == ["kumquat-17"]
+    note = _frames(rel)[0]["_meta"]["note"]
+    assert "composed ['pixel-probe']" in note
+    assert "with no session key composed []" in note
+
+
 def test_every_live_kas_capture_names_the_engine_version() -> None:
     """KAS is versioned apart from kiro-cli; a live capture records the engine's own."""
     import re
@@ -480,3 +571,76 @@ def test_spec_servers_off_wire_captures_run_the_spec_server_off_an_empty_array()
         assert "probe_codeword" in json.dumps(call), rel
         reply = "".join(u["content"]["text"] for u in _updates(rel, "agent_message_chunk"))
         assert reply.strip() == "tangerine-42", rel
+
+
+def _info(rel: str, kind: str) -> list[dict]:
+    """The ``_meta.kiro`` blob of every KAS ``session_info_update`` of *kind*."""
+    out = []
+    for u in _updates(rel, "session_info_update"):
+        kiro = (u.get("_meta") or {}).get("kiro") or {}
+        if kiro.get("kind") == kind:
+            out.append(kiro)
+    return out
+
+
+def test_open_external_url_capture_shows_the_consent_url_request() -> None:
+    """After a resetServer sign-in, KAS asks the client to open the server's consent URL."""
+    rel = "kas/open-external-url-live.jsonl"
+    (ask,) = _methods(rel, "_kiro/openExternalUrl")
+    assert "id" in ask, "it is a request the client answers, so it carries an id"
+    assert set(ask["params"]) == {"url"}
+    url = ask["params"]["url"]
+    assert "/authorize?" in url and "response_type=code" in url
+    assert "code_challenge_method=S256" in url and "redirect_uri=" in url
+
+
+def test_auto_compaction_capture_shows_the_engine_summarizing_on_its_own() -> None:
+    """One prompt, no compact request: KAS sends started then completed, then ends the turn."""
+    rel = "kas/auto-compaction-live.jsonl"
+    frames = _frames(rel)[1:]
+    assert not any(str(f.get("method", "")).startswith("_kiro/session/compact") for f in frames)
+    kinds = [
+        ((f["params"]["update"].get("_meta") or {}).get("kiro") or {}).get("kind")
+        for f in frames
+        if (f.get("params") or {}).get("update", {}).get("sessionUpdate") == "session_info_update"
+    ]
+    started = kinds.index("summarization_started")
+    assert kinds[started + 1] == "summarization_completed"
+    (done,) = _info(rel, "summarization_completed")
+    assert done["summarization"]["status"] == "success"
+    assert frames[-1]["result"]["stopReason"] == "end_turn"
+
+
+def test_report_usage_captures_each_carry_the_turn_bill() -> None:
+    """kiro and KAS bill in credits; claude, opencode, goose and codex in prompt-result tokens."""
+    rel = "kiro/compaction-live.jsonl"
+    metered = [
+        e
+        for f in _methods(rel, "_kiro.dev/metadata")
+        for e in (f["params"].get("meteringUsage") or [])
+    ]
+    assert metered and all(e["unit"] == "credit" and e["value"] > 0 for e in metered)
+    (done,) = _info("kas/turn-usage-live.jsonl", "turn_completion")
+    (entry,) = done["promptTurnSummaries"]
+    assert entry["unit"] == "credit" and entry["usage"] > 0
+    for rel in (
+        "claude/session.jsonl",
+        "opencode/session-live.jsonl",
+        "goose/turn-live.jsonl",
+        "codex/session-live.jsonl",
+    ):
+        results = [r.get("result") or {} for r in _responses(rel).values()]
+        ends = [r for r in results if "stopReason" in r]
+        assert ends and all(e["usage"]["outputTokens"] > 0 for e in ends), rel
+
+
+def test_codex_refused_turn_reports_no_usage_and_reads_as_unbilled() -> None:
+    """codex-acp ends a turn the provider refused with ``usage: null``, read as no counts."""
+    from kiro_crew.acp._dispatch import parse_prompt_token_usage
+
+    results = [
+        r.get("result") or {} for r in _responses("codex/turn-usage-null-live.jsonl").values()
+    ]
+    (end,) = [r for r in results if "stopReason" in r]
+    assert end["usage"] is None
+    assert parse_prompt_token_usage(end) is None

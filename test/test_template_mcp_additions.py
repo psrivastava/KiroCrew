@@ -54,9 +54,20 @@ def _plant(template: str) -> None:
     path.write_text(json.dumps(data), encoding="utf-8")
 
 
-def _add(template: str, server: str = "fetch", entry: dict | None = None, card: str = "c1"):
+def _add(
+    template: str,
+    server: str = "fetch",
+    entry: dict | None = None,
+    card: str = "c1",
+    **kwargs: object,
+):
     return tma.add_addition(
-        template, server, entry or dict(_ENTRY), approved_by="owner", card_id=card
+        template,
+        server,
+        entry or dict(_ENTRY),
+        approved_by="owner",
+        card_id=card,
+        **kwargs,  # type: ignore[arg-type]
     )
 
 
@@ -265,6 +276,44 @@ def test_the_default_agent_and_the_worker_are_refused_everywhere(home, template)
     assert tma.merge_at_spawn(template, spec) is spec
 
 
+def test_a_default_mount_only_addition_round_trips_and_reaches_the_worker(home):
+    added = _add("kirocrew", mount_only=True)
+    assert added is not None and added.mount_only is True
+    assert tma.read_additions("kirocrew")["fetch"].mount_only is True
+    assert tma.mount_only_names("kirocrew") == frozenset({"fetch"})
+    assert tma.mount_only_names("my-agent") == frozenset()
+    assert tma.addition_reach("kirocrew", mount_only=True) == (
+        "kirocrew",
+        "kirocrew-worker",
+    )
+    assert tma.addition_support("kirocrew", "", mount_only=True) == tma.AdditionSupport(True)
+    spec: dict[str, Any] = {"tools": ["fs_read"], "allowedTools": ["fs_read"], "mcpServers": {}}
+    assert tma.merge_into_spec("kirocrew", spec) == ["fetch"]
+    assert spec["tools"] == ["fs_read", "@fetch"]
+    assert spec["allowedTools"] == ["fs_read"]
+    assert (
+        "mount_only" in json.loads(tma.record_path().read_text())["templates"]["kirocrew"]["fetch"]
+    )
+
+
+def test_a_default_addition_without_the_flag_or_on_the_worker_is_refused(home):
+    with pytest.raises(tma.AdditionError, match="template_not_covered"):
+        _add("kirocrew")
+    with pytest.raises(tma.AdditionError, match="template_not_covered"):
+        _add("kirocrew-worker", mount_only=True)
+    assert tma.read_additions("kirocrew") == {}
+    assert tma.read_additions("kirocrew-worker") == {}
+
+
+def test_a_planted_default_entry_without_the_flag_is_never_merged(home):
+    _plant("kirocrew")
+    assert tma.read_additions("kirocrew") == {}
+    assert tma.mount_only_names("kirocrew") == frozenset()
+    spec: dict[str, Any] = {"tools": [], "mcpServers": {}}
+    assert tma.merge_into_spec("kirocrew", spec) == []
+    assert spec == {"tools": [], "mcpServers": {}}
+
+
 def test_reach_follows_the_alias():
     assert tma.addition_reach("kirocrew-conductor") == (
         "kirocrew-conductor",
@@ -454,6 +503,50 @@ def test_another_templates_addition_does_not_reach_a_conductor(tmp_path, monkeyp
     assert "fetch" not in data["mcpServers"]
 
 
+# -- waitForReady: a server the session holds its first prompt for -----------------
+
+_WAITED = {**_ENTRY, "waitForReady": True, "timeout": 10000}
+
+
+def test_wait_for_ready_round_trips_and_reaches_the_merge(home):
+    added = _add("my-agent", entry=dict(_WAITED))
+    assert added.entry["waitForReady"] is True
+    assert tma.read_additions("my-agent")["fetch"].entry == _WAITED
+    assert tma.merge_into("my-agent", {})["fetch"] == _WAITED
+
+
+@pytest.mark.parametrize("value", ["yes", 1, 0, None, ["true"]])
+def test_wait_for_ready_is_refused_unless_a_bool(home, value):
+    with pytest.raises(tma.AdditionError, match="wait_for_ready_invalid"):
+        _add("my-agent", entry={**_ENTRY, "waitForReady": value})
+    assert tma.read_additions("my-agent") == {}
+
+
+def test_a_server_the_session_waits_for_is_merged_first(home):
+    """The engine starts servers a few at a time in map order, so a server the first
+    prompt waits for is put at the front; one that does not ask keeps its place last."""
+    _add("my-agent", entry=dict(_WAITED))
+    _add("my-agent", server="plain", card="c2")
+    own = {"a": {"command": "a"}, "b": {"command": "b"}}
+    merged = tma.merge_into("my-agent", own)
+    assert list(merged) == ["fetch", "a", "b", "plain"]
+    assert list(own) == ["a", "b"]
+
+
+@pytest.mark.parametrize(("installer", "filename", "template"), _CONDUCTOR_INSTALLERS)
+def test_a_conductor_keeps_a_waited_for_addition_first_with_its_key(
+    tmp_path, monkeypatch, installer, filename, template
+):
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
+    _pin_conductor_template(tmp_path, monkeypatch)
+    _add(template, entry=dict(_WAITED))
+    assert getattr(agent, installer)() is True
+    data = json.loads((tmp_path / filename).read_text(encoding="utf-8"))
+    assert next(iter(data["mcpServers"])) == "fetch"
+    assert data["mcpServers"]["fetch"]["waitForReady"] is True
+    assert data["mcpServers"]["fetch"]["timeout"] == 10000
+
+
 # -- the spawn merge (templates Crew does not own) ---------------------------------
 
 
@@ -618,3 +711,52 @@ def test_the_doctor_row_lists_each_templates_additions(home, capsys):
     out = capsys.readouterr().out
     assert "mcp additions: 'kirocrew-conductor'" in out
     assert "'fetch' (card 'card-9'," in out
+
+
+def _page_switches(monkeypatch, switched: dict[str, list[str]]) -> None:
+    """The MCP page's ``disabledTools`` switch, as ``list_servers`` reports it."""
+    from types import SimpleNamespace
+
+    from kiro_crew import mcp_discovery
+
+    rows = [SimpleNamespace(name=n, disabled_tools=list(t)) for n, t in switched.items()]
+    monkeypatch.setattr(mcp_discovery, "list_servers", lambda: rows)
+
+
+def test_an_addition_never_brings_back_a_tool_the_page_switched_off(home, monkeypatch):
+    tma.add_addition(
+        "kirocrew-conductor", "github", {"command": "gh-mcp"}, approved_by="u", card_id="c"
+    )
+    _page_switches(monkeypatch, {"github": ["delete_repo"], "other": ["x"]})
+    merged = tma.merge_into("kirocrew-conductor", {})
+    assert merged["github"]["disabledTools"] == ["delete_repo"]
+    assert merged["github"]["command"] == "gh-mcp"
+    # A tool switched off after the approval is off on the next merge too.
+    _page_switches(monkeypatch, {"github": ["delete_repo", "push"]})
+    assert tma.merge_into("kirocrew-conductor", {})["github"]["disabledTools"] == [
+        "delete_repo",
+        "push",
+    ]
+
+
+def test_a_restriction_and_the_page_switch_both_apply(home, monkeypatch):
+    tma.add_addition(
+        "kirocrew-conductor", "github", {"command": "gh-mcp"}, approved_by="u", card_id="c"
+    )
+    _page_switches(monkeypatch, {"github": ["delete_repo"]})
+    merged = tma.merge_into("kirocrew-conductor", {"github": {"disabledTools": ["push"]}})
+    assert merged["github"]["disabledTools"] == ["push", "delete_repo"]
+
+
+def test_an_unreadable_page_adds_no_switch(home, monkeypatch):
+    from kiro_crew import mcp_discovery
+
+    tma.add_addition(
+        "kirocrew-conductor", "github", {"command": "gh-mcp"}, approved_by="u", card_id="c"
+    )
+
+    def boom():
+        raise OSError("config unreadable")
+
+    monkeypatch.setattr(mcp_discovery, "list_servers", boom)
+    assert "disabledTools" not in tma.merge_into("kirocrew-conductor", {})["github"]

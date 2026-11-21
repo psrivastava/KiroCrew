@@ -52,6 +52,7 @@ def test_round_trips_through_to_dict(tmp_path, monkeypatch):
     assert cfg.to_dict()["mcp"] == {
         "extra_path_dirs": ["/opt/a/bin"],
         "honour_auto_approve": True,
+        "protect_kiro_permission_rules": False,
     }
 
 
@@ -150,6 +151,13 @@ def test_honour_auto_approve_parses_a_real_true(tmp_path, monkeypatch):
     assert cfg.mcp.honour_auto_approve is True
 
 
+def test_protect_kiro_permission_rules_is_off_through_the_real_load(tmp_path, monkeypatch):
+    """Absent, the write fence stays off, as on main; only a real ``true`` opts in."""
+    assert _load_from(tmp_path, monkeypatch, {"mcp": {}}).mcp.protect_kiro_permission_rules is False
+    cfg = _load_from(tmp_path, monkeypatch, {"mcp": {"protect_kiro_permission_rules": True}})
+    assert cfg.mcp.protect_kiro_permission_rules is True
+
+
 @pytest.mark.parametrize("raw", ["true", "yes", 1, ["x"], {}, None])
 def test_a_value_that_is_not_a_boolean_degrades_to_the_default(tmp_path, monkeypatch, raw):
     """config.json is hand-editable, and a value of the wrong type is not a decision.
@@ -214,15 +222,9 @@ def test_the_setting_is_restart_marked():
     """The contribution is not live for every consumer, and the mark is how the UI
     says so.
 
-    A resolution caller (the MCP probe, the agent-config resolver, the rewriter)
-    reads the published snapshot on every call, so an edit reaches it at once. The
-    broker daemon instead receives the contribution as a process PATH baked when
-    ``manager._spawn_once`` spawns it, and every pooled backend inherits that
-    PATH; a gateway that ADOPTS a surviving daemon never applies a new one, since
-    the adoption gates compare the target-stem map and the code fingerprint and
-    neither sees a PATH. That is the "hot for one consumer and boot-only for the
-    others" case ``config.live._refuse_restart_marked`` names, and it is the same
-    mark every baked-at-spawn broker field carries.
+    Resolution callers read the snapshot each call, but the broker daemon gets a PATH
+    baked by ``manager._spawn_once``, and adoption never compares PATH. That is the
+    case ``config.live._refuse_restart_marked`` names.
     """
     from kiro_crew.config.schema import requires_restart
 

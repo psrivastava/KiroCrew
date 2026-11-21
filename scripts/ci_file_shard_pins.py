@@ -1,0 +1,138 @@
+"""Write a backend shard pin file from measured CI test times.
+
+``scripts.ci_file_shards`` gives a file to a shard by hashing its path, which
+evens out the file COUNT per shard but not the test TIME: a few heavy files
+landing together make one shard minutes slower than the rest, and the run waits
+for it. This script reads the ``<platform>-pytest-progress-<N>`` artifacts that
+``ci.yml``'s Backend Tests (``linux``) and Backend Tests (Windows) (``windows``)
+upload, sums each file's setup/call/teardown seconds, and pins the heaviest
+files to shards so the totals come out even. Every other file keeps its hash
+shard, and the pin file only ever changes WHICH shard owns a file, never whether
+it is collected. Each platform has its own pin file because a file's share of
+the time differs between them.
+
+Refresh one from several green runs (the artifacts are kept 7 days)::
+
+    gh run download <run-id> -p 'linux-pytest-progress-*' -D <dir>/<run-id>
+    python scripts/ci_file_shard_pins.py <dir>/<run-id> [<dir>/<run-id> ...]
+
+    gh run download <run-id> -p 'windows-pytest-progress-*' -D <dir>/<run-id>
+    python scripts/ci_file_shard_pins.py --platform windows <dir>/<run-id> [...]
+
+Each file's weight is its median share of a run's total test time, scaled by the
+median total, so one slow runner does not dominate. Pins are placed heaviest
+first onto the shard whose load (hashed files plus pins so far) is lowest.
+
+``--every-file`` plans every file that has a measured weight instead of the
+``--pins`` heaviest. The hashed remainder is what leaves the shards uneven: on
+12 green main runs (2026-11-18), planned from 11 and replayed on the one held
+out, the heaviest shard's test seconds were 1.07x the mean with 800 pins and
+1.02x with every file planned (Linux; 1.06x and 1.02x on Windows). A file with
+no weight (new, or measured in under half the runs) still keeps its hash shard:
+the lightest-shard rule would put every such file on the same shard.
+"""
+
+from __future__ import annotations
+
+import argparse
+import heapq
+import json
+import statistics
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from scripts.ci_file_shards import hash_shard  # noqa: E402
+
+DEFAULT_OUT = {
+    "linux": ROOT / "scripts" / "ci_file_shard_pins.txt",
+    "windows": ROOT / "scripts" / "ci_file_shard_pins_windows.txt",
+}
+DEFAULT_SHARDS = 8
+DEFAULT_PINS = 800
+
+
+def run_seconds(run_dir: Path, platform: str = "linux") -> dict[str, float]:
+    """Sum per-file test-phase seconds over every shard and worker of one run."""
+    seconds: defaultdict[str, float] = defaultdict(float)
+    pattern = f"{platform}-pytest-progress-*/*.jsonl"
+    files = sorted(run_dir.glob(pattern))
+    if not files:
+        raise SystemExit(f"{run_dir}: no {pattern} files")
+    for path in files:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            record = json.loads(line)
+            if record.get("event") == "phase_end" and "module" in record:
+                seconds[record["module"]] += float(record["elapsed"])
+    return seconds
+
+
+def weights(runs: list[dict[str, float]]) -> dict[str, float]:
+    totals = [sum(run.values()) for run in runs]
+    scale = statistics.median(totals)
+    names = set().union(*runs)
+    return {
+        name: statistics.median(run.get(name, 0.0) / total for run, total in zip(runs, totals))
+        * scale
+        for name in names
+    }
+
+
+def place(weight: dict[str, float], shards: int, pins: int) -> dict[str, int]:
+    """Pin the ``pins`` heaviest files, heaviest first, onto the lightest shard."""
+    order = sorted(weight, key=lambda name: (-weight[name], name))
+    load = [0.0] * (shards + 1)
+    for name in order[pins:]:
+        load[hash_shard(name, shards)] += weight[name]
+    heap = [(load[shard], shard) for shard in range(1, shards + 1)]
+    heapq.heapify(heap)
+    owners = {}
+    for name in order[:pins]:
+        total, shard = heapq.heappop(heap)
+        owners[name] = shard
+        heapq.heappush(heap, (total + weight[name], shard))
+    return owners
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("runs", nargs="+", type=Path, help="one directory per downloaded run")
+    parser.add_argument("--shards", type=int, default=DEFAULT_SHARDS)
+    parser.add_argument("--pins", type=int, default=DEFAULT_PINS)
+    parser.add_argument(
+        "--every-file",
+        action="store_true",
+        help="plan every file with a measured weight, not only the --pins heaviest",
+    )
+    parser.add_argument("--platform", choices=sorted(DEFAULT_OUT), default="linux")
+    parser.add_argument("--out", type=Path, default=None, help="default: the platform's pin file")
+    parser.add_argument("--root", type=Path, default=ROOT, help="checkout the pins are for")
+    args = parser.parse_args(argv)
+    out = args.out or DEFAULT_OUT[args.platform]
+    runs = [run_seconds(path, args.platform) for path in args.runs]
+    # A file measured on an older main but since moved or deleted would only be
+    # a dead pin; leave it out so the pins describe this checkout.
+    weight = {name: value for name, value in weights(runs).items() if (args.root / name).is_file()}
+    pins = sum(value > 0 for value in weight.values()) if args.every_file else args.pins
+    owners = place(weight, args.shards, pins)
+    load = [0.0] * (args.shards + 1)
+    for name, value in weight.items():
+        load[owners.get(name, hash_shard(name, args.shards))] += value
+    lines = [
+        "# Generated by scripts/ci_file_shard_pins.py; regenerate rather than edit.",
+        f"# From {len(runs)} run(s). Each listed file runs on the shard named; every",
+        "# other file keeps its path-hash shard (scripts/ci_file_shards.py).",
+        f"# shards: {args.shards}",
+    ]
+    lines += [f"{owners[name]} {name}" for name in sorted(owners)]
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    loads = ", ".join(f"{value:.0f}" for value in load[1:])
+    print(f"pinned {len(owners)} of {len(weight)} files; predicted worker-seconds: {loads}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

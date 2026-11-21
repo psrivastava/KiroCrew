@@ -1,19 +1,19 @@
-"""Author an ``AcpClient`` session's claude ``settings.local.json`` seed.
+"""Author a ``ClaudeAcpClient`` session's ``settings.local.json`` seed.
 
 Renders the permission payload and creates, adopts, re-seeds, shares or retracts the
 seed, each only while Crew can prove the file is its own.
 
-Each function here whose first parameter is ``self`` is an ``AcpClient`` method: the
+Each function here whose first parameter is ``self`` is a ``ClaudeAcpClient`` method: the
 class binds it by name, so it reads and writes the session's own state on the instance,
 and a patch of the method on the class or on an instance reaches every caller.
 
-Instance fields written: ``_claude_inline_settings``,
-``_claude_local_settings_excluded``, ``_claude_settings_authored``,
-``_claude_settings_claim_unrevoked``, ``_claude_settings_shared``,
-``_claude_settings_written``, ``_permission_surface_share_validated``.
+Instance fields written: ``_claude_inline_settings``, ``_claude_local_settings_excluded``,
+``_claude_settings_authored``, ``_claude_settings_claim_unrevoked``,
+``_claude_settings_shared``, ``_claude_settings_written``,
+``_permission_surface_share_validated``, ``claude_mode_pinned_notice``.
 
 Instance fields read: ``_agent``, ``_model``, ``_permission_mode``, ``_seed_owner``,
-``_work_dir``.
+``_session_key``, ``_work_dir``.
 """
 
 from __future__ import annotations
@@ -30,14 +30,19 @@ from typing import TYPE_CHECKING, Any
 
 from kiro_crew import model_registry, pinned_fs
 from kiro_crew.acp import seed_provenance
-from kiro_crew.acp.claude_settings_sources import other_sources_define_available_models
+from kiro_crew.acp.claude_settings_sources import (
+    other_sources_define_available_models,
+    user_models_a_family_entry_covers,
+)
 from kiro_crew.acp.runtime_models import DEFAULT_MODEL
 from kiro_crew.acp.session_mcp import session_mcp_deny_rules
+from kiro_crew.acp.spec_tools_allowlists import claude_ask_rules, session_allowlist_spec
+from kiro_crew.agent_sdk.backends import ACP_BACKENDS_CREW_ENFORCES_SPEC_TOOLS_SETTINGS
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.security import is_sensitive_path
 
 if TYPE_CHECKING:
-    from kiro_crew.acp.client import AcpClient
+    from kiro_crew.acp.client import ClaudeAcpClient
 
 #: The client's own logger: this code logged under that name before the split.
 logger = logging.getLogger("kiro_crew.acp.client")
@@ -83,7 +88,9 @@ def _claude_settings_usable(path: Path) -> bool:
     return not is_sensitive_path(str(real))
 
 
-def _share_settings_seed_if_identical(self: AcpClient, local_settings: Path, payload: str) -> bool:
+def _share_settings_seed_if_identical(
+    self: ClaudeAcpClient, local_settings: Path, payload: str
+) -> bool:
     """Take the shared-reader state when the existing seed IS this client's payload.
 
     The relaxation of the one-live-holder rule for the case where refusing
@@ -175,7 +182,7 @@ def _share_settings_seed_if_identical(self: AcpClient, local_settings: Path, pay
     return True
 
 
-def _share_sibling_settings_seed(self: AcpClient, local_settings: Path, payload: str) -> bool:
+def _share_sibling_settings_seed(self: ClaudeAcpClient, local_settings: Path, payload: str) -> bool:
     """Share a sibling's seed that governs this session and runs its model.
 
     Only the model half (``availableModels``, ``model``) may differ from
@@ -222,7 +229,7 @@ def _share_sibling_settings_seed(self: AcpClient, local_settings: Path, payload:
 
 
 def _retract_reseed(
-    self: AcpClient,
+    self: ClaudeAcpClient,
     local_settings: Path,
     payload: str,
     reseed_aside: "tuple[Path, tuple[int, int]]",
@@ -248,7 +255,7 @@ def _retract_reseed(
     self._restore_aside_without_clobber(reseed_aside[0], local_settings, reseed_aside[1])
 
 
-def _log_declined_share(self: AcpClient, local_settings: Path) -> None:
+def _log_declined_share(self: ClaudeAcpClient, local_settings: Path) -> None:
     """Log that an existing settings file was left authoritative."""
     logger.info(
         "%s already exists and %s; leaving it as it is. This "
@@ -259,7 +266,7 @@ def _log_declined_share(self: AcpClient, local_settings: Path) -> None:
     )
 
 
-def _render_claude_settings_payload(self: AcpClient) -> str:
+def _render_claude_settings_payload(self: ClaudeAcpClient) -> str:
     """The exact ``settings.local.json`` payload this session would write.
 
     Pure reads, no side effects on the path -- split out of
@@ -274,10 +281,27 @@ def _render_claude_settings_payload(self: AcpClient) -> str:
     if self._permission_mode:
         perms["defaultMode"] = self._permission_mode
     # Same resolution as the wire array: a project-only agent's disabledTools
-    # are a restriction, and resolving only the user level would drop them.
-    deny_rules = session_mcp_deny_rules(self._agent, work_dir=self._work_dir)
+    # are a restriction, and resolving only the user level would drop them. A
+    # crewmate's worker reads its own per-session spec, keyed by the session.
+    from kiro_crew.acp.session_mcp_crewmate import crewmate_worker_deny_rules
+
+    deny_rules = crewmate_worker_deny_rules(
+        self._agent,
+        work_dir=self._work_dir,
+        session_key=self._session_key or "",
+        backend=self.backend,
+    )
+    if deny_rules is None:
+        deny_rules = session_mcp_deny_rules(self._agent, work_dir=self._work_dir)
     if deny_rules:
         perms["deny"] = list(deny_rules)
+    # The spec's `toolsSettings` shell and write allowlists are refused at Crew's
+    # gate, which sees only a call claude asks about; these rules make the shell and
+    # the file-write tools ask while either is set (`spec_tools_allowlists`).
+    if self.backend in ACP_BACKENDS_CREW_ENFORCES_SPEC_TOOLS_SETTINGS and self._agent:
+        ask_rules = claude_ask_rules(session_allowlist_spec(self._agent, self._work_dir))
+        if ask_rules:
+            perms["ask"] = ask_rules
     if perms:
         data["permissions"] = perms
     # Namespace-keyed (claude_code here), the registry index this backend's ids
@@ -295,7 +319,11 @@ def _render_claude_settings_payload(self: AcpClient) -> str:
     allowlist = model_registry.seed_available_models(self._model_registry_namespace)
     if allowlist:
         if other_sources_define_available_models(Path(self._work_dir)):
-            data["availableModels"] = allowlist
+            # The adapter gives each literal entry one picker row, while the CLI
+            # also allows the newer models a version prefix covers. Naming the
+            # ones the user's own settings route keeps the two pickers equal.
+            covered = user_models_a_family_entry_covers()
+            data["availableModels"] = [*allowlist, *(m for m in covered if m not in allowlist)]
         else:
             logger.info(
                 "advertised-model cache is warm but no settings file Crew checks defines "
@@ -339,10 +367,23 @@ def _render_claude_settings_payload(self: AcpClient) -> str:
             "and availableModels too when another settings source defines one.",
             self._claude_local_settings_path(),
         )
+        # The names the user's own settings cover come from no cache. Under the
+        # adapter's union they only add rows to a list another file defines.
+        if other_sources_define_available_models(Path(self._work_dir)):
+            covered = user_models_a_family_entry_covers()
+            if covered:
+                data["availableModels"] = covered
+        # The one model written on a cold cache: the one the backend itself
+        # named in a substitution advisory, so it is served. Left out, the
+        # user's own settings keep naming the restricted model the retry is
+        # meant to replace.
+        adopted = getattr(self, "_adopted_substitute_model", None)
+        if adopted and self._model == adopted:
+            data["model"] = adopted
     return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
 
 
-def _write_claude_local_settings(self: AcpClient) -> None:
+def _write_claude_local_settings(self: ClaudeAcpClient) -> None:
     """Seed ``<work_dir>/.claude/settings.local.json`` for this session.
 
     The highest-precedence project settings source the claude-agent-acp
@@ -353,8 +394,11 @@ def _write_claude_local_settings(self: AcpClient) -> None:
        ``bypassPermissions``; every other mode keeps forwarding tool
        decisions to the host as ``session/request_permission``, which is what
        puts a claude session under the same gate kiro-cli sessions run under.
-       Omitted when no mode was requested, leaving the adapter's own default
-       (ask) rather than asserting one.
+       Omitted when no mode was requested: the user's own settings then name
+       the starting mode. With ``KIROCREW_CC_PIN_INHERITED_MODE`` on,
+       :meth:`_pin_claude_starting_mode` moves an ``auto`` or
+       ``bypassPermissions`` start of a session that carries Crew's tools to
+       ``default``.
     2. ``permissions.deny``, from
        :func:`~kiro_crew.acp.session_mcp.session_mcp_deny_rules`: the agent
        spec's ``disabledTools`` cannot ride along in the ``mcpServers`` array,
@@ -369,7 +413,8 @@ def _write_claude_local_settings(self: AcpClient) -> None:
        registry-derived list seeded here does exactly the same thing to any
        model the registry has not caught up on. So on a cold advertised-model
        cache both keys are omitted (the adapter's own provider list is
-       already right) and the re-seed after this session's capture fills them
+       already right), apart from the names the user's own settings cover,
+       and the re-seed after this session's capture fills them
        in. With a warm cache and no other source defining a list, only
        ``model`` is written: a specific id in Crew's list disables that
        family's alias wildcard, and a ``model`` key does not. See
@@ -419,6 +464,7 @@ def _write_claude_local_settings(self: AcpClient) -> None:
     # Re-decided on every run; only the foreign-file branch below sets it.
     self._claude_local_settings_excluded = False
     self._claude_inline_settings = None
+    self.claude_mode_pinned_notice = ""
     if not _claude_settings_usable(local_settings):
         # A symlink, or a sensitive resolved target: creating the file would
         # follow the link and write Crew's settings through it. Left entirely
@@ -775,7 +821,9 @@ def _write_claude_local_settings(self: AcpClient) -> None:
                         break
                     time.sleep(0.05)
                 self._invalidate_session_mcp_projection()
-                self._log_declined_share(local_settings)
+                # The same guarded exclusion as a file that was there before.
+                if not self._exclude_foreign_local_settings(local_settings, payload):
+                    self._log_declined_share(local_settings)
                 return
             with os.fdopen(fd, "wb") as handle:
                 handle.write(payload.encode("utf-8"))
@@ -925,7 +973,7 @@ def _write_claude_local_settings(self: AcpClient) -> None:
     self._invalidate_session_mcp_projection()
 
 
-async def _reseed_after_capture(self: AcpClient) -> None:
+async def _reseed_after_capture(self: ClaudeAcpClient) -> None:
     """Re-seed settings.local.json once the backend's model list is known.
 
     The spawn-time seed necessarily runs BEFORE ``session/new`` --
@@ -966,7 +1014,7 @@ async def _reseed_after_capture(self: AcpClient) -> None:
         logger.warning("post-capture re-seed of settings.local.json failed", exc_info=True)
 
 
-async def _seed_session_settings(self: AcpClient) -> None:
+async def _seed_session_settings(self: ClaudeAcpClient) -> None:
     """Seed this session's settings file before its launch, off the loop.
 
     A seed that cannot be written costs model/permission fidelity, not the
@@ -977,3 +1025,8 @@ async def _seed_session_settings(self: AcpClient) -> None:
         await asyncio.to_thread(self._write_claude_local_settings)
     except (OSError, ValueError, TypeError):
         logger.warning("initial seed of settings.local.json failed", exc_info=True)
+
+
+def _write_settings_seed(self: ClaudeAcpClient) -> None:
+    """Re-seed this session's ``settings.local.json`` (:meth:`_write_claude_local_settings`)."""
+    self._write_claude_local_settings()

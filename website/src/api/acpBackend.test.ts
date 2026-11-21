@@ -1,13 +1,13 @@
 /**
- * `isKiroBackend` decides whether the pill's Kiro-only surfaces (the no-reading
- * dash) render. It must be POSITIVE — true only for the kiro id, and never for a
- * config that has not loaded — because a guess here puts a "could not read your
- * balance; open to refresh" control in front of a user whose harness has no
- * balance to read.
+ * `isKiroHarness` decides whether the pill's Kiro-account surfaces (the
+ * no-reading and failed dashes) render. It must be POSITIVE — true only for the
+ * Kiro harness ids, and never for a config that has not loaded — because a guess
+ * here puts a "could not read your balance; open to refresh" control in front of
+ * a user whose harness has no balance to read.
  */
 import { describe, expect, it } from 'vitest'
 
-import { ACP_BACKEND_KAS, ACP_BACKEND_KIRO, acpBackendName, acpBackendShortName, configuredAcpBackend, DEFAULT_ACP_BACKEND, isKiroBackend, mcpServerDeny, mcpWholeServerDeny, reportsCredits, isKiroHarness } from './acpBackend'
+import { ACP_BACKEND_KAS, ACP_BACKEND_KIRO, acpBackendName, acpBackendShortName, configuredAcpBackend, DEFAULT_ACP_BACKEND, isKiroBackend, kasInUse, mcpServerDeny, mcpWholeServerDeny, reportsCredits, reportsDollars, isKiroHarness } from './acpBackend'
 import type { AcpBackendProbe } from './client/config'
 
 describe('isKiroBackend', () => {
@@ -54,6 +54,19 @@ describe('reportsCredits', () => {
   it('is false for a harness that bills in tokens or dollars', () => {
     for (const backend of ['claude', 'codex', 'opencode', 'pi', 'goose', 'deepseek', 'some-future-harness']) {
       expect(reportsCredits({ agent: { acp_backend: backend } }), backend).toBe(false)
+    }
+  })
+})
+
+describe('reportsDollars', () => {
+  it('is true only for a loaded config naming a harness that records a dollar cost', () => {
+    expect(reportsDollars({ agent: { acp_backend: 'claude' } })).toBe(true)
+    expect(reportsDollars(undefined)).toBe(false)
+  })
+
+  it('is false for a credit harness and for one that reports no cost', () => {
+    for (const backend of ['', 'kiro', 'kas', 'codex', 'pi', 'deepseek', 'copilot', 'strands', 'some-future-harness']) {
+      expect(reportsDollars({ agent: { acp_backend: backend } }), backend).toBe(false)
     }
   })
 })
@@ -153,5 +166,27 @@ describe('acpBackendName / acpBackendShortName', () => {
     expect(acpBackendName({ id: ACP_BACKEND_KAS })).toBe('Kiro Agent')
     expect(acpBackendShortName(ACP_BACKEND_KAS)).toBe('Kiro Agent')
     expect(acpBackendName({ id: ACP_BACKEND_KIRO })).toBe('Kiro CLI')
+  })
+
+  it('names the Antigravity harness by its product name, not its raw id', () => {
+    expect(acpBackendName({ id: 'antigravity' })).toBe('Google Antigravity')
+    expect(acpBackendShortName('antigravity')).toBe('Google Antigravity')
+  })
+})
+
+describe('kasInUse', () => {
+  it('takes the gateway\'s answer when it sends one', () => {
+    expect(kasInUse({ agent: { acp_backend: 'kiro' }, kas_in_use: true })).toBe(true)
+    expect(kasInUse({ agent: { acp_backend: 'kas' }, kas_in_use: false })).toBe(false)
+  })
+
+  it('falls back to the main harness on a gateway that sends no answer', () => {
+    expect(kasInUse({ agent: { acp_backend: 'kas' } })).toBe(true)
+    expect(kasInUse({ agent: { acp_backend: '' } })).toBe(true)
+    expect(kasInUse({ agent: { acp_backend: 'kiro' } })).toBe(false)
+  })
+
+  it('reads a body with no agent section as naming no harness, not as KAS', () => {
+    expect(kasInUse({})).toBe(false)
   })
 })

@@ -3,17 +3,22 @@ refusal.
 """
 
 import json
-import time
+import threading
 import types
 from unittest.mock import AsyncMock
 
 import pytest
 from acp_client_helpers import _native_projection_for_fake_processes  # noqa: F401 - fixture
 from acp_client_helpers import _pin_the_installed_kiro_cli_version  # noqa: F401 - fixture
+from redaction_structured_cases import github_classic
 
 import kiro_crew.acp.client as acp_client
 from kiro_crew.acp.client import AcpClient
-from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_OPENCODE
+from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX, ACP_BACKEND_OPENCODE
+
+# A GitHub token with a valid checksum: the plan redacts it, while an AWS key ID
+# stays visible as an identifier.
+_SECRET = github_classic(seed=31)
 
 
 class TestAcpClientToolAudit:
@@ -88,21 +93,31 @@ class TestAcpClientToolAudit:
         assert reached == [True]
 
     @pytest.mark.asyncio
-    async def test_hung_backend_times_out_and_is_swallowed(self, monkeypatch):
+    async def test_hung_backend_times_out_and_is_swallowed(self, monkeypatch, caplog):
         # A wedged SEL backend must not stall tool dispatch: the wait_for bound
         # raises TimeoutError (caught) so the coroutine returns promptly.
+        release = threading.Event()
+
         class _Sel:
             def log_tool_invocation(self, **kw):
-                # flake-ok: the stubbed SEL backend hangs 5 s on purpose so the patched 50 ms wait_for bound returns
-                # nosemgrep: kirocrew.test-sleep-as-barrier -- the stubbed SEL backend's own hang, which the wait_for bound cuts short; not a barrier
-                time.sleep(5)  # simulate a hung backend, well past the timeout
+                # The stubbed backend holds its executor thread until the test
+                # releases it; the 30 s ceiling frees the thread if no release comes.
+                release.wait(timeout=30)
 
         monkeypatch.setattr(acp_client, "sel", lambda: _Sel())
         monkeypatch.setattr(acp_client, "_SEL_AUDIT_TIMEOUT_SECONDS", 0.05)
         client = AcpClient(session_key="sk", audit_source="subagent")
-        start = time.monotonic()
-        await client._maybe_audit_tool_call(self._ev())  # must not raise / hang
-        assert time.monotonic() - start < 4  # returned via timeout, not the 5s sleep
+        try:
+            with caplog.at_level("WARNING", logger="kiro_crew.acp.client"):
+                await client._maybe_audit_tool_call(self._ev())  # must not raise / hang
+            # Returned via the wait_for bound, not the release: the swallowed
+            # failure is the bound's TimeoutError.
+            failed = [r for r in caplog.records if r.getMessage() == "ACP-layer SEL audit failed"]
+            assert len(failed) == 1
+            assert failed[0].exc_info is not None
+            assert issubclass(failed[0].exc_info[0], TimeoutError)
+        finally:
+            release.set()
 
 
 class TestAcpClientUnaskedClaudeAutoAudit:
@@ -200,6 +215,16 @@ class TestAcpClientUnaskedClaudeAutoAudit:
         assert calls == []
 
     @pytest.mark.asyncio
+    async def test_an_auto_request_pinned_on_the_exclusion_path_writes_nothing(self, monkeypatch):
+        """It asked for ``auto`` but runs in ``default``: no classifier approved it."""
+        calls = self._sel_calls(monkeypatch)
+        client = self._client()
+        client._claude_local_settings_excluded = True
+        client._observed_tool_calls["tc1"] = ("Read", "read")
+        await client._maybe_audit_unasked_tool_call(self._result_ev())
+        assert calls == []
+
+    @pytest.mark.asyncio
     async def test_a_session_not_in_auto_mode_writes_nothing(self, monkeypatch):
         calls = self._sel_calls(monkeypatch)
         client = self._client(permission_mode=None)
@@ -224,6 +249,8 @@ class TestAcpClientUnaskedClaudeAutoAudit:
         client = self._client()
         # A SEL failure must never break tool dispatch.
         await client._maybe_audit_unasked_tool_call(self._result_ev())
+        # The call is settled even though its write failed, so no later event retries it.
+        assert client._sel_settled_tool_calls == {"tc1"}
 
     @pytest.mark.asyncio
     async def test_the_send_message_path_records_an_unasked_call(self, monkeypatch):
@@ -397,9 +424,11 @@ class TestAcpClientZeroTools:
 
     @pytest.mark.asyncio
     async def test_a_backend_that_does_not_honour_the_ban_is_not_refused(self):
-        """claude's routing is not enforced, so the refusal is not applied there and
-        a zero-tool spec does not force the session to judge requests."""
-        client = AcpClient(acp_backend=ACP_BACKEND_CLAUDE)
+        """codex's sessions run on ``AcpRuntime``, whose handle refuses on its own
+        (``AcpSessionHandle._deny_zero_tools``, pinned in ``test_codex_zero_tools.py``),
+        so the client's refusal is not applied here and a zero-tool spec does not force
+        this client to judge requests."""
+        client = AcpClient(acp_backend=ACP_BACKEND_CODEX)
         client._spec_zero_tools = True
         event = client._build_permission_event(self._permission_request())
         assert event is not None
@@ -717,11 +746,8 @@ class TestAuthoredSpecDeclaresZeroTools:
 class TestAcpClientToolHooks:
     """Covers the ACP-layer PreToolUse/PostToolUse HOOK ENGINE fire (worker-pool path).
 
-    These fire the script-hook engine (not the SEL audit) so app/worker-pool
-    subagents reach hook parity with the main agent and SubagentManager
-    subagents — e.g. so the skill-usage 'Reading *SKILL.md*' PostToolUse hook
-    fires for their skill loads. Gated on ``audit_source`` so the chat/main
-    client (audit_source=None) never fires here (it fires via chat_runner).
+    Worker-pool subagents get hook parity with the main agent. Gated on
+    ``audit_source``: the main client (None) fires via chat_runner instead.
     """
 
     @staticmethod
@@ -759,7 +785,7 @@ class TestAcpClientToolHooks:
         # frontmatter: the Post-fire path MUST redact it (parity with chat_runner's
         # PostToolUse) before handing it to the hook engine — addresses review-bot
         # security-controls.
-        raw_output = "---\nname: x\nsecret: AKIAIOSFODNN7EXAMPLE\n---"
+        raw_output = f"---\nname: x\nsecret: {_SECRET}\n---"
         await client._maybe_fire_post_tool_hooks(self._result_ev(output=raw_output))
 
         pre = [c for c in store.calls if c["event"] == "PreToolUse"]
@@ -773,7 +799,7 @@ class TestAcpClientToolHooks:
         # redacted (not the raw form).
         fired_output = post[0]["tool_response"]["output"]
         assert fired_output == "---\nname: x\nsecret: [REDACTED: credential]\n---"
-        assert "AKIAIOSFODNN7EXAMPLE" not in fired_output  # raw credential scrubbed
+        assert _SECRET not in fired_output  # raw credential scrubbed
         # YAML frontmatter (name:) is untouched by redaction → skill capture intact.
         assert "name: x" in fired_output
 
@@ -781,26 +807,22 @@ class TestAcpClientToolHooks:
     async def test_post_fire_truncates_tool_output_to_2000(self, monkeypatch):
         """Post-fire MUST bound tool_output to 2000 chars before firing user hooks.
 
-        Regression guard: the redacted tool_output was passed to
-        the hook engine unbounded — chat_runner/subagent.py cap it at [:2000].
-        Redact-then-truncate is deliberate (redact the FULL output first so a
-        secret past char 2000 is still scrubbed, THEN truncate). The credential
-        sits at the START, so after truncation the redaction marker survives and
-        proves the value reaching the hook is BOTH truncated AND redacted.
+        Matches chat_runner/subagent.py's [:2000]. Redact the full output first, then
+        truncate; the credential sits at the start so the marker proves both.
         """
         store = self._Store()
         monkeypatch.setattr(acp_client, "get_global_hook_store", lambda: store)
         client = AcpClient(session_key="sk", agent="code-review-sage", audit_source="subagent")
         client._observed_tool_calls["tc1"] = ("Reading /x/SKILL.md", "read")
         # Credential near the front + padding to blow past the 2000-char bound.
-        raw_output = "secret: AKIAIOSFODNN7EXAMPLE\n" + ("x" * 3000)
+        raw_output = f"secret: {_SECRET}\n" + ("x" * 3000)
         await client._maybe_fire_post_tool_hooks(self._result_ev(output=raw_output))
 
         post = [c for c in store.calls if c["event"] == "PostToolUse"]
         assert len(post) == 1
         fired_output = post[0]["tool_response"]["output"]
         assert len(fired_output) == 2000  # bounded to first 2000 chars
-        assert "AKIAIOSFODNN7EXAMPLE" not in fired_output  # raw credential scrubbed
+        assert _SECRET not in fired_output  # raw credential scrubbed
         assert "[REDACTED: credential]" in fired_output  # redaction survives truncation
 
     @pytest.mark.asyncio
@@ -815,37 +837,34 @@ class TestAcpClientToolHooks:
         store = self._Store()
         monkeypatch.setattr(acp_client, "get_global_hook_store", lambda: store)
         client = AcpClient(session_key="sk", agent="code-review-sage", audit_source="subagent")
-        raw_input = '{"cmd": "aws configure set key AKIAIOSFODNN7EXAMPLE"}'
+        raw_input = json.dumps({"cmd": f"gh auth login --with-token {_SECRET}"})
         await client._maybe_fire_pre_tool_hooks(self._call_ev(tool_input=raw_input))
 
         pre = [c for c in store.calls if c["event"] == "PreToolUse"]
         assert len(pre) == 1
         fired_input = pre[0]["tool_input"]  # parsed by fire_tool_hooks
         fired_str = json.dumps(fired_input)
-        assert "AKIAIOSFODNN7EXAMPLE" not in fired_str  # raw credential scrubbed
+        assert _SECRET not in fired_str  # raw credential scrubbed
         assert "[REDACTED: credential]" in fired_str  # redaction marker present
 
     @pytest.mark.asyncio
     async def test_pre_fire_redacts_credential_in_dict_tool_input(self, monkeypatch):
         """A DICT tool_input containing a credential MUST also be redacted.
 
-        An isinstance(str) guard would bypass redaction for dict/list inputs, so
-        LLM-generated dict inputs could reach user hook scripts RAW. Non-str inputs
-        are serialized to JSON, redacted, and passed as a redacted JSON string
-        (fire_tool_hooks json.loads it, yielding a redacted parsed value at
-        store.fire).
+        Non-str inputs are serialized to JSON and redacted; fire_tool_hooks json.loads
+        the result, so store.fire sees a redacted parsed value.
         """
         store = self._Store()
         monkeypatch.setattr(acp_client, "get_global_hook_store", lambda: store)
         client = AcpClient(session_key="sk", agent="code-review-sage", audit_source="subagent")
-        raw_input = {"cmd": "aws configure set key AKIAIOSFODNN7EXAMPLE"}
+        raw_input = {"cmd": f"gh auth login --with-token {_SECRET}"}
         await client._maybe_fire_pre_tool_hooks(self._call_ev(tool_input=raw_input))
 
         pre = [c for c in store.calls if c["event"] == "PreToolUse"]
         assert len(pre) == 1
         fired_input = pre[0]["tool_input"]  # parsed by fire_tool_hooks
         fired_str = json.dumps(fired_input)
-        assert "AKIAIOSFODNN7EXAMPLE" not in fired_str  # raw credential scrubbed
+        assert _SECRET not in fired_str  # raw credential scrubbed
         assert "[REDACTED: credential]" in fired_str  # redaction marker present
 
     @pytest.mark.asyncio
@@ -929,11 +948,8 @@ class TestAcpClientToolHooks:
     async def test_read_prompt_response_update_fires_hooks(self, monkeypatch):
         """send_message -> _read_prompt_response (worker-pool path) fires hooks.
 
-        Worker-pool subagents (knowledge/llm_pool) drive tools through
-        send_message -> _read_prompt_response, not the stream _dispatch_events. Its
-        update branch must fire Pre+Post hooks so those clients reach hook parity:
-        otherwise an llm_pool worker's auto-approved @builder-mcp/ReadInternalWebsites
-        call fires NO hook.
+        Worker-pool subagents (knowledge/llm_pool) use this path, not the stream
+        _dispatch_events, so its update branch must fire Pre+Post hooks too.
         """
         store = self._Store()
         monkeypatch.setattr(acp_client, "get_global_hook_store", lambda: store)

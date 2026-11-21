@@ -53,17 +53,20 @@ def _nt_expand(path: str) -> str:
 
 
 def _nt_norm_item(path: str) -> str:
-    """``_norm_item`` as a Windows gateway runs it: the same steps on ``ntpath``."""
-    norm = ntpath.abspath(_nt_expand(path))
-    if norm.startswith("//") and not norm.startswith("///"):
-        norm = norm[1:]
-    return norm
+    """``_norm_item`` as a Windows gateway running from ``C:\\gateway`` computes it.
+
+    Anchored at a drive, as Windows' ``abspath`` always is: ``ntpath.abspath`` on a
+    POSIX host keeps ``/workspace/app/x`` driveless, a path no Windows gateway
+    produces, so it would meet a driveless POSIX pattern no real Windows item meets.
+    """
+    return ntpath.normpath(ntpath.join("C:\\gateway", _nt_expand(path)))
 
 
 def _windows_reading(monkeypatch) -> None:
     # Through the facade: the split family's mirror sends the write to every holder.
     monkeypatch.setattr(governance, "_norm_item", _nt_norm_item)
     monkeypatch.setattr(governance, "_expand", _nt_expand)
+    monkeypatch.setattr(governance, "_WINDOWS_PATHS", True)
 
 
 @pytest.fixture(params=["this-os", "windows"])
@@ -236,7 +239,7 @@ def test_a_local_call_through_a_server_named_workspace_keeps_the_gateway_reading
     monkeypatch, reading
 ):
     # Same frame, but the runtime attached no remote workspace: no tag, so the
-    # target is matched as this gateway's path, exactly as before this change.
+    # target is matched as this gateway's path.
     event = _event("read_file", "read", {"path": "/workspace/app/x"}, remote=False)
     assert type(event.raw_tool_params) is dict
     remote = _event("read_file", "read", {"path": "/workspace/app/x"})
@@ -345,7 +348,9 @@ def test_a_remote_call_cannot_reach_a_gateway_path(monkeypatch, reading, path):
     [
         ("C:\\work\\secret\\k", "C:\\work\\secret\\*", True),
         ("C:\\work\\x\\..\\secret\\k", "C:\\work\\secret\\*", True),
-        ("C:\\work\\secret\\k", "c:\\work\\secret\\*", False),  # case-sensitive, as on main
+        ("C:\\work\\secret\\k", "c:\\work\\secret\\*", True),  # a drive in either case
+        ("C:\\work\\secret\\k", "C:\\work\\Secret\\*", False),  # only a deny folds the rest
+        ("C:\\work\\secret\\k", "C:/work/secret/*", True),  # either separator
         ("C:/work/secret/k", "C:\\work\\secret\\*", True),  # ntpath folds / to \\
         ("/workspace/app/x", "/workspace/app/**", False),  # a POSIX pattern never met it
     ],
@@ -397,7 +402,7 @@ def test_classify_mints_guest_items_only_for_tagged_arguments():
     assert not any(isinstance(item, GuestPath) for _, item in plain)
     # An unverifiable spelling keeps its literal pair and adds the marker beside it.
     odd = classify_tool_args("edit", GuestPathParams({"path": "$X/y"}, root=ROOT))
-    assert [type(item) for _, item in odd] == [GuestPath, str]
+    assert [type(item) for _, item in odd] == [GuestPath, matching._Marker]
 
 
 def test_a_guest_item_never_dedupes_into_a_plain_twin():

@@ -47,8 +47,13 @@ SET_GATE_ALLOWLIST: Dict[Tuple[str, str], int] = {
     ("acp/client_mcp_array.py", "ACP_BACKENDS_SESSION_MCP_ARRAY"): 2,
     ("acp/client_model_selection.py", "ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION"): 2,
     ("acp/client_permissions.py", "ACP_BACKENDS_SESSION_MCP_ARRAY"): 1,
-    ("acp/client_start.py", "ACP_BACKENDS_FORK_AT_MESSAGE"): 1,
-    ("acp/client_start.py", "ACP_BACKENDS_RESUME_WITHOUT_LOAD"): 2,
+    # Moved out of client_start.py with the fork, which only the claude client makes.
+    ("acp/client_claude_session.py", "ACP_BACKENDS_FORK_AT_MESSAGE"): 1,
+    ("acp/client_start.py", "ACP_BACKENDS_RESUME_WITHOUT_LOAD"): 1,
+    # The shared runtime's restore verb, read from the same set as the client's
+    # above so the two drivers cannot pick different verbs. The advertised fields
+    # say whether a host restores, not which verb Crew sends it.
+    ("acp/runtime_session_load.py", "ACP_BACKENDS_RESUME_WITHOUT_LOAD"): 1,
     ("acp/client_start.py", "ACP_BACKENDS_SESSION_MCP_ARRAY"): 1,
     ("acp/client_turn_control.py", "ACP_BACKENDS_STEERING_REQUEST"): 2,
     ("acp/client_turn_control.py", "ACP_BACKENDS_STEER_CONCURRENT_PROMPT"): 1,
@@ -68,7 +73,6 @@ SET_GATE_ALLOWLIST: Dict[Tuple[str, str], int] = {
     ("dashboard/chat_turn/slash_commands.py", "ACP_BACKENDS_COMPACT"): 1,
     ("deny_notice.py", "ACP_BACKENDS_STEER"): 1,
     ("providers/acp.py", "ACP_BACKENDS_COMPACT"): 2,
-    ("providers/acp.py", "ACP_BACKENDS_KIRO_FAMILY"): 1,
     ("providers/acp.py", "ACP_BACKENDS_STEER"): 1,
     ("providers/acp.py", "ACP_BACKENDS_STEERING_REQUEST"): 2,
     ("providers/acp_model_effort.py", "ACP_BACKENDS_KIRO_FAMILY"): 2,
@@ -76,6 +80,21 @@ SET_GATE_ALLOWLIST: Dict[Tuple[str, str], int] = {
     ("providers/acp_turns.py", "ACP_BACKENDS_STEERING_REQUEST"): 1,
     ("subagent_manager/continuation.py", "ACP_BACKENDS_STEERING_REQUEST"): 1,
     ("subagent_parts/model_choice.py", "ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION"): 1,
+    # The launch-time channel (Strands): the model and effort are argv, and the
+    # harness advertises no model select or effort option, so there is no field
+    # for these sites to read. Each picks the relaunch path, as the kiro-family
+    # sites above pick their native requests. Shrink-only from here like the rest.
+    ("acp/client_model_selection.py", "ACP_BACKENDS_MODEL_AT_LAUNCH"): 2,
+    ("acp/launch_tuning.py", "ACP_BACKENDS_EFFORT_AT_LAUNCH"): 1,
+    ("acp/launch_tuning.py", "ACP_BACKENDS_MODEL_AT_LAUNCH"): 1,
+    ("config/loader_config.py", "ACP_BACKENDS_EFFORT_AT_LAUNCH"): 1,
+    ("dashboard/handlers/agents.py", "ACP_BACKENDS_MODEL_AT_LAUNCH"): 2,
+    ("llm_helpers_parts/model_fallback.py", "ACP_BACKENDS_MODEL_AT_LAUNCH"): 1,
+    ("providers/acp_lifecycle.py", "ACP_BACKENDS_EFFORT_AT_LAUNCH"): 1,
+    ("providers/acp.py", "ACP_BACKENDS_EFFORT_AT_LAUNCH"): 1,
+    ("providers/acp.py", "ACP_BACKENDS_MODEL_AT_LAUNCH"): 1,
+    ("providers/acp_model_effort.py", "ACP_BACKENDS_EFFORT_AT_LAUNCH"): 5,
+    ("session_allocation_parts/get_or_create.py", "ACP_BACKENDS_MODEL_AT_LAUNCH"): 1,
 }
 
 _SET_METHODS = frozenset(

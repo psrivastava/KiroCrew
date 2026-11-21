@@ -26,11 +26,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from kiro_crew import _llama_lib_path, cli_doctor
+from kiro_crew import _llama_lib_path, cli_doctor, loopback_http
 from kiro_crew.agent_sdk.backends import ACP_BACKEND_KAS, ACP_BACKEND_KIRO
 from kiro_crew.config.loader import KiroCrewConfig
-from kiro_crew.doctor_checks import access, install, services
+from kiro_crew.doctor_checks import access, agents, install, services
 from kiro_crew.platform import PlatformCompositionError
+from kiro_crew.service import live_target
 
 pytestmark = pytest.mark.skipif(
     not sys.platform.startswith("linux"), reason="the frozen report describes a Linux host"
@@ -42,6 +43,7 @@ pytestmark = pytest.mark.skipif(
 _SECTIONS = (
     "_doctor_headless_auth",
     "_doctor_claude_backend",
+    "_doctor_codex_backend",
     "_doctor_agent_auth",
     "_doctor_effective_model",
     "_doctor_member_dispatchability",
@@ -49,10 +51,12 @@ _SECTIONS = (
     "render_doctor_section",
     "_doctor_managed_service_policy",
     "_doctor_data_home",
+    "_doctor_data_home_owner",
     "_doctor_cron_script_sources",
     "_doctor_skill_currency",
     "_doctor_deprecated_agent_specs",
     "_doctor_path_launcher",
+    "_doctor_service_launch",
     "_doctor_trust_root",
     "_doctor_signing_key",
     "_doctor_name_grant_platform_scope",
@@ -93,6 +97,7 @@ _TAKES_ISSUES = frozenset(_SECTIONS) - {
     "_doctor_agent_auth",
     "_doctor_data_home",
     "_doctor_path_launcher",
+    "_doctor_service_launch",
     "_doctor_trust_root",
     "_doctor_name_grant_platform_scope",
     "_doctor_strict_identity",
@@ -106,8 +111,10 @@ _TAKES_ISSUES = frozenset(_SECTIONS) - {
 #: Sections defined in a family AFTER the move. The facade forwards only the names
 #: it held before, so these are stubbed on their family module.
 _FAMILY_ONLY = {
+    "_doctor_codex_backend": agents,
     "_doctor_signing_key": access,
     "_doctor_kiro_chat_delegate": services,
+    "_doctor_service_launch": install,
 }
 
 _GATED_OFF = frozenset({"kirocrew-computer"})
@@ -144,7 +151,7 @@ class _Host:
         self.calls: list[tuple[str, tuple, dict]] = []
         self.issue_from: set[str] = set()
         self.which: dict[str, str] = {}
-        self.runs: dict[tuple[str, ...], subprocess.CompletedProcess] = {}
+        self.runs: dict[tuple[str, ...], subprocess.CompletedProcess | BaseException] = {}
         self.urls: dict[str, object] = {}
         self.home = tmp_path / "datahome"
         self.home.mkdir()
@@ -175,6 +182,7 @@ class _Host:
         mp.setattr(cli_doctor, "data_home", lambda: self.home)
         mp.setattr(cli_doctor, "warm_backend", lambda timeout=None: None)
         mp.setattr(cli_doctor, "_mc_version", "9.9.9")
+        mp.setattr(live_target, "selected_version", lambda: ("9.9.9", None))
         mp.setattr(cli_doctor, "MIN_NODE_VERSION", (20, 0, 0))
         mp.setattr(KiroCrewConfig, "load", classmethod(lambda cls: self.cfg))
         mp.setattr(KiroCrewConfig, "load_credentials", lambda cfg, **kw: dict(self.creds))
@@ -186,6 +194,7 @@ class _Host:
         )
         mp.setattr(cli_doctor.subprocess, "run", self._run)
         mp.setattr(cli_doctor.urllib.request, "urlopen", self._urlopen)
+        mp.setattr(loopback_http, "loopback_urlopen", self._urlopen)
         mp.setattr(cli_doctor, "current_context", lambda: self.ctx)
         mp.setattr(cli_doctor, "_agent_spec_model_problems", self._model_pins)
         mp.setattr(cli_doctor, "_doctor_gated_off_mcps", lambda: _GATED_OFF)
@@ -220,12 +229,12 @@ class _Host:
             cli_doctor, "dump_first_stack_lines", lambda p, max_lines=5: ['File "loop.py", 1']
         )
         mp.setattr(cli_doctor, "attribute_dump", lambda p, base: self.attribution)
+        mp.setattr(cli_doctor, "dump_fired_at", lambda p: "2026-11-07T18:28:28Z")
         mp.setattr(cli_doctor, "describe", lambda a: ["surface: cron", "job: nightly"])
         mp.setattr(cli_doctor, "job_pause_state_from_disk", lambda job_id: self.paused)
         mp.setattr(cli_doctor, "machine_hostname", lambda: "devbox")
         mp.setattr(cli_doctor, "is_local_only", lambda host, has_slack: self.local)
         import kiro_crew._sqlite_compat as sqlite_compat
-        import kiro_crew.browser_cli.install as browser_install
         import kiro_crew.channels as channels
 
         mp.setattr(sqlite_compat, "fts5_available", lambda: self.fts5)
@@ -233,19 +242,6 @@ class _Host:
         # the host's real data never decides.
         mp.setattr(install, "_tz_probe_offset", lambda: self.tz_offset)
         mp.setattr(install, "_tz_data_from_system", lambda: True)
-        # The browser-bootstrap rows resolve through the patched ``shutil.which``;
-        # pin the writability probe too, so the host's real files never decide.
-        mp.setattr(
-            browser_install,
-            "bootstrap_tool_provenance",
-            lambda path: {
-                "path": path,
-                "real_path": path,
-                "writable_at": "",
-                "own_toolchain": False,
-                "shared_write": False,
-            },
-        )
         mp.setattr(channels, "channel_readiness", lambda cfg, creds: tuple(self.readiness))
         import kiro_crew.doctor_checks.resources as resources
 
@@ -260,6 +256,12 @@ class _Host:
         # Same reason: added after the move. The real section walks the host's
         # ledger stores, which no frozen report can pin.
         mp.setattr(workload, "_doctor_ledger_backlog", self._marker("_doctor_ledger_backlog"))
+        # Same reason: it reads the session tree checkpoint's marker under the data home.
+        mp.setattr(
+            workload,
+            "_doctor_session_tree_checkpoint",
+            self._marker("_doctor_session_tree_checkpoint"),
+        )
         mp.setitem(sys.modules, "faiss", None)
         mp.setitem(sys.modules, "amazon_transcribe", None)
         mp.setitem(sys.modules, "amazon_transcribe.client", None)
@@ -301,7 +303,7 @@ class _Host:
         self.dump_age = 0.0
         self.stalls = 0
         self.superseded = False
-        self.attribution = SimpleNamespace(is_cron=False, job=None)
+        self.attribution = SimpleNamespace(is_cron=False, job=None, host_pause_secs=None)
         self.paused: str | None = None
         self.local = True
         self.fts5 = True
@@ -329,7 +331,10 @@ class _Host:
         key = tuple(str(part) for part in argv)
         if key not in self.runs:
             raise AssertionError(f"doctor spawned an unpinned command: {key}")
-        return self.runs[key]
+        answer = self.runs[key]
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
 
     def _urlopen(self, req, timeout=None):
         url = req.full_url if hasattr(req, "full_url") else str(req)
@@ -389,13 +394,10 @@ Dependencies
   kiro-cli:    ✅ /opt/kiro/bin/kiro-cli
   <<_doctor_headless_auth>>
   <<_doctor_claude_backend>>
+  <<_doctor_codex_backend>>
   <<_doctor_agent_auth>>
   git:         ✅ /usr/bin/git
   node:        ✅ /usr/bin/node (v22.3.0)
-  browser npm: ⏹ not found (the browser install needs Node.js with npm)
-  browser node: ✅ /usr/bin/node
-               These rows resolve from this shell's PATH; the gateway logs the npm and Node it
-               actually ran at install time.
 
 Project
   source dir:  ✅ <TMP>/checkout (Kiro Crew source checkout)
@@ -419,10 +421,12 @@ Configuration
   <<render_doctor_section>>
   <<_doctor_managed_service_policy>>
   <<_doctor_data_home>>
+  <<_doctor_data_home_owner>>
   <<_doctor_cron_script_sources>>
   <<_doctor_skill_currency>>
   <<_doctor_deprecated_agent_specs>>
   <<_doctor_path_launcher>>
+  <<_doctor_service_launch>>
   <<_doctor_trust_root>>
   <<_doctor_signing_key>>
   <<_doctor_name_grant_platform_scope>>
@@ -461,7 +465,8 @@ Runtime
   deps:        ✅ websockets, slack_sdk, aiohttp available
   <<_doctor_import_path>>
   sqlite fts5: ✅ available
-  tz data:     ✅ current (America/Vancouver stays UTC-7 in winter)
+  tz data:     ✅ current (IANA tzdb 2026b or later)
+               Sample check on America/Vancouver, not your configured zone.
 
 Vector Memory (in-process embeddings)
   runtime:     ✅ vendored llama-cpp-python importable
@@ -488,6 +493,7 @@ Other Channels
 Loop-stall Crash Dumps
   dumps:       ✅ no crash dumps found (healthy)
   dump dir:    <TMP>/dumps
+  <<_doctor_session_tree_checkpoint>>
 
 Connectivity
   kiro-cli:    ✅ kiro-cli 1.2.3
@@ -548,6 +554,118 @@ def test_a_ready_host_prints_every_section_in_order_and_passes(host, capsys) -> 
     assert len(lists) == 1
 
 
+_LAUNCH_FAILURES = pytest.mark.parametrize(
+    ("failure", "reason"),
+    [
+        (subprocess.TimeoutExpired([_KIRO, "--version"], 5), "--version did not answer in 5s"),
+        (
+            FileNotFoundError(2, "No such file or directory"),
+            "cannot be launched (No such file or directory)",
+        ),
+        (PermissionError(13, "Permission denied"), "cannot be launched (Permission denied)"),
+    ],
+    ids=["hangs", "missing", "not-executable"],
+)
+
+
+def _run_with_launch_failure(host, capsys, failure: BaseException) -> tuple[str, int | None]:
+    host.runs[(_KIRO, "--version")] = failure
+    try:
+        return host.run(capsys)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        pytest.fail(f"doctor raised {exc!r} instead of printing the kiro-cli row")
+
+
+@_LAUNCH_FAILURES
+def test_a_kiro_cli_no_selected_route_runs_is_a_warning_row_and_doctor_passes(
+    host, capsys, failure: BaseException, reason: str
+) -> None:
+    _ready(host)
+    host.cfg.agent.acp_backend = "claude"
+    host.cfg.agent.member_acp_backend = "claude"
+
+    out, code = _run_with_launch_failure(host, capsys, failure)
+
+    row = f"  kiro-cli:    ⚠  {reason} (optional backend)\n"
+    assert out == _READY.replace("  kiro-cli:    ✅ kiro-cli 1.2.3\n", row)
+    assert code is None
+
+
+@pytest.mark.parametrize(
+    ("backend", "member_backend", "relay_entry"),
+    [
+        (ACP_BACKEND_KIRO, "claude", None),
+        ("claude", ACP_BACKEND_KIRO, None),
+        # Relay KAS with no vault-named sibling enters through the launcher.
+        (ACP_BACKEND_KAS, "claude", None),
+        # The Kiro CLI role still runs the launcher beside a relay sibling.
+        (ACP_BACKEND_KIRO, ACP_BACKEND_KAS, "/opt/kiro/bin/kiro-cli-chat"),
+    ],
+)
+@_LAUNCH_FAILURES
+def test_a_kiro_cli_a_selected_route_runs_is_an_issue_and_doctor_still_summarizes(
+    host, capsys, monkeypatch, backend, member_backend, relay_entry, failure, reason
+) -> None:
+    _ready(host)
+    host.cfg.agent.acp_backend = backend
+    host.cfg.agent.member_acp_backend = member_backend
+    host.cfg.agent.kas_bundle = False
+    monkeypatch.setattr(services, "kas_relay_entry", lambda kiro: relay_entry)
+
+    out, code = _run_with_launch_failure(host, capsys, failure)
+
+    assert f"  kiro-cli:    ❌ {reason} (a selected backend runs it)\n" in out
+    assert out.endswith(f"❌ Fix these issues: kiro-cli {reason}\n")
+    assert code == 1
+
+
+@_LAUNCH_FAILURES
+def test_relay_kas_through_a_vault_named_sibling_keeps_the_launcher_optional(
+    host, capsys, monkeypatch, failure: BaseException, reason: str
+) -> None:
+    _ready(host)
+    host.cfg.agent.acp_backend = ACP_BACKEND_KAS
+    host.cfg.agent.member_acp_backend = "claude"
+    host.cfg.agent.kas_bundle = False
+    monkeypatch.setattr(services, "kas_relay_entry", lambda kiro: "/opt/kiro/bin/kiro-cli-chat")
+
+    out, code = _run_with_launch_failure(host, capsys, failure)
+
+    assert f"  kiro-cli:    ⚠  {reason} (optional backend)\n" in out
+    assert code is None
+
+
+@pytest.mark.parametrize(
+    ("backend", "member_backend", "kas_bundle", "fatal"),
+    [
+        (ACP_BACKEND_KIRO, "claude", False, True),
+        ("claude", ACP_BACKEND_KIRO, False, True),
+        # The main role on Crew's own engine does not cover a Bot role on Kiro CLI.
+        (ACP_BACKEND_KAS, ACP_BACKEND_KIRO, True, True),
+        # Relay KAS is not counted: with no kiro-cli its spawn takes Crew's own engine.
+        ("claude", ACP_BACKEND_KAS, False, False),
+    ],
+)
+def test_a_missing_kiro_cli_is_an_issue_only_when_a_selected_kiro_cli_role_runs_it(
+    host, capsys, backend, member_backend, kas_bundle, fatal
+) -> None:
+    _ready(host)
+    host.kiro = None
+    host.cfg.agent.acp_backend = backend
+    host.cfg.agent.member_acp_backend = member_backend
+    host.cfg.agent.kas_bundle = kas_bundle
+
+    out, code = host.run(capsys)
+
+    if fatal:
+        assert "  kiro-cli:    ❌ not found (a selected backend runs it)\n" in out
+        assert out.endswith("❌ Fix these issues: kiro-cli not found\n")
+        assert code == 1
+    else:
+        assert "  kiro-cli:    ⏭  not found (the default agent backend)\n" in out
+        assert code is None
+
+
 def test_a_start_up_record_of_an_inherited_lib_path_leaves_the_report_unchanged(
     host, capsys
 ) -> None:
@@ -571,14 +689,11 @@ Dependencies
   kiro-cli:    ⏭  not found (the default agent backend)
                Install kiro-cli per its docs, then: kiro-cli login
   <<_doctor_claude_backend>>
+  <<_doctor_codex_backend>>
   <<_doctor_agent_auth>>
   git:         ❌ not found (needed for kirocrew update)
   node:        ❌ v18.19.0 < v20.0.0
                Fix: Node.js v18.19.0 is too old: Kiro Crew needs v20.0.0 or newer. Update Node.js: install 24 LTS from https://nodejs.org, or run `nvm install 24` / `mise use -g node@24`.
-  browser npm: ⏹ not found (the browser install needs Node.js with npm)
-  browser node: ✅ /usr/bin/node
-               These rows resolve from this shell's PATH; the gateway logs the npm and Node it
-               actually ran at install time.
 
 Project
   source dir:  ❌ stale — points to deleted <TMP>/gone
@@ -604,10 +719,12 @@ Configuration
   <<render_doctor_section>>
   <<_doctor_managed_service_policy>>
   <<_doctor_data_home>>
+  <<_doctor_data_home_owner>>
   <<_doctor_cron_script_sources>>
   <<_doctor_skill_currency>>
   <<_doctor_deprecated_agent_specs>>
   <<_doctor_path_launcher>>
+  <<_doctor_service_launch>>
   <<_doctor_trust_root>>
   <<_doctor_signing_key>>
   <<_doctor_name_grant_platform_scope>>
@@ -664,9 +781,9 @@ Vector Memory (in-process embeddings)
 
 Speech-to-Text
   provider:    ✅ local
-  engine:      ❌ install the voice extra
+  engine:      ⚠️  install the voice extra
   model:       ⏹ base.en not downloaded yet (148 MB, fetched on first use)
-  ffmpeg:      ❌ not found
+  ffmpeg:      ⚠️  not found
                Fix: download the audio decoder from the dashboard (Settings → Voice → Speech-to-Text), or install ffmpeg into /usr/local/bin
 
 Slack Integration
@@ -681,7 +798,7 @@ Other Channels
                The channel will not start. Set it in Settings > Messaging Channels, or in ~/.kiro/crew/.env
 
 Loop-stall Crash Dumps
-  last dump:   ⚠️  crash-1.dump (2.0h ago)
+  last dump:   ⚠️  crash-1.dump (fired 2026-11-07T18:28:28Z, 2.0h ago)
   MainThread stuck at:
     File "loop.py", 1
   attribution:
@@ -689,6 +806,7 @@ Loop-stall Crash Dumps
     job: nightly
     job is currently auto-paused
   dump dir:    <TMP>/dumps
+  <<_doctor_session_tree_checkpoint>>
 
 Connectivity
   kiro-cli:    ⏭  skipped (not installed)
@@ -702,7 +820,7 @@ Connectivity
      Then run: kirocrew token
   auth check:  ❌ external access allowed without token!
 
-❌ Fix these issues: platform composition failed: companion missing, git, node, stale project_dir, agent config, agent model pin, dashboard auth: remote bind without Slack, _doctor_effective_model issue, render_doctor_section issue, _doctor_credentials issue, _doctor_sandbox issue, _doctor_live_target_pointer issue, doctor_dead_paths issue, python deps, _doctor_import_path issue, sqlite fts5, timezone data out of date, embedding runtime, custom embedding model unusable, speech recogniser (extra_missing), ffmpeg, _doctor_discord issue, _doctor_whatsapp issue, telegram: missing TELEGRAM_BOT_TOKEN and telegram.allowed_chat_ids, loop-stall dump attributed to cron job 'nightly' ('job-7'), recent loop-stall crash dump (2h ago), gateway restart needed (running version differs from on-disk), dashboard auth: no token required on external interface
+❌ Fix these issues: platform composition failed: companion missing, git, node, stale project_dir, agent config, agent model pin, dashboard auth: remote bind without Slack, _doctor_effective_model issue, render_doctor_section issue, _doctor_credentials issue, _doctor_sandbox issue, _doctor_live_target_pointer issue, doctor_dead_paths issue, python deps, _doctor_import_path issue, sqlite fts5, timezone data out of date, embedding runtime, custom embedding model unusable, _doctor_discord issue, _doctor_whatsapp issue, telegram: missing TELEGRAM_BOT_TOKEN and telegram.allowed_chat_ids, loop-stall dump attributed to cron job 'nightly' ('job-7'), recent loop-stall crash dump (2h ago), gateway restart needed (running version differs from on-disk), dashboard auth: no token required on external interface
 """
 
 
@@ -732,7 +850,7 @@ def test_a_broken_host_reports_every_issue_in_order_and_exits_one(host, capsys) 
     host.cfg.stt.enabled = True
     host.cfg.stt.provider = "local"
     host.stt_engine = SimpleNamespace(
-        ok=False, detail="install the voice extra", code="extra_missing"
+        ok=False, detail="install the voice extra", code="stt_extra_missing"
     )
     host.ffmpeg = None
     host.pip_ok = False
@@ -757,7 +875,7 @@ def test_a_broken_host_reports_every_issue_in_order_and_exits_one(host, capsys) 
     host.dump_age = 7200.0
     host.stalls = 1
     host.attribution = SimpleNamespace(
-        is_cron=True, job=SimpleNamespace(job_id="job-7", name="nightly")
+        is_cron=True, job=SimpleNamespace(job_id="job-7", name="nightly"), host_pause_secs=None
     )
     host.paused = "auto-paused"
     host.urls["http://127.0.0.1:9999/api/status"] = urllib.error.HTTPError(
@@ -906,6 +1024,67 @@ def test_chat_delegate_row_is_fatal_only_for_a_harness_that_spawns_kiro_cli(
     }
 
 
+@pytest.mark.parametrize(
+    ("backend", "member_backend", "kas_bundle", "required"),
+    [
+        (ACP_BACKEND_KIRO, "claude", False, True),
+        (ACP_BACKEND_KAS, "claude", False, True),
+        (ACP_BACKEND_KAS, ACP_BACKEND_KAS, True, False),
+        ("claude", "claude", False, False),
+        ("claude", ACP_BACKEND_KAS, False, True),
+        ("claude", ACP_BACKEND_KIRO, True, True),
+    ],
+)
+def test_kiro_sandbox_row_is_fatal_only_for_a_harness_that_spawns_kiro_cli(
+    host, capsys, monkeypatch, backend, member_backend, kas_bundle, required
+) -> None:
+    """kiro-cli's own sandbox blocks Crew's MCP servers only in a kiro-cli spawn."""
+    from kiro_crew.doctor_checks import confinement
+
+    _ready(host)
+    host.cfg.agent.acp_backend = backend
+    host.cfg.agent.member_acp_backend = member_backend
+    host.cfg.agent.kas_bundle = kas_bundle
+    seen: list[dict] = []
+    monkeypatch.setattr(
+        confinement,
+        "_doctor_kiro_sandbox_blocks_crew_mcp",
+        lambda issues, **kwargs: seen.append(kwargs),
+    )
+
+    host.run(capsys)
+
+    assert seen == [{"required": required}]
+
+
+@pytest.mark.parametrize("unreadable", [True, False], ids=["unreadable", "readable"])
+def test_channel_sections_learn_whether_the_credentials_were_readable(
+    host, capsys, monkeypatch, unreadable
+) -> None:
+    """The Configuration section's denied credentials read reaches every channel check."""
+    from kiro_crew.doctor_checks import channels, confinement
+
+    _ready(host)
+    seen: dict[str, dict] = {}
+    for name in ("_doctor_slack", "_doctor_other_channels"):
+        monkeypatch.setattr(
+            channels, name, lambda *_a, _name=name, **kw: seen.__setitem__(_name, kw)
+        )
+    if unreadable:
+
+        def _denied(cfg, **_kw):
+            raise PermissionError(1, "Operation not permitted")
+
+        monkeypatch.setattr(KiroCrewConfig, "load_credentials", _denied)
+        monkeypatch.setattr(confinement, "_doctor_vantage_confined", lambda: True)
+
+    host.run(capsys)
+
+    seen["_doctor_discord"] = host.called("_doctor_discord")[1]
+    for name in ("_doctor_slack", "_doctor_discord", "_doctor_other_channels"):
+        assert seen[name] == {"creds_unreadable": unreadable}, name
+
+
 _BUNDLE = """\
 Kiro Crew Doctor 👻
 
@@ -920,6 +1099,10 @@ Collecting diagnostics bundle (secrets are redacted)...
 """
 
 
+def _pin_bundle_alignment(monkeypatch) -> None:
+    monkeypatch.setattr(services, "_bundle_version_alignment", lambda: "aligned (1.2.3)")
+
+
 def test_bundle_mode_prints_only_the_bundle(host, capsys, monkeypatch) -> None:
     result = SimpleNamespace(
         zip_path=host.tmp / "diag.zip",
@@ -927,7 +1110,13 @@ def test_bundle_mode_prints_only_the_bundle(host, capsys, monkeypatch) -> None:
         total_redactions=3,
         skipped=["gateway.log"],
     )
-    monkeypatch.setattr(cli_doctor.diagnostics, "collect_bundle", lambda: result)
+    collected: list[dict] = []
+    _pin_bundle_alignment(monkeypatch)
+    monkeypatch.setattr(
+        cli_doctor.diagnostics,
+        "collect_bundle",
+        lambda **kwargs: collected.append(kwargs) or result,
+    )
     monkeypatch.setattr(
         cli_doctor.diagnostics, "terminal_issue_url", lambda r: "https://example.invalid/issues/new"
     )
@@ -937,6 +1126,7 @@ def test_bundle_mode_prints_only_the_bundle(host, capsys, monkeypatch) -> None:
     assert out == _BUNDLE
     assert code is None
     assert host.calls == []
+    assert collected == [{"version_alignment": "aligned (1.2.3)"}]
 
 
 def test_bundle_mode_prints_the_bundle_when_the_companion_does_not_compose(
@@ -945,7 +1135,8 @@ def test_bundle_mode_prints_the_bundle_when_the_companion_does_not_compose(
     result = cli_doctor.diagnostics.BundleResult(
         zip_path=host.tmp / "diag.zip", filename="diag.zip"
     )
-    monkeypatch.setattr(cli_doctor.diagnostics, "collect_bundle", lambda: result)
+    _pin_bundle_alignment(monkeypatch)
+    monkeypatch.setattr(cli_doctor.diagnostics, "collect_bundle", lambda **_: result)
 
     def refuse_context():
         raise PlatformCompositionError("companion did not compose")
@@ -963,9 +1154,10 @@ def test_bundle_mode_prints_the_bundle_when_the_companion_does_not_compose(
 
 
 def test_bundle_mode_exits_one_when_the_bundle_cannot_be_written(host, capsys, monkeypatch) -> None:
-    def refuse():
+    def refuse(**_):
         raise OSError("disk full")
 
+    _pin_bundle_alignment(monkeypatch)
     monkeypatch.setattr(cli_doctor.diagnostics, "collect_bundle", refuse)
 
     out, code = host.run(capsys, bundle=True)
@@ -975,3 +1167,59 @@ def test_bundle_mode_exits_one_when_the_bundle_cannot_be_written(host, capsys, m
         "     Check that ~/.kiro/crew is writable and has free space.\n"
     )
     assert code == 1
+
+
+def test_bundle_route_without_node_on_path_reads_the_bundles_node(
+    host, capsys, monkeypatch
+) -> None:
+    """The node row on the KAS bundle route names the engine's own Node, not an install."""
+    _ready(host)
+    host.kiro = None
+    del host.which["node"]
+    monkeypatch.setattr(cli_doctor.kas_bundle, "kas_bundle_route", lambda: True)
+    monkeypatch.setattr(
+        cli_doctor.kas_bundle,
+        "installed_bundle",
+        lambda: SimpleNamespace(node_version="22.23.3"),
+    )
+    monkeypatch.setattr(cli_doctor.kas_bundle, "installed_engine_label", lambda: "KAS 0.66.33")
+
+    out, code = host.run(capsys)
+
+    assert (
+        "  node:        ⏭  not on PATH; not needed "
+        "(KAS runs its engine bundle's own Node 22.23.3)\n"
+    ) in out
+    assert "Fix: install Node.js" not in out
+    assert "node" not in (out.rsplit("Fix these issues:", 1)[1] if code else "")
+
+
+@pytest.mark.parametrize(("member_backend", "fails"), [(ACP_BACKEND_KAS, False), ("claude", True)])
+def test_bundle_route_judges_an_old_node_by_every_selected_role(
+    host, capsys, monkeypatch, member_backend, fails
+) -> None:
+    """An old Node on PATH is only a warning when every selected role runs on the
+    bundle; a Bot role on Claude's adapter spawns on that Node, so it still fails."""
+    _ready(host)
+    host.kiro = None
+    host.runs[("/usr/bin/node", "-v")] = _done("v18.19.0\n")
+    host.cfg.agent.acp_backend = ACP_BACKEND_KAS
+    host.cfg.agent.member_acp_backend = member_backend
+    monkeypatch.setattr(cli_doctor.kas_bundle, "kas_bundle_route", lambda: True)
+    monkeypatch.setattr(
+        cli_doctor.kas_bundle,
+        "installed_bundle",
+        lambda: SimpleNamespace(node_version="22.23.3"),
+    )
+    monkeypatch.setattr(cli_doctor.kas_bundle, "installed_engine_label", lambda: "KAS 0.66.33")
+
+    out, code = host.run(capsys)
+
+    listed = out.rsplit("Fix these issues:", 1)[1].split("\n", 1)[0] if code else ""
+    if fails:
+        assert "  node:        ❌ v18.19.0 < " in out
+        assert "node" in [item.strip() for item in listed.split(",")]
+    else:
+        assert "  node:        ⚠  v18.19.0 on PATH < " in out
+        assert "engine bundle's own Node 22.23.3" in out
+        assert "node" not in [item.strip() for item in listed.split(",")]

@@ -206,7 +206,7 @@ class TestRunChatTransientRetryImageDiscard:
         state.sessions.discard_conversation.assert_not_awaited()
         state.sessions.reset.assert_not_awaited()
         assert slot._queue == []
-        assert any(t.startswith("❌") for t in self._err_texts(slot))
+        assert any(t.startswith("Error:") for t in self._err_texts(slot))
         assert slot._poisoned_reset_used is False
 
     @pytest.mark.asyncio
@@ -232,7 +232,7 @@ class TestRunChatTransientRetryImageDiscard:
 
         state.sessions.discard_conversation.assert_not_awaited()
         assert slot._queue == []
-        assert any(t.startswith("❌") for t in self._err_texts(slot))
+        assert any(t.startswith("Error:") for t in self._err_texts(slot))
         assert slot._poisoned_reset_used is True
 
     @pytest.mark.asyncio
@@ -267,7 +267,7 @@ class TestRunChatTransientRetryImageDiscard:
         state.sessions.discard_conversation.assert_not_awaited()
         state.sessions.reset.assert_not_awaited()
         assert slot._queue == []
-        assert any(t.startswith("❌") for t in self._err_texts(slot))
+        assert any(t.startswith("Error:") for t in self._err_texts(slot))
         assert slot._poisoned_reset_used is False
 
     @pytest.mark.asyncio
@@ -401,7 +401,7 @@ class TestRunChatTransientRetryPoisonedDiscard:
             await _run_chat(state, slot, "hello")
             await self._drain_bg(state)
 
-        assert any(t.startswith("❌") for t in self._err_texts(slot))
+        assert any(t.startswith("Error:") for t in self._err_texts(slot))
         state.sessions.discard_conversation.assert_not_awaited()
         state.sessions.reset.assert_not_awaited()
         # The exhausted cycle is counted toward the consecutive streak.
@@ -412,19 +412,11 @@ class TestRunChatTransientRetryPoisonedDiscard:
     async def test_poisoned_conversation_discarded_on_second_exhausted_cycle(
         self, tmp_path, monkeypatch
     ):
-        """Regression (poisoned persisted conversation): when TWO consecutive
-        cycles each exhaust the full pre-stream transient ladder with zero
-        output, the backend is deterministically rejecting this session's
-        native conversation — retrying into it can never succeed (observed
-        live: a session/load'ed conversation failing pre-stream identically
-        11 hours apart while a NEW session on the same gateway+model answered
-        instantly). The second exhaustion must escalate: discard the
-        native conversation (discard_conversation() clears the resume sid —
-        reset() would session/load the poison right back — while keeping the
-        session-map entry with its channel linkage) and re-queue the message
-        once, so the recovery cycle cold-starts a fresh conversation and the
-        slot self-heals instead of telling the user to 'retry in a moment'
-        forever."""
+        """Two consecutive exhausted transient ladders discard the native conversation.
+
+        Two silent exhaustions mean the backend rejects this conversation for good. The
+        second discards it (discard_conversation(), since reset() would session/load the
+        poison back) keeping the session-map entry, and re-queues the message once."""
         from kiro_crew.acp.client import AcpError
         from kiro_crew.dashboard.chat import _run_chat
         from kiro_crew.llm_helpers import TRANSIENT_RETRIES
@@ -485,7 +477,7 @@ class TestRunChatTransientRetryPoisonedDiscard:
         state.sessions.reset.assert_not_awaited()
         # Cycle 1 ❌ + cycle 2 escalation notice, then the recovered answer.
         errs = self._err_texts(slot)
-        assert any(t.startswith("❌") for t in errs)
+        assert any(t.startswith("Error:") for t in errs)
         assert any("keeps rejecting" in t for t in errs)
         assert any("recovered-after-discard" in t for t in self._assistant_texts(slot))
         # Attempt accounting: two full ladders + the single recovery prompt.
@@ -539,7 +531,7 @@ class TestRunChatTransientRetryPoisonedDiscard:
         # No turn ever landed: the one-shot stays consumed.
         assert slot._poisoned_reset_used is True
         # Terminal ❌ surfaced after the failed recovery and again on cycle 3.
-        assert sum(1 for t in self._err_texts(slot) if t.startswith("❌")) >= 2
+        assert sum(1 for t in self._err_texts(slot) if t.startswith("Error:")) >= 2
 
     @pytest.mark.asyncio
     async def test_cancelled_turn_does_not_rearm_poisoned_one_shot(self, tmp_path, monkeypatch):
@@ -648,7 +640,7 @@ class TestRunChatTransientRetryPoisonedDiscard:
         # later cycle whose canary succeeds, and the streak keeps accruing.
         assert slot._poisoned_reset_used is False
         assert slot._prestream_exhausted_cycles == 2
-        assert sum(1 for t in self._err_texts(slot) if t.startswith("❌")) >= 2
+        assert sum(1 for t in self._err_texts(slot) if t.startswith("Error:")) >= 2
 
     @pytest.mark.asyncio
     async def test_canary_empty_reply_is_not_positive_evidence(self, tmp_path, monkeypatch):
@@ -685,14 +677,11 @@ class TestRunChatTransientRetryPoisonedDiscard:
 
     @pytest.mark.asyncio
     async def test_stop_during_canary_vetoes_discard_and_requeue(self, tmp_path, monkeypatch):
-        """GPT-review fix: a Stop initiated DURING the (up to 30s) canary probe
-        must veto the discard and the synthetic re-queue even when the canary
-        succeeds — the user just cancelled this work, and re-queueing would
-        re-execute it with tool side effects. The veto keys on the monotonic
-        _stop_generation, not _stop_state, because teardown can drive
-        _stop_state back to "idle" before the check (a stop that fired AND
-        resolved mid-probe must still veto). Nothing is consumed: the one-shot
-        stays armed and the streak stays accrued."""
+        """A Stop during the canary probe vetoes the discard and re-queue.
+
+        Re-queueing cancelled work would repeat its tool side effects. The veto keys on
+        _stop_generation, since teardown can reset _stop_state to "idle" before the check.
+        Nothing is consumed: the one-shot stays armed and the streak stays accrued."""
         from kiro_crew.acp.client import AcpError
         from kiro_crew.dashboard.chat import _run_chat
 

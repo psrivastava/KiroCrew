@@ -1,29 +1,12 @@
 """Residue sweep for the agent aggregate source.
 
-An agent-document add commits its item chunks, then -- in ONE transaction -- the
-previous group's deletion and its ``agent_item_state`` ownership row.
-A plain cancellation is already covered -- the row is written from inside the
-ingest's uncancellable finalize hop -- but a HARD KILL between the item commit
-and the row commit still leaves committed items that no state row names. Nothing
-on the agent path reaps by absence, so that residue is permanent: the
-replacement path keys off the missing row, so the next add of the same document
-stores a second copy instead of replacing the first.
+A hard kill between the item commit and the ``agent_item_state`` row commit leaves
+items no row names, and the next add stores a second copy.
 
-``KnowledgeStore.reclaim_agent_source_residue`` removes it, but ONLY on positive
-evidence of an interrupted ingest, never by absence of a row. "No row names this
-item" is not proof of crash residue: ``_import_bundle_state`` leaves a bundle's
-agent items unowned on several legitimate paths (a row skipped as
-``ownership_row_key_held_locally``, an empty or over-claiming group, a bundle
-with no state tables), and a single-item export/import round trip does the same.
-So the ingest records an intent marker in ``agent_ingest_intent`` (carrying the
-content hash it stamps on every chunk) BEFORE it commits items and deletes that
-marker on finalize; the sweep deletes an unowned item ONLY when an intent marker
-names its hash. The marker is a separate table, not a status on the ownership
-row, so it coexists with a live row -- a crash while REPLACING a group leaves a
-marker exactly as a first add does. These tests pin both halves: real crash
-residue (items + a stranded intent marker) is removed, and legitimately unowned
-content -- a bundle-imported item with no marker, folder/artifact sources -- is
-never touched.
+``KnowledgeStore.reclaim_agent_source_residue`` removes an unowned item only when an
+``agent_ingest_intent`` marker names its hash: ``_import_bundle_state`` and export/import
+leave items unowned legitimately. The marker is its own table, so it coexists with a
+live row during a replace.
 """
 
 from __future__ import annotations
@@ -104,13 +87,8 @@ def _bodies(store, source_id, needle):
 def _simulate_hard_kill(store, source_id, slug):
     """Model a process killed between the item commit and the finalize hop.
 
-    The real sequence is: record the intent marker in ``agent_ingest_intent``,
-    commit the item chunks, then (never reached) write the ``active`` ownership
-    row and delete the marker. A hard kill before the finalize hop therefore
-    leaves the committed items, NO ownership row, AND a stranded intent marker
-    that still names their content hash. Reproduce that end state: drop the
-    finalized ownership row and re-insert the intent marker the ingest wrote
-    first.
+    The kill leaves committed items, no ownership row and a stranded intent marker, so
+    drop the finalized row and re-insert the marker the ingest wrote first.
     """
     row = store.db.execute(
         "SELECT content_hash FROM agent_item_state WHERE source_id = ? AND slug = ?",
@@ -354,7 +332,7 @@ class TestOtherSourcesAreNeverTouched:
         assert imported in _live_ids(kstore, sid)
 
     def test_an_active_group_shields_items_sharing_a_crashed_hash(self, kstore):
-        # F1 (GPT 6.1): a stale ingesting marker names a hash, and an item that
+        # A stale ingesting marker names a hash, and an item that
         # a healthy group OWNS shares that hash. The owned item is of course
         # never swept -- but neither is an UNOWNED copy of the same hash: once
         # the content is live-held by a healthy row, a bare hash match must not
@@ -436,15 +414,24 @@ class TestReplacePathAndNormalization:
         assert left == 0
 
     @pytest.mark.asyncio
-    async def test_a_crlf_document_crash_is_reaped(self, kstore, pipeline):
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "line one\r\nline two\r\n",
+            # A leading U+FEFF is written as a UTF-8 BOM, which the reader strips.
+            "\ufeffline one\nline two\n",
+            "\ufeff\ufeffline one\nline two\n",
+        ],
+        ids=["crlf", "bom", "double-bom"],
+    )
+    async def test_a_crlf_document_crash_is_reaped(self, kstore, pipeline, content):
         # The marker hash must match the hash the pipeline stamps on chunks. The
-        # reader normalizes CRLF to LF before chunking, so the ingest normalizes
-        # the submitted text before hashing. A CRLF document crashed mid-ingest
-        # must therefore still be reaped -- its marker hash matches its chunks'.
+        # reader normalizes CRLF to LF (and drops a BOM) before chunking, so the
+        # ingest normalizes the submitted text before hashing. Such a document
+        # crashed mid-ingest must therefore still be reaped -- its marker hash
+        # matches its chunks'.
         sid, _ = ensure_agent_source(kstore)
-        await add_agent_document(
-            pipeline, title="CRLF", content="line one\r\nline two\r\n", source_uri=URI
-        )
+        await add_agent_document(pipeline, title="CRLF", content=content, source_uri=URI)
         slug = document_slug(URI)
         _, ids = get_state(kstore, sid, slug)
         assert ids
@@ -473,7 +460,7 @@ class TestReplacePathAndNormalization:
 class TestHashAloneNeverAuthorizesDeletion:
     @pytest.mark.asyncio
     async def test_an_unowned_copy_of_live_held_content_survives(self, kstore, pipeline):
-        # F1 (GPT 6.1): a matching marker hash alone must not delete an item. If
+        # A matching marker hash alone must not delete an item. If
         # the SAME content is still held by a healthy ownership row anywhere, an
         # unowned copy of that hash is a reassigned/pre-existing item (left
         # unowned by _adopt_reassigned_item's ambiguous-hash refusal), not this
@@ -519,7 +506,7 @@ class TestHashAloneNeverAuthorizesDeletion:
 class TestMarkerRetirementAcrossChunks:
     @pytest.mark.asyncio
     async def test_a_crash_larger_than_one_delete_chunk_is_fully_reaped(self, kstore, pipeline):
-        # F2 (GPT 6.1 + Opus): a document's chunks all share one content_hash and
+        # A document's chunks all share one content_hash and
         # one interrupted ingest can exceed _RECLAIM_CHUNK. If the first batch
         # retired that hash's marker, later batches would miss it and
         # the rest of the document would survive as permanent duplicates.
@@ -560,17 +547,10 @@ class TestMarkerRetirementAcrossChunks:
 
     @pytest.mark.asyncio
     async def test_a_same_hash_retry_preserves_the_shielded_duplicate(self, kstore, pipeline):
-        # A crashed attempt and a later successful retry of the SAME content at
-        # the SAME slug share one marker row. The retry's finalize must NOT erase
-        # the marker while the earlier attempt's orphan is still unowned.
-        #
-        # Fail-safe shield (GPT 6.1 F1 + Opus 5.5): because the retry's healthy
-        # row owns a live copy of this content, the hash is live-owned, so the sweep leaves EVERY unowned copy of it alone. The earlier
-        # attempt's orphan is therefore preserved as a (self-healing) duplicate
-        # rather than reaped -- the deliberate cost of never deleting what might
-        # be a slug's sole surviving copy. The marker-pair exclusion that once
-        # let this specific orphan be reaped is gone, because it also stripped
-        # protection from the sole-copy case.
+        # A crashed attempt and a successful retry of the same content share one marker
+        # row; the retry's finalize must not erase it while the orphan is unowned.
+        # The hash is live-owned, so the sweep keeps every unowned copy: a duplicate
+        # is the cost of never deleting what might be a slug's sole copy.
         from kiro_crew.knowledge.agent_source import clear_ingesting, mark_ingesting
 
         sid, _ = ensure_agent_source(kstore)
@@ -611,11 +591,8 @@ class TestMarkerRetirementAcrossChunks:
 class TestResidueIsScopedToTheAttempt:
     """A marker hash matched by an item created BEFORE the attempt is not residue.
 
-    GPT 6.1 F1 and Opus both trace deletion of a legitimately-unowned item to
-    the sweep tying evidence to a source-wide hash rather than to the attempt.
-    The marker carries ``started_at``; an item is this attempt's residue ONLY if
-    its ``created_at`` is at or after that. A pre-existing or bundle-imported
-    item that merely shares the hash predates the marker and is never deleted.
+    An item is the attempt's residue only if its ``created_at`` is at or after the
+    marker's ``started_at``.
     """
 
     @pytest.mark.asyncio
@@ -699,7 +676,7 @@ class TestResidueIsScopedToTheAttempt:
 class TestLockedRecheckStatusGate:
     @pytest.mark.asyncio
     async def test_an_item_cleared_from_active_in_the_window_is_not_swept(self, kstore, pipeline):
-        # F2 (GPT 6.1 FLAG): the locked recheck filters status = 'active'. An
+        # The locked recheck filters status = 'active'. An
         # item flipped out of 'active' by any concurrent writer between the
         # candidate read and the writer lock must not be swept -- the sweep acts
         # only on rows it re-confirms are live residue. Model that end state
@@ -732,13 +709,12 @@ class TestLockedRecheckStatusGate:
 
 class TestEmptyGroupDedupRowShieldsItsHash:
     def test_a_deduped_row_with_an_empty_group_shields_the_reassigned_sole_copy(self, kstore):
-        # F1 (GPT 6.1, this round): the shield skipped rows whose item group is
-        # empty, so a `deduped` row left by a reassignment that could not
-        # establish ownership (_adopt_reassigned_item refuses an ambiguous hash)
-        # gave its hash NO protection. Its surviving copy is the ONLY one, and a
-        # same-content crash marker names its hash -> the sweep deleted it
-        # irreversibly. The row's EXISTENCE must shield its hash even with an
-        # empty group.
+        # A `deduped` row left by a reassignment that could not establish
+        # ownership (_adopt_reassigned_item refuses an ambiguous hash) has an
+        # empty item group. Its surviving copy is the ONLY one, and a
+        # same-content crash marker names its hash, so a shield that skips empty
+        # groups lets the sweep delete it irreversibly. The row's EXISTENCE must
+        # shield its hash even with an empty group.
         import hashlib
 
         sid, _ = ensure_agent_source(kstore)
@@ -775,13 +751,11 @@ class TestEmptyGroupDedupRowShieldsItsHash:
         assert sole in _live_ids(kstore, sid)
 
     def test_a_sole_copy_at_the_same_slug_as_its_marker_is_not_deleted(self, kstore):
-        # GPT 6.1 F1 + Opus 5.5: an exclusion once skipped a (slug, hash) pair
-        # that ALSO carried a crash marker from the shield, so a same-slug retry's
-        # orphan could be reaped. But when that slug's only
-        # surviving content is the single unowned copy -- no healthy row names a
-        # live item -- that "orphan" IS the sole copy, and the exclusion deleted
-        # it irreversibly. The exclusion is gone: a `deduped` row shields its
-        # hash even when a crash marker shares its exact slug.
+        # Excluding a (slug, hash) pair that ALSO carries a crash marker from the
+        # shield would let a same-slug retry's orphan be reaped. But when that
+        # slug's only surviving content is the single unowned copy -- no healthy
+        # row names a live item -- that "orphan" IS the sole copy. So a `deduped`
+        # row shields its hash even when a crash marker shares its exact slug.
         import hashlib
 
         sid, _ = ensure_agent_source(kstore)
@@ -817,10 +791,10 @@ class TestEmptyGroupDedupRowShieldsItsHash:
 
 class TestEarliestStartIsKeptAcrossRetries:
     def test_a_same_content_retry_keeps_the_earlier_attempts_start(self, kstore):
-        # F2 (GPT 6.1, this round): INSERT OR REPLACE overwrote started_at, so a
-        # same-content retry pushed the older orphan below the finalize's
-        # `created_at >= started_at` gate, dropping its marker and stranding it.
-        # _write_ingest_intent now keeps the EARLIEST start on conflict.
+        # _write_ingest_intent keeps the EARLIEST start on conflict. Overwriting
+        # started_at (plain INSERT OR REPLACE) would let a same-content retry push
+        # the first orphan below the finalize's `created_at >= started_at` gate,
+        # dropping its marker and stranding it.
         from kiro_crew.knowledge.agent_source import mark_ingesting
 
         sid, _ = ensure_agent_source(kstore)
@@ -858,10 +832,9 @@ class TestIngestionGateHeldAcrossIntent:
     async def test_the_add_holds_the_ingestion_gate_before_writing_the_intent(
         self, kstore, pipeline
     ):
-        # F3 (GPT 6.1 FLAG, this round): the intent marker was written BEFORE the
-        # ingest took the gate, so a maintenance sweep could begin in that gap
-        # and retire a live add's fresh marker. The add now holds
-        # ingestion_in_flight across the whole span. Prove the gate is held while
+        # The add holds ingestion_in_flight across the whole span. A marker
+        # written BEFORE the ingest takes the gate leaves a gap where a
+        # maintenance sweep can retire a live add's fresh marker. Prove the gate is held while
         # mark_ingesting runs: patch mark_ingesting to assert the gate depth is
         # non-zero at the moment the marker is written.
         import kiro_crew.knowledge.agent_source as agent_source
@@ -890,11 +863,8 @@ class TestIngestionGateHeldAcrossIntent:
 class TestOwnedIdDerivationIsShared:
     """The owned-id derivation lives in one place and both callers stand down together.
 
-    ``KnowledgeStore.agent_owned_item_ids`` is the single source of "which items
-    a live state row names". The residue sweep and ``clear_ingesting`` both read
-    it, and both treat an unreadable group as "cannot tell" -- the sweep returns
-    0 and ``clear_ingesting`` keeps the marker -- because a wrongly-deleted item
-    is unrecoverable where a stale one is not.
+    Both read ``KnowledgeStore.agent_owned_item_ids``; on an unreadable group the sweep
+    returns 0 and ``clear_ingesting`` keeps the marker, since a wrong delete is final.
     """
 
     def test_the_shared_helper_returns_none_on_an_unreadable_group(self, kstore):
@@ -947,11 +917,8 @@ class TestReplaceNeverLosesTheSoleCopy:
     """A replace interrupted between the old-group delete and the
     ownership-row write must never end with the document's only copy deleted.
 
-    Two independent guards, both pinned here: the delete and the row write now
-    commit as ONE transaction (so the window cannot be persisted by a new
-    store), and the sweep ADOPTS unowned residue into the slug's row when that
-    row's own group is gone (so a store that already persisted the window, or
-    any future path that does, is repaired instead of emptied).
+    Two guards: the delete and the row write commit as one transaction, and the sweep
+    adopts unowned residue into the slug's row when that row's group is gone.
     """
 
     @pytest.mark.asyncio
@@ -1269,12 +1236,8 @@ def _legacy_window(kstore, sid, slug, text, started):
 class TestAdoptionNeedsCompletionEvidence:
     """Adoption must not publish a partial crashed attempt as a complete document.
 
-    A crashed attempt's residue is whatever chunks it committed before it died,
-    and nothing stored says how many chunks the attempt meant to write. Writing
-    its hash into the row tells the next add of the same text "unchanged since
-    last add", so the missing chunks are never written. And adopting only the
-    newest attempt lets the sweep reap an older attempt that may be the last
-    complete version.
+    Writing a partial attempt's hash into the row would make the next add skip as
+    unchanged, and reaping older attempts could remove the last complete version.
     """
 
     @pytest.mark.asyncio

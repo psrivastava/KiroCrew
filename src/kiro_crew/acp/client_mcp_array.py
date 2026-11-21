@@ -9,23 +9,21 @@ class binds it by name, so it reads and writes the session's own state on the in
 and a patch of the method on the class or on an instance reaches every caller.
 
 Instance fields written: ``_capability_projection_gaps``, ``_copilot_mcp_config_path``,
-``_loaded_capability_template``, ``_mcp_mount_opened_at``, ``_mcp_mount_servers``,
-``_mcp_pruned``, ``_mcp_pruned_names``,
-``_mcp_pruned_omitted``, ``_mcp_report_frame_floor``, ``_member_dispatch_mounted``,
-``_member_stub_allowlist``, ``_pending_oauth_requests``, ``_pi_mcp_handoff``,
-``_session_agent_spec``,
-``_session_harness_deny_rules``, ``_session_mcp_cache``,
-``_session_mcp_excludes_local``, ``_session_mcp_inline_settings``,
-``_session_mcp_snapshot``, ``_session_mcp_unhonoured``, ``_spec_denied_tools``,
-``_spec_zero_tools``.
+``_crew_bridge_snapshots``, ``_loaded_capability_template``, ``_mcp_mount_opened_at``,
+``_mcp_mount_servers``, ``_mcp_pruned``, ``_mcp_pruned_names``, ``_mcp_pruned_omitted``,
+``_mcp_report_frame_floor``, ``_member_dispatch_mounted``, ``_member_stub_allowlist``,
+``_pending_oauth_requests``, ``_pi_mcp_handoff``, ``_session_agent_spec``,
+``_session_harness_deny_rules``, ``_session_mcp_cache``, ``_session_mcp_excludes_local``,
+``_session_mcp_inline_settings``, ``_session_mcp_snapshot``, ``_session_mcp_unhonoured``,
+``_spec_denied_tools``, ``_spec_shell_allowlist``, ``_spec_write_allowlist``,
+``_spec_write_cwd``, ``_spec_zero_tools``.
 
-Instance fields read: ``_agent``, ``_channel_id``, ``_claude_inline_settings``,
-``_claude_local_settings_excluded``, ``_mcp_gateway_overlay``, ``_mcp_gateway_socket``,
-``_mcp_notifications``,
-``_mcp_ref_spec``, ``_mcp_report``, ``_native_skill_projection``,
-``_opencode_config_mcp_servers``, ``_opencode_denies_in_force``, ``_pi_gate_nonce``,
-``_pi_mcp_server_names``, ``_session_id``, ``_session_key``, ``_side_read_only``,
-``_stub_session_token``, ``_work_dir``, ``member_context``.
+Instance fields read: ``_acp_backend``, ``_agent``, ``_channel_id``, ``_child_env_names``,
+``_mcp_gateway_overlay``, ``_mcp_gateway_socket``, ``_mcp_json_names``,
+``_mcp_notifications``, ``_mcp_ref_spec``, ``_mcp_report``, ``_native_skill_projection``,
+``_pi_gate_nonce``, ``_pi_mcp_server_names``, ``_session_id``, ``_session_key``,
+``_spawn_work_dir``, ``_stub_session_token``, ``_work_dir``,
+``member_context``.
 """
 
 from __future__ import annotations
@@ -33,19 +31,33 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import weakref
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Collection
 
 from kiro_crew import acp_tool_gate
+from kiro_crew.acp.ipc_pickup import with_ipc_pickups
 from kiro_crew.acp.mcp_mount_check import schedule_mount_check
-from kiro_crew.acp.mcp_ref_guard import warn_remote_header_secret_refs, warn_unresolved_server_refs
-from kiro_crew.acp.mcp_session_report import BUCKET_CAP as MCP_REPORT_BUCKET_CAP
-from kiro_crew.acp.mcp_session_report import ERROR_CAP as MCP_REPORT_ERROR_CAP
-from kiro_crew.acp.mcp_session_report import NAME_CAP as MCP_REPORT_NAME_CAP
-from kiro_crew.acp.mcp_session_report import McpSessionReport, sanitize_sink_text
-from kiro_crew.acp.mcp_startable import PrunedServer, prune_unstartable
-from kiro_crew.acp.session_mcp import ToolsAllowlist, agent_spec_snapshot
+from kiro_crew.acp.mcp_prune import prune_session_servers, record_pruned
+from kiro_crew.acp.mcp_ref_guard import (
+    warn_remote_header_secret_refs,
+    warn_unresolved_server_refs,
+    warn_unset_env_placeholders,
+)
+from kiro_crew.acp.mcp_session_report import McpSessionReport
+from kiro_crew.acp.mcp_sign_in_probe import schedule_sign_in_probe
+from kiro_crew.acp.pi_mcp_registration import discard_registration
+from kiro_crew.acp.session_mcp import SessionMcpProjection, ToolsAllowlist, agent_spec_snapshot
+from kiro_crew.acp.spec_tools_allowlists import (
+    session_allowlist_spec,
+    spec_shell_patterns,
+    spec_write_globs,
+)
 from kiro_crew.acp.types import (
+    ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_MIMOCODE,
+    ACP_BACKEND_OPENCODE,
     ACP_BACKENDS_MATE_WORKER_TOOL_LIMITS,
     ACP_BACKENDS_MEMBER_DISPATCH,
     ACP_BACKENDS_MEMBER_PANEL,
@@ -57,6 +69,10 @@ from kiro_crew.acp.types import (
     overlay_project_scope,
 )
 from kiro_crew.agent_discovery import _read_agent_spec
+from kiro_crew.agent_sdk.backends import (
+    ACP_BACKENDS_CREW_ENFORCES_SPEC_TOOLS_SETTINGS,
+    ACP_BACKENDS_CREW_OAUTH_BRIDGE,
+)
 from kiro_crew.mcp_gateway.session_servers import (
     attach_stub_session_token,
     injection_server_names,
@@ -86,8 +102,9 @@ def spec_is_toolless(spec: object) -> bool:
     ``includeMcpJson`` is exactly ``False`` (kiro-cli defaults it to True and would
     then start every server in the user-level ``mcp.json``). An empty ``tools``
     alone is not enough: a server listed under ``mcpServers`` is still started, a
-    hook still runs a command, and either include flag widens the visible tools
-    (``acp.kas_agents`` forwards both), in a turn that must run none.
+    hook still runs a command, and either include flag widens what the turn can
+    reach (``acp.kas_agents`` forwards ``includePowers``, and the ``includeMcpJson``
+    opt-in decides which ``mcp.json`` servers KAS starts), in a turn that must run none.
 
     Fails closed: a non-dict and any key of the wrong type answer False.
     """
@@ -131,6 +148,33 @@ def authored_agent_spec_is_toolless(agent: str, work_dir: Any = None) -> bool:
             agent,
             exc_info=True,
         )
+        return False
+    return spec_is_toolless(spec)
+
+
+def kas_lite_spec_is_toolless(agent: str, work_dir: Any = None) -> bool | None:
+    """Whether the ``kirocrew-lite`` spec KAS is sent mounts nothing, or ``None``.
+
+    ``None`` for any other agent, and when a checkout spec of that name exists (the
+    caller then judges the authored spec as before). Otherwise the user-level spec
+    as the KAS projection sends it (``service_agents.lite_view_without_registered_injection``):
+    the template when the file's only change is a registered injection, else the
+    file itself. Blocking; fails closed: an unreadable spec answers False.
+    """
+    from kiro_crew.acp import session_mcp
+    from kiro_crew.agent import lite_view_without_registered_injection
+    from kiro_crew.agent_files import LITE_AGENT_FILENAME
+
+    if agent != Path(LITE_AGENT_FILENAME).stem:
+        return None
+    try:
+        if work_dir and session_mcp._project_spec_path_for(agent, work_dir) is not None:
+            return None
+        spec = agent_spec_snapshot(agent, work_dir=work_dir)
+        if isinstance(spec, dict):
+            spec = lite_view_without_registered_injection(spec)
+    except Exception:
+        logger.warning("lite spec unreadable; not confirming zero tools", exc_info=True)
         return False
     return spec_is_toolless(spec)
 
@@ -206,6 +250,12 @@ def effective_spec_declares_zero_tools(
     """
     projection = getattr(self, "_native_skill_projection", None)
     if projection is None:
+        if getattr(self, "_acp_backend", "") == ACP_BACKEND_KAS:
+            # KAS is sent the spec Crew reads, and for the background helper that is
+            # the spec without a registered injection (``kas_lite_spec_is_toolless``).
+            sent = kas_lite_spec_is_toolless(self._agent, self._work_dir)
+            if sent is not None:
+                return authored_before_spawn and sent
         return authored_before_spawn and authored_agent_spec_is_toolless(
             self._agent, self._work_dir
         )
@@ -321,15 +371,13 @@ def _resolve_session_mcp_servers(self: AcpClient) -> list[dict[str, Any]]:
         stubbed = frozenset()
     mirror = mirror_for(self.backend)
     if mirror is None:
-        return self._mirrorless_member_mounts(stubbed)
+        return _with_own_ipc_pickups(self, self._mirrorless_member_mounts(stubbed))
     # Recorded BEFORE the projection reads the governed flag, and beside the
     # array it authorizes: the session/new envelope reads this record, so an
     # array delivered under the exclusion always ships with it.
-    excludes_local = bool(getattr(self, "_claude_local_settings_excluded", False))
+    excludes_local, inline_settings = self._local_settings_exclusion()
     self._session_mcp_excludes_local = excludes_local
-    self._session_mcp_inline_settings = (
-        getattr(self, "_claude_inline_settings", None) if excludes_local else None
-    )
+    self._session_mcp_inline_settings = inline_settings
     # The STRUCTURED face rather than the wire one, for every mirror alike: two
     # things can come out of the one spec parse and only one of them is wire
     # data -- the array, and a per-tool deny set this client enforces at the
@@ -354,29 +402,92 @@ def _resolve_session_mcp_servers(self: AcpClient) -> list[dict[str, Any]]:
         # identity through the signed mapping rather than through an env key
         # a warm-pool rekey can leave stale.
         session_token=self._stub_session_token,
-        # The deny rules the opencode read-back found in force (None before any
+        # The deny rules this harness's read-back found in force (None before any
         # were seeded), so a later re-parse withholds a server whose rule is not.
-        harness_denies_in_force=getattr(self, "_opencode_denies_in_force", None),
+        harness_denies_in_force=self._harness_read_back().denies_in_force,
     )
     self._spec_denied_tools = projection.denied_tools
+    if self.backend in ACP_BACKENDS_CREW_ENFORCES_SPEC_TOOLS_SETTINGS:
+        # The spec's `toolsSettings` shell and write allowlists, which this harness
+        # never reads: stamped on the session's own permission requests for the
+        # gate to refuse what they do not cover. A withheld array carries no spec,
+        # but the native shell and write tools still run, so the spec is read again,
+        # through the same mirrored resolution, rather than the allowlists dropped.
+        allowlist_spec = projection.agent_spec
+        if allowlist_spec is None and self._agent:
+            allowlist_spec = session_allowlist_spec(self._agent, self._work_dir)
+        cwd = str(getattr(self, "_spawn_work_dir", "") or self._work_dir or "")
+        self._spec_shell_allowlist = spec_shell_patterns(allowlist_spec)
+        self._spec_write_allowlist = spec_write_globs(allowlist_spec, cwd)
+        self._spec_write_cwd = cwd
     self._session_mcp_unhonoured = projection.unhonoured_servers
+    if self.backend == ACP_BACKEND_MIMOCODE:
+        # MiMo Code also mounts servers of its own config, which withholding an
+        # element cannot reach, so its read-back refuses one switched off whole.
+        self._harness_read_back().disabled_servers = projection.disabled_servers
     self._session_harness_deny_rules = projection.harness_deny_rules
     self._spec_zero_tools = projection.zero_tools
+    self._note_worker_builtin_tools(projection.builtin_tools)
     # Kept beside the array it describes, so the post-consume check judges the
     # generation these elements were built from and not a later read of the file.
     self._session_mcp_snapshot = projection.derived_spec_snapshot
     self._session_agent_spec = projection.agent_spec
     servers = projection.params.get("mcpServers") or []
     out = list(servers) if isinstance(servers, list) else []
+    if self.backend in ACP_BACKENDS_CREW_OAUTH_BRIDGE:
+        from kiro_crew.acp import kas_env_launch
+
+        # A Crew-owned Connection reaches the vendor through the gateway bridge;
+        # the snapshots it wrote go when this process ends (``_reset_state``).
+        out, written = kas_env_launch.bridge_array(
+            out, backend=self.backend, session_key=self._session_key or "", agent_id=self._agent
+        )
+        self._crew_bridge_snapshots = [*getattr(self, "_crew_bridge_snapshots", []), *written]
+    if self._worker_settings_lag(projection.agent_spec):
+        logger.warning(
+            "session MCP: withholding the whole mcpServers array -- the claude settings "
+            "this worker ships lack a deny rule its crewmate file asks for (the file "
+            "changed after they were written, or the re-seed was declined). The worker "
+            "runs without MCP tools; the next start reads the file again.",
+        )
+        return []
     # The restriction half of the projection's withhold set, from the SAME parse the
     # array came out of: the member append must not re-add a name this projection
     # refused on a transport where the withhold is the whole of the enforcement.
-    return self._append_member_panel_server(
-        self._append_member_dispatch_server(
-            out, projection.restricted_servers, projection.disabled_servers
+    return _with_own_ipc_pickups(
+        self,
+        self._append_member_panel_server(
+            self._append_member_dispatch_server(
+                out, projection.restricted_servers, projection.disabled_servers
+            ),
+            projection.restricted_servers,
+            projection.disabled_servers,
         ),
-        projection.restricted_servers,
-        projection.disabled_servers,
+    )
+
+
+def _with_own_ipc_pickups(client: AcpClient, servers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """*servers* with this client's agent-socket pickups (``acp/ipc_pickup.py``).
+
+    The sessions an ``AcpClient`` drives (opencode, goose and the other backends the
+    shared runtime does not host) build their array here, so an enforced harness's
+    ``kirocrew-core`` gets its pickup on this path as it does on the runtime's. Bound
+    to this client's stub token and its own root pid, and dropped with the client.
+    """
+    client_ref = weakref.ref(client)
+
+    def _own_root_pid() -> int | None:
+        live_client = client_ref()
+        if live_client is None:
+            return None
+        return live_client._pid  # pid-owner-ok: the client reads its own root
+
+    return with_ipc_pickups(
+        servers,
+        backend=str(client.backend or ""),
+        session_token=client._stub_session_token,
+        runtime_pid=_own_root_pid,
+        owner=client,
     )
 
 
@@ -425,8 +536,24 @@ def _mirrorless_member_mounts(self: AcpClient, stubbed: Collection[str]) -> list
     applies it to the stubs it places itself, and without it a stub the spec never
     references would reach pi beside a spec confirmed as consumed. A non-member
     session records none, so its stubs are unchanged.
+
+    A crewmate's WORKER session on pi (``members.is_crewmate_worker_session``) is
+    held the same way to the spec built for that session (the worker base plus its
+    crewmate's file, ``session_mcp._crewmate_worker_spec``): its servers are mounted
+    and, as a member session, its stubs pass that spec's allowlist. A worker whose
+    kit cannot be read, or whose crewmate's file sets single-tool limits or
+    ``hooks``, ``permissions`` or ``toolsSettings`` pi cannot carry, raises here
+    rather than running as plain chat, as a mirrored host's projection does.
     """
     records_zero_tools = projection_for(self.backend).kind is ProjectionKind.BROKER_ONLY
+    # A crewmate's WORKER session (see the docstring): positive identity, asked only
+    # on the BROKER_ONLY host (pi), so every other backend's path is unchanged (H13).
+    worker = False
+    if records_zero_tools:
+        # circular import: members' module graph is heavy; resolved at call time.
+        from kiro_crew.members import is_crewmate_worker_session
+
+        worker = is_crewmate_worker_session(self._session_key)
     if (
         not records_zero_tools
         and self.backend not in ACP_BACKENDS_MEMBER_DISPATCH
@@ -443,6 +570,7 @@ def _mirrorless_member_mounts(self: AcpClient, stubbed: Collection[str]) -> list
         )
     try:
         from kiro_crew.acp.session_mcp import session_mcp_projection
+        from kiro_crew.mate_spec_policy import applies_spec_policy
 
         projection = session_mcp_projection(
             self._agent,
@@ -450,8 +578,13 @@ def _mirrorless_member_mounts(self: AcpClient, stubbed: Collection[str]) -> list
             work_dir=self._work_dir,
             session_key=self._session_key or "",
             worker_tool_limits_honoured=self.backend in ACP_BACKENDS_MATE_WORKER_TOOL_LIMITS,
+            spec_policy_honoured=applies_spec_policy(self.backend),
         )
     except Exception:
+        if worker:
+            # A worker never runs without its kit: an unreadable kit, or single-tool
+            # limits this host cannot carry, refuse the session as on a mirrored host.
+            raise
         logger.warning(
             "member session %s: agent spec unreadable, so no member tools are "
             "mounted -- the DM thread runs as plain chat this session",
@@ -487,11 +620,148 @@ def _mirrorless_member_mounts(self: AcpClient, stubbed: Collection[str]) -> list
     narrowed = frozenset(server for server, _tool in projection.disabled_tools)
     self._session_mcp_unhonoured = narrowed
     disabled = projection.disabled_servers
-    return self._append_member_panel_server(
+    members = self._append_member_panel_server(
         self._append_member_dispatch_server([], narrowed, disabled),
         narrowed,
         disabled,
     )
+    # A BROKER_ONLY member host (pi) has no mirror to translate the agent spec's
+    # OWN mcpServers, so without this a crewmate DM session carries only Crew's
+    # member mounts above. ``projection.servers`` is that translation, from the
+    # SAME parse and already filtered by the ``tools`` allowlist, the whole-server
+    # ``disabled`` mute and registry mode -- the same list a mirrored harness
+    # mounts. The spec servers lead, so the member mounts keep last-wins on a name
+    # clash, as they do over a pooled stub. Scoped to the crewmate DM session the
+    # gap is about -- the same ``is_member_session_key`` gate the member mounts
+    # above ride -- and to a crewmate's worker, whose projection above is its own
+    # per-session spec (``session_mcp._crewmate_worker_spec``), so an ordinary pi
+    # session is unchanged, as it is on every other mirror-less path (the member
+    # mounts are already empty for it).
+    # circular import: members' module graph is heavy; resolved at call time.
+    from kiro_crew.members import is_member_session_key
+
+    out = members
+    if records_zero_tools and (worker or is_member_session_key(self._session_key)):
+        out = self._broker_only_spec_mounts(projection) + members
+    if records_zero_tools and self.backend in ACP_BACKENDS_CREW_OAUTH_BRIDGE:
+        out = _with_crew_connections(self, projection, out)
+    return out
+
+
+def _with_crew_connections(
+    client: AcpClient, projection: SessionMcpProjection, out: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """*out* led by the spec's Crew-owned Connections as bridge elements (pi).
+
+    A BROKER_ONLY host receives no spec server otherwise; a Crew-owned Connection
+    is the one exception (RFC row 3f). Withheld when a tool of it is switched off,
+    as :meth:`_broker_only_spec_mounts` withholds. A same-named server in pi's own
+    ``mcp.json`` is the gate extension's to refuse and report (its registration
+    receipt names ``mcp_json``), as for every other server Crew hands pi.
+    """
+    from kiro_crew.acp import kas_env_launch
+
+    narrowed = {server for server, _tool in projection.disabled_tools}
+    # Every remote element is offered: bridge_array keeps only those Crew owns
+    # (a registry card, or an owner-added server whose grant Crew holds).
+    wanted = [
+        e for e in projection.servers if isinstance(e, dict) and e.get("name") not in narrowed
+    ]
+    if not wanted:
+        return out
+    bridged, written = kas_env_launch.bridge_array(
+        wanted,
+        backend=client.backend,
+        session_key=client._session_key or "",
+        agent_id=client._agent,
+    )
+    client._crew_bridge_snapshots = [*getattr(client, "_crew_bridge_snapshots", []), *written]
+    shims = [s for s, e in zip(bridged, wanted) if s is not e]
+    names = {s["name"] for s in shims}
+    return [*shims, *(e for e in out if e.get("name") not in names)]
+
+
+def _broker_only_spec_mounts(
+    self: AcpClient, projection: SessionMcpProjection
+) -> list[dict[str, Any]]:
+    """The agent spec's own MCP servers, for a BROKER_ONLY member host (pi).
+
+    ``projection.servers`` is the spec translated once by
+    :func:`session_mcp_projection`, already narrowed by the ``tools`` allowlist and
+    the whole-server ``disabled`` mute, with Crew's control plane REPLACED from the
+    managed source (so a hand-edited ``kirocrew-core`` command never reaches pi).
+    The pi handoff carries these elements to the gate extension, which registers
+    each with pi's built-in MCP support -- the same servers a mirrored harness
+    mounts, no server the spec does not already declare.
+
+    Two kinds of server are withheld here:
+
+    * a server with ANY switched-off tool (``disabledTools`` in the spec or a tool
+      turned off in the global settings file). pi has NO per-tool deny channel of
+      its own, and the mirror-less path fills no ``_spec_denied_tools`` for a later
+      per-call refusal, so a narrowed server handed to pi would make the
+      switched-off tool reachable with nothing to refuse the call. The whole server
+      is withheld, the control plane INCLUDED -- ``kirocrew-core`` with a tool
+      switched off stays off too. This is ``frozenset(server for server, _tool in
+      projection.disabled_tools)``, NOT ``projection.restricted``: the latter
+      exempts the control plane (a backend with a per-call deny refuses the narrowed
+      tool there), which pi cannot do.
+    * Crew's own IDENTITY-BOUND servers (``kirocrew-dashboard``, ``kirocrew-panel``
+      -- every managed server except the control plane). An element the spec
+      describes cannot carry this session's credential, so these are withheld from
+      the spec-described half and re-added WITH identity by the member mounts; the
+      mirror does exactly this (``opencode.session_projection``). Emitting the
+      spec's copy too would mount the server twice, unrestricted.
+
+    What is left rides the spec's own command, args and env. Crew's control plane
+    (``kirocrew-core`` / ``kirocrew-cron``) is the one part that carries THIS
+    session's identity, resolved live rather than read from the spec, the same env
+    :func:`control_plane_identity_env` puts on every other harness's control plane.
+
+    Empty when the spec declares no servers, so a pi member whose spec adds nothing
+    composes only the member mounts beside this.
+    """
+    from kiro_crew.mcp_cleanup import CONTROL_PLANE_SERVERS
+    from kiro_crew.providers.mirrors.identity import (
+        control_plane_identity_env,
+        identity_bound_crew_servers,
+        with_env,
+    )
+
+    # Every server with a switched-off tool, control plane included: pi has no
+    # per-call deny, so the whole server is withheld. Not gated on
+    # ``_withhold_is_the_only_deny_channel``, which answers a narrower question
+    # (and False for pi, whose ``PerToolDeny`` is None) and would leave the
+    # narrowed server mounted whole.
+    narrowed = frozenset(server for server, _tool in projection.disabled_tools)
+    identity = control_plane_identity_env(
+        self._session_key or "",
+        self._channel_id or "",
+        label="pi",
+        session_token=self._stub_session_token,
+    )
+    out: list[dict[str, Any]] = []
+    for element in projection.servers:
+        if not isinstance(element, dict):
+            continue
+        name = str(element.get("name") or "")
+        if name in narrowed:
+            logger.warning(
+                "member session %s: one of %r's tools is switched off and this backend "
+                "has no channel to refuse a call to it, so the spec server is withheld -- "
+                "stop narrowing that server to restore it",
+                self._session_key,
+                name,
+            )
+            continue
+        # An identity-bound Crew server (dashboard/panel): the member mounts add it
+        # with this session's identity, so the spec's identity-less copy is dropped.
+        if name in identity_bound_crew_servers():
+            continue
+        if identity and name in CONTROL_PLANE_SERVERS:
+            element = with_env(element, identity)
+        out.append(element)
+    return out
 
 
 def _pooled_broker_stubs(self: AcpClient) -> list[dict[str, Any]]:
@@ -809,6 +1079,7 @@ def _guard_unresolved_mcp_refs(self: AcpClient, wire_servers: Any) -> None:
     # unconfigured would send the user after the projection instead of the
     # command.
     pruned = getattr(self, "_mcp_pruned_names", ())
+    sent = wire_servers
     if pruned and isinstance(wire_servers, (list, tuple)):
         wire_servers = [*wire_servers, *({"name": name} for name in pruned)]
     try:
@@ -818,6 +1089,7 @@ def _guard_unresolved_mcp_refs(self: AcpClient, wire_servers: Any) -> None:
             backend=self.backend,
             agent=self._agent,
             gateway_enabled=self._mcp_gateway_overlay is not None,
+            mcp_json=self._mcp_json_names,
         )
         if unresolved:
             self._mcp_report.record_unresolved_refs(unresolved)
@@ -832,12 +1104,25 @@ def _guard_unresolved_mcp_refs(self: AcpClient, wire_servers: Any) -> None:
     except Exception:
         logger.debug("remote-header guard: evaluation failed", exc_info=True)
     try:
+        env_refs, env_omitted = warn_unset_env_placeholders(
+            spec,
+            sent,  # a pruned server never starts, so its env reaches no process
+            backend=self.backend,
+            agent=self._agent,
+            child_env=self._child_env_names,
+        )
+        if env_refs:
+            self._mcp_report.record_env_placeholder_refs(env_refs, env_omitted)
+    except Exception:
+        logger.debug("env-placeholder guard: evaluation failed", exc_info=True)
+    try:
         # The same spec names the servers an unattended run waits for, but only
-        # on kiro-cli: it launches the spec's own servers (via --agent) and
-        # reports each one's start. Elsewhere a spec server may be held back or
-        # never report, and every run would wait out the bound for nothing.
+        # on kiro-cli: it launches the spec's own servers (via --agent), and the
+        # mcp.json ones the spec opts in to, and reports each one's start.
+        # Elsewhere a spec server may be held back or never report, and every
+        # run would wait out the bound for nothing.
         if self.backend == ACP_BACKEND_KIRO:
-            self._mcp_report.record_declared(spec)
+            self._mcp_report.record_declared(spec, self._mcp_json_names)
     except Exception:
         logger.debug("declared MCP servers: spec unreadable", exc_info=True)
 
@@ -885,93 +1170,16 @@ def _session_mcp_servers(self: AcpClient) -> list[dict[str, Any]]:
     return list(self._session_mcp_cache)
 
 
-def _claude_session_mcp_servers(self: AcpClient) -> list:
-    """MCP server array passed to a claude ``session/new`` / ``session/load``.
+def _mimocode_session_mcp_servers(self: AcpClient) -> list:
+    """MCP server array passed to a MiMo Code ``session/new`` / ``session/load``.
 
-    Overridable seam, now FILLED for the public build. An empty array is
-    byte-identical for kiro-cli (it gets its servers via ``--agent``)
-    but a REAL GAP for claude: the claude-agent-acp adapter does not read
-    ``kirocrew.mcp.json`` on its own, so a claude session had zero MCP tools.
-    The harness itself worked — prompts, streaming, permissions — but Crew's own
-    tools were absent, with no error anywhere.
-
-    The translation lives in the mirror
-    (:mod:`kiro_crew.providers.mirrors.claude_code`), not here: projecting the
-    agent spec onto a backend's native shape is one named contract with one
-    implementation per backend, rather than a per-harness override each backend
-    author rediscovers. See ``docs/request-for-change/rfc-agent-config-mirror.md``.
-
-    The seam is deliberately KEPT rather than replaced by a capability-set call:
-    an edition already overrides this method, and swapping the call site for a
-    set membership test would silently stop calling that override.
-
-    In-memory only. The spawn path warms ``_session_mcp_cache`` off the loop, so
-    this accessor adds no scheduling or failure point to a call site shared with
-    kiro-cli (harness-parity H13).
-    """
-    return self._session_mcp_servers()
-
-
-def _opencode_session_mcp_servers(self: AcpClient) -> list:
-    """MCP server array passed to an opencode ``session/new`` / ``session/load``.
-
-    The opencode twin of
-    :meth:`kiro_crew.acp.harness.codex.CodexHarness.session_mcp_servers`, and it
-    must stay non-empty for the same reason: ``opencode acp`` reads no
-    ``~/.kiro/agents/<name>.json``, so nothing Crew declares reaches the session
-    through any other door. Until this hook existed an opencode session held
-    none of Crew's own tools at all -- no ``spawn_run``, no ``cron_add``, no
-    ``send_message`` -- while working in every visible respect.
-
-    What it does NOT do is the interesting half. There is no transport filter
-    here, unlike codex: an ``http`` element and an ``sse`` element are both
-    ACCEPTED by ``opencode acp``, so ``drop_unadvertised_transports`` would only
-    remove servers the harness would have mounted. Measured, not assumed --
-    ``test/test_opencode_session_mcp.py::test_real_opencode_acp_accepts_the_crew_stdio_element``
-    drives a real ``opencode acp`` the way its codex sibling drives codex-acp,
-    and pins the ``initialize`` ``mcpCapabilities`` shape so a release that
-    starts refusing the stdio element goes red here rather than silently
-    emptying every session's tool set.
-
-    The failure mode a bad element causes is the OPPOSITE of codex's, which is
-    why the shared translator's skip discipline matters more here, not less: a
-    malformed element (no ``command``, or an ``env`` that is not an array) fails
-    the WHOLE ``session/new`` with ``-32602`` on this harness, where codex drops
-    the element and succeeds. ``acp.session_mcp.acp_server_element`` returns
-    ``None`` for an entry with neither ``command`` nor ``url`` and stringifies
-    what it cannot type, so one hand-edited spec line costs that server rather
-    than the session.
-
-    The translation lives in the mirror
-    (:mod:`kiro_crew.providers.mirrors.opencode`), not here, for the same reason
-    claude's and codex's do: projecting the agent spec onto a backend's native
-    shape is one named contract with one implementation per backend.
-
-    The seam is deliberately KEPT rather than replaced by a capability-set
-    call: an edition may override this method, and swapping the call site for a
-    set membership test would silently stop calling that override.
-
-    In-memory only. The spawn path warms ``_session_mcp_cache`` off the loop, so
-    this accessor adds no scheduling or failure point to a call site shared with
-    kiro-cli (harness-parity H13).
-    """
-    return self._session_mcp_servers()
-
-
-def _deepseek_session_mcp_servers(self: AcpClient) -> list:
-    """MCP server array passed to a deepseek ``session/new`` / ``session/load``.
-
-    The deepseek twin of :meth:`_goose_session_mcp_servers`: ``dsh --profile acp``
-    reads no ``~/.kiro/agents/<name>.json``, and with deepseek in ``MIRRORS``
-    :meth:`_pooled_mcp_servers` answers ``[]`` for it, so this array is the only
-    route for Crew's own tools, the spec's servers and a member session's own
-    mounts (session control and the panel). An element whose command cannot start
-    fails ``session/new`` whole on this harness
-    (``test/fixtures/acp_frames/deepseek/mcp-stdio-rollback-live.jsonl``).
-
-    In-memory only. The spawn path warms ``_session_mcp_cache`` off the loop, so
-    this accessor adds no scheduling or failure point to a call site shared with
-    kiro-cli (harness-parity H13).
+    The MiMo Code twin of ``OpencodeAcpClient._opencode_session_mcp_servers``, on the same
+    grounds and measured rather than inherited: ``mimo acp`` reads no agent spec of
+    Crew's, and driven on 0.1.15 it mounted the element
+    ``acp.session_mcp.acp_server_element`` emits, listed its tools and completed a
+    call to one (``test/fixtures/acp_frames/mimocode/mcp-stdio-mount-live.jsonl``).
+    Kept as its own seam for the reason the opencode one is: an edition may
+    override it.
     """
     return self._session_mcp_servers()
 
@@ -989,6 +1197,20 @@ def _copilot_session_mcp_servers(self: AcpClient) -> list:
     In-memory only. The spawn path warms ``_session_mcp_cache`` off the loop, so
     this accessor adds no scheduling or failure point to a call site shared with
     kiro-cli (harness-parity H13).
+    """
+    return self._session_mcp_servers()
+
+
+def _antigravity_session_mcp_servers(self: AcpClient) -> list:
+    """MCP server array passed to an antigravity ``session/new`` / ``session/load``.
+
+    The antigravity twin of :meth:`_copilot_session_mcp_servers`: the member's
+    projected servers, unchanged. A named seam rather than a bare
+    :meth:`_session_mcp_servers` call at the splice, so the wire composition keeps
+    one gated per-harness hook per harness (an edition can override this one
+    alone, and harness-parity H6 sees it). In-memory only, so this accessor adds
+    no scheduling or failure point to a call site shared with kiro-cli
+    (harness-parity H13).
     """
     return self._session_mcp_servers()
 
@@ -1018,6 +1240,7 @@ async def _republish_pi_mcp_handoff(self: AcpClient) -> None:
 
     path, payload = getattr(self, "_pi_mcp_handoff", ("", b""))
     if path and self._pi_gate_nonce:
+        await asyncio.to_thread(discard_registration, self.work_scratch_dir, self._pi_gate_nonce)
         await asyncio.to_thread(publish_pi_mcp_handoff, self._pi_gate_nonce, payload)
 
 
@@ -1043,90 +1266,6 @@ async def _discard_copilot_mcp_config(self: AcpClient) -> None:
     self._copilot_mcp_config_path = ""
     if path:
         await asyncio.to_thread(discard_copilot_mcp_config, path)
-
-
-def _goose_session_mcp_servers(self: AcpClient) -> list:
-    """MCP server array passed to a goose ``session/new`` / ``session/load``.
-
-    The goose twin of :meth:`_opencode_session_mcp_servers`, and it must stay
-    non-empty for the same reason: ``goose acp`` reads no
-    ``~/.kiro/agents/<name>.json``, so nothing Crew declares reaches the session
-    through any other door. Without this hook a goose session holds none of Crew's
-    own tools at all -- no ``spawn_run``, no ``cron_add``, no ``send_message`` --
-    while working in every visible respect. It also holds no pooled broker stubs,
-    because :meth:`_pooled_mcp_servers` answers ``[]`` for any backend in
-    ``MIRRORS`` and hands that half to the mirror instead.
-
-    No transport filter, for opencode's reason rather than by copying it: this
-    harness ACCEPTS the stdio element and mounts it, measured as a round trip
-    against 1.50.1 -- the named child is asked ``initialize``,
-    ``notifications/initialized``, ``tools/list`` and ``tools/call``, and the
-    tool's own result comes back. So a filter would only remove servers the
-    harness would have mounted.
-
-    The failure mode a bad element causes is the LOOSEST of the three, and it is
-    the one thing about this accessor a reader has to know: an element whose command
-    cannot start does not fail ``session/new`` at all. The session is created with
-    that element dropped, so a malformed spec line costs Crew's tools rather than the
-    session.
-
-    **The drop is unobservable on this harness, and the corpus pin is the accepted
-    control.** goose emits no per-server MCP notification of any kind, so
-    ``_mcp_timeout_progress`` -- which reads ``mcp_server_initialized`` -- has
-    nothing to read here even as the timeout diagnostic it is; and the one
-    enumeration ``session/new`` does carry, ``available_commands_update``, is
-    byte-identical between a good mount and a dropped one. A session missing every
-    Crew tool is therefore indistinguishable on the wire from a healthy one, and
-    what stands in for a runtime check is
-    ``test/fixtures/acp_frames/goose/mcp-stdio-mount-live.jsonl``: it pins the round
-    trip -- ``initialize``, ``notifications/initialized``, ``tools/list`` and
-    ``tools/call`` reaching the child, and its result coming back -- so a release
-    that stops mounting the element goes red in the corpus rather than silently
-    emptying every session's tool set.
-
-    Accepted rather than closed, on two grounds. A dropped mount is a FUNCTIONALITY
-    loss and not a gate bypass: permission routing on this harness rides on the
-    seeded mode and its read-back, not on MCP, so every tool call a degraded session
-    does make still reaches ``HookManager.on_tool_call``. And observing the connect
-    is not goose-shaped work -- Crew hosts the broker stubs, so it can watch for the
-    child's own ``initialize`` for every member of
-    ``ACP_BACKENDS_SESSION_MCP_ARRAY``. That makes it a shared-path feature rather
-    than one harness's onboarding cost, and it is named as a follow-up: the broker
-    observes an ``initialize`` from the child within N seconds of ``session/new``,
-    and otherwise logs a warning and marks the session degraded.
-
-    The translation lives in the mirror
-    (:mod:`kiro_crew.providers.mirrors.goose`), not here, for the same reason the
-    three siblings' do: projecting the agent spec onto a backend's native shape is
-    one named contract with one implementation per backend.
-
-    The seam is deliberately KEPT rather than replaced by a capability-set call: an
-    edition may override this method, and swapping the call site for a set
-    membership test would silently stop calling that override.
-
-    In-memory only. The spawn path warms ``_session_mcp_cache`` off the loop, so
-    this accessor adds no scheduling or failure point to a call site shared with
-    kiro-cli (harness-parity H13).
-
-    The count is logged HERE, on the goose arm, because it is the one thing about a
-    goose session's tool set that is observable at all: the harness reports nothing
-    per server and nothing on a drop, so the number Crew handed over is the only
-    greppable fact a degraded session leaves behind until the broker-side mount
-    check exists. A count is not a mount -- it says what was offered, not what took.
-    """
-    if getattr(self, "_side_read_only", False):
-        # A Side Chat session mounts no MCP server, as on claude: READ_ONLY
-        # refuses every MCP call, and a server named after goose's builtin
-        # extension would replace its read tools.
-        return []
-    servers = self._session_mcp_servers()
-    logger.info(
-        "goose session MCP: %d server(s) placed on the session array; this harness "
-        "reports neither a mount nor a drop per server [session=%s]",
-        len(servers),
-        self._session_id,
-    )
-    return servers
 
 
 def _invalidate_session_mcp_projection(self: AcpClient) -> None:
@@ -1275,13 +1414,7 @@ def _begin_session_report(self: AcpClient, servers: Any) -> None:
     omitted, self._mcp_pruned_omitted = getattr(self, "_mcp_pruned_omitted", 0), 0
     # Only a server the report admitted counts as configured for the ref guard:
     # a name the failed bucket refused must get no row anywhere.
-    admitted: list[str] = []
-    for server in pruned:
-        if self._mcp_report.record_pruned(server.name, server.reason):
-            if server.name not in admitted:
-                admitted.append(server.name)
-    self._mcp_report.record_pruned_omitted(omitted)
-    self._mcp_pruned_names = tuple(admitted)
+    self._mcp_pruned_names = record_pruned(self._mcp_report, pruned, omitted)
 
 
 async def _prune_unstartable_mcp(self: AcpClient, servers: list[Any]) -> list[Any]:
@@ -1290,42 +1423,16 @@ async def _prune_unstartable_mcp(self: AcpClient, servers: list[Any]) -> list[An
     Only for ``ACP_BACKENDS_PRUNE_UNSTARTABLE_MCP``, where such an element is
     otherwise lost without a word (goose) or takes the whole session with it
     (deepseek). Each call site checks that set BEFORE awaiting this, so the kiro
-    path gains no awaited step (harness-parity H13). The stats run off the loop.
-    Each pruned server is warned about here and recorded on the MCP report as
-    failed by :meth:`_begin_session_report`, which every array build reaches
-    before its request is sent.
+    path gains no awaited step (harness-parity H13). The stats run off the loop
+    (:func:`kiro_crew.acp.mcp_prune.prune_session_servers`, shared with the
+    shared runtime). Each pruned server is warned about there and recorded on the
+    MCP report as failed by :meth:`_begin_session_report`, which every array build
+    reaches before its request is sent.
     """
-    kept, pruned = await asyncio.to_thread(prune_unstartable, servers)
-    # Bounded where it is kept, by the report's own caps: the count by the
-    # failed bucket's size, and each name and reason by its string cap. The
-    # reason quotes the configured command, which can hold a whole CLI line
-    # with a key in it, so it is cleaned before it is kept or logged.
-    retained = tuple(
-        PrunedServer(
-            sanitize_sink_text(str(server.name or ""), MCP_REPORT_NAME_CAP),
-            sanitize_sink_text(str(server.reason or ""), MCP_REPORT_ERROR_CAP),
-        )
-        for server in pruned[:MCP_REPORT_BUCKET_CAP]
-    )
-    omitted = len(pruned) - len(retained)
-    for server in retained:
-        logger.warning(
-            "%s session MCP: leaving server %r out of this session -- %s. The "
-            "session starts without it; fix its command to get its tools back",
-            self.backend,
-            server.name,
-            server.reason,
-        )
-    if omitted:
-        logger.warning(
-            "%s session MCP: leaving %d more unstartable servers out of this "
-            "session, not listed",
-            self.backend,
-            omitted,
-        )
-    self._mcp_pruned = retained
-    self._mcp_pruned_omitted = omitted
-    return kept
+    result = await prune_session_servers(self.backend, servers)
+    self._mcp_pruned = result.pruned
+    self._mcp_pruned_omitted = result.omitted
+    return result.kept
 
 
 def _start_mount_check(self: AcpClient) -> None:
@@ -1334,10 +1441,20 @@ def _start_mount_check(self: AcpClient) -> None:
     Only for ``ACP_BACKENDS_SESSION_MCP_ARRAY``, after the session exists, as a
     background task (:mod:`kiro_crew.acp.mcp_mount_check`): it never blocks or
     fails the start, and the kiro path gains no call (harness-parity H13).
+
+    On opencode it also starts the credential-free sign-in probe of the same array's
+    remote servers (:mod:`kiro_crew.acp.mcp_sign_in_probe`): opencode sends no frame
+    when one asks for a sign-in, so the probe is what lists it as awaiting one.
     """
     if self.backend not in ACP_BACKENDS_SESSION_MCP_ARRAY or not self._session_id:
         return
     session_id = self._session_id
+    if self.backend == ACP_BACKEND_OPENCODE:
+        schedule_sign_in_probe(
+            self._mcp_report,
+            getattr(self, "_mcp_mount_servers", None) or [],
+            alive=lambda: self._session_id == session_id,
+        )
     schedule_mount_check(
         self._mcp_report,
         getattr(self, "_mcp_mount_servers", None) or [],
@@ -1386,10 +1503,14 @@ def _placed_mcp_server_names(self: AcpClient) -> tuple[str, ...]:
     ``__init__``, which has no array cache to read.
     """
     if getattr(self, "_session_mcp_cache", None) is None:
-        return ()
+        # A settings re-seed after ``session/new`` drops the projection, but the
+        # live session still runs the array it was sent: name that one.
+        elements = getattr(self, "_mcp_mount_servers", None) or []
+    else:
+        elements = self._session_mcp_servers()
     return tuple(
         element["name"]
-        for element in self._session_mcp_servers()
+        for element in elements
         if isinstance(element, dict) and isinstance(element.get("name"), str)
     )
 
@@ -1397,11 +1518,11 @@ def _placed_mcp_server_names(self: AcpClient) -> tuple[str, ...]:
 def _harness_mcp_server_names(self: AcpClient) -> tuple[str, ...]:
     """Every MCP server name this session's harness may state a tool of.
 
-    The servers Crew placed, then those the opencode read-back found in the
-    harness's own config, then every server the pi MCP handoff carried -- on pi
-    the pooled stubs are not in the placed array, and pi spells each of their
+    The servers Crew placed, then those the opencode or MiMo Code read-back found
+    in the harness's own config, then every server the pi MCP handoff carried --
+    on pi the pooled stubs are not in the placed array, and pi spells each of their
     tools after its name. An instance built without ``__init__`` has none.
     """
-    found = getattr(self, "_opencode_config_mcp_servers", ())
+    found = self._harness_read_back().config_mcp_servers
     handed_off = getattr(self, "_pi_mcp_server_names", ())
     return tuple(dict.fromkeys([*self._placed_mcp_server_names(), *found, *handed_off]))

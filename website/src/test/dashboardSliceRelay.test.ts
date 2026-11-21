@@ -5,18 +5,27 @@
  * Instances hub can badge the chip. Only the non-secret count is sent.
  */
 import { describe, it, expect, afterEach, vi } from 'vitest'
-import dashboardReducer, { markSlotUnread, markSlotRead } from '../store/dashboardSlice'
+import dashboardReducer, { markSlotUnread, markSlotRead, sseSlots } from '../store/dashboardSlice'
+import type { ChatSlot } from '../types'
 
 const realParent = window.parent
+const HUB = 'http://127.0.0.1:8899'
+
+// jsdom has no referrer; the relay posts only to a hub origin it can name.
+const setReferrer = (value: string) => {
+  Object.defineProperty(document, 'referrer', { value, configurable: true })
+}
 
 afterEach(() => {
   Object.defineProperty(window, 'parent', { value: realParent, configurable: true })
+  setReferrer('')
   vi.restoreAllMocks()
 })
 
 describe('dashboardSlice unread relay', () => {
   it('posts the unread count to the parent when embedded', () => {
     const postMessage = vi.fn()
+    setReferrer(`${HUB}/chat`)
     // Simulate being inside an iframe: parent !== window.
     Object.defineProperty(window, 'parent', {
       value: { postMessage },
@@ -29,6 +38,7 @@ describe('dashboardSlice unread relay', () => {
     expect(postMessage).toHaveBeenCalled()
     const [payload] = postMessage.mock.calls[0]
     expect(payload).toMatchObject({ source: 'kirocrew', type: 'mc-unread-slots', count: 1 })
+    expect(postMessage.mock.calls[0][1]).toBe(HUB)
 
     // Reading clears it -> relays count 0.
     postMessage.mockClear()
@@ -42,6 +52,7 @@ describe('dashboardSlice unread relay', () => {
   // the chip to light.
   it('relays the count on every arrival, including on an already-unread slot', () => {
     const postMessage = vi.fn()
+    setReferrer(`${HUB}/`)
     Object.defineProperty(window, 'parent', { value: { postMessage }, configurable: true })
 
     let state = dashboardReducer(undefined, { type: '@@INIT' })
@@ -50,6 +61,27 @@ describe('dashboardSlice unread relay', () => {
     state = dashboardReducer(state, markSlotUnread({ slot: 'slot-2', ts: '2026-01-01T00:00:03Z' }))
     expect(postMessage.mock.calls.map(([p]) => p.count)).toEqual([1, 1, 2])
     expect(state.unreadSlots).toEqual(['slot-1', 'slot-2'])
+  })
+
+  it('relays the unread count when only the Bot thread leaves the slot list', () => {
+    const postMessage = vi.fn()
+    setReferrer(`${HUB}/chat`)
+    Object.defineProperty(window, 'parent', { value: { postMessage }, configurable: true })
+
+    const bot: ChatSlot = { key: 'bot', mode: 'member', messages: 0, running: false }
+    const session: ChatSlot = { key: 'bot-session', mate_root: bot.key, messages: 1, running: false }
+    let state = dashboardReducer(undefined, { type: '@@INIT' })
+    state = dashboardReducer(state, sseSlots([bot, session]))
+    state = dashboardReducer(state, markSlotUnread(session.key))
+    expect(postMessage).toHaveBeenLastCalledWith({ source: 'kirocrew', type: 'mc-unread-slots', count: 0 }, HUB)
+    postMessage.mockClear()
+
+    // The Bot thread closes: its session is a row of the person's list again.
+    state = dashboardReducer(state, sseSlots([session]))
+    expect(postMessage).toHaveBeenLastCalledWith({ source: 'kirocrew', type: 'mc-unread-slots', count: 1 }, HUB)
+    state = dashboardReducer(state, sseSlots([bot, session]))
+    expect(postMessage.mock.calls.map(([payload]) => payload.count)).toEqual([1, 0])
+    expect(state.unreadSlots).toEqual([session.key])
   })
 
   it('does not post when not embedded (parent === window)', () => {
@@ -61,5 +93,30 @@ describe('dashboardSlice unread relay', () => {
     state = dashboardReducer(state, markSlotUnread('slot-1'))
     expect(postMessage).not.toHaveBeenCalled()
     expect(state.unreadSlots).toContain('slot-1')
+  })
+
+  it.each([
+    ['no referrer', ''],
+    ['a page that is not a hub', 'https://evil.example/frame'],
+    ['a public host on a loopback port', 'http://example.com:8899/'],
+    ['an opaque referrer', 'about:blank'],
+  ])('sends nothing when embedded under %s', (_label, referrer) => {
+    const postMessage = vi.fn()
+    setReferrer(referrer)
+    Object.defineProperty(window, 'parent', { value: { postMessage }, configurable: true })
+
+    let state = dashboardReducer(undefined, { type: '@@INIT' })
+    state = dashboardReducer(state, markSlotUnread('slot-1'))
+    expect(postMessage).not.toHaveBeenCalled()
+    expect(state.unreadSlots).toContain('slot-1')
+  })
+
+  it('never posts to the wildcard target', () => {
+    const postMessage = vi.fn()
+    setReferrer('http://localhost:5173/')
+    Object.defineProperty(window, 'parent', { value: { postMessage }, configurable: true })
+
+    dashboardReducer(dashboardReducer(undefined, { type: '@@INIT' }), markSlotUnread('slot-1'))
+    expect(postMessage.mock.calls.map(([, target]) => target)).toEqual(['http://localhost:5173'])
   })
 })

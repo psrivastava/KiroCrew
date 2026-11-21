@@ -38,7 +38,7 @@ import { isSystemNoticeRow } from '../../pages/chat/CompactionCard'
 import { isWorkflowCompletionMessage } from '../../pages/chat/WorkflowCompletionCard'
 import { isSubagentCompletionMessage } from '../../pages/chat/subagentCompletion'
 import { REASONING_ROLES } from '../../pages/chat/groupDisplayItems'
-import { isPendingTransientNotice } from '../../pages/chat/transientNotice'
+import { isPendingTransientNotice } from '../../pages/chat/gatewayNotice'
 import type { ChatMessage } from '../../types'
 import { isHiddenInvisibleAssistantRow } from '../../utils/invisibleText'
 
@@ -65,7 +65,7 @@ const MACHINERY_ROLES: ReadonlySet<string> = new Set([
   ...REASONING_ROLES,
 ])
 
-/** A turn's progress rows: tool calls (the 🔧 line and its hidden ✅ / 🚫
+/** A turn's progress rows: tool calls (the Tool: line and its hidden Approved: / Refused:
  *  siblings) and thinking. Never drawn in the chat; a run reads past them. */
 const PROGRESS_ROLES: ReadonlySet<string> = new Set(['tool', ...REASONING_ROLES])
 

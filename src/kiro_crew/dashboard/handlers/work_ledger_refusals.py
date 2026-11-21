@@ -31,6 +31,8 @@ logger = logging.getLogger("kiro_crew.dashboard.handlers.work_ledger")
 _CODE_STATUS: dict[str, int] = {
     work_ledger.CODE_CREW_LOG_INCOMPLETE: 409,
     work_ledger.CODE_CACHE_DIRTY: 409,
+    # A remote retire while every kept binding still waits to be closed (wave 8).
+    work_ledger.CODE_RETIRED_HISTORY_FULL: 409,
     work_ledger.CODE_NO_LEDGER: 404,
     work_ledger.CODE_UNKNOWN_ITEM: 404,
     work_ledger.CODE_ALREADY_BOUND: 409,
@@ -38,11 +40,16 @@ _CODE_STATUS: dict[str, int] = {
     work_ledger.CODE_ITEM_CLOSED: 409,
     work_ledger.CODE_ITEM_CAP_EXCEEDED: 409,
     work_ledger.CODE_GOAL_CONCURRENCY_CAP_REACHED: 409,
+    work_ledger.CODE_HOST_MEMORY_CRITICAL: 409,
     work_ledger.CODE_DEPTH_EXCEEDED: 409,
     work_ledger.CODE_FIELD_TOO_LONG: 400,
     work_ledger.CODE_INVALID_ACTION: 400,
     work_ledger.CODE_INVALID_STATUS: 400,
     work_ledger.CODE_INVALID_VALUE: 400,
+    work_ledger.CODE_WAKE_AT_REQUIRES_PROGRESS: 400,
+    work_ledger.CODE_WAKE_AT_INVALID: 400,
+    work_ledger.CODE_WAKE_AT_IN_PAST: 400,
+    work_ledger.CODE_WAKE_AT_TOO_FAR: 400,
     # Raised only by ``work_ledger.purge_conductor``, the maintenance primitive
     # behind ``kirocrew ledger-sweep``, which no route calls. Mapped
     # anyway because this map is asserted EXHAUSTIVE over the store's ``CODE_*``
@@ -70,6 +77,7 @@ ROUTE_CODES: frozenset[str] = frozenset(
         "invalid_json",
         "invalid_body",
         "ledger_write_failed",
+        "ledger_unreadable",
         "crew_log_off",
         "crew_log_unit_unknown",
         "crew_log_unreadable",

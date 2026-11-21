@@ -14,6 +14,7 @@ if TYPE_CHECKING:
         LINK_PATTERNS_MAX,
         MODEL_PICKER_HIDDEN_MODEL_ID_RE,
         MODEL_PICKER_HIDDEN_MODELS_MAX,
+        PREFERRED_LANGUAGES,
         SESSION_FOLDER_ROOT_MAX_CHARS,
         VALID_MEMORY_MODES,
         _body_err_code,
@@ -83,9 +84,10 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
             "restore_window_minutes",
             "merge_queued_messages",
             "default_memory_mode",
+            "new_chat_crew_mode",
             "widget_density",
-            "use_builtin_browser",
             "verbosity",
+            "preferred_language",
             "quick_send",
             "session_grid",
             "tail_fork_enabled",
@@ -95,7 +97,10 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
             "auto_open_git_panel",
             "side_panel_always_open",
             "side_panel_pin_summary",
+            "auto_open_conductor_board",
             "folder_suggestions_enabled",
+            "folder_suggestions_auto_apply",
+            "project_tags_enabled",
             "topic_tags_enabled",
             "session_card_source_links",
             "session_folder_root",
@@ -119,10 +124,12 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
             "social_share_enabled",
             "social_share_sites",
             "decisions_enabled",
+            "browse_enabled",
             "model_picker_hidden_models",
             "model_picker_configured",
             "upload_max_mb",
             "knowledge_upload_max_mb",
+            "knowledge_upload_max_bytes",
         }
         body = {
             k: v
@@ -245,6 +252,20 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
                     status=400,
                 )
             updates["default_memory_mode"] = val
+        if "new_chat_crew_mode" in body:
+            val = body["new_chat_crew_mode"]
+            if not isinstance(val, bool):
+                _sel().log_tool_invocation(
+                    session_key="dashboard", tool_name="dashboard_config_write", outcome="failure"
+                )
+                return web.json_response(
+                    {
+                        "error": "new_chat_crew_mode must be a boolean",
+                        "code": "invalid_new_chat_crew_mode",
+                    },
+                    status=400,
+                )
+            updates["new_chat_crew_mode"] = val
         if "widget_density" in body:
             val = body["widget_density"]
             if val not in ("more", "less"):
@@ -313,25 +334,6 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
                     status=400,
                 )
             updates["link_patterns"] = cleaned
-        # Apply ONLY when it is the sole submitted setting. The Browser panel
-        # sends it alone; the Chat settings panel PUTs the whole config object
-        # from its own (possibly stale) cache, and applying it on that path would
-        # let a Chat-panel save silently revert a toggle another client changed
-        # (lost update).
-        if body.keys() == {"use_builtin_browser"}:
-            val = body["use_builtin_browser"]
-            if not isinstance(val, bool):
-                _sel().log_tool_invocation(
-                    session_key="dashboard", tool_name="dashboard_config_write", outcome="failure"
-                )
-                return web.json_response(
-                    {
-                        "error": "use_builtin_browser must be a boolean",
-                        "code": "invalid_use_builtin_browser",
-                    },
-                    status=400,
-                )
-            updates["use_builtin_browser"] = val
         if "verbosity" in body:
             # An older client may still send the retired ``ultra``; store
             # what it now means instead of rejecting the write. Spelled out
@@ -349,6 +351,21 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
                     status=400,
                 )
             updates["verbosity"] = val
+        if "preferred_language" in body:
+            val = body["preferred_language"]
+            if val != "" and (not isinstance(val, str) or val not in PREFERRED_LANGUAGES):
+                _sel().log_tool_invocation(
+                    session_key="dashboard", tool_name="dashboard_config_write", outcome="failure"
+                )
+                return web.json_response(
+                    {
+                        "error": "preferred_language must be '' (auto) or one of "
+                        + ", ".join(PREFERRED_LANGUAGES),
+                        "code": "invalid_preferred_language",
+                    },
+                    status=400,
+                )
+            updates["preferred_language"] = val
         if "tail_fork_enabled" in body:
             val = body["tail_fork_enabled"]
             if not isinstance(val, bool):
@@ -373,20 +390,36 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
                     status=400,
                 )
             updates["folder_suggestions_enabled"] = val
-        if "topic_tags_enabled" in body:
-            val = body["topic_tags_enabled"]
+        if "folder_suggestions_auto_apply" in body:
+            val = body["folder_suggestions_auto_apply"]
             if not isinstance(val, bool):
                 _sel().log_tool_invocation(
                     session_key="dashboard", tool_name="dashboard_config_write", outcome="failure"
                 )
                 return web.json_response(
                     {
-                        "error": "topic_tags_enabled must be a boolean",
-                        "code": "invalid_topic_tags_enabled",
+                        "error": "folder_suggestions_auto_apply must be a boolean",
+                        "code": "invalid_folder_suggestions_auto_apply",
                     },
                     status=400,
                 )
-            updates["topic_tags_enabled"] = val
+            updates["folder_suggestions_auto_apply"] = val
+        for tags_key in ("project_tags_enabled", "topic_tags_enabled"):
+            if tags_key not in body:
+                continue
+            val = body[tags_key]
+            if not isinstance(val, bool):
+                _sel().log_tool_invocation(
+                    session_key="dashboard", tool_name="dashboard_config_write", outcome="failure"
+                )
+                return web.json_response(
+                    {
+                        "error": f"{tags_key} must be a boolean",
+                        "code": f"invalid_{tags_key}",
+                    },
+                    status=400,
+                )
+            updates[tags_key] = val
         if "link_previews" in body:
             val = body["link_previews"]
             if not isinstance(val, bool):
@@ -473,6 +506,20 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
                     status=400,
                 )
             updates["side_panel_pin_summary"] = val
+        if "auto_open_conductor_board" in body:
+            val = body["auto_open_conductor_board"]
+            if not isinstance(val, bool):
+                _sel().log_tool_invocation(
+                    session_key="dashboard", tool_name="dashboard_config_write", outcome="failure"
+                )
+                return web.json_response(
+                    {
+                        "error": "auto_open_conductor_board must be a boolean",
+                        "code": "invalid_auto_open_conductor_board",
+                    },
+                    status=400,
+                )
+            updates["auto_open_conductor_board"] = val
         if "session_card_source_links" in body:
             val = body["session_card_source_links"]
             if not isinstance(val, bool):
@@ -580,7 +627,10 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
         # Both run OFF-THREAD so the event loop is never blocked. Only the
         # dashboard.<field> keys this request validated are written, leaving every
         # other config section on disk untouched. GET stays lock-free.
-        from kiro_crew.config.loader import update_config_locked  # noqa: F811
+        from kiro_crew.config.loader import (  # noqa: F811
+            PendingEditBlocksSave,
+            update_config_locked,
+        )
         from kiro_crew.dashboard.handlers.agents import (  # lazy: import cycle
             _get_config_lock,
         )
@@ -636,6 +686,17 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
                 tool_name="dashboard_config_write",
                 outcome="failure",
                 error="request_cancelled",
+            )
+            raise
+        except PendingEditBlocksSave:
+            # config.json has a change pending owner review: logged like any refused
+            # write, then the dashboard chain answers 409 with the code the UI links
+            # to the pending card.
+            _sel().log_tool_invocation(
+                session_key="dashboard",
+                tool_name="dashboard_config_write",
+                outcome="failure",
+                error="file_pending_review",
             )
             raise
         except Exception:
@@ -707,37 +768,50 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
     share_sites = (
         [] if social_share_denied else await asyncio.to_thread(social_share.permitted_sites)
     )
-    # Same shape, same reason: the Decisions feature-preview card is drawn only when
-    # the ceiling permits the seam, and this endpoint is the only place the dashboard
-    # can learn that. Presentation, not the control -- the consent PUT and the gate's
+    # Same shape, same reason: the Decisions feature-preview card draws its controls
+    # only when the ceiling permits the seam, and the administrator's notice when it
+    # does not, and this endpoint is the only place the dashboard can learn that. Presentation, not the control -- the consent PUT and the gate's
     # own consent read are the two chokepoints (``decisions/capability.py``). The card
     # is drawn while EITHER side permits: a fleet that allows hosted Jev but withdraws
     # local models (``capabilities.decisions_local``) still needs the card. A pinned
-    # ``capabilities.decisions`` deny covers the local side too, so it hides the card.
+    # ``capabilities.decisions`` deny covers the local side too, so it draws the notice.
     # Both rows evaluated in one hop, each audited once, never short-circuited.
     hosted_denied, local_denied = await asyncio.to_thread(denied_sides)
     decisions_denied = hosted_denied and local_denied
+    # Same again for the browser: Settings -> Browser and the live card show the
+    # policy line instead of their controls. Presentation only; every browser route
+    # and the engine refuse on their own (``browser_harness/governance.py``).
+    from kiro_crew.browser_harness.governance import browse_denied_async
+
+    browse_denied = await browse_denied_async(audit=False)
+    knowledge_ceiling = knowledge_ceiling_bytes(
+        cfg.dashboard.upload_max_mb, float(cfg.knowledge.max_ingest_file_mb)
+    )
     return web.json_response(
         {
             "restore_sessions": cfg.dashboard.restore_sessions,
             "restore_window_minutes": cfg.dashboard.restore_window_minutes,
             "merge_queued_messages": cfg.dashboard.merge_queued_messages,
             "default_memory_mode": cfg.dashboard.default_memory_mode,
+            "new_chat_crew_mode": cfg.dashboard.new_chat_crew_mode,
             "widget_density": cfg.dashboard.widget_density,
-            "use_builtin_browser": cfg.dashboard.use_builtin_browser,
             "verbosity": cfg.dashboard.verbosity,
+            "preferred_language": cfg.dashboard.preferred_language,
             "quick_send": cfg.dashboard.quick_send,
             "session_grid": cfg.dashboard.session_grid,
             "mcp_app_panel": cfg.dashboard.mcp_app_panel,
             "auto_open_git_panel": cfg.dashboard.auto_open_git_panel,
             "side_panel_always_open": cfg.dashboard.side_panel_always_open,
             "side_panel_pin_summary": cfg.dashboard.side_panel_pin_summary,
+            "auto_open_conductor_board": cfg.dashboard.auto_open_conductor_board,
             "session_card_source_links": cfg.dashboard.session_card_source_links,
             "session_folder_root": cfg.dashboard.session_folder_root,
             "default_session_folder": cfg.dashboard.default_session_folder,
             "tail_fork_enabled": cfg.dashboard.tail_fork_enabled,
             "link_previews": cfg.dashboard.link_previews,
             "folder_suggestions_enabled": cfg.dashboard.folder_suggestions_enabled,
+            "folder_suggestions_auto_apply": cfg.dashboard.folder_suggestions_auto_apply,
+            "project_tags_enabled": cfg.dashboard.project_tags_enabled,
             "topic_tags_enabled": cfg.dashboard.topic_tags_enabled,
             "model_picker_hidden_models": list(cfg.dashboard.model_picker_hidden_models),
             "model_picker_configured": cfg.dashboard.model_picker_configured,
@@ -762,12 +836,11 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
             "upload_max_mb": cfg.dashboard.upload_max_mb,
             # Read-only: the Knowledge upload ceiling, which ingestion's own
             # `knowledge.max_ingest_file_mb` also bounds. The Knowledge page
-            # shows it; the ingest handler enforces the same figure.
-            "knowledge_upload_max_mb": bytes_to_mb_figure(
-                knowledge_ceiling_bytes(
-                    cfg.dashboard.upload_max_mb, float(cfg.knowledge.max_ingest_file_mb)
-                )
-            ),
+            # shows it, rounded to one decimal; the page pre-checks a file
+            # against the exact byte figure, which is what the ingest handler
+            # enforces.
+            "knowledge_upload_max_mb": bytes_to_mb_figure(knowledge_ceiling),
+            "knowledge_upload_max_bytes": knowledge_ceiling,
             # Read-only: the `capabilities.social_share` governance answer. False
             # withdraws the "Share as image" menu entry; there is no toggle behind
             # it, so nothing here is writable.
@@ -776,10 +849,15 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
             # The dialog draws only these buttons and re-reads this list before it
             # opens a site.
             "social_share_sites": share_sites,
-            # Read-only: the `capabilities.decisions` governance answer. False hides
-            # the Decisions (Jev) feature-preview card; the owner's own switch is
-            # the keystone behind `/api/decisions/consent`, never a field here.
+            # Read-only: the `capabilities.decisions` governance answer. False makes
+            # the Decisions feature-preview card draw the administrator's notice in
+            # place of its controls; the owner's own switch is the keystone behind
+            # `/api/decisions/consent`, never a field here.
             "decisions_enabled": not decisions_denied,
+            # Read-only: the `capabilities.browse` governance answer. False makes
+            # Settings -> Browser and the live browser card say browsing is off by
+            # policy, with no install or takeover control.
+            "browse_enabled": not browse_denied,
             # Read-write (unlike the host allowlists above): a rule only changes
             # how this dashboard RENDERS text -- it grants no fetch and no CLI
             # any authority -- so the settings editor may manage it.

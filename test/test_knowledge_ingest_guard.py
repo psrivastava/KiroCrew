@@ -26,6 +26,7 @@ import threading
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from redaction_structured_cases import github_classic
 
 from kiro_crew.knowledge import ingestion as ingestion_mod
 from kiro_crew.knowledge.chunker import HeadingAwareChunker
@@ -34,6 +35,10 @@ from kiro_crew.knowledge.ingestion import FileTooLargeError, IngestionPipeline
 from kiro_crew.knowledge.readers import FileReader
 from kiro_crew.knowledge.store import KnowledgeStore
 from kiro_crew.knowledge.watcher import KnowledgeWatcher
+
+# A GitHub token with a valid checksum, which the plan redacts. An AWS key ID
+# stays visible as an identifier, so it cannot show that a value is scrubbed.
+_SECRET_TOKEN = github_classic(seed=43)
 
 
 @pytest.fixture()
@@ -132,6 +137,20 @@ class TestSizeGuard:
 
 
 class TestChunkingOffLoop:
+    @pytest.mark.asyncio
+    @pytest.mark.asyncio
+    async def test_a_staged_upload_is_titled_by_its_original_name(
+        self, pipeline, kstore, tmp_path, monkeypatch
+    ):
+        """An upload is read from a ``kn_<hex>`` staging copy; its title is the upload's name."""
+        monkeypatch.setattr(ingestion_mod, "_max_ingest_file_mb", lambda: 0)
+        staged = tmp_path / "kn_15bdc0aa11bb22cc33dd44ee55ff6677.md"
+        staged.write_text("# Notes\n\nbody\n", encoding="utf-8")
+        await pipeline.ingest_file(str(staged), original_name="quarterly-report.md")
+        rows = kstore.db.execute("SELECT name, properties FROM sources").fetchall()
+        assert len(rows) == 1
+        assert json.loads(rows[0]["properties"])["title"] == "quarterly-report"
+
     @pytest.mark.asyncio
     async def test_ingest_file_chunks_off_the_event_loop(
             self, pipeline, tmp_path, monkeypatch):
@@ -486,15 +505,15 @@ def test_oversized_file_message_redacts_the_caller_supplied_name(tmp_path, monke
         big.write_text("x" * 4096)
         _set_limit_mb(monkeypatch, 0.001)
 
-        leaky = "report AKIAIOSFODNN7EXAMPLE.md"
+        leaky = f"report {_SECRET_TOKEN}.md"
         with caplog.at_level(logging.WARNING):
             with pytest.raises(FileTooLargeError) as excinfo:
                 asyncio.get_event_loop().run_until_complete(
                     pipe.ingest_file(str(big), original_name=leaky))
 
-        assert "AKIAIOSFODNN7EXAMPLE" not in str(excinfo.value)
+        assert _SECRET_TOKEN not in str(excinfo.value)
         assert "REDACTED" in str(excinfo.value)
-        assert "AKIAIOSFODNN7EXAMPLE" not in caplog.text
+        assert _SECRET_TOKEN not in caplog.text
     finally:
         store.close()
 
@@ -553,7 +572,7 @@ async def test_an_auto_added_source_scrubs_secrets_before_extraction(
     own text is therefore scrubbed ahead of chunking, extraction and storage.
     """
     doc = tmp_path / "runbook.md"
-    doc.write_text("# Runbook\n\nUse AKIAIOSFODNN7EXAMPLE to rotate the fleet.\n")
+    doc.write_text(f"# Runbook\n\nUse {_SECRET_TOKEN} to rotate the fleet.\n")
     src = kstore.add_source(
         name="project docs", source_type="local_folder", uri=str(tmp_path),
         properties={"sync_status": "active", "auto_added": True})
@@ -564,14 +583,14 @@ async def test_an_auto_added_source_scrubs_secrets_before_extraction(
         r["content"] or "" for r in kstore.db.execute(
             "SELECT content FROM items WHERE source_id = ?", (src,)).fetchall())
     assert stored, "the document should have been ingested"
-    assert "AKIAIOSFODNN7EXAMPLE" not in stored, (
+    assert _SECRET_TOKEN not in stored, (
         "an auto-added source must not store a raw credential")
     # What the extractor was handed must be scrubbed too -- that is the call that
     # leaves the machine.
     sent = " ".join(
         str(c) for call in pipeline.extractor.extract_batch.await_args_list
         for c in (call.args[0] if call.args else []))
-    assert "AKIAIOSFODNN7EXAMPLE" not in sent, (
+    assert _SECRET_TOKEN not in sent, (
         "the credential must not reach the extraction worker")
 
 
@@ -583,7 +602,7 @@ async def test_a_hand_registered_source_is_left_alone(pipeline, kstore, tmp_path
     indexed text would be a behaviour change for every existing source.
     """
     doc = tmp_path / "notes.md"
-    doc.write_text("# Notes\n\nUse AKIAIOSFODNN7EXAMPLE to rotate the fleet.\n")
+    doc.write_text(f"# Notes\n\nUse {_SECRET_TOKEN} to rotate the fleet.\n")
     src = kstore.add_source(name="my docs", source_type="local_folder",
                             uri=str(tmp_path), properties={"sync_status": "active"})
 
@@ -592,7 +611,8 @@ async def test_a_hand_registered_source_is_left_alone(pipeline, kstore, tmp_path
     stored = " ".join(
         r["content"] or "" for r in kstore.db.execute(
             "SELECT content FROM items WHERE source_id = ?", (src,)).fetchall())
-    assert "AKIAIOSFODNN7EXAMPLE" in stored, (
+    # Synthetic token, expected visible: this path deliberately skips redaction.
+    assert _SECRET_TOKEN in stored, (
         "a hand-registered source keeps its existing behaviour")
 
 

@@ -77,8 +77,10 @@ import time
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
+from kiro_crew.atomic_write import replace_with_retry
 from kiro_crew.platform_compat import kill_and_reap
 from kiro_crew.sandbox import (
+    app_backend_secret_mask_targets,
     create_subprocess_limited,
     sandboxed_spawn_argv,
     sandboxed_spawn_argv_async,
@@ -309,7 +311,7 @@ def write_record(directory: str, record: ResolvedRecord) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(record.to_json(), fh)
-        os.replace(tmp, target)
+        replace_with_retry(tmp, target)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
@@ -713,7 +715,7 @@ async def install(
     # relative to the prefix it was given, so a prefix reached through a symlink
     # makes it compute a traversing path instead of a plain ``node_modules/x``.
     # One install could absorb that, but a clean tree costs nothing.
-    real_target = os.path.realpath(staging_target)
+    real_target = await asyncio.to_thread(os.path.realpath, staging_target)
 
     argv = [
         npm_cmd,
@@ -747,6 +749,9 @@ async def install(
         mode="standard",
         strip_python_env=True,
         extra_writable_dirs=(real_target,),
+        # The install runs third-party lifecycle scripts, which have no use for
+        # the gateway's internal-API secret.
+        extra_hidden_dirs=await asyncio.to_thread(app_backend_secret_mask_targets),
         _prepare=sandboxed_spawn_argv,
     )
     try:

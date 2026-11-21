@@ -22,10 +22,13 @@ from kiro_crew.discord.renderer import _UPLOAD_LIMITS, DiscordRenderer
 from kiro_crew.discord.transport import DISCORD_CAPABILITIES, DiscordTransport
 from kiro_crew.messaging import outbound_files as outbound
 from kiro_crew.messaging.display_safety import canonicalize_display
+from kiro_crew.testing.synthetic_credentials import SAMPLE_SLACK_BOT_TOKEN, github_classic
 
 _PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
 _JPEG = b"\xff\xd8\xff" + b"\x11" * 64
-_KEY = "AKIAIOSFODNN7EXAMPLE"
+# A synthetic Slack bot token: no "/" so it can also be a file name, and no "_" or
+# other display markup, so a reassembled form is the token itself.
+_KEY = SAMPLE_SLACK_BOT_TOKEN
 _TEST_UPLOAD_ROOT = ""
 
 
@@ -271,7 +274,9 @@ class TestSealTimeExtraction:
         r, _ = _renderer()
         r._buf, components = ["A" * (DISCORD_MAX_TEXT * 2 + 1)], [{"type": 1}]
         r._land_sealed = land = AsyncMock(side_effect=[True, False, True])  # type: ignore[method-assign]
-        await r._seal_current(components=components, extract_uploads=False)
+        landed = await r._seal_current(components=components, extract_uploads=False)
+        # One chunk never reached the reader, so the seal must not report delivery.
+        assert landed is False
         assert land.await_count == 3 and land.await_args_list[-1].args[2] is components
 
 
@@ -350,7 +355,7 @@ class TestRestrictedGate:
 
 
 class TestDescriptionRedaction:
-    @pytest.mark.parametrize("streamed", [f"key AKIA\\{_KEY[4:]} here", f"https://x.example.com/u?k=AKIA\\{_KEY[4:]}", f"{_KEY[:4]}\u200b{_KEY[4:]}"])
+    @pytest.mark.parametrize("streamed", [f"key {_KEY[:4]}\\{_KEY[4:]} here", f"https://x.example.com/u?k={_KEY[:4]}\\{_KEY[4:]}", f"{_KEY[:4]}\u200b{_KEY[4:]}"])
     def test_a_display_reassembled_credential_is_redacted(self, streamed: str) -> None:
         from kiro_crew.messaging.outbound_files import unescape_md
         from kiro_crew.security import redact_credentials
@@ -423,7 +428,7 @@ class TestMultipartWire:
     def test_the_form_carries_bytes_and_never_reopens_the_path(self) -> None:
         assert _fields({"content": ""}, [_file("/nonexistent/dir/chart.png")])[1][2] == _PNG
 
-    @pytest.mark.parametrize("raw,mime,expected", [("/tmp/chart.png", "image/jpeg", "chart.jpg"), ("/tmp/deep/dir/shot.png", "image/png", "shot.png"), ('/tmp/no"quotes.png', "image/png", None), ("/tmp/no\nnewline.png", "image/png", None), ("/tmp/../../etc/passwd.png", "image/png", None), ("/tmp/.hidden.png", "image/png", None), ("/tmp/ghp:" + "a" * 36 + ".png", "image/png", "image_0.png")])
+    @pytest.mark.parametrize("raw,mime,expected", [("/tmp/chart.png", "image/jpeg", "chart.jpg"), ("/tmp/deep/dir/shot.png", "image/png", "shot.png"), ('/tmp/no"quotes.png', "image/png", None), ("/tmp/no\nnewline.png", "image/png", None), ("/tmp/../../etc/passwd.png", "image/png", None), ("/tmp/.hidden.png", "image/png", None), ("/tmp/" + github_classic(seed=126) + ".png", "image/png", "image_0.png")])
     def test_the_upload_filename_is_derived_not_trusted(self, raw: str, mime: str, expected: str | None) -> None:
         name = upload_filename(_file(raw, mime=mime), 0)
         if expected is not None:
@@ -468,16 +473,12 @@ class TestMultipartWire:
 class TestDocumentVerb:
     """The name-preserving document send.
 
-    Separate from ``send_message_with_files`` on purpose: that path's sanitizer
-    is aimed at LLM-authored reference paths and maps every non-raster mime to
-    ``.bin``, so it would deliver ``report.pdf`` as ``report.bin``. These tests
-    pin BOTH halves — the admitted name survives here, and the extraction path's
-    derivation is untouched.
+    ``send_message_with_files`` maps every non-raster mime to ``.bin`` (it sanitizes
+    LLM-authored paths), so ``report.pdf`` would arrive as ``report.bin``.
     """
 
     def test_the_extraction_path_still_derives_the_name(self) -> None:
-        # The guarantee `upload_filename` makes to its existing callers: an
-        # untrusted path, a non-raster mime, `.bin`. Unchanged by this verb.
+        # `upload_filename`: an untrusted path with a non-raster mime becomes `.bin`.
         assert upload_filename(_doc(), 0) == "report.bin"
         fields = _fields({"content": ""}, [_doc()])
         assert json.loads(fields[0][2])["attachments"][0]["filename"] == "report.bin"
@@ -542,43 +543,40 @@ async def _noop_sleep(_seconds: float) -> None:
 class TestDisplayRedactionIsAFloor:
     """Display-form redaction runs on every send, not only the upload path.
 
-    ``TurnDriver`` redacts the LITERAL form of every chunk upstream. The display
-    pass exists for the credential that is invisible until Discord renders the
-    markdown away, so gating it on the upload path left a restricted session, an
-    unset upload root, and every length rotation sending model text that only the
-    literal-form redactor had seen.
+    ``TurnDriver`` redacts only the LITERAL form upstream; the display pass catches a
+    credential that appears once Discord renders the markdown away.
     """
 
     #: A credential split by Markdown that Discord strips when it renders. The
     #: literal bytes carry ``**``, so a literal-form scan does not match; the
     #: rendered form is one contiguous key.
-    SPLIT_SECRET = "AKIA**IOSFODNN7**EXAMPLE"
+    SPLIT_SECRET = f"{_KEY[:4]}**{_KEY[4:13]}**{_KEY[13:]}"
+    SPLIT_MIDDLE = _KEY[4:13]
 
     @pytest.mark.asyncio
     async def test_a_restricted_session_still_gets_the_display_pass(self) -> None:
         cli = await _turn(f"here it is {self.SPLIT_SECRET}", uploads_allowed=False)
         body = cli.final_text()
-        assert "IOSFODNN7" not in body, body
+        assert self.SPLIT_MIDDLE not in body, body
 
     @pytest.mark.asyncio
     async def test_no_upload_root_still_gets_the_display_pass(self) -> None:
         cli = await _turn(f"here it is {self.SPLIT_SECRET}", upload_root="")
-        assert "IOSFODNN7" not in cli.final_text()
+        assert self.SPLIT_MIDDLE not in cli.final_text()
 
     @pytest.mark.asyncio
     async def test_a_channel_without_files_outbound_still_gets_the_display_pass(self) -> None:
         caps = replace(DISCORD_CAPABILITIES, files_outbound=False)
         cli = await _turn(f"here it is {self.SPLIT_SECRET}", capabilities=caps)
-        assert "IOSFODNN7" not in cli.final_text()
+        assert self.SPLIT_MIDDLE not in cli.final_text()
 
     @pytest.mark.asyncio
     async def test_a_length_rotated_segment_still_gets_the_display_pass(self) -> None:
-        """Length seals pass ``extract_uploads=False``, which was the widest of
-        the ungated routes: it is reached on any reply long enough to rotate."""
+        """A length seal passes ``extract_uploads=False``; any long reply reaches it."""
         r, cli = _renderer()
         await r.on_text_chunk("y" * (r._limit() + 50) + f"\n\n{self.SPLIT_SECRET}\n")
         await r.on_done()
-        assert all("IOSFODNN7" not in text for text in _bodies(cli))
+        assert all(self.SPLIT_MIDDLE not in text for text in _bodies(cli))
 
     @pytest.mark.asyncio
     async def test_mentions_are_defanged_on_an_ungated_send_too(self) -> None:
@@ -591,12 +589,8 @@ class TestDisplayRedactionIsAFloor:
 class TestDeliveryAccountingCountsEverySink:
     """`delivery_failed` answers "the user saw NOTHING", so every sink must report.
 
-    The dispatcher records a turn's outcome from what the provider produced, which
-    says nothing about whether anything arrived; `delivery_failed` is the
-    observable that separates them, and a cron turn acts on it (it re-alerts over
-    Slack and refuses to advance its dedup hash). So a sink that delivers without
-    reporting turns a success into a duplicate alert, and a sink that fails
-    without reporting turns a silent turn into a recorded success.
+    A cron turn acts on it (re-alerts over Slack, holds its dedup hash), so an
+    unreported delivery becomes a duplicate alert and an unreported failure a success.
     """
 
     @pytest.mark.asyncio

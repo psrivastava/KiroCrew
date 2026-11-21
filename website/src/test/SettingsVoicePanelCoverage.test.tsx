@@ -18,7 +18,7 @@
  */
 import { Profiler } from 'react'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { screen, fireEvent, waitFor } from '@testing-library/react'
+import { act, screen, fireEvent, waitFor } from '@testing-library/react'
 
 import { renderWithProviders } from './helpers'
 import { initI18n } from '../i18n'
@@ -36,11 +36,16 @@ vi.mock('../pages/settings/SttSettings', () => ({
 // environment down and throw "window is not defined" as an UNHANDLED error —
 // every test passing and the run still exiting non-zero. `shouldAdvanceTime`
 // keeps the clock moving so `findBy*` behaves as it does with real timers.
+// Testing Library ticks a fake clock inside act() for every `findBy*` and `waitFor` only when it sees a
+// `jest` global, and vitest's `vi` has the same API: the panel's chained reads (config, then the chosen
+// provider's voice list) and the Radix selects they mount all commit inside that act().
 beforeEach(async () => {
   vi.useFakeTimers({ shouldAdvanceTime: true })
+  vi.stubGlobal('jest', vi)
   await initI18n('en')
 })
 afterEach(() => {
+  vi.unstubAllGlobals()
   vi.clearAllTimers()
   vi.useRealTimers()
   vi.restoreAllMocks()
@@ -89,6 +94,8 @@ interface SeedOpts {
   configPending?: boolean
   /** Reject the Polly catalogue query. */
   voicesFail?: boolean
+  /** Answer the catalogue with no voices, as the gateway does before AWS consent. */
+  voicesEmpty?: boolean
   /** Reject the save, driving the `onError` rollback arm. */
   saveFails?: boolean
   /** Report a host with no built-in speech engine. */
@@ -109,6 +116,7 @@ function seed(over: Record<string, unknown> = {}, opts: SeedOpts = {}) {
 
   const voices = vi.spyOn(api, 'voiceVoices')
   if (opts.voicesFail) voices.mockRejectedValue(new Error('no aws cli'))
+  else if (opts.voicesEmpty) voices.mockResolvedValue({ voices: [] })
   else voices.mockResolvedValue(CATALOGUE)
 
   const systemVoices = vi.spyOn(api, 'voiceSystemVoices')
@@ -233,6 +241,15 @@ describe('VoicePanel system fields', () => {
     const calls = systemVoices.mock.calls.length
     fireEvent.click(screen.getByRole('button', { name: 'Check again' }))
     await waitFor(() => expect(systemVoices.mock.calls.length).toBeGreaterThan(calls))
+  })
+
+  it('tells a teammate the Crew has no engine without the install command for a host they cannot reach', async () => {
+    vi.spyOn(api, 'viewerOwnerOk').mockResolvedValue(false)
+    seed({ provider: 'system' }, { systemUnavailable: true })
+    await waitFor(() => {
+      expect(screen.getByTestId('system-engine-absent').textContent).toMatch(/Crew's computer has no built-in speech engine/)
+    }, { timeout: 5_000 })
+    expect(screen.getByTestId('system-engine-absent').textContent).not.toMatch(/sudo|install espeak-ng/)
   })
 
   it('disables the re-fetch button while the probe is in flight', async () => {
@@ -367,6 +384,20 @@ describe('VoicePanel polly fields', () => {
     expect(await screen.findByRole('option', { name: 'Matthew (US M)' }, { timeout: 5_000 })).toBeTruthy()
   })
 
+  it('offers the offline fallback list when the catalogue answers with no voices', async () => {
+    // The gateway answers `[]` before AWS consent and without the AWS CLI; an
+    // empty picker there leaves the user no voice to choose.
+    const { voices } = seed({ provider: 'polly' }, { voicesEmpty: true })
+    await field('AWS Profile (Amazon Polly)')
+    // Read the picker after the empty answer lands, not in the loading window,
+    // where the fallback shows on any version of the panel.
+    await waitFor(() => expect(voices).toHaveBeenCalled())
+    await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+    fireEvent.click(select(/^Voice$/))
+    expect(await screen.findByRole('option', { name: 'Matthew (US M)' }, { timeout: 5_000 })).toBeTruthy()
+    expect(screen.getByRole('option', { name: 'Ruth (US F)' })).toBeTruthy()
+  })
+
   it('folds the engine to the first supported one when the new voice cannot do it', async () => {
     // Brian supports only `standard`, so keeping `generative` would send a
     // combination Polly rejects.
@@ -472,7 +503,7 @@ describe('VoicePanel polly consent-gate invalidation', () => {
 /* ── save failure ─────────────────────────────────────────────────────────── */
 
 describe('VoicePanel save failure', () => {
-  it('surfaces the save error and rolls the local inputs back', async () => {
+  it('surfaces the save error and keeps the profile draft', async () => {
     const { save } = seed({ provider: 'polly', aws_profile: 'original' }, { saveFails: true })
     await field('AWS Profile (Amazon Polly)')
 
@@ -482,10 +513,12 @@ describe('VoicePanel save failure', () => {
 
     await waitFor(() => expect(save).toHaveBeenCalled())
     await screen.findByText('Failed to save voice config', undefined, { timeout: 5_000 })
-    await waitFor(() => expect(screen.getByPlaceholderText('default')).toHaveValue('original'))
+    await waitFor(() => expect(profile).not.toBeDisabled())
+    expect(profile).toHaveValue('typo')
+    expect(screen.queryByRole('button', { name: /ask the agent/i })).not.toBeInTheDocument()
   })
 
-  it('dismisses the save error banner', async () => {
+  it('keeps the region draft and dismisses the save error banner', async () => {
     seed({ provider: 'polly' }, { saveFails: true })
     await field('AWS Profile (Amazon Polly)')
 
@@ -495,6 +528,8 @@ describe('VoicePanel save failure', () => {
 
     const banner = await screen.findByText('Failed to save voice config', undefined, { timeout: 5_000 })
     expect(banner).toBeTruthy()
+    await waitFor(() => expect(region).not.toBeDisabled())
+    expect(region).toHaveValue('eu-west-1')
     fireEvent.click(screen.getByRole('button', { name: /dismiss/i }))
     await waitFor(() => expect(screen.queryByText('Failed to save voice config')).toBeNull())
   })

@@ -17,10 +17,8 @@ from kiro_crew.image_refs import strip_image_refs
 from kiro_crew.llm_helpers import _steer_host_deny
 from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_PERMISSION_REQUEST, EVENT_TEXT_CHUNK
 from kiro_crew.security import (
-    _URL_RE,
     contains_injection,
     redact_credentials,
-    redact_exfiltration_urls_with_records,
 )
 from kiro_crew.sel import sel
 
@@ -35,10 +33,6 @@ _OPTIMIZER_DENY_REASON = (
     "the prompt optimizer runs no tools: it only rewrites the prompt it was "
     "given and answers with text, so every tool call is refused here"
 )
-
-#: Sentence punctuation ``_URL_RE`` can include at the end of a match. Stripped
-#: from both the draft's URLs and the redacted addresses before they are compared.
-_URL_TRAILING_PUNCT = ".,;:!?]"
 
 # Placeholder the frontend collapses large pastes into (mirrors formatToken in
 # pasteTokens.ts: "[ Paste #N · M lines ]"). The middle dot is U+00B7. Captured
@@ -279,7 +273,7 @@ async def handle_optimize(request: web.Request) -> web.Response:
     try:
         data = await request.json()
     except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
     # Shape validation: valid JSON like `[]` has no .get(), and a non-string
     # prompt/context has no .strip() and cannot be scrubbed — either would
     # 500. 400 instead. An absent field still defaults to "".
@@ -414,7 +408,10 @@ async def handle_optimize(request: web.Request) -> web.Response:
                         await client.reject_tool(event.request_id)
                     elif event.kind == EVENT_COMPLETE:
                         break
-                return text
+                # kiro-cli's [STEERING steer-…] ack is protocol, not the rewrite.
+                from kiro_crew.messaging.driver import strip_steering_markers
+
+                return strip_steering_markers(text)
             finally:
                 logger.debug("Optimizer: releasing dedicated session")
                 state.sessions.release(optimizer_session_key)
@@ -477,21 +474,8 @@ async def handle_optimize(request: web.Request) -> web.Response:
         )
         return web.json_response({"optimized": prompt, "changed": False})
 
-    # Redact any exfiltration URLs or credentials from LLM output. When the pass
-    # removes a URL the user wrote in the draft, the rewrite would hand back a
-    # placeholder for their own link, so keep the draft instead. Nothing in the
-    # model's text is exempted: the whole reply is redacted either way. A URL
-    # match can swallow the sentence punctuation after it, so both sides drop
-    # trailing ``.,;:!?]`` before the comparison; a looser match only ever
-    # keeps the user's own draft.
-    removed: list[tuple[str, str]] = []
-    optimized, _, _ = redact_exfiltration_urls_with_records(optimized, removed_out=removed)
-    draft_urls = {m.group(0).rstrip(_URL_TRAILING_PUNCT) for m in _URL_RE.finditer(prompt)}
-    if any(address.rstrip(_URL_TRAILING_PUNCT) in draft_urls for address, _ in removed):
-        logger.info("Optimizer rewrite redacted a URL from the draft; returning original")
-        return web.json_response(
-            {"optimized": prompt, "changed": False, "reason": "draft_url_redacted"}
-        )
+    # Redact credentials from LLM output, inside a URL or not. Nothing in the
+    # model's text is exempted.
     optimized, _ = redact_credentials(optimized)
 
     changed = optimized.lower().strip() != prompt.lower().strip()

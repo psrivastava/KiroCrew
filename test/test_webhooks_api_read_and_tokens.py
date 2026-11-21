@@ -22,6 +22,7 @@ from webhooks_api_helpers import _bearer, _payload, _req
 
 from kiro_crew import webhooks
 from kiro_crew.dashboard.handlers import hooks as H
+from kiro_crew.testing.synthetic_credentials import github_classic
 
 
 class TestWebhooksRead:
@@ -62,7 +63,7 @@ class TestWebhooksRead:
         like the delivered result and the kiro-hooks command list, both of which
         already scrub, so it must scrub too.
         """
-        secret = "ghp_" + "a" * 36
+        secret = github_classic(seed=312)
         (wired / "hooks.json").write_text(
             json.dumps(
                 {
@@ -84,7 +85,7 @@ class TestWebhooksRead:
     @pytest.mark.asyncio
     async def test_redaction_runs_before_the_transport_slice(self, wired):
         """Slicing first would let a secret survive by straddling the cut."""
-        secret = "ghp_" + "b" * 36
+        secret = github_classic(seed=313)
         padding = "p" * (webhooks.CONTEXT_SUMMARY_TRANSPORT_MAX - 10)
         (wired / "hooks.json").write_text(
             json.dumps(
@@ -104,9 +105,9 @@ class TestWebhooksRead:
         assert ctx["context_chars"] == len(padding + secret)
 
     @pytest.mark.asyncio
-    async def test_contexts_carry_shared_freshness(self, wired):
-        # flake-ok: pre-existing real-clock anchor for the registration offsets the handler ages on its own clock, moved verbatim; tracked for a de-flake pass
-        now = time.time()
+    async def test_contexts_carry_shared_freshness(self, wired, monkeypatch, manual_clock):
+        manual_clock.install(monkeypatch, H)
+        now = manual_clock.time()
         (wired / "hooks.json").write_text(
             json.dumps(
                 {
@@ -130,8 +131,7 @@ class TestWebhooksRead:
         assert fresh["context_chars"] == 2500
         assert len(fresh["context_summary"]) == webhooks.CONTEXT_SUMMARY_TRANSPORT_MAX
         assert fresh["session_key"] == "hook:review:pr-1"
-        # flake-ok: pre-existing 55-120 s real-clock age window around the 60 s registration offset, moved verbatim; tracked for a de-flake pass
-        assert 55 <= fresh["age_seconds"] <= 120
+        assert fresh["age_seconds"] == 60
         assert by_id["old:job"]["freshness"] == "expired"
         # Newest registration first.
         assert data["contexts"][0]["hook_id"] == "review:pr-1"
@@ -542,7 +542,7 @@ class TestIdentifierRedaction:
 
     @pytest.mark.asyncio
     async def test_hook_id_and_session_key_are_redacted(self, wired):
-        secret = "ghp_" + "c" * 36
+        secret = github_classic(seed=314)
         (wired / "hooks.json").write_text(
             json.dumps(
                 {
@@ -564,7 +564,7 @@ class TestIdentifierRedaction:
     @pytest.mark.asyncio
     async def test_a_redacted_context_can_still_be_deleted(self, wired):
         """Redacting the id must not strand the context: delete still resolves it."""
-        secret = "ghp_" + "d" * 36
+        secret = github_classic(seed=315)
         raw_id = f"job-{secret}"
         (wired / "hooks.json").write_text(
             json.dumps({raw_id: {"context_summary": "x", "registered_at": time.time()}}),

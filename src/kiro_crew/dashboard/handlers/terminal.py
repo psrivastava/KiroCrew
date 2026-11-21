@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING
 from aiohttp import web
 
 from kiro_crew import _facade_mirror, platform_compat
-from kiro_crew.dashboard import terminal_commands
+from kiro_crew.dashboard import terminal_commands, ws_heartbeat
 from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
 from kiro_crew.dashboard.handlers.files import _PathProbeBusy, _run_path_probe
 from kiro_crew.dashboard.handlers.terminal_complete import (
@@ -54,6 +54,7 @@ from kiro_crew.dashboard.handlers.terminal_lifecycle import (
     _sess_alive,
     _sess_pid,
     _take_shell_to_evict,
+    apply_terminal_enabled,
 )
 from kiro_crew.dashboard.handlers.terminal_placement import (
     _CHAT_NOT_LOADED,
@@ -74,6 +75,7 @@ from kiro_crew.dashboard.handlers.terminal_session import (
     _get_registry,
     _is_enabled,
     _sel,
+    _terminal_enabled,
     _TerminalSession,
 )
 from kiro_crew.dashboard.handlers.terminal_shell import (
@@ -83,6 +85,7 @@ from kiro_crew.dashboard.handlers.terminal_shell import (
     _resolve_shell,
 )
 from kiro_crew.dashboard.handlers.terminal_transport import (
+    _TAKEOVER_READY_TIMEOUT_S,
     _close_terminal_ws_bounded,
     _record_and_forward_terminal_output,
     _release_terminal_ws_identity,
@@ -92,7 +95,8 @@ from kiro_crew.dashboard.handlers.terminal_transport import (
     _write_terminal_input,
 )
 from kiro_crew.dashboard.origin import check_origin, mark_audit_claimed
-from kiro_crew.executors import discovery_executor, subprocess_executor
+from kiro_crew.executors import subprocess_executor  # noqa: F401 -- facade name
+from kiro_crew.executors import discovery_executor
 from kiro_crew.notifications.bus import NotificationBus
 from kiro_crew.sandbox import RLIMIT_PROFILE_NONE, spawn_shim_argv
 from kiro_crew.security import (  # noqa: F401 - is_sensitive_path: tests patch it here
@@ -158,7 +162,7 @@ def _proc_cwd(pid: int) -> str | None:
     try:
         out = subprocess.run(
             [lsof, "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
-            capture_output=True, text=True, timeout=2,
+            capture_output=True, text=True, encoding="utf-8", timeout=2,
         ).stdout
         for line in out.splitlines():
             if line.startswith("n") and len(line) > 1:
@@ -209,7 +213,7 @@ async def _session_cwd_cached(sess: "_TerminalSession") -> str | None:
     if probe is not None and now - probe[0] < _CWD_PROBE_TTL_S:
         return probe[1]
     loop = asyncio.get_running_loop()
-    cwd = await loop.run_in_executor(subprocess_executor(), _session_cwd, sess)
+    cwd = await loop.run_in_executor(discovery_executor(), _session_cwd, sess)
     # _session_cwd memoizes its own probes; this covers the branches where it
     # returns without probing (no shell, non-POSIX host) so those do not re-hop
     # to the executor on every keystroke.
@@ -392,14 +396,19 @@ def _bash_ready_env(token: str) -> dict[str, str]:
     The snippet is single-shot and self-removing: it emits only while the token
     variable is still set, unsets that token so neither a later prompt nor a
     child shell repeats the sequence, and withdraws itself from
-    ``PROMPT_COMMAND`` only when that variable is still exactly the scalar that
-    was exported. Both halves of that last test matter: a profile that APPENDED
-    (``PROMPT_COMMAND="$PROMPT_COMMAND; history -a"``) no longer matches, and one
-    that appended as an ARRAY (``PROMPT_COMMAND+=("history -a")``, Bash 5.1+)
-    leaves the exported text as element zero — which the scalar expansion alone
-    would match, so unsetting there would take the user's own element with it.
-    ``${PROMPT_COMMAND[1]+x}`` distinguishes the two without Bash 5.1 syntax the
-    ``/bin/bash`` on macOS (3.2) cannot parse.
+    ``PROMPT_COMMAND`` only while element zero is still exactly the value that
+    was exported. A profile that APPENDED to the scalar
+    (``PROMPT_COMMAND="$PROMPT_COMMAND; history -a"``) does not match it, so the
+    hook stays. A profile that appended as an ARRAY
+    (``PROMPT_COMMAND+=("history -a")``, Bash 5.1+) leaves the exported text as
+    element zero. systemd's ``/etc/profile.d`` OSC-context script does this on
+    every login shell of a systemd host, so it is the common case there, not a
+    corner. Unsetting the variable there would take the profile's own elements
+    with it, so the hook drops ONLY element zero: replaced by the inherited
+    command when there is one, else removed with the rest shifted down, which
+    is the array the profile would have built with no hook in front.
+    ``${PROMPT_COMMAND[1]+x}`` tells the two shapes apart without Bash 5.1
+    syntax the ``/bin/bash`` on macOS (3.2) cannot parse.
 
     A profile that ASSIGNS ``PROMPT_COMMAND`` outright drops the hook, and with
     it the marker: that session's barrier never opens, and the client's own
@@ -432,11 +441,11 @@ def _bash_ready_env(token: str) -> dict[str, str]:
         f"builtin printf '\\033]697;KiroCrewReady;%s\\007' "
         f'"${{{_READY_TOKEN_VAR}}}"; '
         f"builtin unset {_READY_TOKEN_VAR}; "
-        f'if [[ "${{PROMPT_COMMAND-}}" == "${{{_READY_HOOK_VAR}-}}" '
-        f'&& -z "${{PROMPT_COMMAND[1]+x}}" ]]; then '
+        f'if [[ "${{PROMPT_COMMAND-}}" == "${{{_READY_HOOK_VAR}-}}" ]]; then '
         f'if [[ -n "${{{_READY_PREV_VAR}+x}}" ]]; then '
         f'PROMPT_COMMAND="${{{_READY_PREV_VAR}}}"; '
-        f"else builtin unset PROMPT_COMMAND; fi; fi; "
+        f'elif [[ -z "${{PROMPT_COMMAND[1]+x}}" ]]; then builtin unset PROMPT_COMMAND; '
+        f'else PROMPT_COMMAND=("${{PROMPT_COMMAND[@]:1}}"); fi; fi; '
         f"builtin unset {_READY_HOOK_VAR} {_READY_PREV_VAR}; fi"
     )
     inherited = os.environ.get("PROMPT_COMMAND") or ""
@@ -651,7 +660,7 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
             source="dashboard",
             resources=f"max_sessions={max_sessions}",
         )
-        return web.Response(status=429, text=f"Max {max_sessions} terminal sessions")
+        return web.Response(status=409, text=f"Max {max_sessions} terminal sessions")
 
     # Reserve a placeholder so concurrent requests see the slot as taken
     placeholder = not existing
@@ -659,7 +668,7 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
         registry[session_id] = None
 
     try:
-        ws = web.WebSocketResponse(heartbeat=30, timeout=300)
+        ws = ws_heartbeat.LagTolerantWebSocketResponse(heartbeat=30, timeout=300)
         cwd = ""
         if placeholder:
             try:
@@ -990,6 +999,13 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
         if evicted is not None and not _restore_evicted_shell(registry, evicted):
             await _end_evicted_shell(request.app, evicted, max_sessions)
 
+    # A switch-off applied while this open awaited skipped its reservation: read the
+    # switch again now that the shell is published, so this read or the applier ends it.
+    cfg = _get_config(request)
+    if registry.get(session_id) is sess and not _terminal_enabled(cfg):
+        await apply_terminal_enabled(registry, cfg)
+        return ws
+
     # The placement check above ran before this shell was published, and a bind
     # in between skipped the then-unpublished reservation: read it again now
     # that the shell is visible, so either this read or the bind's retire sees it.
@@ -1002,6 +1018,22 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
                 registry, sess.chat_slot, error_message=why, error_code=code
             )
             return ws
+
+    if not existing:
+        # A fresh session has no saved output. Mark the live boundary before
+        # starting its PTY reader, independently of the shell's readiness hook.
+        try:
+            async with sess.send_lock:
+                if sess.ws is ws and not ws.closed:
+                    await asyncio.wait_for(
+                        ws.send_str(json.dumps({"type": "replayed"})),
+                        timeout=_TAKEOVER_READY_TIMEOUT_S,
+                    )
+        except (ConnectionResetError, RuntimeError, OSError, asyncio.TimeoutError):
+            # Keep draining the PTY for a reconnect, but send no live bytes to
+            # a socket that does not have its replay boundary.
+            _release_terminal_ws_identity(sess, ws)
+            await _close_terminal_ws_bounded(ws)
 
     # --- Read loop: PTY → WebSocket ---
     notification_bus: NotificationBus | None = getattr(
@@ -1174,7 +1206,7 @@ async def api_terminal_redact(request: web.Request) -> web.Response:
         return t
 
     try:
-        redacted = await loop.run_in_executor(subprocess_executor(), _scan, text)
+        redacted = await loop.run_in_executor(discovery_executor(), _scan, text)
     except Exception:
         # Fail closed: the caller gets no text to insert.
         logger.exception("terminal: selection redaction failed")
@@ -1463,17 +1495,18 @@ async def poll_terminal_titles(app: web.Application) -> None:
                 # _session_title / _session_cwd do blocking syscalls (tcgetpgrp
                 # ioctl, /proc reads, lsof where nothing cheaper answers) that
                 # can wedge on a D-state process or a stuck fs; run them off the
-                # loop on the subprocess pool (same rationale as the os.close
-                # offload in _kill_session) so one stuck read can never freeze
-                # the gateway event loop. Both probes share one cwd lookup via
-                # the session's memo.
+                # loop so one stuck read can never freeze the gateway event
+                # loop. They ride the discovery pool, not the subprocess pool,
+                # so process-tree walks holding every subprocess worker cannot
+                # stall the title. Both probes share one cwd lookup via the
+                # session's memo.
                 # The WS can detach (sess.ws = None) or be displaced by a
                 # reconnect while an executor probe is in flight — capture +
                 # revalidate the socket after EACH hop, and let the bounded
                 # owner-checked sender re-confirm identity under the transport
                 # lock so a displaced socket never receives a frame and a
                 # blocked transport can never park the singleton poller.
-                title = await loop.run_in_executor(subprocess_executor(), _session_title, sess)
+                title = await loop.run_in_executor(discovery_executor(), _session_title, sess)
                 ws = sess.ws
                 if ws is None or ws.closed:
                     continue
@@ -1489,7 +1522,7 @@ async def poll_terminal_titles(app: web.Application) -> None:
                 # Live cwd (full path) rides the same poll: the frontend uses it
                 # to attribute terminal output handed off to chat. Pushed only
                 # on change, like the title.
-                cwd = await loop.run_in_executor(subprocess_executor(), _session_cwd, sess)
+                cwd = await loop.run_in_executor(discovery_executor(), _session_cwd, sess)
                 ws = sess.ws
                 if ws is None or ws.closed:
                     continue
@@ -1546,7 +1579,9 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _orphan_timeout_s,
         _record_orphan_reap,
         _shell_failure_note,
+        _shell_to_evict,
         _sweep_terminals,
+        end_shells_if_policy_refuses,
         reap_orphaned_terminals,
     )
     from kiro_crew.dashboard.handlers.terminal_placement import (  # noqa: F401
@@ -1560,23 +1595,33 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     from kiro_crew.dashboard.handlers.terminal_session import (  # noqa: F401
         _ConptyBackend,
         _enabled_cache,
+        _policy_refuses_terminal,
         _read_terminal_config,
     )
     from kiro_crew.dashboard.handlers.terminal_transport import (  # noqa: F401
+        _CSI_QUERIES,
         _OWNER_CONTROL_SEND_TIMEOUT_S,
         _SCROLLBACK_MAX,
         _STALE_OWNER_ERROR_CODE,
         _STALE_OWNER_ERROR_MESSAGE,
         _TAKEOVER_CATCH_UP_ROUNDS,
-        _TAKEOVER_READY_TIMEOUT_S,
         _TAKEOVER_REPLAY_SEND_TIMEOUT_S,
         _TERMINAL_WS_CLEANUP_TIMEOUT_S,
         _consume_ready_marker,
+        _csi_query_end,
+        _is_colour_query,
+        _string_end,
+        _strip_terminal_queries,
         _write_all,
     )
 
 if TYPE_CHECKING:  # names it serves from outside the family, from their homes
-    from kiro_crew.config.loader import config_path, read_config_text  # noqa: F401
+    from kiro_crew.config.loader import (  # noqa: F401
+        config_local_path,
+        config_path,
+        read_config_text,
+        read_merged_config_files,
+    )
     from kiro_crew.executors import maintenance_executor  # noqa: F401
     from kiro_crew.hooks import validate_file_path  # noqa: F401
     from kiro_crew.notifications.bus import NotificationPayload  # noqa: F401

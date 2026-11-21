@@ -53,7 +53,7 @@ import re
 import sys
 from dataclasses import dataclass, replace
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence, cast
 
 import pathspec
@@ -265,6 +265,52 @@ def _string_list(value: object, *, where: str) -> list[str]:
     return [item.strip() for item in value if isinstance(item, str) and item.strip()]
 
 
+#: Maximum bracket/brace nesting depth allowed in a declaration file before the
+#: parser is refused.  A real member list is flat; anything deeper is either
+#: pathological input or an exploit attempt.  The cap is enforced BEFORE handing
+#: text to a recursive parser, so the parser never reaches the recursion ceiling
+#: and the process never enters the state where a GC-triggered finalizer finds
+#: no stack headroom to run pytest's unraisable hook.
+_MAX_DECLARATION_NESTING = 64
+
+
+def _nesting_too_deep(text: str) -> bool:
+    """Return whether ``text`` contains bracket/brace nesting beyond the cap.
+
+    Walks the raw characters with a simple quote-state machine so that brackets
+    inside string literals are ignored.  The scan is intentionally coarse: it
+    is a quick-check cap that rejects adversarial input before it reaches a recursive
+    parser, not a full grammar check.  Escape sequences inside strings are
+    handled with a single ``escaped`` flag that skips the next character, which
+    is sufficient because the only characters that matter to this scanner are
+    ``[``, ``{``, ``]``, ``}``, ``"``, ``'``, and ``\\``.
+    """
+    depth = 0
+    in_string: str | None = None  # the opening quote character, or None
+    escaped = False
+    for ch in text:
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if in_string is not None:
+            if ch == in_string:
+                in_string = None
+            continue
+        if ch in ('"', "'"):
+            in_string = ch
+            continue
+        if ch in ("[", "{"):
+            depth += 1
+            if depth > _MAX_DECLARATION_NESTING:
+                return True
+        elif ch in ("]", "}"):
+            depth -= 1
+    return False
+
+
 def _npm_workspaces(text: str) -> list[str]:
     """Return the member patterns declared by a ``package.json``.
 
@@ -274,6 +320,8 @@ def _npm_workspaces(text: str) -> list[str]:
     packages.
     """
 
+    if _nesting_too_deep(text):
+        raise DeclarationError("nesting too deep to be a valid member list")
     try:
         data = json.loads(text)
     except (ValueError, RecursionError) as exc:
@@ -323,6 +371,8 @@ def _load_no_alias_yaml(text: str) -> object:
 def _pnpm_packages(text: str) -> list[str]:
     """Return the member patterns declared by a ``pnpm-workspace.yaml``."""
 
+    if _nesting_too_deep(text):
+        raise DeclarationError("nesting too deep to be a valid member list")
     try:
         data = _load_no_alias_yaml(text)
     except (yaml.YAMLError, RecursionError, ValueError) as exc:
@@ -350,6 +400,8 @@ def _cargo_members(text: str) -> list[str]:
 
     if _toml is None:  # pragma: no cover - only on 3.10 without tomli
         return _scan_cargo_members(text)
+    if _nesting_too_deep(text):
+        raise DeclarationError("nesting too deep to be a valid member list")
     try:
         data = _toml.loads(text)
     except (ValueError, RecursionError) as exc:  # TOMLDecodeError is a ValueError
@@ -361,7 +413,30 @@ def _cargo_members(text: str) -> list[str]:
     if not isinstance(workspace, dict):
         return []
     members = workspace.get("members")
-    return [] if members is None else _string_list(members, where="workspace.members")
+    patterns = [] if members is None else _string_list(members, where="workspace.members")
+    exclude = workspace.get("exclude")
+    # Only an array excludes anything. Any other value costs only itself, so
+    # the members still stand, and the fallback parser skips it the same way.
+    if isinstance(exclude, list):
+        patterns.extend(_cargo_exclusions(_string_list(exclude, where="workspace.exclude")))
+    return patterns
+
+
+def _cargo_exclusions(paths: Sequence[str]) -> list[str]:
+    """Return Cargo ``exclude`` paths as ``!pattern`` exclusions.
+
+    Cargo reads an exclude entry as a path prefix: the directory and everything
+    beneath it leave the workspace. A trailing ``**`` expands to the directory
+    itself and its whole subtree, so a recursive member glob cannot bring back
+    a crate nested inside an excluded one.
+    """
+
+    exclusions: list[str] = []
+    for path in paths:
+        cleaned = path.strip().rstrip("/\\")
+        if cleaned:
+            exclusions.append(f"!{cleaned}/{_ANY_DEPTH}")
+    return exclusions
 
 
 _TOML_TABLE = re.compile(r"^\s*\[\s*([^\]]+?)\s*\]")
@@ -369,18 +444,18 @@ _TOML_STRING = re.compile(r"\"([^\"]*)\"|'([^']*)'")
 
 
 def _scan_cargo_members(text: str) -> list[str]:
-    """Extract ``[workspace] members`` from Cargo manifest text without a parser.
+    """Extract ``[workspace] members`` and ``exclude`` without a parser.
 
     Deliberately narrow: it recognizes the one shape Cargo itself writes — an
-    array of quoted strings assigned to ``members`` inside the ``[workspace]``
-    table, optionally spread across lines — and ignores everything else,
-    including a ``#`` inside a string. It also cannot detect a malformed file,
+    array of quoted strings assigned to ``members`` or ``exclude`` inside the
+    ``[workspace]`` table, optionally spread across lines — and ignores
+    everything else, including a ``#`` inside a string. It also cannot detect a malformed file,
     which is why a real parser is preferred wherever one is importable.
     """
 
-    members: list[str] = []
+    lists: dict[str, list[str]] = {"members": [], "exclude": []}
     in_workspace = False
-    collecting = False
+    collecting: str | None = None
     for raw_line in text.splitlines():
         line = raw_line.split("#", 1)[0]
         table = _TOML_TABLE.match(line)
@@ -388,22 +463,26 @@ def _scan_cargo_members(text: str) -> list[str]:
             # Any other table ends the workspace table, including a sub-table
             # such as [workspace.dependencies], whose keys are not members.
             in_workspace = table.group(1) == "workspace"
-            collecting = False
+            collecting = None
             continue
         if not in_workspace:
             continue
-        if not collecting:
+        if collecting is None:
             key, separator, remainder = line.partition("=")
-            if not separator or key.strip() != "members":
+            if not separator or key.strip() not in lists:
                 continue
-            collecting = True
+            if key.strip() == "exclude" and not remainder.lstrip().startswith("["):
+                # The real parser ignores an ``exclude`` that is not an array.
+                continue
+            collecting = key.strip()
             line = remainder
-        members.extend(
+        lists[collecting].extend(
             double or single for double, single in _TOML_STRING.findall(line) if double or single
         )
         if "]" in line:
-            collecting = False
-    return [member.strip() for member in members if member.strip()]
+            collecting = None
+    members = [member.strip() for member in lists["members"] if member.strip()]
+    return members + _cargo_exclusions(lists["exclude"])
 
 
 _GO_USE = re.compile(r"^use\b\s*(.*)$")
@@ -1376,10 +1455,12 @@ def _declared_members(
             )
             continue
 
-        # npm and pnpm both spell an exclusion "!pattern". Honouring it matters
+        # npm and pnpm both spell an exclusion "!pattern", and the Cargo parser
+        # turns each ``workspace.exclude`` entry into one. Honouring it matters
         # because an excluded directory is one the project has already said is
         # not a member; offering it anyway would contradict the file we just
-        # read. Exclusions are expanded the same way, then subtracted.
+        # read. Exclusions are expanded the same way, then subtracted. Cargo
+        # spares a path that a literal ``members`` entry also covers.
         included: dict[str, None] = {}
         excluded: set[str] = set()
         for pattern in patterns:
@@ -1391,8 +1472,46 @@ def _declared_members(
                 excluded.update(expanded)
             else:
                 included.update(dict.fromkeys(expanded))
+        if filename == DECL_CARGO and excluded:
+            literals = _cargo_literal_members(directory, patterns)
+            excluded = {path for path in excluded if not _under_any(path, directory, literals)}
         members.update((path, None) for path in included if path not in excluded)
     return list(members)
+
+
+def _cargo_literal_members(directory: str, patterns: Sequence[str]) -> set[str]:
+    """Return the directories that non-glob Cargo ``members`` entries name.
+
+    Cargo keeps a path in the workspace when a literal ``members`` entry is a
+    prefix of it, even if an ``exclude`` entry is a prefix too. A glob entry
+    never counts: Cargo compares the raw entry as a path, and a glob segment
+    names no real directory.
+    """
+
+    literals: set[str] = set()
+    for pattern in patterns:
+        if pattern.startswith("!") or any(char in pattern for char in _GLOB_MAGIC):
+            continue
+        cleaned = pattern.strip().replace("\\", "/")
+        if cleaned.startswith(("~", "/")) or os.path.isabs(cleaned):
+            continue
+        parts = PurePosixPath(cleaned).parts
+        if ".." in parts:
+            continue
+        literals.add(os.path.join(directory, *parts))
+    return literals
+
+
+def _under_any(path: str, directory: str, prefixes: set[str]) -> bool:
+    """Return whether ``path`` or one of its ancestors up to ``directory`` is in ``prefixes``."""
+
+    current = path
+    while True:
+        if current in prefixes:
+            return True
+        if current == directory or not _is_within(current, directory):
+            return False
+        current = os.path.dirname(current)
 
 
 def _nearest_ancestor(path: str, candidates: Mapping[str, Candidate], root: str) -> str | None:

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import sys
 from pathlib import Path
 
 import pytest
@@ -28,9 +29,7 @@ from kiro_crew.apps.manager import (
     uninstall_app,
 )
 
-# ---------------------------------------------------------------------------
 # InstalledApp dataclass
-# ---------------------------------------------------------------------------
 
 
 class TestInstalledApp:
@@ -100,6 +99,34 @@ class TestInstalledApp:
     def test_invalid_resources_falls_back(self):
         meta = InstalledApp.from_dict({"name": "bad", "resources": "self"})
         assert meta.resources == "gateway"
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "two",
+            [1],
+            {},
+            None,
+            True,
+            float("inf"),  # json.loads("1e400") / "Infinity" parse to this
+            float("nan"),
+        ],
+    )
+    def test_non_integer_schema_version_falls_back(self, bad):
+        # A corrupted or hand-edited installed.json whose schemaVersion is not a
+        # plain integer must degrade like every other malformed field, not crash
+        # from_dict: the str/bool fields never raise, so schemaVersion (the one
+        # int() coercion) must not either. A non-finite float (1e400 -> inf)
+        # makes int() raise OverflowError, which the helper also swallows. It
+        # reads as 1, forcing the legacy-migration pass that bumps a pre-origin
+        # record up to 2.
+        meta = InstalledApp.from_dict({"name": "bad", "schemaVersion": bad})
+        assert meta.schemaVersion == 2  # 1 -> migration pass -> 2
+
+    def test_numeric_string_schema_version_is_read(self):
+        # A JSON integer is the norm; a numeric string still coerces cleanly.
+        meta = InstalledApp.from_dict({"name": "ok", "origin": "registry", "schemaVersion": "2"})
+        assert meta.schemaVersion == 2
 
     def test_validate_fields_valid(self):
         meta = InstalledApp(origin="builtin", resources="app", lifecycle="locked")
@@ -259,9 +286,7 @@ class TestInstalledApp:
         assert "locked" in result.error
 
 
-# ---------------------------------------------------------------------------
 # InstalledApp property tests (Hypothesis)
-# ---------------------------------------------------------------------------
 
 _valid_origins = st.sampled_from(["builtin", "registry", "local", "external"])
 
@@ -334,9 +359,7 @@ class TestInstalledAppProperties:
         assert meta.lifecycle == "gateway"
 
 
-# ---------------------------------------------------------------------------
 # AppResult
-# ---------------------------------------------------------------------------
 
 
 class TestAppResult:
@@ -357,15 +380,9 @@ class TestAppResult:
 class TestEnabledStateTellsUnreadableFromNotInstalled:
     """``app_enabled_state`` exists to keep those apart, and ``is_file()`` cannot.
 
-    ``Path.is_file()`` answers a silent False for five path shapes that are not
-    absence -- a dangling symlink, a directory or fifo in the file's place, a symlink
-    loop, and a non-directory parent component -- so leading with it made each of them
-    indistinguishable from a deliberate uninstall. A genuine ``stat`` fault such as
-    EACCES was already correct, because ``is_file`` re-raises it.
-
-    The cost is asymmetric now that ``hook_reconcile`` consumes this state unattended
-    on a 15s tick: a wrong ``False`` fires an automatic teardown of a live app's
-    routes and modules, while a ``None`` defers to the next tick.
+    ``Path.is_file()`` answers a silent False for a dangling symlink, a directory or fifo,
+    a symlink loop and a non-directory parent, none of which is absence. ``hook_reconcile``
+    reads this on a 15s tick: a wrong ``False`` tears a live app down, ``None`` defers.
     """
 
     def test_a_dangling_symlink_is_unknown(self, app_home):
@@ -411,15 +428,9 @@ class TestEnabledStateTellsUnreadableFromNotInstalled:
     ):
         """The verdict must come from the path's SHAPE, not the exception class.
 
-        One condition, two classes: POSIX raises NotADirectoryError (ENOTDIR) while
-        Windows maps ERROR_PATH_NOT_FOUND to ENOENT and raises FileNotFoundError --
-        the same class a genuinely missing file raises. Keying absence on that class
-        told the truth on Linux and not on Windows, where a wrong-shape parent still
-        read as a deliberate uninstall and the hook reconciler would tear a LIVE app
-        down for it.
-
-        The Windows mapping is injected so this runs on every platform; the natural
-        path is covered by the test above on whichever platform produces it.
+        POSIX raises NotADirectoryError here, but Windows maps ERROR_PATH_NOT_FOUND to
+        FileNotFoundError, the class a missing file raises. The Windows mapping is injected so
+        this runs on every platform.
         """
         (app_home / "apps").mkdir(parents=True, exist_ok=True)
         (app_home / "apps" / "shape-probe").write_text("not a directory", encoding="utf-8")
@@ -459,18 +470,9 @@ class TestEnabledStateTellsUnreadableFromNotInstalled:
     def test_a_dangling_windows_junction_ancestor_is_unknown(self, app_home, monkeypatch):
         """A dangling junction occupies the path while looking absent to every predicate.
 
-        The same mistake as the error-class one, one predicate over: ``is_symlink`` is
-        False for a Windows directory junction, so a junction whose target is gone
-        presents as ``is_dir=False, exists=False, is_symlink=False`` -- indistinguishable
-        from nothing at all, which is why this walk stepped over it and reported genuine
-        absence. ``app_enabled_state`` then answers False and the hook reconciler tears a
-        LIVE app down.
-
-        Fed as a SHAPE rather than a real junction: os.mkfifo has a POSIX equivalent to
-        skip for, but a junction has none at all, so requiring one would mean this case
-        is only ever exercised on the platform it breaks. The three ordinary predicates
-        are already False for a path that does not exist, which IS the dangling
-        junction's shape, so only the junction probe has to be stood in for.
+        ``is_symlink`` is False for a Windows junction, so a dangling one reads
+        ``is_dir=False, exists=False, is_symlink=False``. Fed as a SHAPE (no POSIX junction
+        exists): a missing path already has that shape, so only the junction probe is stubbed.
         """
         (app_home / "apps").mkdir(parents=True, exist_ok=True)
         junction = app_home / "apps" / "shape-probe"
@@ -486,11 +488,8 @@ class TestEnabledStateTellsUnreadableFromNotInstalled:
     def test_a_dangling_junction_at_the_metadata_path_is_unknown(self, app_home, monkeypatch):
         """The same shape ON the metadata path, which the ancestor walk cannot reach.
 
-        ``Path.parents`` excludes the path itself, so `_absence_is_genuine` inspects
-        every ancestor and never `installed.json`. The self-check beside it asked only
-        `is_symlink`, which a junction answers False, so a junction occupying the
-        metadata path read as a deliberate uninstall while every ancestor was a healthy
-        directory.
+        ``Path.parents`` excludes the path itself, so `_absence_is_genuine` never inspects
+        `installed.json`, and `is_symlink` alone answers False for a junction.
         """
         (app_home / "apps" / "shape-probe").mkdir(parents=True)
         meta = app_home / "apps" / "shape-probe" / "installed.json"
@@ -585,3 +584,220 @@ class TestEnabledReadsStrictly:
         assert get_app("strict-probe")["enabled"] is True
         rows = [r for r in list_apps() if r.get("name") == "strict-probe"]
         assert [r["enabled"] for r in rows] == [True]
+
+
+class TestRecordThatIsNotAnObject:
+    """An ``installed.json`` that parses but is not an object is reported as damaged.
+
+    Never read as "not installed" (that would let install and cleanup paths treat
+    the tree as a leftover), and never allowed to take the whole listing down.
+    """
+
+    def _write(self, app_home, name, payload):
+        app_root = app_home / "apps" / name
+        app_root.mkdir(parents=True)
+        path = app_root / "installed.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    @pytest.mark.parametrize("payload", [[], None, "x", 3])
+    def test_the_listing_skips_it_and_keeps_the_others(self, app_home, payload):
+        bad = self._write(app_home, "bad-record", payload)
+        self._write(app_home, "good-record", {"name": "good-record", "enabled": True})
+        before = bad.read_bytes()
+
+        try:
+            names = [r.get("name") for r in list_apps()]
+        except AttributeError as exc:
+            pytest.fail(f"one damaged record took the listing down: {exc}")
+
+        assert "good-record" in names
+        assert "bad-record" not in names
+        assert bad.read_bytes() == before
+
+    def test_readers_get_one_typed_error_not_absent(self, app_home):
+        from kiro_crew.apps.manager_records import InstalledRecordShapeError
+
+        self._write(app_home, "bad-record", [])
+        with pytest.raises(InstalledRecordShapeError):
+            _read_installed("bad-record")
+        assert app_enabled_state("bad-record") is None
+
+    def test_the_orphan_scan_never_marks_it_for_teardown(self, app_home):
+        from kiro_crew.apps.manager_builtins import (
+            detect_orphaned_builtins,
+            invalidate_orphan_cache,
+        )
+
+        self._write(app_home, "bad-record", [])
+        invalidate_orphan_cache()
+        assert "bad-record" not in detect_orphaned_builtins()
+
+    def test_a_legacy_record_with_a_non_string_source_still_reads(self, app_home):
+        self._write(app_home, "legacy-record", {"name": "legacy-record", "source": 1})
+        assert _read_installed("legacy-record").name == "legacy-record"
+
+
+class TestListingReusesTheWalk:
+    """``list_apps`` walks the apps folder only when the folder changed.
+
+    Strays (entries with no record) cost nothing on an unchanged folder, while each
+    record is still read on every call, so an in-place edit shows at once.
+    """
+
+    _SETTLED_NS = 1_000_000_000_000_000_000  # 2001, long past the settle window
+
+    def _record(self, app_home, name, **fields):
+        root = app_home / "apps" / name
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "installed.json").write_text(
+            json.dumps({"name": name, "enabled": True, **fields}), encoding="utf-8"
+        )
+
+    def _settle(self, app_home, ns=_SETTLED_NS):
+        os.utime(app_home / "apps", ns=(ns, ns))
+
+    def _count_walks(self, monkeypatch, app_home):
+        from kiro_crew.apps import manager_records
+
+        walks: list[str] = []
+        real = manager_records.os.scandir
+        # manager_records.os is the shared os module, so other callers' one-time
+        # scans of the apps folder (credential masks, orphaned built-ins, the
+        # grants import) reach this patch too; only the listing's own walk counts.
+        listing_walk = manager_records._recorded_app_names.__code__
+
+        def counting(path=".", *args, **kwargs):
+            if sys._getframe(1).f_code is listing_walk:
+                walks.append(os.fspath(path))
+            return real(path, *args, **kwargs)
+
+        monkeypatch.setattr(manager_records.os, "scandir", counting)
+        return walks
+
+    def test_an_unchanged_folder_is_not_walked_again(self, app_home, monkeypatch):
+        self._record(app_home, "real-app")
+        for i in range(5):
+            (app_home / "apps" / f"stray-{i}" / "data").mkdir(parents=True)
+        self._settle(app_home)
+        walks = self._count_walks(monkeypatch, app_home)
+
+        first = [r["name"] for r in list_apps()]
+        second = [r["name"] for r in list_apps()]
+
+        assert first == second == ["real-app"]
+        assert len(walks) == 1
+
+    def test_a_changed_folder_is_walked_again(self, app_home, monkeypatch):
+        self._record(app_home, "real-app")
+        self._settle(app_home)
+        walks = self._count_walks(monkeypatch, app_home)
+
+        assert [r["name"] for r in list_apps()] == ["real-app"]
+        (app_home / "apps" / "stray" / "data").mkdir(parents=True)
+        self._settle(app_home, ns=self._SETTLED_NS + 1_000_000_000)
+        assert [r["name"] for r in list_apps()] == ["real-app"]
+
+        assert walks == [os.fspath(app_home / "apps")] * 2
+
+    def test_an_in_place_record_edit_is_seen(self, app_home):
+        self._record(app_home, "real-app", version="1.0.0")
+        self._settle(app_home)
+        assert [r["version"] for r in list_apps()] == ["1.0.0"]
+
+        self._record(app_home, "real-app", version="2.0.0")
+        self._settle(app_home)
+
+        assert [r["version"] for r in list_apps()] == ["2.0.0"]
+
+    def test_a_record_written_into_a_stray_entry_is_listed(self, app_home):
+        (app_home / "apps" / "late-app" / "data").mkdir(parents=True)
+        self._settle(app_home)
+        assert list_apps() == []
+
+        _write_installed("late-app", InstalledApp(name="late-app"))
+
+        # Touched, so another process's listing sees the new record too.
+        assert (app_home / "apps").stat().st_mtime_ns != self._SETTLED_NS
+        assert [r["name"] for r in list_apps()] == ["late-app"]
+
+    def test_a_scan_started_inside_the_settle_window_is_not_reused(self, app_home, monkeypatch):
+        from kiro_crew.apps import manager_records
+        from kiro_crew.testing.clock import ManualClock
+
+        apps_root = app_home / "apps"
+        (apps_root / "late-app" / "data").mkdir(parents=True)
+        self._settle(app_home)
+        clock = ManualClock(start=self._SETTLED_NS / 1e9 + 2)  # inside the 3 s window
+        clock.install(monkeypatch, manager_records)
+        real_scandir = manager_records.os.scandir
+        # manager_records.os is the shared os module: only the listing's own walk
+        # moves the clock, not another caller's scan of the apps folder.
+        listing_walk = manager_records._recorded_app_names.__code__
+
+        def slow_walk(path=".", *args, **kwargs):
+            if sys._getframe(1).f_code is listing_walk:
+                clock.advance(5)  # the walk ends past the window
+            return real_scandir(path, *args, **kwargs)
+
+        monkeypatch.setattr(manager_records.os, "scandir", slow_walk)
+
+        assert list_apps() == []
+        self._record(app_home, "late-app")
+        self._settle(app_home)  # The write landed in the same timestamp tick.
+
+        assert [record["name"] for record in list_apps()] == ["late-app"]
+
+    @pytest.mark.skipif(os.name == "nt", reason="chmod does not deny directory search on Windows")
+    @pytest.mark.skipif(
+        getattr(os, "geteuid", lambda: 0)() == 0,
+        reason="root bypasses directory search permissions",
+    )
+    def test_a_transient_inspection_failure_is_not_reused(self, app_home):
+        self._record(app_home, "temporarily-unreadable")
+        app_root = app_home / "apps" / "temporarily-unreadable"
+        original_mode = stat.S_IMODE(app_root.stat().st_mode)
+        self._settle(app_home)
+
+        app_root.chmod(0)
+        try:
+            assert list_apps() == []
+        finally:
+            app_root.chmod(original_mode)
+
+        assert [record["name"] for record in list_apps()] == ["temporarily-unreadable"]
+
+    def test_a_symlink_loop_entry_is_skipped(self, app_home):
+        self._record(app_home, "real-app")
+        (app_home / "apps" / "loop").symlink_to(app_home / "apps" / "loop")
+
+        assert [r["name"] for r in list_apps()] == ["real-app"]
+
+    def test_a_record_moved_aside_and_back_is_listed(self, app_home):
+        self._record(app_home, "real-app")
+        self._settle(app_home)
+        assert [r["name"] for r in list_apps()] == ["real-app"]
+        record = app_home / "apps" / "real-app" / "installed.json"
+        aside = record.with_name("installed.json.aside")
+
+        record.rename(aside)
+        (app_home / "apps" / "other").mkdir()
+        self._settle(app_home, ns=self._SETTLED_NS + 1)  # a new walk, with the record away
+        assert list_apps() == []
+        aside.rename(record)  # moves the entry's mtime, not the apps folder's
+
+        assert [r["name"] for r in list_apps()] == ["real-app"]
+
+    def test_a_record_moved_aside_right_after_install_is_listed(self, app_home):
+        (app_home / "apps").mkdir(parents=True, exist_ok=True)
+        _write_installed("new-app", InstalledApp(name="new-app"))
+        assert [r["name"] for r in list_apps()] == ["new-app"]  # a scan inside the window
+        record = app_home / "apps" / "new-app" / "installed.json"
+        aside = record.with_name("installed.json.aside")
+
+        record.rename(aside)
+        self._settle(app_home)
+        assert list_apps() == []
+        aside.rename(record)
+
+        assert [r["name"] for r in list_apps()] == ["new-app"]

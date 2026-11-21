@@ -120,14 +120,8 @@ def _binary_name() -> str:
 def _install(directory: Path, name: str) -> Path:
     """Write a real executable the PLATFORM'S OWN resolver will find.
 
-    The ladder under test ends at ``shutil.which(name)``, and that call does not mean
-    the same thing on both platforms. On POSIX it wants an execute bit. On Windows
-    there is no execute bit and ``which`` only matches a name carrying one of the
-    ``PATHEXT`` suffixes, so an extensionless shell script is invisible to it -- the
-    probe then reads MISSING after an install this helper called successful, and the
-    failure surfaces three assertions later as if the product had lost the binary.
-    ``.cmd`` is in the default ``PATHEXT``, and ``which("dsh")`` resolves ``dsh.cmd``,
-    which is the lookup this test exists to drive.
+    ``shutil.which`` needs an execute bit on POSIX and a ``PATHEXT`` suffix on Windows,
+    so Windows gets ``dsh.cmd``, which ``which("dsh")`` resolves.
     """
     if os.name == "nt":
         target = directory / f"{name}.cmd"
@@ -252,6 +246,45 @@ class TestRecheckOverHttp:
         finally:
             await client.close()
 
+    async def test_opencode_from_its_own_installer_is_found_on_recheck(
+        self, tmp_path, monkeypatch, owner_middleware
+    ):
+        """OpenCode's installer writes ``~/.opencode/bin`` and puts it on PATH for new
+        shells only, so the gateway's PATH never has it. Check again finds it.
+
+        The augmented PATH and mise are pinned to an empty directory and to nothing:
+        either could find the host's own opencode, and the first verdict would then not
+        be a real miss.
+        """
+        from kiro_crew.acp import client as acp_client
+        from kiro_crew.agent_sdk.backends import launch_for
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        monkeypatch.delenv(launch_for(ACP_BACKEND_OPENCODE).bin_env_var, raising=False)
+        monkeypatch.setattr(acp_client, "_mise_which", lambda _tool: None)
+        monkeypatch.setattr(acp_client, "augmented_path", lambda _path: str(_bin_dir(tmp_path)))
+
+        client = await _client(owner_middleware)
+        try:
+            assert (await _row(client, ACP_BACKEND_OPENCODE))["installed"] == MISSING
+
+            install_dir = tmp_path / ".opencode" / "bin"
+            install_dir.mkdir(parents=True)
+            _install(install_dir, launch_for(ACP_BACKEND_OPENCODE).binary)
+
+            resp = await client.post(
+                "/api/acp-backends/recheck",
+                data=json.dumps({"backend": ACP_BACKEND_OPENCODE}),
+                headers={"Content-Type": "application/json"},
+            )
+            assert resp.status == 200
+            rechecked = (await resp.json())["backend"]
+            assert rechecked["installed"] == INSTALLED
+            assert rechecked["restart_required"] is False
+        finally:
+            await client.close()
+
     async def test_an_unknown_backend_is_refused_over_http(self, monkeypatch, owner_middleware):
         """The id validation, through the router rather than the handler alone."""
         client = await _client(owner_middleware)
@@ -279,14 +312,8 @@ class TestRecheckOverHttp:
 class TestGenerationFence:
     """A resolution already in flight cannot undo a re-check's clear.
 
-    The hazard is structural rather than incidental: every publish site checks the
-    sentinel, AWAITS its resolver, then assigns. So a resolve that began before the
-    operator installed a component can complete after the clear and stamp its stale miss
-    back over the cleared sentinel -- the panel having already reported the harness
-    ready, and the next spawn failing on the revived miss.
-
-    These cases drive the interleaving rather than waiting for it: the resolver blocks on
-    an event, the clear lands while it is blocked, and only then is it released.
+    Every publish site checks the sentinel, awaits its resolver, then assigns, so a stale
+    miss could land after the clear. The resolver blocks on an event until the clear lands.
     """
 
     async def test_a_pre_clear_resolution_does_not_revive_the_stale_miss(self, monkeypatch):

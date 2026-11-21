@@ -24,7 +24,16 @@ def _make_bus() -> tuple[NotificationBus, list[dict]]:
 class TestPayloadValidation:
     def test_valid_minimal_payload(self):
         p = NotificationPayload(source="system", channel="system.cron", title="t", body="b")
-        p.validate()  # must not raise
+        bus, _ = _make_bus()
+        note = bus.push(p)
+        assert {k: note[k] for k in ("kind", "channel", "priority", "title", "body")} == {
+            "kind": "cron",
+            "channel": "system.cron",
+            "priority": SYSTEM_CHANNELS["system.cron"],
+            "title": "t",
+            "body": "b",
+        }
+        assert not {"actions", "url", "icon", "ttl", "group_key"} & set(note)
 
     @pytest.mark.parametrize("field_name", ["source", "channel", "title"])
     def test_missing_required_field_rejected(self, field_name):
@@ -100,7 +109,9 @@ class TestPayloadValidation:
             body="b",
             actions=[{"id": "view", "label": "View schedule", "url": "/schedule"}],
         )
-        p.validate()  # must not raise
+        bus, _ = _make_bus()
+        note = bus.push(p)
+        assert note["actions"] == [{"id": "view", "label": "View schedule", "url": "/schedule"}]
 
     def test_action_without_url_accepted(self):
         # URL-less actions are legal per the Phase 4 contract: they persist
@@ -112,7 +123,9 @@ class TestPayloadValidation:
             body="b",
             actions=[{"id": "ack", "label": "Acknowledge"}],
         )
-        p.validate()  # must not raise
+        bus, _ = _make_bus()
+        note = bus.push(p)
+        assert note["actions"] == [{"id": "ack", "label": "Acknowledge"}]
 
     @pytest.mark.parametrize(
         "bad_url",
@@ -168,7 +181,9 @@ class TestPayloadValidation:
         p = NotificationPayload(
             source="system", channel="system.cron", title="t", body="b", actions=actions
         )
-        p.validate()  # must not raise
+        bus, _ = _make_bus()
+        note = bus.push(p)
+        assert [a["id"] for a in note["actions"]] == ["a0", "a1", "a2", "a3"]
 
     @pytest.mark.parametrize(
         ("field", "action"),
@@ -200,7 +215,9 @@ class TestPayloadValidation:
         p = NotificationPayload(
             source="system", channel="system.cron", title="t", body="b", url="/schedule"
         )
-        p.validate()  # must not raise
+        bus, _ = _make_bus()
+        note = bus.push(p)
+        assert note["url"] == "/schedule"
 
     def test_protocol_relative_url_rejected(self):
         # "//evil.example.com" starts with "/" but resolves to an external
@@ -483,7 +500,7 @@ class TestPayloadFromLegacy:
         assert p.channel == "system.agent"
 
     def test_unknown_kind_preserved_in_note(self):
-        # Regression: notify("secretary_alert", ...) must keep its kind for
+        # notify("secretary_alert", ...) must keep its kind for
         # frontend filters even though it delivers on the fallback channel.
         bus, delivered = _make_bus()
         bus.push(payload_from_legacy("secretary_alert", "t", "b"))
@@ -491,7 +508,7 @@ class TestPayloadFromLegacy:
         assert delivered[0]["channel"] == "system.agent"
 
     def test_oversized_body_truncated_not_dropped(self):
-        # Regression: legacy notify() never dropped — cron results and
+        # Legacy notify() never drops — cron results and
         # send_message text can exceed the schema body cap.
         bus, delivered = _make_bus()
         bus.push(payload_from_legacy("cron", "t", "x" * 30000))
@@ -506,14 +523,14 @@ class TestPayloadFromLegacy:
         assert len(delivered[0]["title"]) == 500
 
     def test_empty_title_gets_placeholder(self):
-        # Regression: send_message with title="" must still deliver.
+        # send_message with title="" must still deliver.
         bus, delivered = _make_bus()
         bus.push(payload_from_legacy("agent", "", "b"))
         assert len(delivered) == 1
         assert delivered[0]["title"] == "Notification"
 
     def test_non_string_inputs_coerced_not_raised(self):
-        # Regression: legacy notify() never raised — a None/int body must be
+        # Legacy notify() never raises — a None/int body must be
         # coerced, not TypeError out of the adapter.
         bus, delivered = _make_bus()
         bus.push(payload_from_legacy("agent", None, 42))  # type: ignore[arg-type]

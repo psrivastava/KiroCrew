@@ -5,9 +5,10 @@ and claiming a run's container row and settling it from the final status, and ad
 each step through its lane before the step opens a session (``taskq.md`` § Runner
 adapters). New queue behaviour for task runs goes here.
 
-Instance fields written: ``_adopt_inflight``, ``_run_handles``, ``_task_admission``.
+Instance fields written: ``_adopt_inflight``, ``_recovery_pending``, ``_run_handles``,
+``_task_admission``.
 
-Instance fields read: ``_agent``, ``_run_session_keys``, ``_runs``.
+Instance fields read: ``_run_session_keys``, ``_runs``.
 """
 
 from __future__ import annotations
@@ -26,6 +27,15 @@ if TYPE_CHECKING:
 
 # The facade's logger: records keep the name ``kiro_crew.taskrunner``.
 logger = logging.getLogger("kiro_crew.taskrunner")
+
+
+def end_recovery_wait(self: TaskRunner) -> None:
+    """No adoption sweep will decide the runs a restart recovered as ``paused``.
+
+    Fair admission's task probe holds their records while they wait; from here
+    a recovered run that is not running holds nothing, and its record settles.
+    """
+    self._recovery_pending.clear()
 
 
 def attach_task_admission(
@@ -47,7 +57,10 @@ def attach_task_admission(
     at that boundary -- two sweeps over one set of rows.
     """
     self._task_admission = admission
-    if admission is None or admission.store is None:
+    if admission is None:
+        self.end_recovery_wait()  # no queue, so no adoption sweep
+        return
+    if admission.store is None:
         return
     try:
         loop = asyncio.get_running_loop()
@@ -83,8 +96,10 @@ async def adopt_task_rows(self: TaskRunner) -> "_runner_adapter.AdoptReport | No
         return None
     from kiro_crew.taskq import model as _taskq_model
     from kiro_crew.taskq.adapters import runner as _runner_adapter
+    from kiro_crew.taskq.store import TaskStoreUnavailable
 
     resumable: list[str] = []
+    row_of: dict[str, str] = {}
 
     def _resume(rec: _taskq_model.TaskRecord) -> bool:
         run_id = str(rec.params.get("task_id") or "")
@@ -96,26 +111,47 @@ async def adopt_task_rows(self: TaskRunner) -> "_runner_adapter.AdoptReport | No
         if run.execution_context is not None and run.execution_context.memory_mode != "persistent":
             return False
         resumable.append(run_id)
+        row_of[run_id] = rec.id
         return True
 
-    report = await asyncio.to_thread(
-        _runner_adapter.adopt_orphaned_rows,
-        store,
-        kinds=(_taskq_model.KIND_TASKRUNNER_STEP,),
-        resume=_resume,
-    )
-    for run_id in resumable:
-        try:
-            await self.execute_plan(run_id)
-        except ValueError as exc:
-            logger.warning("taskq adopt: could not resume run %s: %s", run_id, exc)
+    try:
+        report = await asyncio.to_thread(
+            _runner_adapter.adopt_orphaned_rows,
+            store,
+            kinds=(_taskq_model.KIND_TASKRUNNER_STEP,),
+            resume=_resume,
+        )
+        for run_id in resumable:
+            try:
+                await self.execute_plan(run_id, adopting=True)
+            except ValueError as exc:
+                logger.warning("taskq adopt: could not resume run %s: %s", run_id, exc)
+                # An operator's cancel of a run the sweep had not reached ended the run,
+                # but its adopted row has no handle for the cancel to settle.
+                run = self._runs.get(run_id)
+                if run is not None and run.status in ("cancelling", "cancelled"):
+                    try:
+                        await store.run(store.cancel, row_of[run_id], reason="run cancelled")
+                    except TaskStoreUnavailable:
+                        logger.warning("taskq adopt: could not end the row of run %s", run_id)
+                continue
+            await self._notify(
+                "Resumed after a gateway restart",
+                "The gateway stopped while this run was running. It continues from its "
+                "checkpoint: steps that passed are kept.",
+                run=self._runs.get(run_id),
+            )
+    finally:
+        # Decided, or failed: a resumed run is live again, and nothing else
+        # resumes the rest on its own.
+        self.end_recovery_wait()
     for rec_id in report.unknown_side_effect:
         if ":task" in rec_id:
             continue
         run = self._runs.get(rec_id[len(_runner_adapter.TASKRUNNER_ID_PREFIX) :])
         if run is not None and run.status == "paused":
             await self._notify(
-                "\u23f8\ufe0f Run not auto-resumed",
+                "Run not auto-resumed",
                 "The interrupted step may have had a side effect (no git worktree "
                 "to checkpoint against). Review the workspace and resume manually.",
                 run=run,
@@ -127,7 +163,7 @@ async def adopt_task_rows(self: TaskRunner) -> "_runner_adapter.AdoptReport | No
         run = self._runs.get(owner[1]) if owner is not None else None
         if run is not None and run.status == "paused":
             await self._notify(
-                "\u23f8\ufe0f Run not auto-resumed",
+                "Run not auto-resumed",
                 f"This run was resumed automatically {_taskq_model.RECOVERY_MAX_ATTEMPTS} "
                 "times after the gateway stopped, and the gateway stopped again before it "
                 "finished, so it is not resumed again. The limit counts every gateway stop, "
@@ -168,7 +204,7 @@ async def _taskq_begin_run(self: TaskRunner, run: Project) -> None:
                 _runner_adapter.PARAM_SAFE_RETRY: bool(run.branch_name),
             },
             workspace=run.work_dir or None,
-            scope_ref={"auto_approve": False, "agent": self._agent},
+            scope_ref={"auto_approve": False, "agent": run.agent},
             side_effect_class=_taskq_model.SIDE_EFFECT_UNKNOWN,
         )
     except _runner_adapter.RunnerAdmissionRefused as exc:
@@ -181,7 +217,15 @@ async def _taskq_begin_run(self: TaskRunner, run: Project) -> None:
     )
     if handle is None:
         return
-    if not await handle.running_async({"phase": "executing", "steps": len(run.tasks)}):
+    try:
+        marked = await handle.running_async({"phase": "executing", "steps": len(run.tasks)})
+    except asyncio.CancelledError:
+        # Synchronous, as on every unwinding arm: the handle is not in
+        # ``_run_handles`` yet, so ``_taskq_end_run`` would find nothing to settle
+        # and the row would stay leased to this incarnation until the next boot.
+        handle.cancel("run cancelled before it started")
+        raise
+    if not marked:
         # THE ROW'S STATE DECIDES, not the refusal. A refused mark on this
         # container row is not the sibling case that fails the unit
         # (``run_steps._execute_single_task``, ``workflows.agent_pool``): a STEP row
@@ -273,7 +317,7 @@ async def _taskq_admit_step(
                     _runner_adapter.PARAM_SAFE_RETRY: bool(run.branch_name),
                 },
                 workspace=run.work_dir or None,
-                scope_ref={"auto_approve": bool(run.auto_approve), "agent": self._agent},
+                scope_ref={"auto_approve": bool(run.auto_approve), "agent": run.agent},
                 side_effect_class=_taskq_model.SIDE_EFFECT_UNKNOWN,
                 parent_id=parent.task_id if parent is not None else None,
             )

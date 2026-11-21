@@ -16,7 +16,6 @@ from kiro_crew.monitoring.models import (
     MAX_MONITOR_CONDITIONS,
     PULL_REQUEST_CHECK_FIELDS,
     PULL_REQUEST_MERGEABILITY,
-    PULL_REQUEST_MONITOR_KINDS,
     PULL_REQUEST_REVIEW_DECISIONS,
     PULL_REQUEST_STATES,
     PULL_REQUEST_SUPERSEDED_CHECK_FIELD,
@@ -29,6 +28,7 @@ from kiro_crew.monitoring.models import (
     MonitorSeverity,
     ProviderErrorKind,
 )
+from kiro_crew.monitoring.registry import is_pull_request_monitor_kind
 from kiro_crew.security import redact
 
 # Every state a provider may report, which is exactly the set of canonical check
@@ -202,15 +202,16 @@ class PullRequestFacts:
     checks_complete: bool = True
     #: A stable digest over the pull request's comment bodies, or "" when there
     #: are none or the read was incomplete. Set by the GitHub adapter (PR-level
-    #: issue comments) and the Azure DevOps adapter (the comments nested inside
-    #: its PR threads); other adapters leave it "". This is the surface a review
+    #: issue comments), the Azure DevOps adapter (the comments nested inside
+    #: its PR threads) and the Bitbucket adapter (``/pullrequests/{id}/comments``);
+    #: other adapters leave it "". This is the surface a review
     #: bot's verdict comment actually lives on -- created_at frozen at PR open,
     #: body rewritten in place -- so it is the digest that catches a verdict a
     #: thread or status digest cannot see.
     pr_comment_body_digest: str = ""
 
     def __post_init__(self) -> None:
-        if self.kind not in PULL_REQUEST_MONITOR_KINDS:
+        if not is_pull_request_monitor_kind(self.kind):
             raise ValueError("kind is not a supported pull-request monitor")
         if not isinstance(self.target, str) or not self.target:
             raise ValueError("target must be a non-empty string")
@@ -525,19 +526,16 @@ def pull_request_conditions(canonical: Mapping[str, object]) -> tuple[MonitorCon
         )
     comment_digest = canonical.get("pr_comment_body_digest")
     if isinstance(comment_digest, str) and comment_digest:
-        # The digest is inside the KEY, not only the brief: the engine dedupes
-        # per condition key, so a stable key with a changing brief would be
-        # masked and never wake again. A bot rewrites a verdict comment IN PLACE
-        # -- created_at does not move -- so a count or a newest-timestamp probe
-        # cannot see it, only a digest over the bodies can. WAKE / NEVER: a
-        # comment belongs to the conversation, not the commit, so a force-push
-        # must not replay it (the same reasoning as the two review conditions
-        # above). Fail-closed lives in the provider: it emits "" (so this key is
-        # absent) on an incomplete comment read, so an empty/absent digest is the
-        # incomplete-read signal and no condition is emitted. There is no separate
-        # ``pr_comments_complete`` canonical field because an always-present key
-        # would break the pinned full-canonical shape and the public projection,
-        # and PR-level comment completeness has no bearing on readiness anyway.
+        # The digest is in the KEY, not only the brief: the engine dedupes per
+        # condition key, so a changing brief under a stable key would never wake.
+        # A bot rewrites a verdict comment IN PLACE (created_at does not move), so
+        # only a digest over the bodies sees it. WAKE / NEVER: a comment belongs
+        # to the conversation, not the commit, so a force-push must not replay it.
+        # The provider fails closed: on an incomplete comment read it emits "",
+        # so no condition is emitted. No separate ``pr_comments_complete`` field:
+        # an always-present key would break the pinned full-canonical shape and
+        # the public projection, and comment completeness does not affect
+        # readiness.
         conditions.append(
             MonitorCondition(
                 key=f"review_comment_bodies:{comment_digest}",

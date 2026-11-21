@@ -20,8 +20,10 @@ from typing import Dict, Mapping, Optional, Protocol, Tuple, runtime_checkable
 from kiro_crew.platform.context import PlatformCompositionError
 from kiro_crew.platform.governance_parts.matching import (
     _DEFAULT_MATCHER,
+    _DENY_MATCHERS,
     _MATCHERS,
     _ORDINAL_SCALES,
+    _Marker,
     _url_host,
 )
 
@@ -214,12 +216,13 @@ class ScopedRuleset:
         match = _MATCHERS[self.matcher]
         if self.mode == MODE_ALLOW:
             ok = any(match(item, pat) for pat in self.allow)
-            return Decision(
-                ok,
-                f"{item!r} {'in' if ok else 'not in'} allow-set",
-                rule="rule1-allow",
-            )
+            reason = f"{item!r} {'in' if ok else 'not in'} allow-set"
+            if not ok and isinstance(item, _Marker):
+                # A marker names no real target, so its own refusal says why.
+                reason = item.refusal
+            return Decision(ok, reason, rule="rule1-allow")
         # deny mode: permitted unless explicitly denied.
+        match = _DENY_MATCHERS.get(self.matcher, match)
         hit = next((pat for pat in self.deny if match(item, pat)), None)
         if hit is not None:
             return Decision(

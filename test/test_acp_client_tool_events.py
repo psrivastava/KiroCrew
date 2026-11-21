@@ -7,8 +7,13 @@ from unittest.mock import AsyncMock, call
 import pytest
 from acp_client_helpers import _native_projection_for_fake_processes  # noqa: F401 - fixture
 from acp_client_helpers import _pin_the_installed_kiro_cli_version  # noqa: F401 - fixture
+from redaction_structured_cases import github_classic
 
 from kiro_crew.acp.client import AcpClient, _make_unified_diff
+
+# A GitHub token with a valid checksum, which the plan redacts (AWS key IDs
+# are kept visible as identifiers).
+_SECRET = github_classic(seed=14)
 
 
 class TestMakeUnifiedDiff:
@@ -176,6 +181,32 @@ class TestExtractToolEvent:
         assert event is not None
         assert event.kind == EVENT_TOOL_CALL
         assert event.title == "Read"
+
+    def test_the_debug_frame_line_is_redacted(self, caplog):
+        """The raw frame is logged at DEBUG; a credential in the tool's arguments
+        must not reach the log in the clear."""
+        import logging
+
+        from kiro_crew.acp.types import JsonRpcMessage
+
+        token = "ghp_" + "a1B2" * 9
+        msg = JsonRpcMessage(
+            method="session/update",
+            params={
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "title": "Shell",
+                    "kind": "execute",
+                    "toolCallId": "tc-9",
+                    "rawInput": {"command": f"git push https://x:{token}@github.com/o/r"},
+                }
+            },
+        )
+        with caplog.at_level(logging.DEBUG, logger="kiro_crew.acp"):
+            AcpClient()._extract_tool_event(msg)
+        lines = [r.getMessage() for r in caplog.records if "ACP tool_call raw" in r.getMessage()]
+        assert lines, "the debug frame line was not logged"
+        assert all(token not in line for line in lines)
 
     def test_tool_call_with_diff_content(self):
         client = AcpClient()
@@ -470,7 +501,7 @@ class TestBuildPermissionEvent:
                     "title": "Run Command",
                     "kind": "execute",
                     "toolCallId": "tc-secret",
-                    "rawInput": {"command": "echo AKIAIOSFODNN7EXAMPLE"},
+                    "rawInput": {"command": f"echo {_SECRET}"},
                 }
             }
         )
@@ -488,7 +519,7 @@ class TestBuildPermissionEvent:
         event = client._build_permission_event(permission)
 
         assert event.tool_input_redacted is True
-        assert "AKIAIOSFODNN7EXAMPLE" not in event.tool_input
+        assert _SECRET not in event.tool_input
         assert "[REDACTED: credential]" in event.tool_input
         assert client._tool_call_input_redacted["tc-secret"] is True
         repeated = client._build_permission_event(permission)
@@ -746,8 +777,7 @@ class TestApproveTool:
     """Tests for approve_tool always= and recorded-option dispatch."""
 
     @pytest.fixture(autouse=True)
-    # nosemgrep: kirocrew.test-autouse-shared-monkeypatch -- no test in this module calls monkeypatch.undo()
-    def _recorded_requests(self, monkeypatch):
+    def _recorded_requests(self, _floor_monkeypatch):
         """Every id approved here stands for a request the client built an event for."""
         from kiro_crew.acp.types import EVENT_PERMISSION_REQUEST, AcpEvent
 
@@ -761,7 +791,7 @@ class TestApproveTool:
             original(self, *args, **kwargs)
             self._permission_gate_events = _Recorded()
 
-        monkeypatch.setattr(AcpClient, "__init__", _init)
+        _floor_monkeypatch.setattr(AcpClient, "__init__", _init)
 
     @pytest.mark.asyncio
     async def test_always_uses_recorded_optionid(self, tmp_path):
@@ -932,10 +962,9 @@ class TestReadNewToolResultsSync:
     """Tests for _read_new_tool_results_sync."""
 
     @pytest.fixture(autouse=True)
-    # nosemgrep: kirocrew.test-autouse-shared-monkeypatch -- no test in this module calls monkeypatch.undo()
-    def _isolate_home(self, tmp_path, monkeypatch):
+    def _isolate_home(self, tmp_path, _floor_monkeypatch):
         """Redirect Path.home to tmp_path so JSONL writes are isolated."""
-        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        _floor_monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
 
     @pytest.mark.parametrize(
         "session_id",

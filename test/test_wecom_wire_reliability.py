@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from redaction_structured_cases import github_classic
 
 from kiro_crew.testing.channel_fixtures import load_fixture
 from kiro_crew.wecom.client import (
@@ -401,7 +402,9 @@ class TestShutdownIsQuiescent:
 
     @pytest.mark.asyncio
     async def test_close_is_safe_with_no_tasks(self) -> None:
-        await _client().close()  # must not raise
+        c = _client()
+        await c.close()
+        assert c._closed is True
 
 
 # ---------------------------------------------------------------------------
@@ -1194,15 +1197,14 @@ class TestRendererRollsOffASealedBubble:
         c._ws = ws  # type: ignore[assignment]
         r = _renderer(c)
         await r.on_turn_start()
-        # A live AKIA key, split so neither half matches on its own.
-        await r.on_thinking("checking AKIAIOSFO")
-        await r.on_thinking("DNN7EXAMPLE now")
+        # A GitHub token, split so neither half matches on its own.
+        cred = github_classic(seed=44)
+        await r.on_thinking(f"checking {cred[:12]}")
+        await r.on_thinking(f"{cred[12:]} now")
         await r._push(force=True)
 
         sent = json.dumps(ws.sent, ensure_ascii=False)
-        assert (
-            "AKIAIOSFODNN7EXAMPLE" not in sent
-        ), "the split credential was rejoined and posted in clear text"
+        assert cred not in sent, "the split credential was rejoined and posted in clear text"
         assert "<think>" in sent, "the reasoning block itself must still be sent"
 
     @pytest.mark.asyncio
@@ -1392,12 +1394,20 @@ class TestUnexpectedFaultReconnects:
     @pytest.mark.asyncio
     async def test_cancellation_is_not_treated_as_a_fault(self, monkeypatch) -> None:
         c = _client()
+        calls = {"n": 0}
 
         async def cancelled() -> None:
+            calls["n"] += 1
+            if calls["n"] > 1:
+                # A loop that retried after the cancel ends here instead of spinning.
+                c._closed = True
+                return
             raise asyncio.CancelledError
 
         monkeypatch.setattr(c, "_connect_and_serve", cancelled)
-        await c._run_loop()  # returns rather than retrying
+        await asyncio.wait_for(c._run_loop(), timeout=30)
+
+        assert c._last_status is None, "a shutdown must not put a fault on the badge"
 
 
 async def _immediate_sleep(_delay: float) -> None:

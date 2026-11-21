@@ -8,7 +8,7 @@
  * The header shows the mate's identity; the X close button is rendered by
  * DialogContent itself.
  */
-import { Loader2, ChevronRight, Wrench, Plug, BookOpen, ScrollText, type LucideIcon } from 'lucide-react'
+import { Loader2, ChevronRight, Wrench, Plug, BookOpen, ScrollText, FileText, type LucideIcon } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
@@ -22,7 +22,7 @@ import CrewAvatar from '../CrewAvatar'
 import CrewAvatarBuilder from '../CrewAvatarBuilder'
 import CrewAvatarButton from './CrewAvatarButton'
 import { retiredCueFrom, motionsFrom, soundsFrom } from '../../lib/crewAvatarState'
-import { DisplayNameField, Field, WorkspaceField, WorkspaceModal, ModelField, EffortField, memberMemoryState } from './crewFields'
+import { DisplayNameField, Field, WorkspaceField, WorkspaceModal, ModelField, EffortField, SessionColorField, memberMemoryState } from './crewFields'
 import ErrorNotice from '../ErrorNotice'
 import { useDialogConfirm } from './useDialogConfirm'
 import { effortLabel } from '../../lib/effort'
@@ -40,13 +40,30 @@ import MemoryBackupsCard from '../../pages/overview/MemoryBackupsCard'
 import MemoryRetiredCard from '../../pages/overview/MemoryRetiredCard'
 import MemoryCarveCard from '../../pages/overview/MemoryCarveCard'
 import { api } from '../../api/client'
-import { apiErrorCode } from '../../api/apiError'
+import { pathBasename } from '../../utils/pathBasename'
+import { ApiError, apiErrorCode } from '../../api/apiError'
+import { isDeadlineError } from '../../api/queryClient'
+import { parseErrorField, reportForError } from '../../utils/errorReport'
 import { type CrewEditorController } from './useCrewEditor'
 import CrewEditorNextRail from './CrewEditorNextRail'
 import { uiLocation } from '../../uiLocations/uiLocation'
 
 export type NextSection = 'general' | 'builtFrom' | 'approvals' | 'schedules' | 'webhooks' | 'memory' | 'danger'
 type MemoryTab = 'profile' | 'memories' | 'recovery'
+
+/** The sentence under the Abilities pane's load error. A read past either
+ *  deadline (the gateway's `reason: timed_out`, or the dashboard's own, the
+ *  untranslated `deadline exceeded`) names the likely causes; any other
+ *  `capabilities_unavailable` points at the gateway log. Neither shows the code. */
+function capabilitiesLoadErrorText(error: unknown): string {
+  const timedOut = isDeadlineError(error)
+    || (error instanceof ApiError && parseErrorField(error.body, 'reason') === 'timed_out')
+  if (timedOut) return i18nT('crewEditorNext.load_error_timed_out')
+  if (apiErrorCode(error) === 'capabilities_unavailable') {
+    return i18nT('crewEditorNext.load_error_details')
+  }
+  return error instanceof Error ? error.message : i18nT('crewEditorNext.load_error_details')
+}
 
 /** Split a skill id into owner/namespace + skill name, and de-slugify the name
  *  into a readable Title Case label (hyphens/underscores → spaces). An id with no
@@ -63,11 +80,18 @@ function parseSkillId(id: string): { owner: string | null; name: string; display
   return { owner, name, display: display || name }
 }
 
+/** A resource row's name: a skill URI by its skill, a `file://` one by its path. */
+function resourceLabel(id: string): string {
+  if (id.startsWith('skill://')) return skillLabel(id)
+  return id.startsWith('file://') ? id.slice('file://'.length) || id : id
+}
+
 /** The label a capability row shows in a band. */
 function bandRowLabel(row: CapabilityRow): string {
   if (row.section === 'skills') {
     return row.label || (row.id.includes('://') ? skillLabel(row.id) : parseSkillId(row.id).display)
   }
+  if (row.section === 'resources') return resourceLabel(row.id)
   if (row.section === 'tools') return row.label || toolMeta(row.id).label
   if (row.section === 'prompt') return i18nT('crewEditorNext.band_directions')
   return row.label || row.id
@@ -82,7 +106,7 @@ function bandRowSecondary(row: CapabilityRow): string {
     if (v && typeof v === 'object' && !Array.isArray(v)) {
       const t = v as Record<string, unknown>
       if (typeof t.url === 'string') { try { return new URL(t.url).host } catch { return t.url } }
-      if (typeof t.command === 'string') return t.command.split('/').pop() || t.command
+      if (typeof t.command === 'string') return pathBasename(t.command) || t.command
     }
   }
   return ''
@@ -91,7 +115,8 @@ function bandRowSecondary(row: CapabilityRow): string {
 /** The capability kinds a band shows, in order: heading, icon, and whether the
  *  group starts collapsed (Tools is the long one, so it does). Behaviour
  *  directions is the one prompt slot an add fills; it leads, as it shapes how
- *  the worker uses everything below it. */
+ *  the worker uses everything below it. Resources lists every other `resources`
+ *  entry the agent loads (a `file://` document or glob), so none is left off. */
 const BAND_KINDS: {
   section: CapabilityRow['section']
   heading: () => string
@@ -102,9 +127,10 @@ const BAND_KINDS: {
   { section: 'tools', heading: () => i18nT('crewEditorNext.tab_tools'), Icon: Wrench, collapsed: true },
   { section: 'mcpServers', heading: () => i18nT('crewEditorNext.stat_mcp_servers'), Icon: Plug, collapsed: false },
   { section: 'skills', heading: () => i18nT('crewEditorNext.tab_skills'), Icon: BookOpen, collapsed: false },
+  { section: 'resources', heading: () => i18nT('crewEditorNext.band_resources'), Icon: FileText, collapsed: false },
 ]
 
-/** One collapsible kind group (Tools / MCP servers / Skills) inside a band. */
+/** One collapsible kind group (Tools / MCP servers / Skills / Resources) inside a band. */
 function BandKindGroup({
   testId, section, heading, Icon, startCollapsed, items, onRemove, removeBusy,
 }: {
@@ -184,8 +210,8 @@ function BandKindGroup({
 
 /**
  * One band of the read-only capabilities view: a heading and, under it, the
- * crewmate's tools / MCP servers / skills as collapsible kind groups. Each group
- * shows a count so the whole band scans at a glance; rows are compact (name +
+ * crewmate's tools / MCP servers / skills / resources as collapsible kind groups.
+ * Each group shows a count so the whole band scans at a glance; rows are compact (name +
  * inline description). `onRemove` adds a per-row Remove control (the "Added"
  * band). Approvals and the rest are configured elsewhere.
  */
@@ -194,7 +220,7 @@ function CapabilityBand({
 }: {
   testId: string
   heading: string
-  note: string
+  note?: string
   rows: CapabilityRow[]
   onRemove?: (row: CapabilityRow) => void
   removeBusy?: string | null
@@ -213,7 +239,7 @@ function CapabilityBand({
     <section className="flex flex-col gap-2 rounded-md border border-border bg-bg-elevated p-3" data-testid={`next-band-${testId}`}>
       <div className="flex items-baseline gap-2">
         <span className="text-[11px] font-semibold uppercase tracking-[0.06em] text-muted-strong">{heading}</span>
-        <span className="text-[11px] text-muted">{note}</span>
+        {note && <span className="text-[11px] text-muted">{note}</span>}
       </div>
       {kinds.length === 0 ? (
         <span className="text-[12px] text-muted" data-testid={`next-band-${testId}-empty`}>{emptyText ?? i18nT('crewEditorNext.band_none')}</span>
@@ -374,7 +400,7 @@ export default function CrewEditorNextDialog({
   }
 
   const {
-    editing, editingAgent, displayName, setDisplayName,
+    editing, editingAgent, displayName, setDisplayName, sessionColor, setSessionColor,
     kiroAgent, kiroAgentOptions, templateFieldLabel, persistTemplateSwitch, templateSwitchError,
     templateProvenance, capabilityDirty, capabilityBusy, capabilityLoading, capabilityReadFailed,
     editAvatar, openAvatarBuilder, avatarBuilderOpen, applyAvatar, closeAvatarBuilder, onAvatarImageError,
@@ -384,12 +410,35 @@ export default function CrewEditorNextDialog({
     workspace, setWorkspace, workspaceOptions,
     wsModalOpen, openWsModal, closeWsModal, onWorkspaceCreated, setWsDirty, onPaneSaveChain,
     editModel, setEditModel, editEffort, setEditEffort,
-    modelOptions, modelsDegraded, resolvedError, effortCapable, effortModel,
+    modelOptions, modelsDegraded, retryModels, retryingModels, pinHarness,
+    resolvedError, effortCapable, effortLevels, effortModel,
     memberId, isDefaultCrew, guardedNavigate,
     setSchedDraft, setSchedSaving, requestCancelDraft,
     confirmDelete, setConfirmDelete, deleteCrew, confirmRef,
     discardAsk, setDiscardAsk, discardTakesSheet, askSchedOnly, schedSaving, discardForce, confirmDiscard,
   } = ctl
+
+  // Which single line the model readout shows. A scoped pin the harness serves
+  // under no id stays unsent; a foreign pin can instead resolve to a lower
+  // tier, which the readout must name along with why; only a model chosen
+  // here AND in use is already shown by the picker, so only it gets no line.
+  // A chosen model the harness cannot claim, with nothing below it, says the
+  // pick is not offered and that a model is picked automatically, so the line
+  // never reads as if the choice under it were honoured. Otherwise the line
+  // names the model in use without claiming where it came from (the template
+  // the mate runs as can pin one as well as the global default), or says it
+  // is picked automatically when no tier names one.
+  const modelLine: 'unserved' | 'instead' | 'auto_instead' | 'uses' | null = !resolved
+    ? null
+    : editModel === editingAgent?.model && resolved.pin_served_as === '' && (!resolved.model || resolved.model === editModel)
+      ? 'unserved'
+      : resolved.pinned && !!resolved.model && resolved.model !== editingAgent?.model
+        ? 'instead'
+        : resolved.pinned && !!resolved.model && resolved.model === editingAgent?.model
+          ? null
+          : resolved.pinned && !resolved.model && !!editingAgent?.model
+            ? 'auto_instead'
+            : 'uses'
 
   // A nested child panel (approvals, a memory doc, the memory records editor)
   // owns its OWN unsaved text; the host cannot discard it on the child's
@@ -482,7 +531,7 @@ export default function CrewEditorNextDialog({
       ? i18nT('pages.kiroCrewAgentsPage.private_memory_owned')
       : memoryState === 'legacy'
         ? (editing === 'default' ? i18nT('pages.kiroCrewAgentsPage.global_memory_v1') : i18nT('pages.kiroCrewAgentsPage.private_memory_legacy'))
-        : `${i18nT(memoryState === 'ownership_mismatch' ? 'pages.kiroCrewAgentsPage.memory_binding_mismatch' : 'pages.kiroCrewAgentsPage.memory_binding_unavailable')} ${i18nT('pages.kiroCrewAgentsPage.memory_binding_diagnostic', { command: 'kirocrew doctor' })}`
+        : i18nT(memoryState === 'ownership_mismatch' ? 'pages.kiroCrewAgentsPage.memory_binding_mismatch_diagnostic' : 'pages.kiroCrewAgentsPage.memory_binding_unavailable_diagnostic', { command: 'kirocrew doctor' })
 
   const memoryTabs: { key: MemoryTab; label: string }[] = [
     { key: 'profile', label: i18nT('crewEditorNext.tab_profile') },
@@ -574,6 +623,7 @@ export default function CrewEditorNextDialog({
                       wrappers wrapping components that already carry their own
                       label/hint. This is the layout these fields are built for. */}
                   <DisplayNameField value={displayName} onChange={setDisplayName} fallback={editing} />
+                  <SessionColorField value={sessionColor} onChange={setSessionColor} subject="member" />
 
                   {ownsFile ? (
                     <Field label={i18nT('crewEditorNext.section_capabilities')} hint={i18nT('crewEditorNext.built_from_mate_hint')}>
@@ -630,25 +680,41 @@ export default function CrewEditorNextDialog({
                     <p className="text-[12px] text-muted">
                       {i18nT('components.crew.crewEditorNextDialog.model_frame')}
                     </p>
-                    <ModelField options={modelOptions} value={editModel} onChange={setEditModel} />
+                    <ModelField
+                      options={modelOptions}
+                      value={editModel}
+                      onChange={setEditModel}
+                      servedAs={editModel === editingAgent?.model ? resolved?.pin_served_as : undefined}
+                      harness={pinHarness}
+                    />
                     {/* Model list resolved DEGRADED (transport failure → auto-only/cached list).
                         No hand-off: this is an advisory read-degradation, not a
                         failure, and the hand-off would discard the open editor's
                         unsaved crew/approvals/memory drafts. */}
                     {modelsDegraded && (
-                      <ErrorNotice
-                        className="mt-1"
-                        message={i18nT('pages.chatSidebar.model_list_failed')}
-                        askAgent={false}
-                        testId="next-model-degraded"
-                      />
+                      <div className="mt-1 flex flex-wrap items-center gap-2">
+                        <ErrorNotice
+                          className="min-w-[12rem] flex-1"
+                          // Another harness's list keeps no last-good copy, so a failure leaves only Inherited.
+                          message={resolved?.models_backend === undefined
+                            ? i18nT('pages.chatSidebar.model_list_failed')
+                            : i18nT('pages.kiroCrewAgentsPage.harness_models_failed', { harness: pinHarness })}
+                          askAgent={false}
+                          testId="next-model-degraded"
+                        />
+                        <Btn type="button" className="shrink-0" onClick={retryModels} disabled={retryingModels}>
+                          {i18nT('pages.chatSidebar.retry')}
+                        </Btn>
+                      </div>
                     )}
                     {(effortCapable || !!editEffort) && (
-                      <EffortField value={editEffort} onChange={setEditEffort} />
+                      <EffortField value={editEffort} onChange={setEditEffort} levels={effortLevels} />
                     )}
                     {!effortCapable && !!editEffort && (
                       <div className="rounded-md border border-warn-subtle bg-warn-subtle px-3 py-2.5 text-[11.5px] leading-relaxed text-muted">
-                        {effortModel
+                        {resolved?.effort_supported === false
+                          ? i18nT('pages.kiroCrewAgentsPage.effort_ignored_by_this_backend', { harness: pinHarness })
+                          : effortModel
                           ? i18nT('pages.kiroCrewAgentsPage.effort_ignored_on_this_model', { model: effortModel })
                           : i18nT('pages.kiroCrewAgentsPage.effort_pin_needs_a_model')}
                       </div>
@@ -661,19 +727,34 @@ export default function CrewEditorNextDialog({
                       askAgent={false}
                       testId="next-model-resolved-error"
                     />
-                    {resolved && (
+                    {resolved && (modelLine !== null || effortCapable || !editEffort) && (
                       <div className="flex flex-col gap-1 rounded-md border border-border bg-bg-accent px-3 py-2.5 text-[11.5px] leading-relaxed text-muted">
-                        <div>
-                          <span className="text-text">
-                            {i18nT('pages.kiroCrewAgentsPage.resolves_to', { model: resolved.model || i18nT('pages.kiroCrewAgentsPage.inherited') })}
-                          </span>
-                          {' — '}
-                          {resolved.pinned
-                            ? i18nT('pages.kiroCrewAgentsPage.pinned_on_this_crew')
-                            : resolved.model
-                              ? i18nT('pages.kiroCrewAgentsPage.inherited_from_the_agent_template')
-                              : i18nT('pages.kiroCrewAgentsPage.no_pin_anywhere_the_backend_chooses')}
-                        </div>
+                        {modelLine === 'unserved' && (
+                          <div className="text-text" data-testid="next-model-pin-unserved">
+                            {i18nT('pages.kiroCrewAgentsPage.pin_unserved_resolves_to', { model: editModel, harness: pinHarness })}
+                          </div>
+                        )}
+                        {modelLine === 'instead' && (
+                          <div className="text-text" data-testid="next-model-runs-instead">
+                            {i18nT('pages.kiroCrewAgentsPage.model_runs_instead', {
+                              harness: pinHarness, picked: editingAgent?.model, model: resolved.model,
+                            })}
+                          </div>
+                        )}
+                        {modelLine === 'auto_instead' && (
+                          <div className="text-text" data-testid="next-model-auto-instead">
+                            {i18nT('pages.kiroCrewAgentsPage.model_picked_automatically_instead', {
+                              harness: pinHarness, picked: editingAgent?.model,
+                            })}
+                          </div>
+                        )}
+                        {modelLine === 'uses' && (
+                          <div className="text-text" data-testid="next-model-uses-line">
+                            {resolved.model
+                              ? i18nT('pages.kiroCrewAgentsPage.model_uses', { model: resolved.model })
+                              : i18nT('pages.kiroCrewAgentsPage.model_picked_automatically')}
+                          </div>
+                        )}
                         {(effortCapable || !editEffort) && (
                           <div>
                             {effortCapable ? (
@@ -715,13 +796,28 @@ export default function CrewEditorNextDialog({
                       </div>
                     )}
                     {capsQuery.error && (
-                      // No hand-off: the editor is a modal holding the user's
-                      // unsaved edits in its other sections; the hand-off would
-                      // navigate away and discard them.
+                      // The hand-off goes through the editor's leave guard
+                      // (`leaveGate`): the modal holds the user's unsaved edits
+                      // in its other sections, and the guard asks before the
+                      // navigation to the chat would discard them.
                       <ErrorNotice
-                        message={capsQuery.error instanceof Error ? capsQuery.error.message : i18nT('crewEditorNext.load_error')}
-                        variant="inline"
-                        askAgent={false}
+                        title={i18nT('crewEditorNext.load_error')}
+                        message={capabilitiesLoadErrorText(capsQuery.error)}
+                        report={reportForError(capsQuery.error)}
+                        askAgent
+                        gate={ctl.leaveGate}
+                        actions={(
+                          // A refetch of a query with no data goes back to
+                          // pending, so the pane shows its loading line, not
+                          // this notice, until the read settles again.
+                          <button
+                            type="button"
+                            onClick={() => { void capsQuery.refetch() }}
+                            data-testid="next-builtfrom-retry"
+                          >
+                            {i18nT('crewEditorNext.load_retry')}
+                          </button>
+                        )}
                         testId="next-builtfrom-error"
                       />
                     )}
@@ -750,11 +846,22 @@ export default function CrewEditorNextDialog({
                         <CapabilityBand
                           testId="added"
                           heading={i18nT('crewEditorNext.band_added', { name: displayName.trim() || editing })}
-                          note={i18nT('crewEditorNext.band_added_note')}
+                          // Only a mate that owns its file gets Add abilities (below);
+                          // any other binding's abilities are fixed here, so the band
+                          // must not point at a button that is not shown.
+                          note={ownsFile ? i18nT('crewEditorNext.band_added_note') : undefined}
                           rows={builtFromRows.filter(r => r.present && r.state === 'local')}
                           onRemove={ownsFile ? removeCapability : undefined}
                           removeBusy={removeBusy}
-                          emptyText={i18nT('crewEditorNext.band_added_empty')}
+                          emptyText={
+                            ownsFile
+                              ? i18nT('crewEditorNext.band_added_empty')
+                              // "built-in" only for a direct binding to a built-in template;
+                              // a forked copy (inherited / legacy_snapshot) gets the neutral line.
+                              : caps.mode === 'shared' && caps.template.source === 'builtin'
+                                ? i18nT('crewEditorNext.band_added_empty_builtin', { name: displayName.trim() || editing })
+                                : i18nT('crewEditorNext.band_added_empty_fixed', { name: displayName.trim() || editing })
+                          }
                         />
 
                         {/* No hand-off on the two notices below: the editor modal
@@ -817,6 +924,7 @@ export default function CrewEditorNextDialog({
                       <CrewWakeSection
                         crew={editing}
                         memberId={memberId}
+                        memberStore={memoryStore}
                         agentTemplate={kiroAgent}
                         isDefaultCrew={isDefaultCrew}
                         hideKindBadge
@@ -839,7 +947,7 @@ export default function CrewEditorNextDialog({
                       <p className="text-[12px] text-muted">
                         {i18nT('crewEditorNext.webhooks_frame')}
                       </p>
-                      <CrewWebhookSection crew={editing} onNavigateAway={guardedNavigate} />
+                      <CrewWebhookSection crew={editingAgent} onNavigateAway={guardedNavigate} />
                     </fieldset>
                   </div>
                 </div>
@@ -1073,7 +1181,7 @@ export default function CrewEditorNextDialog({
             </DialogTitle>
           </DialogHeader>
           <DialogBody>
-            <p className="m-0 text-sm text-text">
+            <p className="m-0 text-sm text-text break-words">
               {schedDraft
                 ? i18nT('pages.kiroCrewAgentsPage.discard_new_schedule_body')
                 : i18nT('pages.kiroCrewAgentsPage.discard_unsaved_body', { name: editing })}

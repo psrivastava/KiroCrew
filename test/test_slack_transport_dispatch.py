@@ -1,24 +1,10 @@
 """Unit tests for ``handle_message_transport`` agent resolution (Stage 3).
 
-Locks the messaging-transport fix that makes ``spawn_run`` available: the
-transport session must be created under a kiro agent that carries the
-``kirocrew-core`` MCP server (which provides ``spawn_run``), not under
-kiro-cli's bare built-in default.
-
-Directly asserting "the ``spawn_run`` tool is loaded" would require spawning a
-real kiro-cli process, so we lock the deterministic invariant that guarantees
-it instead: the agent name passed to ``get_or_create`` is non-empty and
-resolves to the canonical ``"kirocrew"`` agent when no thread override /
-``default_agent`` is configured, and a thread override still wins.
-
-What a turn leaves behind once it ends (the agent recorded in the session
-metadata, the auto-title, the error reply held back for a trusted bot and the
-partial-reply rescue) is covered in
-``test_slack_transport_dispatch_turn_outcomes.py``, and the one-session-per-DM
-key and its wiring in ``test_slack_transport_dispatch_flat_dm.py``. The
-message timestamp and the capturing session and context-builder stand-ins these
-files share live in ``slack_transport_dispatch_helpers.py``, which also binds the
-golden-transcript fakes from ``test_slack_golden_transcript``.
+The transport session needs an agent carrying the ``kirocrew-core`` MCP server (for
+``spawn_run``). Checking the loaded tool would need a real kiro-cli, so this pins the
+agent name passed to ``get_or_create``: ``"kirocrew"`` by default, a thread override
+wins. Turn outcomes and the flat-DM key are in the ``_turn_outcomes`` and ``_flat_dm``
+siblings.
 """
 
 from __future__ import annotations
@@ -57,6 +43,7 @@ from kiro_crew.acp.types import (
 from kiro_crew.messaging.link import canonical_key
 from kiro_crew.slack import handler as slack_handler
 from kiro_crew.slack import transport_dispatch
+from kiro_crew.testing.synthetic_credentials import SAMPLE_SLACK_BOT_TOKEN
 
 
 def _run_transport(monkeypatch, thread_agent=None, agent_override=None, **extra):
@@ -189,8 +176,8 @@ class TestTransportAdmissionSpool:
         """The ingested *text* inlines temp paths and file contents.
 
         Both refusal points -- the admission gate and a SessionClosingError at
-        dispatch -- must record what the user sent and how many files it had,
-        never the turn's prompt.
+        dispatch -- must record what the user sent, how many files it had and
+        their names, never the turn's prompt.
         """
         from kiro_crew.session_allocation import SessionClosingError
 
@@ -214,22 +201,37 @@ class TestTransportAdmissionSpool:
             monkeypatch.setattr(transport_dispatch, "spool_refused_turn", spool)
             monkeypatch.setattr(transport_dispatch, "_is_slack_restricted", lambda _key: False)
 
-        _run_transport(monkeypatch, spool_text="look at this", spool_attachments=2)
+        _run_transport(
+            monkeypatch,
+            spool_text="look at this",
+            spool_attachments=2,
+            spool_attachment_names=("shot.png", ""),
+        )
 
         assert len(routes) == 1
         assert routes[0].text == "look at this"
         assert routes[0].attachments_dropped == 2
+        assert routes[0].attachment_names == ("shot.png", "")
 
     @pytest.mark.parametrize(
-        ("extra", "text", "dropped"),
+        ("extra", "text", "dropped", "names"),
         [
-            ({"spool_text": "look at this", "spool_attachments": 2}, "look at this", 2),
+            (
+                {
+                    "spool_text": "look at this",
+                    "spool_attachments": 2,
+                    "spool_attachment_names": ("shot.png", ""),
+                },
+                "look at this",
+                2,
+                ("shot.png", ""),
+            ),
             # No pre-ingestion capture (interaction re-dispatch): text as is.
-            ({}, "approve the plan", 0),
+            ({}, "approve the plan", 0, ()),
         ],
     )
     def test_native_admission_spools_the_pre_ingestion_message(
-        self, monkeypatch, extra, text, dropped
+        self, monkeypatch, extra, text, dropped, names
     ):
         turn_text = (
             "hello\n/tmp/kiro-attach-dead.png\n\n[File: notes.txt]\nbody"
@@ -267,6 +269,7 @@ class TestTransportAdmissionSpool:
         assert len(routes) == 1
         assert routes[0].text == text
         assert routes[0].attachments_dropped == dropped
+        assert routes[0].attachment_names == names
 
     def test_session_closing_does_not_spool_restricted_slack_turn(self, monkeypatch, caplog):
         from kiro_crew.session_allocation import SessionClosingError
@@ -546,7 +549,7 @@ def test_member_memory_refusal_redacts_before_posting(monkeypatch):
     from kiro_crew.memory_stores import UnknownMemoryStore
 
     private_path = "/home/alice/.kiro/crew/memory_stores/member-one/memory.db"
-    credential = "AKIAIOSFODNN7EXAMPLE"
+    credential = SAMPLE_SLACK_BOT_TOKEN  # synthetic Slack bot token
     failure = UnknownMemoryStore(f"memory_unavailable: cannot open {private_path}; {credential}")
     monkeypatch.setattr(
         transport_dispatch, "session_store_for_turn", AsyncMock(side_effect=failure)
@@ -637,7 +640,7 @@ class TestTransportErrorText:
 
     def test_classified_acp_error_is_redacted_before_posting(self):
         private_path = "/Users/alice/secret/x"
-        credential = "AKIAIOSFODNN7EXAMPLE"
+        credential = SAMPLE_SLACK_BOT_TOKEN  # synthetic Slack bot token
         err = AcpError(
             f"Backend refused: cannot read {private_path}; key {credential}",
             transient=False,
@@ -648,11 +651,13 @@ class TestTransportErrorText:
         assert private_path not in text and "alice" not in text
         assert credential not in text
 
-    @pytest.mark.parametrize("split", ["AKIA*{}*", "AKIA**{}**", "AKIA_{}_", "AKIA`{}`"])
+    @pytest.mark.parametrize("split", ["{h}*{r}*", "{h}**{r}**", "{h}_{r}_", "{h}`{r}`"])
     def test_a_key_split_by_display_markup_is_redacted(self, split):
-        rest = "IOSFODNN7EXAMPLE"
+        # A synthetic Slack bot token split after its first 4 characters. (No ``_``
+        # in it: the display form drops that as markup.)
+        head, rest = SAMPLE_SLACK_BOT_TOKEN[:4], SAMPLE_SLACK_BOT_TOKEN[4:]
         err = _classified_acp_error(
-            "The monthly usage limit has been reached. key " + split.format(rest)
+            "The monthly usage limit has been reached. key " + split.format(h=head, r=rest)
         )
         assert err.user_worded and rest in str(err)
         text = transport_dispatch._transport_error_text(err)
@@ -1210,11 +1215,8 @@ class TestTransportCompactionReinjection:
 class TestTransportTemporaryBlocksMemoryReads:
     """``!temporary`` must block memory READS on the DEFAULT transport path.
 
-    ``messaging.use_transport`` defaults True, so this is the live path, and the
-    shared ``NOTICE_TEMPORARY`` promises the thread "won't read or save memory".
-    The write half is covered by the ``_is_slack_restricted`` gates; the read half
-    is one kwarg, and omitting it leaves memories and lessons in the prompt of a
-    thread the user was told reads nothing.
+    ``NOTICE_TEMPORARY`` promises the thread "won't read or save memory". Writes are
+    gated by ``_is_slack_restricted``; the read half is one kwarg.
     """
 
     _KEY = canonical_key(_MSG_TS)
@@ -1468,12 +1470,8 @@ class TestTeardownReleasesSessionOnCancel:
     """A ``!stop`` cancelling the turn task while ``renderer.close()`` awaits
     must still release the session semaphore.
 
-    ``close()`` now awaits (it clears the thread status on a cancelled turn),
-    so a cancellation can land inside it and raise ``CancelledError`` -- which
-    is not an ``Exception`` and escapes the dispatcher's ``except Exception``
-    teardown guard. The session release must sit in a ``finally`` so the
-    permit is always returned; otherwise the semaphore stays locked and every
-    later message in that conversation wedges until the gateway restarts.
+    ``CancelledError`` is not an ``Exception``, so only a ``finally`` returns the permit;
+    otherwise every later message in that conversation wedges until restart.
     """
 
     def _run(self, monkeypatch, *, close_raises):

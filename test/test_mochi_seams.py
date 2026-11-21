@@ -368,7 +368,8 @@ class TestPinPersistFailureIsReportedNotSwallowed:
             raise OSError("No space left on device")
 
         monkeypatch.setattr(pfs, "atomic_write", _boom)
-        assert svc.remove_pin(str(target)) is False
+        with pytest.raises(pfs.PinsWriteError):
+            svc.remove_pin(str(target))
         # The pin survives: the failed write left the file intact, and the reload
         # restored it in memory — no success reported for an unpin that reverts.
         assert [p["path"] for p in svc.get_pins()] == [str(target)]
@@ -389,7 +390,7 @@ class TestPinnedToleratesMalformedEntries:
             json.dumps({"version": 1, "pins": [1, {"path": str(target)}]})
         )
         svc = PinnedFilesService(str(tmp_path), lambda channel, *args: None)
-        # Would raise TypeError before the fix; must cleanly remove the real pin.
+        # Must not raise TypeError; must cleanly remove the real pin.
         assert svc.remove_pin(str(target)) is True
         assert [p for p in svc.get_pins() if isinstance(p, dict)] == []
 

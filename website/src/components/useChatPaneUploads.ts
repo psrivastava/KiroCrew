@@ -1,7 +1,6 @@
-import { useState, useCallback, type Dispatch, type MutableRefObject, type SetStateAction } from 'react'
+import { useState, useCallback, useEffect, type Dispatch, type MutableRefObject, type SetStateAction } from 'react'
 import { useMutation } from '@tanstack/react-query'
 import { useChatFileDrop } from './ChatDropOverlay'
-import { appendSlotMessage } from '../store/chatSlice'
 import { api } from '../api/client'
 import { classifyDrop } from '../utils/dropClassify'
 import { spliceDirTokens, servedUploadMb, VIDEO_EXT } from '../utils/fileTokens'
@@ -11,28 +10,28 @@ import {
   registerComposerUpload,
   composerUploadSlot,
   finishComposerAttachment,
+  reportComposerUploadProgress,
   unregisterComposerUpload,
   useComposerSendHeld,
   useComposerUploadCount,
 } from '../utils/composerSendHolds'
+import { holdSlotUploadFailure, onSlotUploadFailureHeld, takeSlotUploadFailure } from '../utils/slotUploadFailures'
 import { i18nT } from '../i18n/t'
-import type { AppDispatch } from '../store'
 
 /**
  * `ChatPane`'s attachment uploads: the upload mutation (its result follows the
  * slot the files were picked in, not the screen), cancel, the count and size
  * pre-checks, folder drops, and the per-slot upload notices: a refusal hint and
- * a failure banner keyed by slot, or an error row in the slot's transcript
- * when that slot is no longer on screen.
+ * a failure banner keyed by slot. A failure for a slot not on screen is held
+ * for it (`slotUploadFailures`) and enters its banner when it is shown.
  */
 
 /** Variables of the composer upload mutation: the files, the slot they were
  *  picked in, and the AbortController that can end the request. */
 type UploadVars = { files: File[]; forSlot: string; controller: AbortController }
 
-export function useChatPaneUploads({ slotKey, dispatch, slotKeyRef, mountedRef, setInput, dashCfg, dashCfgError }: {
+export function useChatPaneUploads({ slotKey, slotKeyRef, mountedRef, setInput, dashCfg, dashCfgError }: {
   slotKey: string
-  dispatch: AppDispatch
   slotKeyRef: MutableRefObject<string>
   mountedRef: MutableRefObject<boolean>
   setInput: Dispatch<SetStateAction<string>>
@@ -43,8 +42,8 @@ export function useChatPaneUploads({ slotKey, dispatch, slotKeyRef, mountedRef, 
   // A banner belongs to the conversation it happened in: rebinding the pane to
   // another slot must not carry A's banner over B's thread, and coming back to
   // A shows it again until dismissed. Dismiss clears only the shown slot's
-  // entry. A failure for a slot NOT on screen never enters this map — see
-  // reportUploadFailure, which writes it to that slot's transcript instead.
+  // entry. A failure for a slot NOT on screen is held outside this pane (see
+  // reportUploadFailure) and enters the map when the pane shows that slot.
   const [uploadErrors, setUploadErrors] = useState<Record<string, string>>({})
   const uploadError = uploadErrors[slotKey] ?? ''
   // Client-side pre-check refusals (too many files, over the size limit) are
@@ -66,21 +65,29 @@ export function useChatPaneUploads({ slotKey, dispatch, slotKeyRef, mountedRef, 
   }, [slotKey])
   /** Report an upload failure to the slot whose files failed. On screen it is
    *  the banner. Anywhere else — the pane rebound to another slot, or gone —
-   *  it goes into that slot's TRANSCRIPT as an error row, the same place a
-   *  failed send reports: the transcript is store-backed and survives both the
-   *  rebind and leaving the page, so the failure is found on return rather
-   *  than held in component state nobody may ever render. Never dropped. */
+   *  it is held for that slot outside the transcript, where no history rebuild
+   *  can drop it or read it as a turn error, and the first pane or chat page
+   *  that shows the slot takes it into its banner. */
   const reportUploadFailure = useCallback((message: string, forSlot: string) => {
     if (mountedRef.current && forSlot === slotKeyRef.current) { setUploadError(message, forSlot); return }
-    dispatch(appendSlotMessage({ slot: forSlot, message: { role: 'error', content: message, cls: '' } }))
-  }, [dispatch, setUploadError, mountedRef, slotKeyRef])
+    holdSlotUploadFailure(forSlot, message)
+  }, [setUploadError, mountedRef, slotKeyRef])
+  // Showing a slot takes the failure held for it into the banner, and one held
+  // while the slot is already shown (a request an earlier pane started) enters
+  // at once. Only a non-empty take sets it, so an effect replay that finds the
+  // failure already taken leaves the banner alone.
+  useEffect(() => {
+    const show = (message: string) => { if (message) setUploadError(message, slotKey) }
+    show(takeSlotUploadFailure(slotKey))
+    return onSlotUploadFailureHeld(slot => { if (slot === slotKey) show(takeSlotUploadFailure(slot)) })
+  }, [slotKey, setUploadError])
 
   // File upload as a mutation (isPending replaces a manual `uploading` flag).
   //
   // The variables carry the slot the files were picked in: the pane can be
   // rebound to another slot while the upload is in flight, and the result
   // must follow the files' slot, not the screen: completed paths enter that
-  // slot's arrivals inbox, while failures reach its banner or transcript.
+  // slot's arrivals inbox, while failures reach its banner, held for it when off screen.
   //
   // The variables also carry the request's own AbortController. It is
   // registered per slot in the shared composerSendHolds registry, not kept on
@@ -99,7 +106,8 @@ export function useChatPaneUploads({ slotKey, dispatch, slotKeyRef, mountedRef, 
     // hold below) would never run and the slot's Send would stay dead. Running
     // it lets the fetch fail fast and the hold clear through the usual path.
     networkMode: 'always',
-    mutationFn: ({ files, controller }: UploadVars) => api.uploadFiles(files, controller.signal),
+    mutationFn: ({ files, controller }: UploadVars) => api.uploadFiles(files, controller.signal,
+      (loaded, total) => reportComposerUploadProgress(controller, loaded, total)),
     // api.uploadFiles does NOT throw on a server refusal (unsupported type,
     // signature mismatch, over-cap): it resolves with { paths: [], error }.
     // So a refusal lands here in onSuccess, not onError — surface res.error
@@ -133,13 +141,16 @@ export function useChatPaneUploads({ slotKey, dispatch, slotKeyRef, mountedRef, 
   const cancelUpload = useCallback(() => {
     cancelComposerUploads(slotKeyRef.current)
   }, [slotKeyRef])
-  const uploadFiles = useCallback((files: File[]) => {
-    if (!files.length) return
+  // Returns true when a client-side pre-check refused the files and set its own
+  // hint (too many, or one over the cap), so a caller that also wants to show a
+  // hint (a mixed drop carrying a refused folder) does not overwrite it.
+  const uploadFiles = useCallback((files: File[]): boolean => {
+    if (!files.length) return false
     // Clear FIRST, so a refusal from the previous attempt cannot stay on
     // screen and read as the reason this one failed.
     setUploadError('')
     setUploadHint('')
-    if (files.length > 20) { setUploadHint(i18nT('pages.chatPage.too_many_files_max_20')); return }
+    if (files.length > 20) { setUploadHint(i18nT('pages.chatPage.too_many_files_max_20')); return true }
     // Video is deliberately exempt from this pre-check, exactly as in
     // ChatPage: the server's video ceiling is far higher than the per-file
     // cap, so the figure this message states would be a lie for a recording.
@@ -150,7 +161,7 @@ export function useChatPaneUploads({ slotKey, dispatch, slotKeyRef, mountedRef, 
     // against, so the server's own 413 is the only check.
     const maxMb = servedUploadMb(dashCfg?.upload_max_mb)
     const big = maxMb === null ? undefined : files.find((f) => !VIDEO_EXT.test(f.name) && f.size > maxMb * 1024 * 1024)
-    if (big) { setUploadHint(i18nT('pages.chatPage.file_too_large', { name: big.name, max: maxMb })); return }
+    if (big) { setUploadHint(i18nT('pages.chatPage.file_too_large', { name: big.name, max: maxMb })); return true }
     // A failed settings read is reported beside the attempt it affects, not in
     // every pane: the files still go to the server, whose 413 replaces this
     // banner if one is refused. The copy stays true once the upload finishes.
@@ -161,6 +172,9 @@ export function useChatPaneUploads({ slotKey, dispatch, slotKeyRef, mountedRef, 
     holdComposerSend(forSlot)
     registerComposerUpload(forSlot, controller)
     uploadMutation.mutate({ files, forSlot, controller })
+    // The files were sent (a server-side refusal surfaces through the mutation,
+    // not a local pre-check hint), so no local-refusal hint was set.
+    return false
   }, [uploadMutation, setUploadError, setUploadHint, dashCfg, dashCfgError, slotKeyRef])
 
   // Classify BEFORE acting (issue #743): a dropped folder inserts its path
@@ -172,10 +186,28 @@ export function useChatPaneUploads({ slotKey, dispatch, slotKeyRef, mountedRef, 
   // browser no real path is visible, so classifyDrop leaves folders on the
   // upload route there (today's behaviour).
   const handleDrop = useCallback((dataTransfer: DataTransfer) => {
-    const { files, dirPaths } = classifyDrop(dataTransfer)
+    const { files, dirPaths, refusedDirs } = classifyDrop(dataTransfer)
     if (dirPaths.length) setInput((prev) => spliceDirTokens(prev, null, dirPaths).value)
-    if (files.length) uploadFiles(files)
-  }, [uploadFiles, setInput])
+    // uploadFiles clears the hint synchronously and returns whether it refused
+    // the files locally (too many, or one over the cap).
+    const refusedLocally = files.length ? uploadFiles(files) : false
+    // A folder whose resolved path can't be written as a composer folder token
+    // (a space or `@`, or a filesystem root) is refused — nothing is uploaded
+    // or inserted. Show it through the upload HINT (the same validation-refusal
+    // surface the too-many-files / file-too-large pre-checks use — nothing was
+    // sent), not the danger error banner. Set it AFTER uploadFiles' synchronous
+    // clear, and only when uploadFiles did NOT itself set a refusal hint: when
+    // the files were refused too, their hint is the one the user must see
+    // (#30416).
+    if (refusedDirs.length && !refusedLocally) {
+      // A refused-folder-only drop skips uploadFiles, so clear any stale upload-
+      // error banner from a previous failed upload here (uploadFiles is what
+      // clears it otherwise). A mixed drop already cleared it synchronously in
+      // uploadFiles, so this does not wipe a failure from this drop.
+      if (!files.length) setUploadError('')
+      setUploadHint(i18nT('components.chatInput.tree_drop_folder_refused'))
+    }
+  }, [uploadFiles, setInput, setUploadError, setUploadHint])
   const { active: dragOver, dropTargetProps } = useChatFileDrop(handleDrop)
 
   return {

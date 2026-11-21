@@ -79,28 +79,37 @@ _sys.modules[__name__].__class__ = _facade_mirror.MirroredModule
 __all__ = sorted(n for n in set(globals()) | set(_EXPORTS) if not n.startswith("_"))
 if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and IDEs
     from kiro_crew.dashboard.handlers.work_ledger_caller import (  # noqa: F401
-        _caller_admission,
+        _CODE_CHANNEL_CALLER,
         _caller_key,
+        _code_channel_caller,
         _contained_channel_caller,
         _own_ledger,
         _reaches_a_channel,
         _worker_binding,
-        caller_admission,
+        caller_admission_with_route,
         contained_channel_caller,
         reaches_a_channel,
+        session_is_bound_worker,
     )
     from kiro_crew.dashboard.handlers.work_ledger_conductor import (  # noqa: F401
         DISPATCH_FIELD,
         RECORD_ACTIONS,
         _bootstrap,
+        _close_remote_item,
         _close_warning,
         _count_crew_mode_run,
         _count_recorded,
         _ensure,
+        _forward_remote_decide,
+        _is_code_channel_worker,
+        _record_conductor_retire,
         _record_conductor_write,
+        _refuse_code_channel_worker,
         _refuse_dispatch_without_ledger,
         _refuse_dispatched_worker,
         _refuse_unowned_worker,
+        _set_pair_field,
+        _widest_retired_bindings,
         _worker_slot,
         _write,
         api_work_ledger_rebuild,
@@ -119,19 +128,30 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         stamp_send_handback,
     )
     from kiro_crew.dashboard.handlers.work_ledger_read import (  # noqa: F401
+        _CHANNEL_ANSWER_FIELDS,
         _COMPACT_ROW_FIELDS,
         _MAX_EVENT_TAIL,
+        _PUBLISHED_NOTE,
         _QUERY_FALSE,
         _QUERY_TRUE,
+        _UNPLACED_WHY,
+        _bar_is_placed,
         _find_slot,
         _passes_filters,
+        _published_payload,
         _read_options,
+        _remote_dispatch_on,
+        _remote_row_fields,
         _row_with_flags,
         _slot_closed,
+        _slot_loop_held,
         _slot_looping,
         _slot_open,
+        _slot_pending,
         _slot_running,
+        _slot_turn_running,
         _tail_events,
+        api_work_ledger_accept_eval,
         api_work_ledger_get,
         worker_holds_open_item,
     )
@@ -179,16 +199,23 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     from kiro_crew.dashboard.handlers.work_ledger_worker import (  # noqa: F401
         _CODE_DONE_WITHOUT_EVIDENCE,
         _WORKER_REPORT_FIELDS,
+        APPROVAL_ANSWERED_TEXT,
         STEER_CREW_LOG_OFF,
         STEER_ITEM_CLOSED,
         STEER_ITEM_TOO_LARGE,
         STEER_NO_ITEM,
         STEER_NO_UNIT,
         STEER_NOT_RECORDED,
+        STEER_NOT_WAITING,
+        _approval_ask_of,
+        _last_report_id,
         _report,
         _steer_unit,
+        _waits_on_approval,
         api_work_brief,
         api_work_report,
+        note_approval_answered,
+        record_approval_answered,
         record_person_steer_result,
     )
 if TYPE_CHECKING:  # names it serves from outside the family, from their homes
@@ -212,6 +239,7 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     )
     from kiro_crew.dashboard import (  # noqa: F401
         session_control,
+        trace_binding,
     )
     from kiro_crew.dashboard.handlers._shared import (  # noqa: F401
         _is_restricted_session,
@@ -221,6 +249,11 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     )
     from kiro_crew.dashboard.handlers.office_slides import (  # noqa: F401
         _KeyedLocks,
+    )
+    from kiro_crew.dashboard.session_activity import (  # noqa: F401
+        session_activity_for_key,
+        session_known_execution_active,
+        session_work_pending,
     )
     from kiro_crew.dashboard.state import (  # noqa: F401
         DashboardState,
@@ -232,12 +265,14 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
         is_channel_session_key,
     )
     from kiro_crew.metrics import work as work_metrics  # noqa: F401
+    from kiro_crew.tracing import work as trace_work  # noqa: F401
     from kiro_crew.validation import (  # noqa: F401
         WORK_LEDGER_READ_SCHEMA,
         WORK_LEDGER_RECORD_SCHEMA,
         WORK_REPORT_REMOTE_DISPATCH_SCHEMA,
         WORK_REPORT_SCHEMA,
         ValidationError,
+        sanitize_string,
         validate_tool_args,
     )
     from kiro_crew.work_ledger import (  # noqa: F401
@@ -245,5 +280,8 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     )
     from kiro_crew.work_vocab import (  # noqa: F401
         WORK_CONDUCTOR_FIELDS,
+        WORK_MAX_ARTIFACT_VALUE_CHARS,
         WORK_MAX_DEPTH_MAX,
+        WORK_MAX_DEPTH_MIN,
+        WORK_MAX_RETIRE_REASON_CHARS,
     )

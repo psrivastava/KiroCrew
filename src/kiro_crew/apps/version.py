@@ -27,6 +27,14 @@ def parse_version(v: str) -> tuple[int, ...]:
     return tuple(parts + [0] * (3 - len(parts)))
 
 
+def known_version(v: str) -> str:
+    """*v*, or "" when it names no build: an all-zero release such as ``0``."""
+    try:
+        return "" if parse_version(v) == (0, 0, 0) else v
+    except ValueError:
+        return v
+
+
 def versions_compatible(local: str, peer: str) -> bool:
     """Whether two crews can exchange remote-session frames.
 
@@ -41,21 +49,33 @@ def versions_compatible(local: str, peer: str) -> bool:
         return peer == local
 
 
+#: The ``code`` the install route's refusal carries when the app's
+#: ``minKiroCrewVersion`` is newer than the Kiro Crew that checked it.
+MIN_VERSION_REFUSAL_CODE = "kirocrew_version_too_old"
+
+
 def check_min_version(min_version: str) -> str | None:
     """Return an error string if the current KiroCrew version is too old.
 
-    Returns ``None`` if the version is sufficient or if parsing fails.
+    Returns ``None`` if the version is sufficient or if parsing fails. A bare
+    number (``"minKiroCrewVersion": 2``) is read as its string, the way
+    ``AppManifest.from_dict`` reads it, so the install preflight and the install
+    itself agree; any other non-string value is no minimum.
     """
-    if not min_version:
+    if isinstance(min_version, (int, float)) and not isinstance(min_version, bool):
+        min_version = str(min_version)
+    if not min_version or not isinstance(min_version, str):
         return None
     try:
         from kiro_crew import __version__ as current
 
         if parse_version(current) < parse_version(min_version):
+            # "this Kiro Crew": on a forwarded install it is the serving gateway,
+            # which can be older than the CLI until it restarts.
             return (
                 f"App requires Kiro Crew >= {min_version}, "
-                f"but current version is {current}. "
-                f"Please update Kiro Crew first."
+                f"but this Kiro Crew is version {current}. "
+                f"Update Kiro Crew, then restart its gateway."
             )
     except (ValueError, AttributeError, ImportError):
         pass

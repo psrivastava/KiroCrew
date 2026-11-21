@@ -18,6 +18,8 @@ import { AppApiProvider, type AppUpdate } from '../app-sdk'
 import { Btn, PageHeader } from './ui'
 import AppLoadingFallback from './AppLoadingFallback'
 import { importAppBundle } from './appBundleImport'
+import { appBundleReplacedSinceImport, noteAppBundleImport } from './appBundleFreshness'
+import { refusedDeclaredOrigin } from './appFrameSources'
 import ErrorNotice from './ErrorNotice'
 import { errMessage } from '../utils/thunkError'
 
@@ -32,11 +34,17 @@ import { useAppSlotPush } from '../utils/appSlotPush'
 export interface AppHostProps {
   /** Installed app metadata (from /api/apps). */
   app: {
+    /** Declared `ui.frameSources` origins the owner approved, and those an update or edit holds back. */
+    frameSourcesGrant?: { approved: string[]; staged: string[] }
+    /** `permissions.browser` verbs the owner approved; published to the page as `info.permissions.browser`. */
+    browserGrant?: { approved: string[] }
     name: string
     version?: string
     displayName?: string
     enabled?: boolean
     origin?: string
+    /** Set when the gateway skipped this built-in at boot; its routes were never registered. */
+    unavailable?: { reason: string }
     /** Cached update state, carried by both `GET /api/apps` and
      *  `GET /api/apps/{name}` so a routed page and a side-panel tab publish the
      *  same answer. Absent whenever no cache has seen this app, so the SDK
@@ -54,11 +62,15 @@ export interface AppHostProps {
          *  Typed `unknown` on purpose: it is read straight from `app.json` and
          *  `AppLoadingFallback` validates it against a closed set. */
         loading?: unknown
+        /** Exact https origins the app's pages frame (validated by the gateway). */
+        frameSources?: string[]
       }
       permissions?: {
         api?: string[]
         events?: string[]
       }
+      /** The app's own listing copy per locale, read by the title helpers. */
+      l10n?: unknown
     }
   }
   /** Bundle to mount, overriding `manifest.ui.entry`. Resolved against the app's
@@ -80,13 +92,22 @@ export interface AppHostProps {
   /** The name the route asked for, shown when `app` is absent. The not-found
    *  title is "<name> isn't installed", so it needs the requested name. */
   requestedName?: string
+  /** For a surface with no room for the inline fallbacks (a desktop window the
+   *  shell hosts): a bundle that fails to load, or an app that throws, renders
+   *  nothing and is reported here instead, and the load placeholder is empty. */
+  onFailure?: (error: unknown) => void
 }
 
 // ---------------------------------------------------------------------------
 // Error boundary (class component — React requirement)
 // ---------------------------------------------------------------------------
 
-interface EBProps { appName: string; onReset: () => void; children: React.ReactNode }
+interface EBProps {
+  appName: string
+  onReset: () => void
+  onFailure?: (error: unknown) => void
+  children: React.ReactNode
+}
 interface EBState { error: Error | null }
 
 class AppErrorBoundary extends React.Component<EBProps, EBState> {
@@ -99,9 +120,11 @@ class AppErrorBoundary extends React.Component<EBProps, EBState> {
   componentDidCatch(error: Error, info: React.ErrorInfo) {
     // eslint-disable-next-line no-console -- surface app crashes for debugging
     console.error(`[AppHost] ${this.props.appName} crashed:`, error, info.componentStack)
+    this.props.onFailure?.(error)
   }
 
   render() {
+    if (this.state.error && this.props.onFailure) return null
     if (this.state.error) {
       return (
         <AppCrashFallback
@@ -192,13 +215,33 @@ function AppDisabled({ app }: { app: AppHostProps['app'] }) {
   )
 }
 
+function AppUnavailable({ app }: { app: AppHostProps['app'] & { unavailable: { reason: string } } }) {
+  const navigate = useNavigate()
+  return (
+    <>
+      <PageHeader title={appDisplayName(app)} />
+      <div className="flex-1 flex items-center justify-center p-8">
+        <div className="max-w-md grid gap-4 justify-items-center">
+          {/* A caught import error, so it renders through ErrorNotice; leaving this
+              page loses nothing, so the agent hand-off is on. */}
+          <ErrorNotice
+            message={i18nT('pages.appDetailPage.unavailable_notice', { reason: app.unavailable.reason })}
+            askAgent
+          />
+          <Btn onClick={() => navigate('/apps')}><ArrowLeft size={14} /> {i18nT('components.appHost.apps')}</Btn>
+        </div>
+      </div>
+    </>
+  )
+}
+
 function AppNoUI({ app }: { app: AppHostProps['app'] }) {
   const navigate = useNavigate()
   return (
     <>
       <PageHeader
         title={appDisplayName(app)}
-        subtitle={appDescription({ name: app.name, description: app.manifest?.description, origin: app.origin })}
+        subtitle={appDescription({ name: app.name, description: app.manifest?.description, origin: app.origin, l10n: app.manifest?.l10n })}
       />
       <div className="flex-1 flex items-center justify-center p-8">
         <div className="text-center max-w-md">
@@ -214,22 +257,35 @@ function AppNoUI({ app }: { app: AppHostProps['app'] }) {
   )
 }
 
+/** Shown in place of an app whose bundle the gateway replaced after this page imported it. */
+function ReplacedBundleNotice() {
+  return (
+    <div className="flex-1 flex items-center justify-center p-8" data-testid="app-host-replaced-bundle">
+      <div className="text-center max-w-md">
+        <p className="text-sm text-muted mb-4">{i18nT('components.appHost.app_updated_reload_to_open')}</p>
+        <Btn onClick={() => window.location.reload()}><RefreshCw size={14} /> {i18nT('components.appHost.reload_page')}</Btn>
+      </div>
+    </div>
+  )
+}
+
 // ---------------------------------------------------------------------------
 // AppHost
 // ---------------------------------------------------------------------------
 
-function AppHostInner({ app, entry: entryOverride, active = true, sessionKey }: AppHostProps) {
+function AppHostInner({ app, entry: entryOverride, active = true, sessionKey, onFailure }: AppHostProps) {
   const navigate = useNavigate()
   const [resetKey, setResetKey] = useState(0)
 
-  // App dev-mode live reload: the gateway broadcasts app_reload when a
-  // dev-flagged app's ui/ files change (useWebSocket re-dispatches it as a
-  // window CustomEvent). We do a FULL PAGE RELOAD rather than only bumping the
-  // entry-module import URL: cache-busting just the entry leaves its statically
-  // imported dependency chunks pinned to their original URLs, and the browser's
-  // ESM module map is keyed by URL — so edits confined to a chunk would stay
-  // stale. A page reload re-fetches every module (the app's assets are served
-  // no-store in dev mode), guaranteeing the latest bytes across the whole graph.
+  // Live reload: the gateway broadcasts app_reload when an app's files are
+  // replaced (an install, update or Sync, or a dev-flagged app's ui/ edit), and
+  // useWebSocket re-dispatches it as a window CustomEvent. We do a FULL PAGE
+  // RELOAD rather than only bumping the entry-module import URL: cache-busting
+  // just the entry leaves its statically imported dependency chunks pinned to
+  // their original URLs, and the browser's ESM module map is keyed by URL, so
+  // edits confined to a chunk would stay stale. A page reload re-fetches every
+  // module (the app's assets are revalidated on each load, and served no-store
+  // in dev mode), guaranteeing the latest bytes across the whole graph.
   useEffect(() => {
     const handler = (e: Event) => {
       const detail = (e as CustomEvent).detail as { app?: string } | undefined
@@ -239,18 +295,57 @@ function AppHostInner({ app, entry: entryOverride, active = true, sessionKey }: 
     return () => window.removeEventListener('mc:app-reload', handler)
   }, [app.name])
 
+  // The document's CSP is fixed at load. A declared frame origin the gateway
+  // admitted later (the app was enabled, trusted or approved since) is refused here
+  // until a reload, so a refusal of an approved one asks the owner to refresh the
+  // page; one still waiting for approval points to the details page instead, since a
+  // reload would be refused again. Neither acts by itself: the page may hold input
+  // the owner has not saved.
+  const frameSourcesKey = (app.manifest?.ui?.frameSources || []).join(' ')
+  const [blockedFrameOrigin, setBlockedFrameOrigin] = useState('')
+  const blockedFrameNeedsApproval = !!blockedFrameOrigin && !!app.frameSourcesGrant?.staged.includes(blockedFrameOrigin)
+  useEffect(() => {
+    if (!frameSourcesKey) return
+    const declared = frameSourcesKey.split(' ')
+    const onViolation = (e: SecurityPolicyViolationEvent) => {
+      const origin = refusedDeclaredOrigin(e, declared)
+      if (origin) setBlockedFrameOrigin(origin)
+    }
+    document.addEventListener('securitypolicyviolation', onViolation)
+    return () => document.removeEventListener('securitypolicyviolation', onViolation)
+  }, [frameSourcesKey])
+
   const entry = entryOverride || app.manifest?.ui?.entry
   const permissions = app.manifest?.permissions || {}
   const allowedApi = permissions.api || []
   const allowedEvents = permissions.events || []
   const bundlePath = withBase(`/apps/${app.name}/ui/${entry}`)
 
+  // This document imported the app's bundle and the gateway has since replaced
+  // its files while no host showed it. Importing again would return the module
+  // already loaded, so this mount reloads the window, as the handler above does.
+  // Read once per bundle this host loads, never per render: a host already
+  // showing the app keeps showing it when an unsaved-changes prompt cancels the
+  // handler's reload.
+  const bundleReplaced = useMemo(
+    () => appBundleReplacedSinceImport(app.name),
+    [bundlePath, resetKey] // eslint-disable-line react-hooks/exhaustive-deps
+  )
+  useEffect(() => {
+    if (bundleReplaced) window.location.reload()
+  }, [bundleReplaced])
+
   // Dynamically import the app bundle. Keyed on resetKey so retry works.
   const LazyApp = useMemo(
-    () => lazy(() =>
-      importAppBundle(bundlePath).catch(err => {
+    () => lazy(() => {
+      noteAppBundleImport(app.name)
+      return importAppBundle(bundlePath).catch(err => {
         // eslint-disable-next-line no-console -- surface bundle load failures for debugging
         console.error(`[AppHost] Failed to load ${app.name} from ${bundlePath}:`, err)
+        if (onFailure) {
+          onFailure(err)
+          return { default: () => null }
+        }
         // Return a module with a default export that shows the error
         return {
           default: () => (
@@ -271,7 +366,7 @@ function AppHostInner({ app, entry: entryOverride, active = true, sessionKey }: 
           ),
         }
       })
-    ),
+    }),
     [bundlePath, resetKey] // eslint-disable-line react-hooks/exhaustive-deps
   )
 
@@ -298,7 +393,7 @@ function AppHostInner({ app, entry: entryOverride, active = true, sessionKey }: 
   }, [])
 
   return (
-    <AppErrorBoundary appName={app.name} onReset={() => setResetKey(k => k + 1)}>
+    <AppErrorBoundary appName={app.name} onReset={() => setResetKey(k => k + 1)} onFailure={onFailure}>
       <AppApiProvider
         appName={app.name}
         appDisplayName={appDisplayName(app)}
@@ -312,6 +407,8 @@ function AppHostInner({ app, entry: entryOverride, active = true, sessionKey }: 
         origin={app.origin === 'builtin' ? 'builtin' : 'external'}
         allowedApiPaths={allowedApi}
         allowedEvents={allowedEvents}
+        approvedBrowserVerbs={app.browserGrant?.approved}
+        appEnabled={app.enabled}
         active={active}
         subscribeFn={subscribeFn}
         navigateFn={navigateFn}
@@ -319,27 +416,46 @@ function AppHostInner({ app, entry: entryOverride, active = true, sessionKey }: 
         sessionKey={sessionKey}
         slotPush={slotPush}
       >
+        {/* No agent hand-off: it navigates away and unmounts the app, whose own
+            page may hold input it has not saved. The fix is a refresh the owner starts. */}
+        <ErrorNotice
+          impact="partial"
+          testId="app-host-frame-blocked"
+          className="m-3"
+          message={!blockedFrameOrigin ? '' : blockedFrameNeedsApproval
+            ? i18nT('components.appHost.frame_needs_approval', { origin: blockedFrameOrigin })
+            : i18nT('components.appHost.frame_blocked_refresh', { origin: blockedFrameOrigin })}
+          onDismiss={() => setBlockedFrameOrigin('')}
+          footer={blockedFrameNeedsApproval
+            ? <Btn onClick={() => navigate(`/apps/detail/${encodeURIComponent(app.name)}`)}>{i18nT('components.appHost.open_app_details')}</Btn>
+            : <Btn onClick={() => window.location.reload()}><RefreshCw size={14} /> {i18nT('components.appHost.reload_page')}</Btn>}
+        />
         {/* Delayed and shaped: nothing for the first 300 ms, then the layout the
             manifest declares in `ui.loading` (default "page"). See AppLoadingFallback. */}
         {/* `ui.loading` describes the app's routed page. A side-panel tab mounts
             its own bundle (`entry` override) in a narrow panel, so it keeps the
             default shape rather than borrowing the page's rail or split. */}
-        <Suspense fallback={<AppLoadingFallback appName={appDisplayName(app)} loading={entryOverride ? undefined : app.manifest?.ui?.loading} />}>
-          <LazyApp />
+        <Suspense fallback={onFailure ? null : <AppLoadingFallback appName={appDisplayName(app)} loading={entryOverride ? undefined : app.manifest?.ui?.loading} />}>
+          {/* A replaced bundle is never imported again. The notice shows while the
+              window reloads, and stays with a way to retry when a page's
+              unsaved-changes prompt cancels that reload. */}
+          {bundleReplaced ? <ReplacedBundleNotice /> : <LazyApp />}
         </Suspense>
       </AppApiProvider>
     </AppErrorBoundary>
   )
 }
 
-export default function AppHost({ app, entry, active, sessionKey, requestedName }: AppHostProps) {
+export default function AppHost({ app, entry, active, sessionKey, requestedName, onFailure }: AppHostProps) {
   // Guard: not installed
   if (!app) return <AppNotFound name={requestedName || 'unknown'} />
   // Guard: disabled
   if (app.enabled === false) return <AppDisabled app={app} />
+  // Guard: skipped at boot. Its bundle may load, but every route behind it is missing.
+  if (app.unavailable) return <AppUnavailable app={{ ...app, unavailable: app.unavailable }} />
   // Guard: no UI bundle. An explicit `entry` (a panel-tab body) is its own
   // bundle, so it does not require the app to also declare a routed `ui.entry`.
   if (!entry && !app.manifest?.ui?.entry) return <AppNoUI app={app} />
 
-  return <AppHostInner app={app} entry={entry} active={active} sessionKey={sessionKey} />
+  return <AppHostInner app={app} entry={entry} active={active} sessionKey={sessionKey} onFailure={onFailure} />
 }

@@ -86,6 +86,8 @@ import { FACE_FLIGHT_EASE, FACE_FLIGHT_SECS, MembersPageProfileCard, useMembersP
 import { MembersPageRosterColumn, useMembersPageRosterView } from './MembersPageRoster'
 import { MembersPageSidePanel, useMembersPageSidePanel } from './MembersPageSidePanel'
 import { MembersPageThreadColumn, useMembersPageThread, useMembersPageThreadView } from './MembersPageThread'
+import { wantsMateSessions } from '../../lib/crewMode'
+import { useViewerIsNotOwner } from '../../hooks/sharedCrew/useSharedCrew'
 import { MEMBER_PARAM, ROSTER_DRAWER_UNCOVERED_PX, type GoneNotice, type PostCreateFailure, type ProfileCardOpen } from './membersPageModel'
 import { useMembersPageCrewEditor } from './useMembersPageCrewEditor'
 import { useMembersPageDrawers, useMembersPageDrawerSwipes, useMembersPageTrackpadSwipe } from './useMembersPageDrawers'
@@ -419,6 +421,12 @@ export default function MembersPage() {
   // in flight NOW, not the one of the render that armed the callback.
   const followUpRef = useRef(followUp)
   followUpRef.current = followUp
+  // A team Crew teammate creates Bots as they start sessions, but Import from
+  // file stays the owner's (the server refuses anyone else): its change card
+  // writes rules, skills and schedules. A failed owner check holds it too (the
+  // roster says why), rather than offering a door the server may refuse.
+  const ownerCheck = useViewerIsNotOwner()
+  const importHeld = ownerCheck.notOwner || !!ownerCheck.error
   // The one reason every create door (header "+", both heroes) is held, or
   // `null` when creating is open. The failed-step record wins the wording:
   // it is the one with a retry the user can act on.
@@ -474,9 +482,20 @@ export default function MembersPage() {
     [activeName, threadOutcome],
   )
   const layout = useMembersPageLayout({ rosterRead, teamsRead, activeName })
-  const { isMobile, winW, rosterShown } = layout
+  const { isMobile, winW, rosterShown, panelVisible, showOpener } = layout
   const profileCard = useMembersPageProfile({ layout, activeName, profile, setProfile })
   const { schedGuardRef, schedAtStakeRef, openMemberRef } = profileCard
+  // A mate session's breadcrumb asks for the named crewmate's Profile on
+  // Sessions. Declared after the card's own reset-on-switch effect, so it opens
+  // once that member is active; the state is then cleared so a reload does not
+  // reopen it.
+  const openMateSessions = wantsMateSessions(location.state)
+  const { openProfile } = profileCard
+  useEffect(() => {
+    if (!openMateSessions || !urlMember || activeName !== urlMember) return
+    openProfile('sessions')
+    navigate({ pathname: location.pathname, search: location.search }, { replace: true, state: null })
+  }, [openMateSessions, urlMember, activeName, openProfile, navigate, location.pathname, location.search])
   const drawers = useMembersPageDrawers({
     teamsRead, layout, navigate, location, activeName, createOpen, navigationType, active,
   })
@@ -523,6 +542,11 @@ export default function MembersPage() {
   // The profile card (opened from the header pill) holds the Permissions row a
   // "crewmate tools" guide points at (`members.permissions`).
   useGuideRevealScope('members.profile', !!profile)
+  // The side panel (drawn only with a crewmate open), whose first tab is the
+  // Dashboard (`members.dashboard-tab`), and whether its header opener
+  // (`members.details`) is drawn.
+  useGuideRevealScope('members.panel', !!active && panelVisible)
+  useGuidePredicate('crewmate_panel_not_docked', showOpener)
   const rosterView = useMembersPageRosterView({
     rosterRead, teamsRead, t, queryClient, activeName, slotKeyOf, liveSlots, active,
   })
@@ -535,15 +559,15 @@ export default function MembersPage() {
     layout, profileCard, drawers, rosterView, thread, navigate, location, queryClient, activeName, searchParams,
     setSearchParams, profile, setProfile, liveSlots, slotsLoaded, active, activeMemberName,
   })
-  const { schedAtStake, schedulesMountedRef, runInTerminalScope } = sidePanel
+  const { runInTerminalScope } = sidePanel
   // Desktop: a two-finger trackpad swipe moves the same side panel the phone
   // drag above does -- left reveals the Dashboard tab, right hides the panel.
   useMembersPageTrackpadSwipe({ layout, profileCard, sidePanel, drawers, active, createOpen, membersRootRef })
   const schedules = useMembersPageSchedules({
-    crewEditing, layout, rosterView, sidePanel, t, profile, activeSlug, activeMemberName,
+    crewEditing, layout, rosterView, t, profile, activeSlug, activeMemberName,
   })
   const {
-    schedDraftDirty, schedSaving, confirmSched, schedConfirmDialog, releaseSchedRetention, mayLeaveSchedules,
+    schedAtStake, schedulesMountedRef, schedDraftDirty, schedSaving, confirmSched, schedConfirmDialog, releaseSchedRetention, mayLeaveSchedules,
   } = schedules
   // ONE guard for exits that unmount Profile. The ref is what lets callbacks declared
   // in the owners (the header's panel reveal in MembersPageProfile.tsx, a roster
@@ -828,7 +852,7 @@ export default function MembersPage() {
         navigation={navigation} teamView={teamView} activeName={activeName}
         scrollActiveRowIntoView={scrollActiveRowIntoView} gone={gone} createOpen={createOpen}
         openAdvanced={openAdvanced} openQuick={openQuick} postCreateError={postCreateError}
-        createHeld={createHeld} slotKeyOf={slotKeyOf}
+        createHeld={createHeld} importHeld={importHeld} ownerCheckFailed={!!ownerCheck.error} slotKeyOf={slotKeyOf}
         faceOnStageFor={thread.entranceFaceHidden && active ? active.name : ''}
       />)}
 
@@ -842,7 +866,7 @@ export default function MembersPage() {
         editingCrew={editingCrew} profile={profile} gone={gone} openCreate={openCreate}
         openAdvanced={openAdvanced} openQuick={openQuick} threadColumnRef={threadColumnRef}
         postCreateError={postCreateError} setPostCreateError={setPostCreateError}
-        postCreateDismissable={postCreateDismissable} createHeld={createHeld} threadOutcome={threadOutcome}
+        postCreateDismissable={postCreateDismissable} createHeld={createHeld} importHeld={importHeld} ownerCheckFailed={!!ownerCheck.error} threadOutcome={threadOutcome}
         slotsLoaded={slotsLoaded} active={active} leftCreateFailure={leftCreateFailure}
         setLeftCreateFailure={setLeftCreateFailure} retryPostCreate={retryPostCreate}
       />

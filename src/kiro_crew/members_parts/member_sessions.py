@@ -42,12 +42,7 @@ def is_member_session_key(session_key: str | None) -> bool:
     """
     if not session_key:
         return False
-    key = session_key
-    for prefix in ("dashboard_", "dashboard:"):
-        if key.startswith(prefix):
-            key = key[len(prefix) :]
-            break
-    return key.startswith(DM_SLOT_KEY_PREFIX)
+    return _slot_part(session_key).startswith(DM_SLOT_KEY_PREFIX)
 
 
 def _slot_part(session_key: str) -> str:
@@ -89,8 +84,8 @@ def crewmate_worker_prompt_in_context(session_key: str | None) -> bool:
 
 #: The crewmate (its immutable ``member_id``) each known worker slot belongs to,
 #: written with :data:`_CREWMATE_WORKER_SLOTS` from the same execution record. It
-#: names whose harness pin the worker runs on (``crewmate_harness``); the set above
-#: stays the one answer to "is this a worker".
+#: names whose harness pin the worker runs on (``crewmate_harness``);
+#: :data:`_CREWMATE_WORKER_SLOTS` stays the one answer to "is this a worker".
 _CREWMATE_WORKER_MEMBERS: dict[str, str] = {}
 
 
@@ -102,6 +97,37 @@ def note_crewmate_worker_session(session_key: str, member_id: str = "") -> None:
             _CREWMATE_WORKER_MEMBERS[_slot_part(session_key)] = member_id
         else:
             _CREWMATE_WORKER_MEMBERS.pop(_slot_part(session_key), None)
+
+
+#: The harness a dashboard session was created on (``session_create(backend=...)``),
+#: by slot key, in the stored spelling (``"kiro"``, ``"claude"``, ...). Written
+#: when the slot is born or restored with a pick (``note_session_backend_pick``),
+#: so a reader holding only a session key passes the pick to the selection gate
+#: as ``backend_override`` without a file read on the event loop.
+_SESSION_BACKEND_PICKS: dict[str, str] = {}
+
+
+def note_session_backend_pick(session_key: str, stored: str) -> None:
+    """Record *stored* as the harness *session_key* runs on; ``""`` clears it."""
+    if not session_key:
+        return
+    if stored:
+        _SESSION_BACKEND_PICKS[_slot_part(session_key)] = stored
+    else:
+        _SESSION_BACKEND_PICKS.pop(_slot_part(session_key), None)
+
+
+def session_backend_pick(session_key: str | None) -> str | None:
+    """The runtime backend id *session_key* was created on, or ``None`` when no pick.
+
+    What every per-session reader of :func:`select_provider_backend` passes as
+    ``backend_override``. ``""`` is Kiro CLI's id, not "no pick".
+    """
+    from kiro_crew.agent_sdk.backends import backend_from_stored
+
+    stored = _SESSION_BACKEND_PICKS.get(_slot_part(session_key)) if session_key else None
+    backend = backend_from_stored(stored)
+    return backend if isinstance(backend, str) else None
 
 
 def forget_crewmate_worker_session(session_key: str) -> None:
@@ -142,8 +168,10 @@ def select_provider_backend(
 ) -> str:
     """The per-session half of the ONE backend-selection gate (H3/H13).
 
-    Precedence: the caller's explicit backend (``backend_override``, a
-    sub-agent spawned with ``spawn_run(backend=...)``), then the crewmate's own
+    Precedence: the caller's explicit backend (``backend_override``: a
+    sub-agent spawned with ``spawn_run(backend=...)``, or a dashboard session
+    created with ``session_create(backend=...)``, read through
+    :func:`session_backend_pick`), then the crewmate's own
     harness pin (``crew_backend``, from ``crewmate_harness.crewmate_backend_pin``
     for this session), then the member-DM auto-route, then the configured
     default. Every caller passes ``crew_backend`` explicitly, ``None`` included,
@@ -187,8 +215,28 @@ def select_provider_backend(
         return backend
     if crew_backend is not None:
         backend = crew_backend.backend
+        if crew_backend.harness_fallback:
+            logger.info(
+                "Crew bot session %s: routing to acp_backend=%r (agents.%s.acp_backend=%r "
+                "is a harness bots cannot run on)",
+                session_key,
+                backend,
+                crew_backend.crew,
+                crew_backend.stored,
+            )
+            return backend
+        if crew_backend.worker_spec_fallback:
+            logger.info(
+                "Crew bot session %s: routing to acp_backend=%r (%s's worker spec is one "
+                "agent.member_acp_backend=%r cannot carry)",
+                session_key,
+                backend,
+                crew_backend.crew,
+                member_backend,
+            )
+            return backend
         logger.info(
-            "crewmate session %s: routing to acp_backend=%r (agents.%s.acp_backend=%r)",
+            "Bot session %s: routing to acp_backend=%r (agents.%s.acp_backend=%r)",
             session_key,
             backend,
             crew_backend.crew,
@@ -264,13 +312,11 @@ def member_dispatch_session_server(
 
 
 #: MCP server mounted per session into member DM threads so a crew can publish
-#: its own webview (``panel_publish``) and discover what renders it
-#: (``panel_templates``). A SECOND session-level mount beside
-#: :data:`MEMBER_DISPATCH_SERVER` rather than a widening of it, because
-#: assignment in Kiro Crew is per server: the dashboard set is folder
-#: organization plus session control, publishing a document is neither, and the
-#: two are withdrawn independently (``agent.member_dispatch``,
-#: ``agent.crew_panel``).
+#: its own webview (``panel_publish``) and list what renders it
+#: (``panel_templates``). A separate mount, not part of
+#: :data:`MEMBER_DISPATCH_SERVER`: tools are assigned per server, publishing is
+#: neither folder organization nor session control, and each is switched off on
+#: its own (``agent.member_dispatch``, ``agent.crew_panel``).
 MEMBER_PANEL_SERVER = "kirocrew-panel"
 
 
@@ -376,10 +422,8 @@ def _member_session_element(
     if session_token:
         env.append({"name": STUB_SESSION_TOKEN_ENV, "value": session_token})
     env.append({"name": "KIROCREW_SESSION_KEY", "value": session_key})
-    # resolve_serving_port() reads KIROCREW_BOUND_PORT first and only then falls
-    # through the client order, so one call covers both "the gateway exported the
-    # port it bound" and "derive it" — and a malformed export is ignored rather
-    # than forwarded.
+    # resolve_serving_port() prefers an exported KIROCREW_BOUND_PORT and ignores
+    # a malformed one, so the child never gets a bad port forwarded.
     env.append({"name": "KIROCREW_BOUND_PORT", "value": str(resolve_serving_port())})
     return {
         "name": server_name,
@@ -549,13 +593,11 @@ def member_turn_context(member: str, lifecycle: MemberLifecycle) -> MemberTurnCo
     An empty *member* means the turn has no member layer at all: nothing is
     delivered and nothing is gated, whatever the lifecycle.
     """
-    # Deny by default. Both verdict predicates are identity/membership tests
-    # that answer False for anything that is not a genuine enum member — and
-    # the str mixin makes a bare "warm" compare EQUAL to the member while
-    # failing both — so an unrecognized lifecycle would otherwise yield the
-    # one combination the invariant forbids (no delivery, no gate) silently,
-    # at the single decision point the invariant rests on. Refuse loudly
-    # instead.
+    # Deny by default. Both verdict checks are identity/membership tests that
+    # are False for anything but a real enum member, and the str mixin makes a
+    # bare "warm" compare EQUAL while failing both. So an unknown lifecycle
+    # would silently get the forbidden combination (no delivery, no gate).
+    # Raise instead.
     if not isinstance(lifecycle, MemberLifecycle):
         raise TypeError(f"lifecycle must be MemberLifecycle, got {lifecycle!r}")
     if not member:

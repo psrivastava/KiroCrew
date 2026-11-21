@@ -9,14 +9,17 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+from redaction_structured_cases import github_classic
+
 import kiro_crew
 from kiro_crew.messaging.display_safety import joins_to_a_credential
 from kiro_crew.messaging.renderer import _default_redactor
 
-#: AWS's own documented example key, the same fixture the display-safety tests
-#: use, so no real credential shape is introduced anywhere.
-KEY = "AKIAIOSFODNN7EXAMPLE"
-HEAD, TAIL = KEY[:10], KEY[10:]
+#: A synthetic GitHub classic token (valid checksum, 40 characters), built at run
+#: time. An AWS key ID is kept visible once the structured detectors run, so it
+#: cannot stand for the credential here; neither half passes the checksum alone.
+KEY = github_classic(seed=11)
+HEAD, TAIL = KEY[:20], KEY[20:]
 
 SRC = Path(kiro_crew.__file__).parent
 
@@ -24,7 +27,9 @@ SRC = Path(kiro_crew.__file__).parent
 #: well-formed demand. ``chunk_text`` takes no such parameter: it is the blind
 #: fixed-width last resort, and its safety comes from the subject it is handed --
 #: a chunk already cut and graded -- rather than from a scan it could run itself.
-SPLITTERS = frozenset({"split_markdown_safe", "chunk_utf8_bytes"})
+#: ``chunk_for_transport`` is here because a channel can deliver through it alone,
+#: and it falls back to a default redactor where a composed host needs its own.
+SPLITTERS = frozenset({"split_markdown_safe", "chunk_utf8_bytes", "chunk_for_transport"})
 
 
 def _rejoins(chunks: list[str]) -> bool:

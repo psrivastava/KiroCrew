@@ -15,12 +15,13 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from redaction_structured_cases import github_classic
 from telegram_parity_helpers import (  # noqa: F401 -- the autouse fixture registers by import
-    _AWS_KEY,
     _drop_live_config_snapshot,
     _forum_msg,
     _msg,
 )
+from telegram_wire_helpers import telegram_wire
 from test_telegram import _dispatcher, _dm
 
 from kiro_crew.telegram.commands import COMMAND_SPEC, bot_command_payload, parse_command
@@ -196,9 +197,11 @@ class TestTitleCommand:
         dispatcher, _, _ = _dispatcher({1})
         log = MagicMock()
         dispatcher.conv_log = log
-        await dispatcher.handle_message(_msg(f"/title a\n\nb  c {_AWS_KEY} " + "z" * 200))
+        # A GitHub token: an AWS key ID is an identifier the redactor keeps visible.
+        token = github_classic(seed=210)
+        await dispatcher.handle_message(_msg(f"/title a\n\nb  c {token} " + "z" * 200))
         title = log.set_title.call_args.args[1]
-        assert _AWS_KEY not in title and "\n" not in title and len(title) <= 80
+        assert token[:8] not in title and "\n" not in title and len(title) <= 80
 
     @pytest.mark.asyncio
     async def test_a_write_failure_is_reported_not_raised(self) -> None:
@@ -1274,13 +1277,37 @@ class TestHostListingAudienceCharacterization:
         ]
 
     @pytest.mark.asyncio
-    async def test_the_picker_gets_its_arguments(self) -> None:
+    async def test_the_picker_gets_its_arguments(self, tmp_path: Any, monkeypatch: Any) -> None:
         from unittest.mock import call
 
-        d, client, _sess = _dispatcher({7})
-        picker = AsyncMock()
+        from off_loop_helpers import off_loop
+        from telegram_sessions_helpers import _dispatcher as _resume_dispatcher
+        from telegram_sessions_helpers import _log
+
+        log = _log(tmp_path)
+
+        def _seed_other() -> None:
+            log.append("dashboard:chat-2", "assistant", "other work")
+            log.set_title("dashboard:chat-2", "Budget review")
+
+        off_loop(_seed_other)
+        d, _client, _sess, _log_ = _resume_dispatcher(tmp_path, log=log)
+        picker = AsyncMock(wraps=d._session_resume.show_picker)
         d._session_resume.show_picker = picker  # type: ignore[method-assign]
-        await d.handle_message(_dm("/sessions launch"))
+        async with telegram_wire(monkeypatch) as wire:
+            d.client = wire.client  # type: ignore[assignment]
+            await d.handle_message(_dm("/sessions launch"))
+
+        [sent] = wire.messages()
+        assert "for “launch”" in sent.get("text")
+        buttons = [row[0]["text"] for row in sent.get("reply_markup")["inline_keyboard"]]
+        assert buttons == ["1. Launch plan"]
         assert picker.await_args == call(
-            client, 7, 7, "private", None, query="launch", native_key="telegram:kirocrew:direct:7"
+            wire.client,
+            7,
+            7,
+            "private",
+            None,
+            query="launch",
+            native_key="telegram:kirocrew:direct:7",
         )

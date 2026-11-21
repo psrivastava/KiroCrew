@@ -5,44 +5,19 @@ and self-truncates at ``SLACK_MAX_TEXT`` before converting, and each of those
 defeats credential redaction from a different side:
 
 - **redact then convert** -- the ANSI strip *reassembles* a credential the
-  escapes had broken up, so ``AKIA<esc>IOSF...`` sails past the regex and lands
-  on Slack whole.
+  escapes had broken up, so ``AKIA<esc>IOSF...`` reaches Slack whole.
 - **convert then redact** -- the 39,000-char self-truncation cuts a credential in
   half before the regex runs, leaving an unmatchable prefix on the wire.
 
-So there is no ordering a call site can pick that is safe on its own, and before
-this gate every Slack egress path picked one independently: eleven of twelve were
-exposed to one hazard or the other, and the one correct pipeline lived in a
-private helper in ``dashboard/chat_slack.py`` that nobody else could inherit.
+STRUCTURAL tier: :func:`test_no_module_converts_slack_markdown_directly` asserts
+``slack/format.py`` is the ONLY module that calls ``to_slack_mrkdwn``. It polices the
+conversion, not the Slack API calls: a raw ``post_message`` is not covered here
+(``test_slack_post_message_call_sites.py`` pins those counts to a baseline).
 
-Two tiers, deliberately:
+BEHAVIOURAL tier: the ordering tests prove :func:`render_for_slack` and
+:func:`render_one_for_slack` close both hazards.
 
-  STRUCTURAL tier -- :func:`test_no_module_converts_slack_markdown_directly`.
-  An AST scan asserting that ``slack/format.py`` is the ONLY module in
-  ``kiro_crew`` that calls ``to_slack_mrkdwn``. This is what makes alignment a
-  property of the code's shape rather than of whether an author remembered:
-  a newly added egress path cannot render its own way without failing the build,
-  which is precisely the guarantee a per-call-site convention cannot give.
-
-  **Scope, stated so it is not over-read:** this gate polices the CONVERSION
-  primitive, not the Slack API calls. A path that posts raw text to Slack without
-  ever converting it is NOT covered — it skips redaction and still passes the
-  build. Covering that would mean gating ``post_message`` / ``post_blocks``, which
-  carry a great deal of legitimately non-agent text (status lines, error notices,
-  captions) and so cannot be banned outright the way a conversion call can; it is
-  a judgment-tier problem, not a deterministic one. ``security_posture.py`` states
-  the same bound, deliberately, rather than claiming every Slack path is enforced.
-  ``test_slack_post_message_call_sites.py`` does not ban those calls; it pins
-  each module's count to a baseline, so a NEW direct send path fails the build.
-
-  BEHAVIOURAL tier -- the ordering tests below. They prove the pipeline the
-  structural tier funnels everyone into actually closes both hazards, in both
-  the multi-part (:func:`render_for_slack`) and single-message
-  (:func:`render_one_for_slack`) forms.
-
-Escape hatch: a genuinely-justified direct call may carry a trailing
-``# render-ok: <reason>`` comment. Every suppression must state its reason so the
-exception is auditable in review and greppable later.
+A justified direct call may carry a trailing ``# render-ok: <reason>`` comment.
 """
 
 from __future__ import annotations
@@ -52,9 +27,11 @@ import io
 import json
 import pathlib
 import re
+import string
 import tokenize
 
 import pytest
+from redaction_structured_cases import ALNUM, synth
 from source_corpus import parsed_candidates
 
 from kiro_crew.messaging.display_safety import slack_mrkdwn_reading
@@ -70,6 +47,7 @@ from kiro_crew.slack.format import (
     render_for_slack,
     render_one_for_slack,
 )
+from kiro_crew.testing.synthetic_credentials import SAMPLE_AWS_SECRET
 
 # The conversion primitive nobody outside format.py may call.
 _BANNED_FUNC = "to_slack_mrkdwn"
@@ -78,9 +56,20 @@ _OWNER_MODULE = "kiro_crew/slack/format.py"
 # Trailing-comment marker that suppresses a single flagged call.
 _SUPPRESS = "render-ok"
 
-# A representative AWS access key ID: matched by the credential regex, and long
-# enough that a straddling cut leaves a recognisable prefix behind.
-_SECRET = "AKIAIOSFODNN7EXAMPLE"
+# A synthetic 40-character Slack bot token: matched by the credential redactor by its
+# published format, free of markup characters, and long enough that a straddling cut
+# leaves a recognisable prefix behind. (A bare 40-character run stays visible by
+# design, and a GitHub token's ``_`` is markup.)
+_SECRET = (
+    "xoxb-"
+    + synth(10, string.digits, 31)
+    + "-"
+    + synth(10, string.digits, 32)
+    + "-"
+    + synth(13, ALNUM, 33)
+)
+# A second secret that shares the first one's tail: the same token as a user token.
+_SECOND_SECRET = "xoxp" + _SECRET[4:]
 
 
 def _fake_redactor(text: str) -> str:
@@ -109,13 +98,9 @@ def _src_root() -> pathlib.Path:
 def _aliases(tree: ast.Module) -> tuple[set[str], set[str]]:
     """Resolve how a module might name the banned function.
 
-    Returns ``(bare_names, module_names)``:
-      * ``bare_names`` -- locals bound by a ``from ... import to_slack_mrkdwn``,
-        including ``as`` renames, so a bare ``tsm(...)`` still resolves.
-      * ``module_names`` -- locals bound to the ``slack.format`` MODULE, so
-        ``fmt.to_slack_mrkdwn(...)`` resolves too.
-
-    Without both, a single aliased import would silently defeat the gate.
+    Returns ``(bare_names, module_names)``: names bound by ``from ... import
+    to_slack_mrkdwn`` (``as`` renames included) and names bound to the ``slack.format``
+    MODULE. Without both, one aliased import would defeat the gate.
     """
     bare: set[str] = set()
     modules: set[str] = set()
@@ -211,9 +196,7 @@ def test_no_module_converts_slack_markdown_directly() -> None:
     """
     violations = collect_repo_violations()
     if violations:
-        detail = "\n".join(
-            f"  {path}:{lineno}  {name}(...)" for path, lineno, name in violations
-        )
+        detail = "\n".join(f"  {path}:{lineno}  {name}(...)" for path, lineno, name in violations)
         raise AssertionError(
             "to_slack_mrkdwn called outside kiro_crew/slack/format.py.\n\n"
             "Neither redact-then-convert nor convert-then-redact is safe on its "
@@ -317,11 +300,9 @@ class TestRenderForSlackOrdering:
     def test_credential_at_the_conversion_ceiling_is_not_halved(self) -> None:
         """convert-then-redact hazard: the 39k self-truncation must not cut it.
 
-        The filler is newline-free so ``rfind`` cannot snap the cut elsewhere,
-        and the secret starts 10 chars before the ceiling -- so convert-first
-        leaves exactly its first 10 characters behind. A secret placed wholly
-        past the boundary would just be deleted, which is why the obvious
-        version of this test proves nothing.
+        The filler is newline-free so ``rfind`` cannot move the cut, and the secret
+        starts 10 chars before the ceiling. A secret wholly past it would just be
+        deleted and prove nothing.
         """
         filler = "x" * (SLACK_MAX_TEXT - 10)
         assert "\n" not in filler
@@ -340,9 +321,9 @@ class TestRenderForSlackOrdering:
         cut = SLACK_MAX_TEXT // 2 - len(CONTINUATION)
         filler = "q" * (cut - 12)
         content = filler + obfuscated + ("z" * 200)
-        assert len(filler) < cut < len(filler) + len(obfuscated), (
-            "the credential must straddle the cut for this test to mean anything"
-        )
+        assert (
+            len(filler) < cut < len(filler) + len(obfuscated)
+        ), "the credential must straddle the cut for this test to mean anything"
         body = "".join(render_for_slack(content, redactor=_fake_redactor))
         assert _SECRET not in body
         assert _SECRET[:8] not in body
@@ -360,9 +341,7 @@ class TestRenderForSlackOrdering:
         Decorating a maximally-sized part after the split is what pushed the
         backfill's icon-prefixed messages past SLACK_MSG_LIMIT.
         """
-        parts = render_for_slack(
-            "z" * (SLACK_MSG_LIMIT * 3), prefix="🤖 ", redactor=_fake_redactor
-        )
+        parts = render_for_slack("z" * (SLACK_MSG_LIMIT * 3), prefix="🤖 ", redactor=_fake_redactor)
         assert len(parts) > 1
         assert all(p.startswith("🤖 ") for p in parts)
         assert all(len(p) <= SLACK_MSG_LIMIT for p in parts)
@@ -378,11 +357,19 @@ class TestRenderForSlackOrdering:
         link's closing ``>``. The last is the control: the part holding the whole
         link collapses to its label, and the key is never shown.
         """
-        marked_key = "AKIA*IOSFODNN7EXAMPLE*"
+        marked_key = f"{_SECRET[:4]}*{_SECRET[4:]}*"
         chunk_limit = SLACK_MSG_LIMIT - len(CONTINUATION)
         native_link_prefix = "<https://x/"
         filler_length = chunk_limit + key_offset - len(native_link_prefix)
-        payload = native_link_prefix + ("q" * filler_length) + marked_key + "|label>" + ("t" * 200)
+        # A ``/`` before the key: glued to a letter it is no token.
+        payload = (
+            native_link_prefix
+            + ("q" * (filler_length - 1))
+            + "/"
+            + marked_key
+            + "|label>"
+            + ("t" * 200)
+        )
 
         parts = render_for_slack(payload, redactor=self._credential_redactor)
 
@@ -403,9 +390,9 @@ class TestRenderForSlackOrdering:
             assert parts == slack_format.split_message(converted, limit=SLACK_MSG_LIMIT)
 
     def test_final_native_link_split_fenced_code_cannot_reveal_a_key(self) -> None:
-        marked_key = "AKIA```IOSFODNN7EXAMPLE````"
-        payload = "[doc](https://example.com/" + ("q" * 50) + marked_key + ")"
-        limit = 60
+        marked_key = f"{_SECRET[:4]}```{_SECRET[4:]}````"
+        payload = "[doc](https://example.com/" + ("q" * 49) + "/" + marked_key + ")"
+        limit = 70
         unsafe_parts = slack_format.split_message(slack_format.to_slack_mrkdwn(payload), limit)
         assert any(_SECRET in part.replace("```", "") for part in unsafe_parts)
 
@@ -436,7 +423,8 @@ class TestRenderForSlackOrdering:
         ``>``, so the kept text is no link and its ``*...*`` reads as bold.
         """
         limit = 400
-        payload = "<https://x/" + ("q" * 330) + "AKIA*IOSFODNN7EXAMPLE*|label>" + ("t" * 200)
+        marked_key = f"{_SECRET[:4]}*{_SECRET[4:]}*"
+        payload = "<https://x/" + ("q" * 309) + "/" + marked_key + "|label>" + ("t" * 200)
 
         rendered = render_one_for_slack(payload, limit=limit, redactor=self._credential_redactor)
 
@@ -469,7 +457,10 @@ class TestRenderForSlackOrdering:
 
         limit = 400
         payload = (
-            "<https://example.com/" + ("q" * 320) + "AKIA*IOSFODNN7EXAMPLE*|label>" + ("t" * 200)
+            "<https://example.com/"
+            + ("q" * 300)
+            + f"{_SECRET[:4]}*{_SECRET[4:]}*|label>"
+            + ("t" * 200)
         )
         converted = slack_format.to_slack_mrkdwn(payload)
         cut_once = slack_format._truncated(converted, limit)[0]
@@ -508,13 +499,14 @@ class TestRenderForSlackOrdering:
 class TestConvertedSlackDisplayRedaction:
     """The converted mrkdwn must be safe under Slack's display semantics."""
 
+    _HEAD = _SECRET[:4]
     _TAIL = _SECRET[4:]
     _REVEALING_SHAPES = [
-        ("bold-conversion", f"AKIA**{_TAIL}*"),
-        ("italic", f"AKIA_{_TAIL}_"),
-        ("strike-conversion", f"AKIA~~{_TAIL}~~"),
-        ("inline-code", f"AKIA`{_TAIL}`"),
-        ("native-link", f"AK<u|IA>{_TAIL}"),
+        ("bold-conversion", f"{_HEAD}**{_TAIL}*"),
+        ("italic", f"{_HEAD}_{_TAIL}_"),
+        ("strike-conversion", f"{_HEAD}~~{_TAIL}~~"),
+        ("inline-code", f"{_HEAD}`{_TAIL}`"),
+        ("native-link", f"{_HEAD[:2]}<u|{_HEAD[2:]}>{_TAIL}"),
     ]
     _CONTEXTS = [
         ("plain", "{}"),
@@ -561,8 +553,11 @@ class TestConvertedSlackDisplayRedaction:
         assert rendered.redacted is True
 
     def test_the_reported_input_is_safe_in_the_multipart_pipeline(self) -> None:
-        second_secret = "ASIA" + self._TAIL
-        payload = f"[l](https://x/AKIA**{self._TAIL}*/A``{second_secret[1:]}``|)"
+        second_secret = _SECOND_SECRET
+        payload = (
+            f"[l](https://x/{self._HEAD}**{self._TAIL}*"
+            f"/{second_secret[0]}``{second_secret[1:]}``|)"
+        )
         parts = render_for_slack(payload, redactor=self._credential_redactor)
         assert parts
         joined = "".join(parts)
@@ -582,19 +577,19 @@ class TestConvertedSlackDisplayRedaction:
     @pytest.mark.parametrize(
         ("conversion_name", "conversion_shape"),
         [
-            ("bold", "AKIA**{tail}*"),
-            ("underscore", "AKIA__{tail}__"),
-            ("strike", "AKIA~~{tail}~~"),
+            ("bold", "{head}**{tail}*"),
+            ("underscore", "{head}__{tail}__"),
+            ("strike", "{head}~~{tail}~~"),
         ],
     )
     @pytest.mark.parametrize(
         ("display_name", "display_shape"),
         [
-            ("inline-code", "ASIA`{tail}`"),
-            ("bold", "ASIA*{tail}*"),
-            ("italic", "ASIA_{tail}_"),
-            ("strike", "ASIA~{tail}~"),
-            ("native-link", "A<u|SIA{tail}>"),
+            ("inline-code", "{head2}`{tail}`"),
+            ("bold", "{head2}*{tail}*"),
+            ("italic", "{head2}_{tail}_"),
+            ("strike", "{head2}~{tail}~"),
+            ("native-link", "{head2_first}<u|{head2_rest}{tail}>"),
         ],
     )
     def test_every_converted_and_displayed_pair_settles(
@@ -605,8 +600,13 @@ class TestConvertedSlackDisplayRedaction:
         display_shape: str,
     ) -> None:
         payload = "[l](https://x/{}/{}|)".format(
-            conversion_shape.format(tail=self._TAIL),
-            display_shape.format(tail=self._TAIL),
+            conversion_shape.format(head=self._HEAD, tail=self._TAIL),
+            display_shape.format(
+                head2=_SECOND_SECRET[:4],
+                head2_first=_SECOND_SECRET[0],
+                head2_rest=_SECOND_SECRET[1:4],
+                tail=self._TAIL,
+            ),
         )
         rendered = render_one_for_slack(payload, redactor=self._credential_redactor)
         assert rendered.redacted is True, (conversion_name, display_name)
@@ -638,7 +638,7 @@ class TestConvertedSlackDisplayRedaction:
         monkeypatch.setattr(
             slack_format,
             "_render_blocks",
-            lambda *args, **kwargs: (["AKIA", self._TAIL], False),
+            lambda *args, **kwargs: ([self._HEAD, self._TAIL], False),
         )
         rendered = render_one_for_slack("ignored", redactor=self._credential_redactor)
         assert _SECRET not in slack_mrkdwn_reading(rendered.text)
@@ -648,8 +648,14 @@ class TestConvertedSlackDisplayRedaction:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         self._narrow_generic_screen(monkeypatch)
-        second_secret = "ASIA" + self._TAIL
-        payload = f"[l](https://x/AKIA**{self._TAIL}*/A``{second_secret[1:]}``|)"
+        second_secret = _SECOND_SECRET
+        # ``.`` between the secrets: ``-`` is in a Slack token's alphabet, so the first
+        # redaction would take the second secret's first character with it and the
+        # leak this test reopens would be hidden.
+        payload = (
+            f"[l](https://x/{self._HEAD}**{self._TAIL}*"
+            f".{second_secret[0]}``{second_secret[1:]}``|)"
+        )
         protected = render_for_slack(payload, redactor=self._credential_redactor)
         assert second_secret not in slack_mrkdwn_reading("".join(protected))
 
@@ -690,7 +696,7 @@ class TestConvertedSlackDisplayRedaction:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         self._narrow_generic_screen(monkeypatch)
-        payload = f"[l](https://x/AKIA**{self._TAIL}*|)"
+        payload = f"[l](https://x/{self._HEAD}**{self._TAIL}*|)"
         protected = render_one_for_slack(payload, redactor=self._credential_redactor)
         assert _SECRET not in slack_mrkdwn_reading(protected.text)
         assert protected.redacted is True
@@ -704,15 +710,12 @@ class TestConvertedSlackDisplayRedaction:
 class TestLiteralOnlyRedactionKeepsTheBlockMarkup:
     """A converted block dirty only as written keeps its links and emphasis.
 
-    ``_convert_tables`` renders a data row as ``*<header>:* <cell>``, which writes
-    the ``:`` a named-credential pattern needs after a ``SecretAccessKey`` header.
-    That match lives in the literal bytes alone: Slack's reading of the redacted
-    block scans clean, so the block has nothing to settle and must be posted with
-    its native links and emphasis intact. Only a key the Slack reading joins costs
-    the block its markup.
+    ``_convert_tables`` writes ``*<header>:* <cell>``, the ``:`` a named-credential
+    pattern needs after a ``SecretAccessKey`` header. Slack's reading scans clean, so
+    the markup stays; only a key the Slack reading joins costs the block its markup.
     """
 
-    _SECRET_VALUE = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    _SECRET_VALUE = SAMPLE_AWS_SECRET
     _URL = "https://wiki.example.com/bin/view/Runbook"
     _PAYLOAD = (
         "Findings **so far**:\n\n"
@@ -729,7 +732,8 @@ class TestLiteralOnlyRedactionKeepsTheBlockMarkup:
     def _assert_key_gone_and_markup_kept(self, text: str) -> None:
         assert self._SECRET_VALUE not in text
         assert self._SECRET_VALUE not in slack_mrkdwn_reading(text)
-        assert "SecretAccessKey" not in text
+        # The structured detectors keep the header label and redact only its value.
+        assert "*SecretAccessKey:* [REDACTED: credential]" in text
         assert f"<{self._URL}|the wiki>" in text
         assert "*so far*" in text
         assert "*runbook*" in text
@@ -747,7 +751,7 @@ class TestLiteralOnlyRedactionKeepsTheBlockMarkup:
         self._assert_key_gone_and_markup_kept(rendered.text)
 
     def test_a_key_the_slack_reading_joins_still_costs_the_markup(self) -> None:
-        payload = f"AKIA**{_SECRET[4:]}* and [the wiki]({self._URL})"
+        payload = f"{_SECRET[:4]}**{_SECRET[4:]}* and [the wiki]({self._URL})"
         rendered = render_one_for_slack(payload, redactor=self._credential_redactor)
         assert _SECRET not in slack_mrkdwn_reading(rendered.text)
         assert rendered.redacted is True
@@ -766,11 +770,8 @@ class TestLiteralOnlyRedactionKeepsTheBlockMarkup:
 class TestHeaderCaptionsAreRedactedAtTheSeam:
     """A caption skips conversion, so it needs its own redaction pass.
 
-    Captions like ``⏰ *Cron: <name>*`` are already Slack mrkdwn, so they must not
-    go through ``to_slack_mrkdwn`` -- which also means they skip the pipeline's
-    redaction. They are usually built from LLM-authored data (a cron's name comes
-    from the ``cron_add`` tool), and the hand-rolled ``header + parts[0]`` this
-    replaces had already forgotten to redact one.
+    Captions like ``⏰ *Cron: <name>*`` are already mrkdwn and skip ``to_slack_mrkdwn``,
+    yet carry LLM-authored data (a cron's name comes from ``cron_add``).
     """
 
     def test_a_credential_in_the_caption_is_redacted(self) -> None:
@@ -802,9 +803,9 @@ class TestHeaderCaptionsAreRedactedAtTheSeam:
             header=header,
             redactor=_fake_redactor,
         )
-        assert all(len(p) <= SLACK_MSG_LIMIT for p in parts), (
-            "a caption pushed a part past the limit"
-        )
+        assert all(
+            len(p) <= SLACK_MSG_LIMIT for p in parts
+        ), "a caption pushed a part past the limit"
 
     def test_an_empty_body_still_yields_the_caption(self) -> None:
         """The cron path attaches an ack button to the first part."""
@@ -817,11 +818,9 @@ class TestHeaderCaptionsAreRedactedAtTheSeam:
 class TestFencedCodeSurvivesThePreSplit:
     """A ``` block longer than the pre-split window must not be rewritten.
 
-    Fence state is per-conversion-call. Convert in blocks without carrying it and
-    the block that opens mid-fence is treated as prose, so ``_convert_inline``
-    rewrites the CODE -- turning `**x**` inside a code sample into Slack bold, and
-    mangling anything markdown-shaped the user is quoting verbatim. A fenced region
-    can be longer than any block size, so no choice of cut point avoids this.
+    Fence state is per-conversion-call, so a block opening mid-fence would be read as
+    prose and ``_convert_inline`` would turn `**x**` in the code into Slack bold. No cut
+    point avoids it, since a fence can outgrow any block size.
     """
 
     def _long_fence(self) -> str:
@@ -848,9 +847,9 @@ class TestFencedCodeSurvivesThePreSplit:
         were also treated as code.
         """
         body = "".join(render_for_slack(self._long_fence(), redactor=_fake_redactor))
-        assert body.count("**not_bold_in_code**") == 1_200, (
-            "later blocks lost fence state and had their code rewritten"
-        )
+        assert (
+            body.count("**not_bold_in_code**") == 1_200
+        ), "later blocks lost fence state and had their code rewritten"
 
     def test_the_fence_tracker_agrees_with_the_converter(self) -> None:
         assert ends_inside_code_fence("```py\nx = 1") is True
@@ -879,12 +878,8 @@ class TestRenderOneForSlackOrdering:
     def test_it_reports_that_redaction_fired(self) -> None:
         """The streaming caller REPLACES an already-posted message on this flag.
 
-        The answer is streamed incrementally by a per-chunk redactor that sees
-        raw chunks and does not strip ANSI, so it can miss a credential that only
-        becomes matchable after normalisation. Nothing downstream can recover the
-        signal either -- the post-render scan sees text this call already cleaned.
-        So if this flag were not reported, the unredacted stream would stay
-        visible on screen.
+        The per-chunk stream redactor does not strip ANSI, and the post-render scan sees
+        already-cleaned text, so this flag is the only signal to replace the stream.
         """
         obfuscated = _SECRET[:4] + "\x1b[0m" + _SECRET[4:]
         assert render_one_for_slack(f"key {obfuscated}", redactor=_fake_redactor).redacted
@@ -913,23 +908,20 @@ class TestRenderOneForSlackOrdering:
     def test_keep_tables_can_be_forced_by_the_caller(self) -> None:
         """The streaming sink renders tables itself, so it forces raw pipes."""
         table = "| a | b |\n| - | - |\n| 1 | 2 |"
-        assert "| a | b |" in render_one_for_slack(
-            table, keep_tables=True, redactor=_fake_redactor
-        ).text
         assert (
-            "*a:*"
-            in render_one_for_slack(table, keep_tables=False, redactor=_fake_redactor).text
+            "| a | b |"
+            in render_one_for_slack(table, keep_tables=True, redactor=_fake_redactor).text
+        )
+        assert (
+            "*a:*" in render_one_for_slack(table, keep_tables=False, redactor=_fake_redactor).text
         )
 
     def test_keep_tables_can_only_add_rawness_never_remove_it(self) -> None:
         """An explicit False must NOT defeat the straddle guard.
 
-        The streaming caller passes ``keep_tables=actually_streamed``, which is
-        False on every turn where start_stream returned None. If False forced
-        conversion, each pre-split block would convert independently: a block
-        beginning on a table DATA row makes _convert_tables adopt that row as
-        headers, and _flush_table drops it entirely when no rows follow. So the
-        flag is advisory in one direction only.
+        The caller passes ``keep_tables=actually_streamed``, False when start_stream
+        returned None. A block starting on a table DATA row would make _convert_tables
+        adopt it as headers, and _flush_table drops it when no rows follow.
         """
         rows = "\n".join(f"| r{i} | v{i} |" for i in range(1_500))
         table = f"| a | b |\n| - | - |\n{rows}"
@@ -1013,9 +1005,7 @@ class TestOptionsChoicesAreRedacted:
     """
 
     def test_checkbox_labels_and_values_are_redacted(self) -> None:
-        blocks = build_options_blocks(
-            [f"Retry with {_SECRET}", "Abort"], redactor=_fake_redactor
-        )
+        blocks = build_options_blocks([f"Retry with {_SECRET}", "Abort"], redactor=_fake_redactor)
         payload = json.dumps(blocks)
         assert _SECRET not in payload
         assert "[REDACTED]" in payload
@@ -1063,9 +1053,9 @@ def test_default_redactor_is_the_platform_shim() -> None:
     import kiro_crew.slack.format as fmt
 
     src = pathlib.Path(fmt.__file__).read_text(encoding="utf-8")
-    assert src.count("redact_via_context") >= 2, (
-        "both render helpers must default to redact_via_context"
-    )
+    assert (
+        src.count("redact_via_context") >= 2
+    ), "both render helpers must default to redact_via_context"
 
 
 @pytest.mark.parametrize("limit", [1, 5, len(CONTINUATION), len(CONTINUATION) + 1])
@@ -1073,6 +1063,127 @@ def test_pathological_limits_terminate(limit: int) -> None:
     """A limit at or below the continuation marker must not spin forever."""
     parts = render_for_slack("a\nb\nc\n" * 50, limit=limit, redactor=_fake_redactor)
     assert parts
+
+
+_LONG_CODE = (
+    "Here is the log:\n```\n"
+    + "".join(f"line {i:04d} = compute(value_{i})\n" for i in range(250))
+    + "```\nDone."
+)
+
+
+def test_a_cut_inside_a_code_block_closes_it_and_reopens_it_in_the_next_post() -> None:
+    """Each post shows the code as code: no post leaves a block open or starts mid-block."""
+    parts = slack_format.split_message(_LONG_CODE, limit=SLACK_MSG_LIMIT)
+    assert len(parts) == 2
+    assert all(len(part) <= SLACK_MSG_LIMIT for part in parts)
+    assert parts[0].endswith("\n```" + CONTINUATION)
+    assert parts[1].startswith("```\nline 0")
+    assert [part.count("```") for part in parts] == [2, 2]
+    rendered = render_for_slack(_LONG_CODE, redactor=_fake_redactor)
+    assert [part.count("```") for part in rendered] == [2, 2]
+
+
+def test_a_cut_after_a_closed_code_block_adds_no_fence() -> None:
+    text = "```\nshort\n```\n" + "prose line\n" * 600
+    parts = slack_format.split_message(text, limit=SLACK_MSG_LIMIT)
+    assert parts[0].count("```") == 2
+    assert all("```" not in part for part in parts[1:])
+
+
+_LINKED_PARAGRAPH = " ".join(
+    f"See <https://example.com/docs/design/section-{i}|the design doc> for item {i}."
+    for i in range(80)
+)
+
+
+def test_a_long_line_is_never_cut_inside_a_slack_link() -> None:
+    """Each post holds whole ``<url|label>`` tokens, so every link stays a link."""
+    parts = slack_format.split_message(_LINKED_PARAGRAPH, limit=SLACK_MSG_LIMIT)
+    assert len(parts) > 1
+    assert all(len(part) <= SLACK_MSG_LIMIT for part in parts)
+    for part in parts:
+        body = part.removesuffix(CONTINUATION)
+        assert body.count("<") == body.count(">"), body[-60:]
+    assert all(not part.startswith(("|", "sign/", "section-")) for part in parts[1:])
+
+
+def test_a_token_longer_than_a_post_is_cut_at_the_limit_with_no_stub_post() -> None:
+    text = "see <https://" + "a" * 8000 + "|x> end"
+    parts = slack_format.split_message(text, limit=SLACK_MSG_LIMIT)
+    assert len(parts[0]) == SLACK_MSG_LIMIT
+
+
+@pytest.mark.parametrize(
+    "unit",
+    [
+        "\U0001f1fa\U0001f1f8",
+        "\U0001f468\u200d\U0001f469\u200d\U0001f467",
+        "e\u0301",
+        "1\ufe0f\u20e3",
+    ],
+    ids=["flag", "zwj", "combining", "keycap"],
+)
+@pytest.mark.parametrize("lead", range(3870, 3880))
+def test_a_hard_cut_never_splits_a_visible_character(unit: str, lead: int) -> None:
+    text = "x" * lead + unit * 60
+    parts = slack_format.split_message(text, limit=SLACK_MSG_LIMIT)
+    bodies = [part.removesuffix(CONTINUATION) for part in parts]
+    assert "".join(bodies) == text
+    offset = 0
+    for body in bodies[:-1]:
+        offset += len(body)
+        assert offset <= lead or (offset - lead) % len(unit) == 0, f"cut at {offset}"
+
+
+@pytest.mark.parametrize(
+    "run",
+    ["a" + "\u0301" * 10000, "\U0001f468\u200d" * 3000],
+    ids=["combining-run", "zwj-run"],
+)
+def test_a_line_of_joining_marks_longer_than_a_post_is_cut_at_the_limit(run: str) -> None:
+    """With no boundary in reach the cut falls at the limit, never one mark per post."""
+    parts = slack_format.split_message(run, limit=SLACK_MSG_LIMIT)
+    assert len(parts) <= len(run) // (SLACK_MSG_LIMIT - len(CONTINUATION)) + 1
+    assert "".join(part.removesuffix(CONTINUATION) for part in parts) == run
+
+
+@pytest.mark.parametrize("width", range(3860, 3900, 3))
+def test_a_link_line_after_a_reopened_block_never_leaves_a_bare_opener_post(
+    width: int,
+) -> None:
+    """A link line too long for one post right after a reopened opener is cut and sealed."""
+    text = (
+        "```\n"
+        + "".join(f"short line {i:03d}\n" for i in range(130))
+        + "<https://example.com/"
+        + "a" * (width - 40)
+        + "|label>"
+        + "\n```\nafter the block\n"
+        + "prose line\n" * 400
+    )
+    parts = slack_format.split_message(text, limit=SLACK_MSG_LIMIT)
+    assert all(len(part) <= SLACK_MSG_LIMIT for part in parts)
+    assert all(part.count("```") % 2 == 0 for part in parts)
+    assert all(part.removesuffix(CONTINUATION).strip() != "```" for part in parts)
+
+
+@pytest.mark.parametrize("width", range(3860, 3900, 3))
+def test_a_line_too_long_for_one_post_after_its_reopened_block_is_cut_inside_it(
+    width: int,
+) -> None:
+    """No post is a bare reopened opener; every post but the last has its block shut."""
+    text = (
+        "```json\n"
+        + "".join(f"short line {i:03d}\n" for i in range(130))
+        + "x" * width
+        + "\n```\nafter the block\n"
+        + "prose line\n" * 400
+    )
+    parts = slack_format.split_message(text, limit=SLACK_MSG_LIMIT)
+    assert all(len(part) <= SLACK_MSG_LIMIT for part in parts)
+    assert all(part.count("```") % 2 == 0 for part in parts)
+    assert all(part.strip() not in {"```json" + CONTINUATION.strip(), "```json"} for part in parts)
 
 
 class TestEmphasisDelimiterRedaction:
@@ -1084,7 +1195,7 @@ class TestEmphasisDelimiterRedaction:
     backticks and shows the reader the joined text.
     """
 
-    KEY = "AKIAIOSFODNN7EXAMPLE"
+    KEY = _SECRET
 
     def _reader_sees(self, wire: str) -> str:
         """Approximate what Slack DISPLAYS: links show their label, delimiters go."""
@@ -1097,12 +1208,13 @@ class TestEmphasisDelimiterRedaction:
     @pytest.mark.parametrize(
         "payload",
         [
-            "AKIA**IOSFODNN7EXAMPLE**",
-            "AKIAIOSF**ODNN**7EXAMPLE",
-            "AKIAIOSF_ODNN_7EXAMPLE",
-            "AKIAIOSF~~ODNN~~7EXAMPLE",
-            "AKIAIOSF`ODNN`7EXAMPLE",
+            f"{_SECRET[:4]}**{_SECRET[4:]}**",
+            f"{_SECRET[:8]}**{_SECRET[8:12]}**{_SECRET[12:]}",
+            f"{_SECRET[:8]}_{_SECRET[8:12]}_{_SECRET[12:]}",
+            f"{_SECRET[:8]}~~{_SECRET[8:12]}~~{_SECRET[12:]}",
+            f"{_SECRET[:8]}`{_SECRET[8:12]}`{_SECRET[12:]}",
         ],
+        ids=["bold-head", "bold-middle", "italic", "strike", "inline-code"],
     )
     def test_delimiter_split_key_never_reaches_a_reader(self, payload):
         rendered = render_one_for_slack(f"credential: {payload}")
@@ -1126,19 +1238,20 @@ class TestEmphasisDelimiterRedaction:
 
     def test_header_is_canonicalised_too(self):
         """A caption is redacted but NOT converted, so it needs the same guard."""
-        parts = render_for_slack("body", header="key AKIA**IOSFODNN7EXAMPLE** ")
+        parts = render_for_slack("body", header=f"key {_SECRET[:4]}**{_SECRET[4:]}** ")
         assert self.KEY not in self._reader_sees("".join(parts))
 
     @pytest.mark.parametrize(
         "payload",
         [
-            "[AKIA](https://example.com)IOSFODNN7EXAMPLE",
-            "AKIAIOSF[ODNN](https://example.com)7EXAMPLE",
-            "<https://example.com|AKIA>IOSFODNN7EXAMPLE",
+            f"[{_SECRET[:4]}](https://example.com){_SECRET[4:]}",
+            f"{_SECRET[:8]}[{_SECRET[8:12]}](https://example.com){_SECRET[12:]}",
+            f"<https://example.com|{_SECRET[:4]}>{_SECRET[4:]}",
             # A balanced pair in the url: Slack links the whole destination, so
             # the screen has to collapse the same link or the halves join unseen.
-            "[AKIA](https://example.com/a_(b))IOSFODNN7EXAMPLE",
+            f"[{_SECRET[:4]}](https://example.com/a_(b)){_SECRET[4:]}",
         ],
+        ids=["md-link-head", "md-link-middle", "native-link-head", "md-link-balanced-url"],
     )
     def test_link_markup_cannot_smuggle_a_key(self, payload):
         """A link DISPLAYS only its label, so the url is an invisible splitter."""
@@ -1164,10 +1277,11 @@ class TestEmphasisDelimiterRedaction:
     @pytest.mark.parametrize(
         "choice",
         [
-            "use AKIAIOSF`ODNN`7EXAMPLE",
-            "use AKIA**IOSFODNN7EXAMPLE**",
-            "use [AKIA](https://example.com)IOSFODNN7EXAMPLE",
+            f"use {_SECRET[:8]}`{_SECRET[8:12]}`{_SECRET[12:]}",
+            f"use {_SECRET[:4]}**{_SECRET[4:]}**",
+            f"use [{_SECRET[:4]}](https://example.com){_SECRET[4:]}",
         ],
+        ids=["inline-code", "bold", "md-link"],
     )
     def test_options_choices_get_the_display_guard(self, choice):
         """A selected choice is echoed back as mrkdwn, so it has the same vector."""
@@ -1198,20 +1312,9 @@ class TestEmphasisDelimiterRedaction:
     def test_link_patterns_exclude_their_own_delimiters(self, pattern_name, required):
         """Structural guard against re-introducing polynomial backtracking.
 
-        Asserted on the pattern source rather than by timing, deliberately: a
-        wall-clock ratio test for this flakes on a loaded runner (this repo already
-        carries one such test that has to be ignored), while the property that
-        actually prevents the blow-up is static.
-
-        If a negated class admits a delimiter that bounds it, input like
-        ``[[[[[[...`` makes every start position consume the rest of the string
-        before failing, which is quadratic in attacker-supplied text on the egress
-        path (CodeQL ``py/polynomial-redos``). Excluding those delimiters makes a
-        doomed start fail in constant time.
-
-        The patterns live in ``messaging.display_safety`` rather than here: the
-        hazard is not Slack-specific (Telegram and Discord collapse the same
-        syntax), and the shared overflow sink needs the canonicaliser too.
+        Asserted on the pattern source, since a timing test flakes on a loaded runner.
+        A negated class that admits its own delimiter makes ``[[[[[[...`` quadratic
+        (CodeQL ``py/polynomial-redos``). The patterns live in ``messaging.display_safety``.
         """
         from kiro_crew.messaging import display_safety as fmt
 

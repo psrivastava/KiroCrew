@@ -17,14 +17,17 @@ from kiro_crew.dashboard.chat_persistence import (
     _validate_turn_timeout_secs,
 )
 from kiro_crew.dashboard.chat_utils import CRON_NOTIFICATION_KIND, redact_display_content
+from kiro_crew.dashboard.chat_utils_slots import cron_tab_name
+from kiro_crew.dashboard.display_floor import DISPLAY_FLOOR_KEY, clip_to_floor, read_display_floor
 from kiro_crew.dashboard.slot_ownership import app_holds_gateway_key
 from kiro_crew.dashboard.state import (
     DashboardState,
     SlotOrigin,
+    durable_row_count,
     note_crew_log_class,
     row_mid,
 )
-from kiro_crew.history import append_rows_if_absent_off_loop
+from kiro_crew.history import append_rows_if_absent_off_loop, latest_transcript_ts
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 
@@ -40,8 +43,13 @@ _DISMISSED_UNREAD: object = object()
 
 if TYPE_CHECKING:
     from kiro_crew.cron import CronJob
+    from kiro_crew.history import ConversationLog
 
 logger = logging.getLogger(__name__)
+
+#: The rows a tab is hydrated with, and how many on-disk rows (all, durable)
+#: its display floor hides before them.
+CronTabRows = tuple[list[dict[str, Any]], tuple[int, int]]
 
 
 def context_meter_reading(client: object) -> dict[str, Any] | None:
@@ -406,6 +414,34 @@ def chat_folder_exists(state: DashboardState, folder_id: str) -> bool:
     return any(str(f.get("id")) == folder_id for f in getattr(state, "_folders", None) or ())
 
 
+def chat_folder_refuses_store(state: DashboardState, folder_id: str, memory_store: str) -> bool:
+    """Whether a tab on *memory_store* may NOT be filed in *folder_id*.
+
+    A job's tab runs on the job's memory store, and a mate's home (and every
+    folder inside it) holds only that mate's sessions: a tab on any other store,
+    the person's included, is kept out. The save routes refuse such a folder
+    and the placement below re-checks it at run time.
+    """
+    from kiro_crew.dashboard.mate_folders import mate_principal, refuses_write_into
+
+    folders = getattr(state, "_folders", None) or []
+    return refuses_write_into(folders, folder_id, mate_principal(memory_store))
+
+
+def chat_folder_move_refuses_store(
+    state: DashboardState, current_folder_id: str, new_folder_id: str, memory_store: str
+) -> bool:
+    """Whether a tab on *memory_store* may NOT move from *current_folder_id* to *new_folder_id*.
+
+    :func:`chat_folder_refuses_store` for both ends of a move: a tab in a
+    mate's home leaves it only when the tab runs on that mate's store.
+    """
+    from kiro_crew.dashboard.mate_folders import mate_principal, refuses_refile
+
+    folders = getattr(state, "_folders", None) or []
+    return refuses_refile(folders, current_folder_id, new_folder_id, mate_principal(memory_store))
+
+
 def chat_folder_for_minted_tab(state: DashboardState, job: "CronJob") -> str:
     """The chat folder a JUST-MINTED ``cron-{id}`` tab belongs in, or ``""``.
 
@@ -417,8 +453,10 @@ def chat_folder_for_minted_tab(state: DashboardState, job: "CronJob") -> str:
     Asked only when the tab is minted, never for one that already exists. An
     existing tab with no folder may be one the reader dragged out to the root
     -- indistinguishable from never-filed -- and filing on "unfiled" would drag
-    it back on every run. A freshly minted tab has no placement history, so
-    filing it cannot undo anyone's. Later transitions belong to the save
+    it back on every run. A tab minted for the first time has no placement
+    history, so filing it cannot undo anyone's; one minted again after a close
+    gets its stored folder back first (:func:`_bind_cron_slot`), and the job's
+    folder replaces it. Later transitions belong to the save
     (:func:`move_cron_job_tab`).
 
     A folder the reader deleted while the job still names it leaves the tab
@@ -472,6 +510,23 @@ async def _commit_cron_tab_placement(
     from kiro_crew.dashboard.chat_folders import _slot_meta_txn_lock
     from kiro_crew.dashboard.chat_utils import slot_history_key
 
+    # A mate's home holds only that mate's sessions: a job's tab runs on the
+    # job's store, so it is filed there only when that store is the mate's.
+    if chat_folder_refuses_store(state, placed, str(getattr(slot, "memory_store", "") or "")):
+        logger.info("Cron '%s': chat folder %s is a Bot's; tab not moved", job.name, placed)
+        try:
+            sel().log_api_access(
+                caller=f"cron:{job.id}",
+                operation="cron.chat_folder_placement",
+                outcome="denied",
+                source="cron",
+                resources=f"job={job.id},slot={slot.key},chat_folder_id={placed}",
+                error="mate_home_locked",
+            )
+        except Exception:
+            logger.debug("SEL logging failed for a refused cron tab placement", exc_info=True)
+        return False
+
     async with _slot_meta_txn_lock(state):
         slot.folder_id = placed
         authorized_history_key = slot_history_key(slot)
@@ -495,7 +550,8 @@ async def _commit_cron_tab_placement(
             )
         if not committed:
             if getattr(slot, "folder_id", "") == placed:
-                slot.folder_id = restore_to
+                # `restore_to` can be deleted while the save awaits: never back into it.
+                slot.folder_id = restore_to if chat_folder_exists(state, restore_to) else ""
             logger.warning("Cron '%s': folder placement of %s did not commit", job.name, slot.key)
         state.push_slots_update()
         return committed
@@ -513,7 +569,9 @@ def persist_cron_chat_folder(state: DashboardState, job: "CronJob", slot: Any) -
     if not target:
         return
     task = asyncio.create_task(
-        _commit_cron_tab_placement(state, job, slot, placed=target, restore_to="")
+        _commit_cron_tab_placement(
+            state, job, slot, placed=target, restore_to=getattr(slot, "folder_id", "")
+        )
     )
     state._background_tasks.add(task)
     task.add_done_callback(state._background_tasks.discard)
@@ -536,16 +594,73 @@ async def move_cron_job_tab(
     slot = state.get_slot(f"cron-{job.id}")
     if slot is None or getattr(slot, "folder_id", "") != previous_folder_id:
         return
+    # The save route refuses a move out of a mate's home; re-checked here
+    # because the tree can change between that check and this move.
+    if chat_folder_refuses_store(
+        state, previous_folder_id, str(getattr(slot, "memory_store", "") or "")
+    ):
+        logger.info("Cron '%s': tab sits in a Bot's folder; not moved out", job.name)
+        return
     await _commit_cron_tab_placement(
         state, job, slot, placed=new_folder_id, restore_to=previous_folder_id
     )
 
 
+def cron_tab_workspace(job: "CronJob") -> str:
+    """The workspace the job's agent is bound to, which its tab belongs in; ``""`` if unknown.
+
+    A run executes in its agent's workspace (``cron_fire._resolve_cron_agent``),
+    and ``session_create`` admits a child only in the caller tab's workspace,
+    checked against the agent that would answer. A tab in any other workspace
+    makes every child of the run refuse with ``agent_workspace_mismatch``.
+    Resolved the way that check resolves it (``resolve_agent_bindings``, then
+    ``_workspace_name_for_dir``), on the config the gateway has applied; a
+    member job names its member by the captured id. Reads ``config.json`` only
+    when no applied config is published (the CLI, a test).
+    """
+    from kiro_crew.config import live
+    from kiro_crew.config.loader import (
+        KiroCrewConfig,
+        _workspace_name_for_dir,
+        resolve_agent_bindings,
+    )
+
+    member = job.member_id if isinstance(job.member_id, str) else ""
+    try:
+        cfg = live.snapshot() or KiroCrewConfig.load()
+        bindings = resolve_agent_bindings(
+            cfg,
+            member or job.agent_id or None,
+            validate_memory_files=False,
+            selection_kind="member" if member else "",
+        )
+        return _workspace_name_for_dir(cfg, bindings.workspace_dir)
+    except Exception:
+        logger.warning("Cron '%s': agent workspace unresolved; tab left as is", job.id)
+        return ""
+
+
+def _place_cron_tab(slot: Any, workspace: str) -> None:
+    """Put the job's tab in *workspace*; an unknown one (``""``) leaves it where it is.
+
+    A found tab is moved too: one minted in ``default`` or restored there, and one
+    whose agent was rebound to another workspace, follows its agent on the next
+    bind. Marked dirty so the move reaches the metadata line.
+    """
+    if workspace and slot.workspace != workspace:
+        slot.workspace = workspace
+        slot._dirty = True
+
+
 def _bind_cron_slot(
     state: DashboardState,
     job: "CronJob",
-    history: list[dict[str, Any]] | None,
+    history: list[dict[str, Any]] | CronTabRows | None,
     dismissed: object = _DISMISSED_UNREAD,
+    *,
+    session_key: str = "",
+    workspace: str | None = None,
+    stored_folder: str = "",
 ) -> Any | None:
     """Create-or-find the job's dashboard slot, bind its identity, publish it.
 
@@ -557,29 +672,48 @@ def _bind_cron_slot(
     hydration without the link would re-run on every bind. Keeping both under
     the one unlink guard makes every caller after the first an idempotent
     no-op, which is what lets the injection run unchanged after a pre-create.
+
+    ``session_key`` names one run's own session (``new_chat_per_run``): the tab
+    is then that run's, ``cron-<id>-<run>``, linked to ``cron:<id>:<run>`` and
+    titled with the run's stamp. Empty means the job's one ``cron:{id}`` tab.
+
+    ``workspace`` is the job agent's workspace (:func:`cron_tab_workspace`) when
+    the caller resolved it off the loop; ``None`` resolves it here.
+
+    ``stored_folder`` is the folder the transcript's line names
+    (:func:`stored_cron_folder`), read off the loop by the caller. A tab minted
+    again after a close is filed back in it, so its first save does not write
+    the tab unfiled over the person's filing; the job's own folder still wins.
     """
+    link_key = session_key or f"cron:{job.id}"
+    name = cron_tab_name(link_key)
     # An app-owned slot under the job's key is never adopted: linking it would
     # hand the app the job's transcript. Nothing is bound or surfaced instead.
-    if app_holds_gateway_key(state, f"cron-{job.id}", "cron.bind_slot"):
+    if app_holds_gateway_key(state, name, "cron.bind_slot"):
         return None
     # Whether this call MINTS the tab decides whether it is filed into the job's
     # chat folder (see the end): a tab found in the table -- filed, unfiled or
     # dragged somewhere by the reader -- is left exactly where it is.
-    minted = state.get_slot(f"cron-{job.id}") is None
+    minted = state.get_slot(name) is None
     slot = state.get_or_create_slot(
-        name=f"cron-{job.id}",
+        name=name,
         agent=job.member_id or job.agent_id or "",
         # A cron result is the job's output, not something the person typed.
         # A USER label would expose it to any app holding `slots:user`.
         origin=SlotOrigin.CRON,
     )
-    slot.title = f"Cron: {_safe_job_name(job)}"
+    slot.title = f"Cron: {_safe_job_name(job)}{run_stamp(job) if session_key else ''}"
+    # Pinned, as a reload restores it, so the auto-titler never renames the tab
+    # after its first user row: this run's header with its hidden marker.
+    slot._titled = True
+    slot._title_origin = "user"
     # A provider-template alias on a legacy V1 job cannot authorize a private
     # member. Private cron dispatch publishes its protected session binding;
     # follow-up turns must use that binding instead of minting one from agent_id.
     slot._memory_assignment_from_history = True
     if job.memory_store:
         slot.memory_store = job.memory_store
+    _place_cron_tab(slot, cron_tab_workspace(job) if workspace is None else workspace)
     if not slot.linked_session_key:
         # Bind + hydrate ALWAYS, so injected results and follow-up turns route to
         # the same ``cron:{id}`` transcript (splitting the binding on a transient
@@ -589,22 +723,25 @@ def _bind_cron_slot(
         # full save CARRIES the on-disk dismissed line forward rather than
         # serializing its empty in-memory set and erasing the real tombstones. A
         # later readable restore clears the flag. Link + hydration move together.
-        slot.linked_session_key = f"cron:{job.id}"
+        slot.linked_session_key = link_key
         # A cron link is exempt from the channel class, so this records nothing in
         # practice. It is here so EVERY assignment site reaches the recorder and the
         # derived pin needs no exception for this one.
         note_crew_log_class(state, slot)
-        from kiro_crew.dashboard.transcript_binding import bind_transcript
+        from kiro_crew.dashboard.transcript_binding import (
+            bind_transcript,
+            mark_turn_timeout_unread,
+        )
 
         bind_transcript(state, slot)
-        hydrate_slot_from_history(slot, history or [])
+        rows, hidden = history if isinstance(history, tuple) else (history or [], (0, 0))
+        hydrate_slot_from_history(slot, rows, hidden)
         # The tab's own turn time limit lives on the transcript's metadata line,
         # which this bind does not read. Until restore_cron_turn_timeout reads
         # it, the slot's saves carry the on-disk value forward rather than
         # writing "follow the global limit" over it; a reused slot's limit from
         # a prior binding is dropped for the same reason.
-        slot.turn_timeout_secs = None
-        slot._turn_timeout_hydrated = False
+        mark_turn_timeout_unread(state, slot)
         if dismissed is not _DISMISSED_UNREAD:
             _restore_dismissed_source_links(slot, dismissed)
         else:
@@ -631,6 +768,13 @@ def _bind_cron_slot(
 
     _sync_dashboard_slots(state)
     if minted:
+        # A folder deleted since, or one this tab's store may not sit in, is
+        # dropped: the tab lands unfiled, as it does for the job's own folder.
+        memory_store = str(getattr(slot, "memory_store", "") or "")
+        if chat_folder_exists(state, stored_folder) and not chat_folder_refuses_store(
+            state, stored_folder, memory_store
+        ):
+            slot.folder_id = stored_folder
         persist_cron_chat_folder(state, job, slot)
     return slot
 
@@ -664,10 +808,12 @@ def inject_cron_result_to_dashboard(
     result_text: str,
     *,
     include_prompt: bool = True,
-    history: list[dict[str, Any]] | None,
+    history: list[dict[str, Any]] | CronTabRows | None,
     dismissed: object = _DISMISSED_UNREAD,
     context_reading: dict[str, Any] | None = None,
     turn_stats: dict[str, Any] | None = None,
+    session_key: str = "",
+    stored_folder: str = "",
 ) -> None:
     """Inject cron result into linked dashboard chat slot (shared by to-chat and auto-inject).
 
@@ -680,14 +826,15 @@ def inject_cron_result_to_dashboard(
     :func:`prefetch_cron_history`; a sync caller must read it itself and own the
     blocking cost.
 
-    ``None`` is legal and means "the injection will not need it" -- the state
-    :func:`prefetch_cron_history` skips its read in. It cannot mean a lost
-    hydration, because the only state that consumes ``history`` is an unlinked
-    slot, and the only writer of ``linked_session_key`` for a cron slot is
-    :func:`_bind_cron_slot` — shared by this function and the run-start
-    pre-create (:func:`ensure_cron_slot`), both of which hydrate in the same
-    step that links. A slot that is already linked was hydrated when it was
-    linked, whichever path did it.
+    It is :func:`prefetch_cron_history`'s :data:`CronTabRows` or a plain row list,
+    which hides nothing. ``None`` is legal and means "the injection will not need
+    it" -- the state :func:`prefetch_cron_history` skips its read in. It cannot mean
+    a lost hydration, because the only state that consumes ``history`` is an
+    unlinked slot, and the only writer of ``linked_session_key`` for a cron slot is
+    :func:`_bind_cron_slot` — shared by this function and the run-start pre-create
+    (:func:`ensure_cron_slot`), both of which hydrate in the same step that links. A
+    slot that is already linked was hydrated when it was linked, whichever path did
+    it.
 
     Writes the run as a PAIR: the job's own prompt as a ``user`` row, then the
     result as an ``assistant`` row, both headed by :func:`run_stamp`. The
@@ -717,8 +864,17 @@ def inject_cron_result_to_dashboard(
     ``turn_stats`` is the run's ``meta.turn_stats`` (``chat_runner.turn_stats_meta``),
     stamped on the result row so the chat footer shows the run's usage the same
     way it does for a chat turn. ``None`` (the to-chat replay path) stamps nothing.
+
+    ``session_key`` is a ``new_chat_per_run`` run's own key: the run lands in
+    its own tab and transcript (see :func:`_bind_cron_slot`). Empty means the
+    job's ``cron:{id}`` tab.
+
+    ``stored_folder`` is :func:`_bind_cron_slot`'s: the folder a tab minted
+    again is filed back in.
     """
-    slot = _bind_cron_slot(state, job, history, dismissed)
+    slot = _bind_cron_slot(
+        state, job, history, dismissed, session_key=session_key, stored_folder=stored_folder
+    )
     if slot is None:
         return
     safe_name = _safe_job_name(job)
@@ -755,9 +911,8 @@ def inject_cron_result_to_dashboard(
         the dashboard conversation_log, and slot.append only updates the
         in-memory slot. Without this, chat_runner.build_session_replay reads an
         empty cron:{id} log and the follow-up agent opens with no memory of the
-        run the user is looking at. The stable linked key (cron:{id}) covers
-        both persistent and stateless crons, since the slot always links there
-        regardless of the per-run execution key.
+        run the user is looking at. Written under the job's ``cron:{id}``, or a
+        ``new_chat_per_run`` run's own ``cron:{id}:{run}``.
 
         ONE grouped write, not one per row: a run writes a prompt row AND a
         result row, and dispatching them separately hands two worker threads two
@@ -778,7 +933,7 @@ def inject_cron_result_to_dashboard(
             return
         append_rows_if_absent_off_loop(
             state.conversation_log,
-            f"cron:{job.id}",
+            session_key or f"cron:{job.id}",
             durable_rows,
             agent=job.agent_id or None,
             row_meta=durable_meta,
@@ -865,7 +1020,79 @@ def _app_owned(slot: Any) -> bool:
     return isinstance(owner, str) and bool(owner)
 
 
-async def prefetch_cron_history(state: DashboardState, job_id: str) -> list[dict[str, Any]] | None:
+#: The ``closed_id`` of the close the person made with the tab's own close button.
+PERSON_CLOSE_KEY = "person_close_id"
+
+
+def note_person_close(log: "ConversationLog", key: str) -> None:
+    """Mark the close stamped on *key*'s line as the person's own.
+
+    Only such a close lets :func:`start_fresh_cron_tab` reopen a job tab empty:
+    the idle sweep, a bulk archive and an agent's close stamp ``closed`` the same
+    way and must not hide the person's history. Keyed by the close's
+    ``closed_id``, so a later close nobody marked does not inherit it.
+    """
+    meta, readable = log.get_metadata_status(key)
+    closed_id = meta.get("closed_id") if readable and meta.get("closed") else None
+    if isinstance(closed_id, str) and closed_id:
+        log.update_metadata_if(
+            key,
+            {PERSON_CLOSE_KEY: closed_id},
+            lambda current: current.get("closed_id") == closed_id,
+        )
+
+
+async def note_cron_tab_closed_by_person(state: DashboardState, slot: Any) -> None:
+    """Off-loop :func:`note_person_close` for a cron tab the person just closed."""
+    key = getattr(slot, "linked_session_key", "")
+    # Every other tab's close returns before the log is touched.
+    if not isinstance(key, str) or not key.startswith("cron:") or state.conversation_log is None:
+        return
+    try:
+        await asyncio.to_thread(note_person_close, state.conversation_log, key)
+    except Exception:
+        logger.warning(
+            "Cron tab %s: its close could not be marked as the person's", key, exc_info=True
+        )
+
+
+def start_fresh_cron_tab(log: "ConversationLog", job_id: str) -> bool:
+    """Hide a closed job tab's rows from the tab a run is about to reopen; True once hidden.
+
+    The ``on_tab_close="fresh"`` step, run off the loop right before the mint. It
+    acts only on a close the person made (:func:`note_person_close`), so an idle
+    sweep, a bulk archive, an agent's close or a restart never empties a tab. The
+    floor is the newest row's ``ts`` (``display_floor``), written only while that
+    close is still the line's latest. The rows stay in the transcript.
+    """
+    key = f"cron:{job_id}"
+    meta, readable = log.get_metadata_status(key)
+    closed_id = meta.get("closed_id") if readable and meta.get("closed") else None
+    # A close with no id (an older build's, or a failed resume's restored stamp)
+    # cannot be the person's.
+    if not isinstance(closed_id, str) or not closed_id or meta.get(PERSON_CLOSE_KEY) != closed_id:
+        return False
+    floor = latest_transcript_ts(*(row.get("ts") for row in log.read_messages_chained_tail(key, 1)))
+    if floor is None:
+        return False
+    return log.update_metadata_if(
+        key,
+        {DISPLAY_FLOOR_KEY: floor},
+        lambda current: bool(current.get("closed")) and current.get("closed_id") == closed_id,
+    )
+
+
+def read_cron_tab_rows(log: "ConversationLog", key: str) -> CronTabRows:
+    """*key*'s rows for hydrating its tab: without those its display floor hides."""
+    rows = log.read_messages(key)
+    floor = read_display_floor(log, key)
+    shown, start, _ = clip_to_floor(rows, 0, floor) if floor else (rows, 0, False)
+    return shown, (start, durable_row_count(rows[:start]))
+
+
+async def prefetch_cron_history(
+    state: DashboardState, job_id: str, session_key: str = "", *, fresh: bool = False
+) -> CronTabRows | None:
     """Off-loop read of the ``cron:{id}`` transcript for the injection above.
 
     :func:`inject_cron_result_to_dashboard` is synchronous and hydrates a
@@ -880,14 +1107,31 @@ async def prefetch_cron_history(state: DashboardState, job_id: str) -> list[dict
     legal value for the parameter, so the skip needs no special handling at the
     call site. Also skipped when an app owns the slot under that key: the binder
     stands down there (``slot_ownership.app_holds_gateway_key``) and consumes
-    nothing either.
+    nothing either. ``session_key`` reads one ``new_chat_per_run`` run's
+    transcript instead of the job's.
+
+    ``fresh`` is the job's ``on_tab_close="fresh"``: when it is about to mint the
+    job's own tab after the person closed it, :func:`start_fresh_cron_tab` hides
+    the old rows and the tab is hydrated with none. Rows an earlier fresh reopen
+    hid are never hydrated either; :func:`read_cron_tab_rows` counts them so the
+    tab's saves keep them as its frozen prefix.
     """
     if state.conversation_log is None:
         return None
-    slot = state.get_slot(f"cron-{job_id}")
+    history_key = session_key or f"cron:{job_id}"
+    slot = state.get_slot(cron_tab_name(history_key))
     if slot is not None and (slot.linked_session_key or _app_owned(slot)):
         return None
-    return await asyncio.to_thread(state.conversation_log.read_messages, f"cron:{job_id}")
+    if fresh and not session_key and slot is None:
+        try:
+            await asyncio.to_thread(start_fresh_cron_tab, state.conversation_log, job_id)
+        except Exception:
+            logger.warning(
+                "Cron %s: its closed tab could not start fresh; it keeps its history",
+                job_id,
+                exc_info=True,
+            )
+    return await asyncio.to_thread(read_cron_tab_rows, state.conversation_log, history_key)
 
 
 async def prefetch_cron_dismissed(state: DashboardState, job_id: str) -> object:
@@ -947,6 +1191,24 @@ async def prefetch_cron_dismissed(state: DashboardState, job_id: str) -> object:
     return dismissed
 
 
+async def stored_cron_folder(state: DashboardState, job_id: str) -> str:
+    """Off-loop read of the folder the job's closed tab was filed in; ``""`` if none.
+
+    Read only while the job has no tab, the one case :func:`_bind_cron_slot`
+    mints it and needs the line's ``folder_id``. A failed or unreadable read
+    answers ``""``: the tab lands unfiled, as it did before this read existed.
+    """
+    log = state.conversation_log
+    if log is None or state.get_slot(f"cron-{job_id}") is not None:
+        return ""
+    try:
+        meta, readable = await asyncio.to_thread(log.get_metadata_status, f"cron:{job_id}")
+    except Exception:
+        return ""
+    folder = meta.get("folder_id") if readable else ""
+    return folder if isinstance(folder, str) else ""
+
+
 async def ensure_cron_slot(state: DashboardState, job: "CronJob") -> None:
     """Make an eligible job's tab exist — and carry its identity — at run START.
 
@@ -977,18 +1239,24 @@ async def ensure_cron_slot(state: DashboardState, job: "CronJob") -> None:
     """
     if not (job.persistent_session and not job.hide_in_chat):
         return
+    # Resolved before the turn starts, so the turn's own session_create meets a
+    # tab in the workspace the turn runs in, an already linked tab included.
+    workspace = await asyncio.to_thread(cron_tab_workspace, job)
     slot = state.get_slot(f"cron-{job.id}")
     if _app_owned(slot):
-        # Never adopted (see _bind_cron_slot). Returned before any read, and with
-        # no audit row: the result injection records the one refusal per run.
+        # Never adopted (see _bind_cron_slot). Returned before any transcript
+        # read, and with no audit row: the result injection records the one
+        # refusal per run.
         return
     if slot is not None and slot.linked_session_key:
+        _place_cron_tab(slot, workspace)
         await prefetch_cron_dismissed(state, job.id)
         await restore_cron_turn_timeout(state, job.id)
         return
-    history = await prefetch_cron_history(state, job.id)
+    history = await prefetch_cron_history(state, job.id, fresh=job.on_tab_close == "fresh")
     dismissed = await prefetch_cron_dismissed(state, job.id)
-    _bind_cron_slot(state, job, history, dismissed)
+    folder = await stored_cron_folder(state, job.id)
+    _bind_cron_slot(state, job, history, dismissed, workspace=workspace, stored_folder=folder)
     await restore_cron_turn_timeout(state, job.id)
 
 
@@ -1038,8 +1306,13 @@ async def restore_cron_turn_timeout(state: DashboardState, job_id: str) -> None:
     apply_cron_turn_timeout(slot, meta)
 
 
-def hydrate_slot_from_history(slot: Any, messages: list[dict[str, Any]]) -> None:
+def hydrate_slot_from_history(
+    slot: Any, messages: list[dict[str, Any]], hidden: tuple[int, int] = (0, 0)
+) -> None:
     """Load last 50 messages from pre-loaded history into a new slot.
+
+    *hidden* is :data:`CronTabRows`'s count of the on-disk rows before *messages*
+    that a display floor hides: the slot's frozen prefix, so a save keeps them.
 
     Each row's ``meta`` rides along so a persisted ``meta.mid`` survives the
     round trip (``_ChatSlot.append`` preserves a supplied id and mints one only
@@ -1049,6 +1322,8 @@ def hydrate_slot_from_history(slot: Any, messages: list[dict[str, Any]]) -> None
     reconciliation selects the identity walk, no window id matches, and the
     whole hydrated history is served twice until the next flush rewrites it.
     """
+    if hidden[0]:
+        slot._disk_older_count, slot._disk_older_durable_count = hidden
     for msg in messages[-50:]:
         role = msg.get("role", "assistant")
         content = msg.get("content", "")

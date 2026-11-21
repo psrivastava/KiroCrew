@@ -1,13 +1,7 @@
 """SessionManager live config: the session/agent/watchdog fields follow config.json.
 
-``SessionManager`` subscribes itself on the process config watcher. These tests
-pin each applier: the manager adopts the reloaded config, a factory-bound
-default goes through ``refresh_defaults`` (which now re-derives the warm-pool
-shape without a second load), the cleanup loop re-reads its idle timeout and
-RSS ceiling every tick, a ``watchdog.*`` change re-clamps live handles through
-``_load_watchdog_settings``, the runtime's session-start budget and the
-context builder's ``{bot_name}`` read the live snapshot, and a file write
-dispatched through ``ConfigWatch`` reaches the manager end to end.
+Pins each applier ``SessionManager`` registers on the config watcher, plus a file
+write through ``ConfigWatch`` reaching the manager end to end.
 """
 
 from __future__ import annotations
@@ -114,11 +108,12 @@ class TestSubscription:
             "default_workspace",
             "aws",
             "apps",
+            "templates",
         )
         assert mgr._config_sub is subs[0]
 
     def test_factory_paths_are_under_the_subscribed_prefixes(self) -> None:
-        prefixes = ("agent.", "session.", "workspaces", "default_workspace")
+        prefixes = ("agent.", "session.", "workspaces", "default_workspace", "templates")
         for path in SessionManager._FACTORY_CONFIG_PATHS:
             assert path.startswith(prefixes)
 
@@ -177,12 +172,80 @@ class TestAdoptOnChange:
         assert "session.pool_agent" in SessionManager._FACTORY_CONFIG_PATHS
 
     @pytest.mark.asyncio
-    async def test_factory_bound_default_goes_through_refresh_defaults(self) -> None:
+    async def test_a_spec_pin_change_retires_the_warm_pool(self) -> None:
+        """A warm provider of a contested name runs the file pinned when it
+        started, so a pin change re-derives the pool instead of letting a new
+        chat claim a provider running a file the pin does not name."""
         mgr, _ = _make_manager()
         mgr.refresh_defaults = AsyncMock()  # type: ignore[method-assign]
         new_cfg = _make_cfg()
-        await mgr._on_config_change(_change(new_cfg, "agent.model"))
+        await mgr._on_config_change(_change(new_cfg, "agent.spec_pins"))
         mgr.refresh_defaults.assert_awaited_once_with(cfg=new_cfg)
+
+    @pytest.mark.asyncio
+    async def test_factory_bound_default_goes_through_refresh_defaults(self) -> None:
+        mgr, old_factory = _make_manager()
+        new_cfg = _make_cfg()
+        with (
+            patch.object(mgr, "refresh_defaults", wraps=mgr.refresh_defaults) as refresh,
+            patch("kiro_crew.session.KiroCrewConfig.load"),
+            patch("kiro_crew.session.default_project_dir", return_value="/ws"),
+            patch("kiro_crew.session.build_provider_factory", side_effect=_factory_for),
+            patch.object(mgr, "start_pool", AsyncMock()),
+            patch.object(mgr, "_retire_stale_backend_bg_runtime", AsyncMock()),
+        ):
+            await mgr._on_config_change(_change(new_cfg, "agent.model"))
+        refresh.assert_awaited_once_with(cfg=new_cfg)
+        assert mgr._cfg is new_cfg
+        assert mgr._provider_factory is not old_factory, "the factory was rebuilt"
+
+    @pytest.mark.asyncio
+    async def test_no_old_provider_is_claimable_once_the_new_config_is_in_force(self) -> None:
+        """The drain empties the queue in the same step that installs the new
+        config, so a claim made while an old provider shuts down finds nothing
+        launched under the previous config."""
+        mgr, _ = _make_manager()
+        for _ in range(2):
+            mgr._warm_pool.put_nowait((MagicMock(), 0.0))
+        claimed_mid_drain: list[object] = []
+
+        async def _discard(provider, context):
+            claimed_mid_drain.append(mgr._claim_from_pool(mgr._pool_agent or None))
+
+        with (
+            patch.object(mgr, "_discard_pool_provider", side_effect=_discard),
+            patch("kiro_crew.session.default_project_dir", return_value="/ws"),
+            patch("kiro_crew.session.build_provider_factory", side_effect=_factory_for),
+            patch.object(mgr, "start_pool", AsyncMock()),
+            patch.object(mgr, "_retire_stale_backend_bg_runtime", AsyncMock()),
+        ):
+            await mgr.refresh_defaults(cfg=_make_cfg())
+        assert claimed_mid_drain == [None, None]
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_drain_still_ends_every_provider_it_took(self) -> None:
+        """A drain interrupted mid-discard hard-kills the providers it had not
+        reached yet: they have left the queue, so nothing else would end them."""
+        mgr, _ = _make_manager()
+        first, rest = MagicMock(), MagicMock()
+        mgr._warm_pool.put_nowait((first, 0.0))
+        mgr._warm_pool.put_nowait((rest, 0.0))
+
+        async def _discard(provider, context):
+            raise asyncio.CancelledError
+
+        with (
+            patch.object(mgr, "_discard_pool_provider", side_effect=_discard),
+            patch.object(mgr, "_dispatch_hard_kill") as hard_kill,
+            patch("kiro_crew.session.default_project_dir", return_value="/ws"),
+            patch("kiro_crew.session.build_provider_factory", side_effect=_factory_for),
+            patch.object(mgr, "start_pool", AsyncMock()),
+            patch.object(mgr, "_retire_stale_backend_bg_runtime", AsyncMock()),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await mgr.refresh_defaults(cfg=_make_cfg())
+        hard_kill.assert_called_once_with(rest)
+        assert mgr._warm_pool.empty()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -200,10 +263,18 @@ class TestAdoptOnChange:
         ],
     )
     async def test_each_factory_path_triggers_a_refresh(self, path: str) -> None:
-        mgr, _ = _make_manager()
-        mgr.refresh_defaults = AsyncMock()  # type: ignore[method-assign]
-        await mgr._on_config_change(_change(_make_cfg(), path))
-        mgr.refresh_defaults.assert_awaited_once()
+        mgr, old_factory = _make_manager()
+        with (
+            patch.object(mgr, "refresh_defaults", wraps=mgr.refresh_defaults) as refresh,
+            patch("kiro_crew.session.KiroCrewConfig.load"),
+            patch("kiro_crew.session.default_project_dir", return_value="/ws"),
+            patch("kiro_crew.session.build_provider_factory", side_effect=_factory_for),
+            patch.object(mgr, "start_pool", AsyncMock()),
+            patch.object(mgr, "_retire_stale_backend_bg_runtime", AsyncMock()),
+        ):
+            await mgr._on_config_change(_change(_make_cfg(), path))
+        refresh.assert_awaited_once()
+        assert mgr._provider_factory is not old_factory, "the factory was rebuilt"
 
 
 class TestRefreshDefaultsRederivesThePool:
@@ -374,13 +445,9 @@ class TestCleanupLoopRereadsPolicy:
     def test_a_long_session_timeout_does_not_slow_the_housekeeping_sweeps(self) -> None:
         """The tick is capped, so long-lived sessions keep the ~5 min cadence.
 
-        One tick drives the idle-expiry hook AND ``_run_cleanup_ticks``'s
-        housekeeping: orphaned session roots, tracked PIDs, untracked MCP
-        servers, sandbox artifacts. Deriving it from ``timeout_secs`` alone puts
-        those sweeps 4 hours apart at ``timeout_secs=86400`` -- while DISABLING
-        idle expiry yields 300 s, so asking for long sessions would buy worse
-        orphan cleanup than switching the sweep off. The floor case is the
-        invariant: the interval must never exceed what ``timeout_secs=0`` gives.
+        The tick also drives ``_run_cleanup_ticks``'s orphan sweeps, so at
+        ``timeout_secs=86400`` it must not stretch to 4 hours. It never exceeds what
+        ``timeout_secs=0`` gives.
         """
         mgr, _ = _make_manager(timeout_secs=0)
         cleanup = mgr._cleanup_boundary()
@@ -465,16 +532,9 @@ class TestCleanupLoopRereadsPolicy:
     async def test_the_tick_prunes_session_pid_mappings_off_the_loop(self) -> None:
         """The mapping prune must run on the tick, and must not run on the loop.
 
-        Both halves are asserted because the alternative design satisfies only
-        the first. Until the tick called it, the prune was reached solely from
-        ``cleanup_orphaned_sessions`` -- startup and shutdown -- so a gateway that
-        kept running held every mapping it published, one per released session,
-        and a recycled pid number went on carrying a dashboard slot's key; the
-        300s cap above is what makes this cadence bounded. Hooking the same work
-        onto a provider teardown would also retract the mapping, but
-        ``AcpClient._reset_state`` is synchronous and on the event loop, so it
-        would be a directory glob and unlinks over agent-plantable paths in the
-        one place ``no-blocking-call-on-event-loop`` forbids.
+        Without the tick a running gateway keeps every mapping, and a recycled pid
+        carries a slot's key. Pruning from ``AcpClient._reset_state`` would put a glob
+        and unlinks on the event loop.
         """
         mgr, _ = _make_manager()
         cleanup = mgr._cleanup_boundary()

@@ -29,6 +29,7 @@ The contract these tests pin:
 from __future__ import annotations
 
 import logging
+import re
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -36,7 +37,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from kiro_crew.config.sections import MemoryConfig
+from kiro_crew.config.sections import MemoryConfig, WorkspaceConfig
 
 
 @pytest.fixture(autouse=True)
@@ -68,6 +69,7 @@ def _fake_config():
         agents={},
         memory_stores={},
         workspaces={},
+        default_workspace="default",
         default_agent="kirocrew",
         save=lambda: saved.append(True),
         saved=saved,
@@ -387,6 +389,23 @@ class TestFirstGreetingOwed:
         assert marked == [("scout", WELCOME_KIND_GOAL, data["member_id"])]
 
     @pytest.mark.asyncio
+    async def test_a_crewmate_named_after_a_windows_device_owes_its_welcome_elsewhere(self):
+        """``members/nul`` is the NUL device on Windows, so the welcome record a
+        crewmate named ``Nul`` owes must land in a directory of another name."""
+        from kiro_crew.members import WELCOME_OWED_FILENAME, members_root
+
+        status, data = await _post(
+            {"name": "Nul", "kiro_agent": "kirocrew", "first_greeting": True},
+            _fake_config(),
+            installed=("kirocrew",),
+        )
+
+        assert status == 200
+        assert re.fullmatch(r"nul-[0-9a-f]{12}", data["member_id"])
+        assert (members_root() / data["member_id"] / WELCOME_OWED_FILENAME).is_file()
+        assert "nul" not in {entry.name for entry in members_root().iterdir()}
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("flag", [None, False, "true", 1])
     async def test_a_create_without_the_flag_owes_nothing(self, flag):
         cfg = _fake_config()
@@ -403,6 +422,75 @@ class TestFirstGreetingOwed:
             status, _ = await _post(body, cfg, installed=("kirocrew",))
         assert status == 200
         assert marked == []
+
+
+class TestCreateRequestHandle:
+    """``request_id`` is the reconcile path for a create whose answer was lost.
+
+    A repeat of the same request is answered with the member that request
+    created; any other repeat of a taken name is still ``409 agent_exists``.
+    """
+
+    RID = "6f1c2b9e-3d4a-4e5f-8a7b-0c1d2e3f4a5b"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "named",
+        [
+            {"name": "scout"},
+            {"name": "Scout Bot"},
+            # Shows the KEY of another crew, which shows a label of its own.
+            {"name": "Foo Bar", "display_name": "ranger"},
+        ],
+    )
+    async def test_a_repeat_of_the_same_request_gets_the_member_it_created(self, named):
+        cfg = _fake_config()
+        other = {"name": "ranger", "display_name": "Range Finder", "kiro_agent": "kirocrew"}
+        assert (await _post(other, cfg, installed=("kirocrew",)))[0] == 200
+        body = {**named, "kiro_agent": "kirocrew", "request_id": self.RID}
+        first = await _post(body, cfg, installed=("kirocrew",))
+        again = await _post(body, cfg, installed=("kirocrew",))
+        assert first[0] == 200 and first[1]["member_id"]
+        assert again == first
+        assert cfg.saved == [True, True] and len(cfg.agents) == 2
+
+    @pytest.mark.asyncio
+    async def test_a_repeat_naming_an_unconfigured_workspace_gets_the_same_warning(self):
+        cfg = _fake_config()
+        body = {
+            "name": "scout",
+            "kiro_agent": "kirocrew",
+            "workspace": "nope",
+            "request_id": self.RID,
+        }
+        first = await _post(body, cfg, installed=("kirocrew",))
+        again = await _post(body, cfg, installed=("kirocrew",))
+        assert first[0] == 200
+        assert first[1].get("warnings") == [
+            "workspace 'nope' is not configured; the crew shares a fallback workspace directory"
+        ]
+        assert again == first
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("repeat_id", [None, "0b9e4a1c-2d3f-4a5b-9c8d-7e6f5a4b3c2d"])
+    async def test_any_other_repeat_is_still_agent_exists(self, repeat_id):
+        cfg = _fake_config()
+        body = {"name": "scout", "kiro_agent": "kirocrew", "request_id": self.RID}
+        assert (await _post(body, cfg, installed=("kirocrew",)))[0] == 200
+        repeat = {"name": "scout", "kiro_agent": "kirocrew"}
+        if repeat_id is not None:
+            repeat["request_id"] = repeat_id
+        status, data = await _post(repeat, cfg, installed=("kirocrew",))
+        assert (status, data["code"]) == (409, "agent_exists")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad", ["", "not-a-uuid", 1, ["6f1c2b9e-3d4a-4e5f-8a7b-0c1d2e3f4a5b"]])
+    async def test_a_request_id_that_is_not_a_uuid_is_refused_before_any_write(self, bad):
+        cfg = _fake_config()
+        body = {"name": "scout", "kiro_agent": "kirocrew", "request_id": bad}
+        status, data = await _post(body, cfg, installed=("kirocrew",))
+        assert (status, data["code"]) == (400, "invalid_request_id")
+        assert cfg.saved == [] and cfg.agents == {}
 
 
 class TestApprovalModeOnCreate:
@@ -513,3 +601,144 @@ class TestImportedCrewmateCreate:
         assert status == 400
         assert data["code"] == "invalid_imported"
         assert cfg.saved == [] and cfg.agents == {}
+
+
+class TestHeadlessAvatarDefault:
+    """A create with no avatar must store the name-seeded ICON the UI posts for
+    the same name, never an empty override (which renders the ghost);
+    an explicitly supplied avatar is never overridden."""
+
+    @pytest.mark.asyncio
+    async def test_no_avatar_stores_the_name_seeded_icon(self):
+        from kiro_crew.crew_avatar_seed import default_icon_avatar
+
+        cfg = _fake_config()
+        status, _ = await _post(
+            {"name": "scout", "kiro_agent": "kirocrew"}, cfg, installed=("kirocrew",)
+        )
+        assert status == 200
+        stored = cfg.written["doc"]["agents"]["scout"]["avatar"]
+        assert stored == default_icon_avatar("scout")
+        assert stored["kind"] == "icon"
+
+    @pytest.mark.asyncio
+    async def test_no_avatar_never_stores_an_empty_override(self):
+        cfg = _fake_config()
+        status, _ = await _post(
+            {"name": "scout", "kiro_agent": "kirocrew"}, cfg, installed=("kirocrew",)
+        )
+        assert status == 200
+        # An empty override is exactly what renders the trait ghost; a headless
+        # create must never land there.
+        assert cfg.written["doc"]["agents"]["scout"]["avatar"] != {}
+
+    @pytest.mark.asyncio
+    async def test_explicit_icon_avatar_is_not_overridden(self):
+        cfg = _fake_config()
+        chosen = {"kind": "icon", "pose": "pose-3", "bg": "#123456"}
+        status, _ = await _post(
+            {"name": "scout", "kiro_agent": "kirocrew", "avatar": chosen},
+            cfg,
+            installed=("kirocrew",),
+        )
+        assert status == 200
+        assert cfg.written["doc"]["agents"]["scout"]["avatar"] == chosen
+
+    @pytest.mark.asyncio
+    async def test_explicit_ghost_avatar_is_not_overridden(self):
+        from kiro_crew.config.sections import _safe_avatar
+
+        cfg = _fake_config()
+        ghost = {"kind": "ghost", "traits": {"eyes": "happy"}}
+        status, _ = await _post(
+            {"name": "scout", "kiro_agent": "kirocrew", "avatar": ghost},
+            cfg,
+            installed=("kirocrew",),
+        )
+        assert status == 200
+        # The ghost the user explicitly picked stands (in its validated form);
+        # only an ABSENT avatar is defaulted to a seeded icon.
+        stored = cfg.written["doc"]["agents"]["scout"]["avatar"]
+        assert stored == _safe_avatar(ghost)
+        assert stored["kind"] == "ghost"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "ghost_reset",
+        [
+            {"kind": "ghost", "traits": {}},
+            {"kind": "ghost", "traits": {"eyes": "", "mouth": ""}},
+        ],
+    )
+    async def test_explicit_ghost_reset_is_not_replaced_by_the_icon(self, ghost_reset):
+        """An explicit ghost RESET -- a ghost override whose traits are all empty --
+        collapses to `{}` under `_safe_avatar` but is a deliberate choice of the
+        name-derived ghost (the `_is_ghost_shaped` canonical reset). The icon
+        default must NOT replace it; the stored avatar stays the empty-override
+        reset, not a seeded icon. (A bare `{"kind": "ghost"}` with no `traits`
+        key is not ghost-shaped and the handler rejects it 400 by existing design.)"""
+        cfg = _fake_config()
+        status, _ = await _post(
+            {"name": "scout", "kiro_agent": "kirocrew", "avatar": ghost_reset},
+            cfg,
+            installed=("kirocrew",),
+        )
+        assert status == 200
+        stored = cfg.written["doc"]["agents"]["scout"].get("avatar", {})
+        # The reset stored as the canonical empty override -- NOT an icon.
+        assert stored.get("kind") != "icon"
+        assert stored in ({}, None)
+
+    @pytest.mark.asyncio
+    async def test_free_form_name_seeds_from_the_shown_label(self):
+        from kiro_crew.crew_avatar_seed import default_icon_avatar
+
+        cfg = _fake_config()
+        # A free-form name becomes the crew's display label over a derived key;
+        # the icon must seed from the shown label, matching the UI preview.
+        status, _ = await _post(
+            {"name": "Scout Ranger", "kiro_agent": "kirocrew"},
+            cfg,
+            installed=("kirocrew",),
+        )
+        assert status == 200
+        agents = cfg.written["doc"]["agents"]
+        (key,) = agents.keys()
+        assert agents[key]["display_name"] == "Scout Ranger"
+        assert agents[key]["avatar"] == default_icon_avatar("Scout Ranger")
+
+
+class TestUnconfiguredWorkspaceWarning:
+    """A named workspace is stored as given; an unconfigured one is warned about.
+
+    Such a name falls back to another workspace's directory, so the create says
+    so with the same line the update route answers, and nothing else changes.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "workspace, warned",
+        [
+            ("nope", True),
+            ("shared", False),
+            ("default", False),
+            ("", False),
+            (None, False),
+        ],
+    )
+    async def test_only_an_unconfigured_name_is_warned_about(self, workspace, warned, tmp_path):
+        cfg = _fake_config()
+        cfg.workspaces["shared"] = WorkspaceConfig(dir=str(tmp_path / "shared"))
+        body = {"name": "scout", "kiro_agent": "kirocrew"}
+        if workspace is not None:
+            body["workspace"] = workspace
+        status, data = await _post(body, cfg, installed=("kirocrew",))
+        assert status == 200 and data["ok"] is True
+        if warned:
+            assert data.get("warnings") == [
+                "workspace 'nope' is not configured; "
+                "the crew shares a fallback workspace directory"
+            ]
+            assert cfg.written["doc"]["agents"]["scout"]["workspace"] == "nope"
+        else:
+            assert "warnings" not in data

@@ -24,6 +24,8 @@ import {
 vi.mock('../../api/client', () => ({
   api: {
     members: vi.fn(),
+    // The owner check behind Import from file (`useViewerIsNotOwner`): the owner.
+    viewerOwnerOk: vi.fn(() => Promise.resolve(true)),
     // The roster's team grouping reads the team list; "no teams" keeps the
     // list flat, which is the shape every case here was written against.
     teams: { list: vi.fn(() => Promise.resolve({ teams: [] })), create: vi.fn(), update: vi.fn(), remove: vi.fn() },
@@ -621,7 +623,7 @@ describe('MembersPage default member, memory and URL', () => {
     expect(api.memberThread).not.toHaveBeenCalledWith('mate')
     expect(api.memberGreet).not.toHaveBeenCalled()
     // Mate stays on the roster: the user can still open it.
-    fireEvent.click(await rosterRow('Mate'))
+    fireEvent.click(await rosterRow('Bot'))
     expect(await screen.findByTestId('chat-pane-stub', undefined, PANE_READY)).toHaveTextContent('member-mate')
   })
 
@@ -879,7 +881,7 @@ describe('MembersPage default member, memory and URL', () => {
     expect(notice).toHaveAttribute('role', 'status')
     expect(screen.queryByTestId('chat-pane-stub')).toBeNull()
     expect(api.memberThread).not.toHaveBeenCalled()
-    await screen.findAllByText(/No mates yet/i)
+    await screen.findAllByText(/No bots yet/i)
     expect(screen.queryByRole('alert')).toBeNull()
     // The return to `/members` is a navigate() issued from an effect once the
     // roster has loaded; on a slow runner the notice can render a tick before

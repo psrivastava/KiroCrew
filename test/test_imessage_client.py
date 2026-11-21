@@ -32,6 +32,7 @@ from kiro_crew.imessage.client import (
 )
 from kiro_crew.imessage.rpc import RpcError, RpcTransportError
 from kiro_crew.imessage.transport import IMessageTransport
+from kiro_crew.testing.clock import ManualClock
 from kiro_crew.testing.wait import await_until
 
 #: The handle every fixture message comes from, and the one the self-chat tests
@@ -494,6 +495,9 @@ class TestOverflowResume:
         ]
         await peers[0].notify("watch.overflow", {"subscription": 1, "resume_after_rowid": 1})
         await _until(lambda: len(peers[0].params_for("watch.subscribe")) == 3)
+        # The retry's answer becomes the live watch.
+        await _until(lambda: imc._subscription is not None)
+        assert imc._subscription == 4
         await imc.close()
 
     @pytest.mark.asyncio
@@ -504,6 +508,8 @@ class TestOverflowResume:
         peers[0].replies["watch.subscribe"] = [{"subscription": 2}]
         await peers[0].notify("watch.overflow", {"subscription": 1})
         await _until(lambda: len(peers[0].params_for("watch.subscribe")) == 2)
+        await _until(lambda: imc._subscription is not None)
+        assert imc._subscription == 2
         await imc.close()
 
 
@@ -958,11 +964,11 @@ class TestOwnEchoLedger:
     async def test_a_guid_match_does_not_leave_the_body_live(
         self, tmp_path: Path, peers: list[StubPeer]
     ) -> None:
-        # A sent message is recognisable by GUID and by body. While those were
-        # two independent entries, matching on the GUID left the body entry
-        # alive, and the user's genuine repeat of those words inside the TTL was
-        # then silently discarded -- no reply, no error (local GPT review of
-        # b19990c9). One record per send is what makes that unreachable.
+        # A sent message is recognisable by GUID and by body. With two
+        # independent entries, matching on the GUID would leave the body entry
+        # alive, and the user's genuine repeat of those words inside the TTL
+        # would be silently discarded -- no reply, no error. One record per send
+        # is what makes that unreachable.
         imc = await _client(tmp_path)
         peers[0].replies["send"] = [{"ok": True, "id": 9, "guid": "SENT-GUID"}]
         await imc.send(OWNER, "on it")
@@ -995,13 +1001,13 @@ class TestOwnEchoLedger:
     ) -> None:
         # Rejected at validation, so nothing was delivered and nothing can echo.
         # Keeping the record would have the undelivered body suppress a genuine
-        # message carrying those words for the rest of the TTL (local Opus
-        # review of b19990c9).
+        # message carrying those words for the rest of the TTL.
         imc = await _client(tmp_path)
         peers[0].replies["send"] = [RpcError(-32602, "invalid params")]
         with pytest.raises(RpcError):
             await imc.send(OWNER, "on it")
         assert imc._own_sends == []
+        assert not imc._sent_history
         undelivered = parse_inbound(_message(text="on it"))
         assert undelivered is not None
         assert imc.is_own_echo(undelivered) is False
@@ -1012,7 +1018,7 @@ class TestOwnEchoLedger:
         self, tmp_path: Path, peers: list[StubPeer], monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # The opposite failure mode of the cleanup above, and the one that
-        # matters more (server GPT review of 20febaeb): the bridge documents
+        # matters more: the bridge documents
         # -32001 as "may have completed or remains in flight", so the message may
         # still be delivered and echo after this call failed. Dropping the record
         # there reopens the loop.
@@ -1103,8 +1109,7 @@ class TestOwnEchoLedger:
     async def test_a_slow_send_does_not_outlive_its_own_guard(
         self, tmp_path: Path, peers: list[StubPeer], monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Third finding in this span, and the one the optional expiry exists for
-        # (local GPT review of 8091b0e9). `_call` waits up to 30s and the TTL is
+        # The case the optional expiry exists for. `_call` waits up to 30s and the TTL is
         # 30s, so with a pre-computed expiry a send that reached its timeout left
         # a record already eligible for pruning at the moment its echo arrived --
         # and the echo was answered, restoring the loop. An in-flight record has
@@ -1156,9 +1161,8 @@ class TestOwnEchoLedger:
     async def test_eviction_never_drops_an_unresolved_record(
         self, tmp_path: Path, peers: list[StubPeer]
     ) -> None:
-        # Fourth finding in this span (local GPT review of 1582c06f1), and the one
-        # the two lanes disagreed on: eviction deleted from the front regardless of
-        # state, so an unresolved record could be evicted and its echo answered --
+        # Eviction that deletes from the front regardless of state could evict
+        # an unresolved record and answer its echo --
         # while `is_own_echo` was carefully skipping exactly those records. The
         # input needs many sends outstanding at once, which this channel does not
         # do today, but the invariant is held rather than argued: unresolved
@@ -1241,6 +1245,48 @@ class TestOwnEchoLedger:
         stale = parse_inbound(_message(text="on it"))
         assert stale is not None
         assert imc.is_own_echo(stale) is False
+        await imc.close()
+
+    @pytest.mark.asyncio
+    async def test_a_late_copy_dated_at_the_send_is_still_an_echo(
+        self, tmp_path: Path, peers: list[StubPeer], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A self-chat on an account with other devices delivers copies of a send
+        # days later: a new guid each, long past the TTL, but the sent row's date.
+        clock = ManualClock(start=1_700_000_000.25)
+        clock.install(monkeypatch, client_mod)
+        imc = await _client(tmp_path)
+        await imc.send(OWNER, "on it")
+        clock.advance(3 * 24 * 3600)
+        for guid in ("LATE-1", "LATE-2"):
+            copy = parse_inbound(
+                _message(guid=guid, text="on it", created_at="2023-11-14T22:13:20.250Z")
+            )
+            assert copy is not None
+            assert imc.is_own_echo(copy) is True
+        an_hour_later = parse_inbound(
+            _message(guid="USER", text="on it", created_at="2023-11-14T23:13:20.250Z")
+        )
+        other_words = parse_inbound(
+            _message(guid="USER-2", text="thanks", created_at="2023-11-14T22:13:20.250Z")
+        )
+        assert an_hour_later is not None and other_words is not None
+        assert imc.is_own_echo(an_hour_later) is False
+        assert imc.is_own_echo(other_words) is False
+        await imc.close()
+
+    @pytest.mark.asyncio
+    async def test_a_retained_body_key_has_one_size_however_long_the_body(
+        self, tmp_path: Path, peers: list[StubPeer]
+    ) -> None:
+        imc = await _client(tmp_path)
+        await imc.send(OWNER, "x" * 100_000)
+        ((key, _sent_at),) = imc._sent_history
+        assert len(key) == len(_echo_key(OWNER, ""))
+        assert imc._own_sends[0].body_key == key
+        echo = parse_inbound(_message(text="x" * 100_000))
+        assert echo is not None
+        assert imc.is_own_echo(echo) is True
         await imc.close()
 
     @pytest.mark.asyncio

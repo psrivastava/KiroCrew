@@ -1,8 +1,8 @@
 """The typed ``app.json`` blocks other than ``contributes``.
 
 One dataclass per block -- ``crons``, ``ui``, ``backend`` and its ``hooks``,
-``permissions``, ``setup``, ``dependencies``, ``platform``, ``publishProvider`` and
-``notifications`` -- each with the ``from_dict`` / ``to_dict`` pair ``AppManifest``
+``permissions``, ``setup``, ``dependencies``, ``platform``, ``publishProvider``,
+``notifications`` and ``l10n`` -- each with the ``from_dict`` / ``to_dict`` pair ``AppManifest``
 composes and, where a block has rules of its own, a ``validate``. Parsing is defensive by
 contract: a wrong JSON type degrades to the field's empty value, and a value that would
 silently change meaning is recorded so validation can refuse it.
@@ -13,12 +13,21 @@ this module never imports it.
 
 from __future__ import annotations
 
+import logging
 import re
 import sys
 from dataclasses import dataclass, field
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
+from kiro_crew.apps.app_hosts import frame_origin_refusal
+from kiro_crew.apps.desktop_capabilities import declared_capabilities
 from kiro_crew.apps.manifest_names import KEBAB_RE
+from kiro_crew.apps.user_session_reach import declared_verbs
+
+if TYPE_CHECKING:
+    from kiro_crew.apps.chat_launch import ChatLaunch
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -337,8 +346,17 @@ class UISidebar:
     def from_dict(cls, data: dict[str, Any]) -> UISidebar:
         return cls(
             section=str(data.get("section", "Apps")),
-            order=int(data.get("order", 10)),
+            order=_sidebar_order(data.get("order", 10)),
         )
+
+
+def _sidebar_order(raw: Any) -> int:
+    """``ui.sidebar.order`` as an int; a value int() cannot take (``null``, ``"top"``,
+    NaN) keeps the default 10 instead of failing the whole manifest."""
+    try:
+        return int(raw)
+    except (TypeError, ValueError, OverflowError):
+        return 10
 
 
 @dataclass
@@ -359,10 +377,34 @@ class UIConfig:
     # supplies markup or styles. Empty means undeclared, which the dashboard
     # renders as "page", the skeleton every app had before the field existed.
     loading_layout: str = ""
+    # Exact ``https://host`` origins the app's pages may frame, from
+    # ``"frameSources"``. The gateway adds them to the dashboard ``frame-src`` while
+    # the app is enabled and trusted (``apps/frame_sources.py``).
+    frameSources: list[str] = field(default_factory=list)  # noqa: N815
+    #: ``frameSources`` present but not a list of strings. Not serialized.
+    bad_frame_sources: bool = False
 
     # Names `ui.loading.layout` may take. Mirrors ``APP_LOADING_LAYOUTS`` in
     # ``website/src/components/AppLoadingFallback.tsx``.
     LOADING_LAYOUTS: ClassVar[frozenset[str]] = frozenset({"page", "rail", "centered", "split"})
+    MAX_FRAME_SOURCES: ClassVar[int] = 8
+
+    def frame_source_errors(self) -> list[str]:
+        """Validation errors of ``ui.frameSources``; empty when it is valid or absent."""
+        if self.bad_frame_sources:
+            return ["ui.frameSources must be an array of https origins"]
+        errors: list[str] = []
+        if len(self.frameSources) > self.MAX_FRAME_SOURCES:
+            errors.append(
+                f"ui.frameSources: {len(self.frameSources)} entries exceeds the limit of "
+                f"{self.MAX_FRAME_SOURCES}"
+            )
+        for origin in self.frameSources:
+            if refusal := frame_origin_refusal(origin):
+                errors.append(f"ui.frameSources entry is {refusal}: {origin!r}")
+        if len(set(self.frameSources)) != len(self.frameSources):
+            errors.append("ui.frameSources repeats an entry")
+        return errors
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {}
@@ -376,6 +418,8 @@ class UIConfig:
             d["pages"] = [p.to_dict() for p in self.pages]
         if self.overlays:
             d["overlays"] = [o.to_dict() for o in self.overlays]
+        if self.frameSources:
+            d["frameSources"] = list(self.frameSources)
         sidebar_d = self.sidebar.to_dict()
         if sidebar_d:
             d["sidebar"] = sidebar_d
@@ -402,12 +446,16 @@ class UIConfig:
         )
         sidebar_raw = data.get("sidebar", {})
         sidebar = UISidebar.from_dict(sidebar_raw) if isinstance(sidebar_raw, dict) else UISidebar()
+        raw_frames = data.get("frameSources", [])
+        frames_ok = isinstance(raw_frames, list) and all(isinstance(o, str) for o in raw_frames)
         return cls(
             entry=str(data.get("entry", "")),
             pages=pages,
             overlays=overlays,
             sidebar=sidebar,
             loading_layout=cls._parse_loading_layout(data.get("loading")),
+            frameSources=list(raw_frames) if frames_ok else [],
+            bad_frame_sources=not frames_ok,
         )
 
     @classmethod
@@ -491,6 +539,10 @@ class BackendConfig:
     # Only the literal JSON boolean true enables it: a string or a number keeps
     # the default off, so a malformed manifest never widens what a backend trusts.
     signedPrincipal: bool = False  # noqa: N815
+    # Opt in to an app web origin: the gateway serves this backend at
+    # ``http://<name>.apps.localhost:<dashboard port>`` (apps/app_web_origin.py).
+    # Same strict parse as signedPrincipal: only the JSON boolean true turns it on.
+    webOrigin: bool = False  # noqa: N815
     hooks: HooksConfig = field(default_factory=HooksConfig)
 
     def to_dict(self) -> dict[str, Any]:
@@ -507,6 +559,8 @@ class BackendConfig:
             d["type"] = self.type
         if self.signedPrincipal:
             d["signedPrincipal"] = True
+        if self.webOrigin:
+            d["webOrigin"] = True
         hooks_d = self.hooks.to_dict()
         if hooks_d:
             d["hooks"] = hooks_d
@@ -523,6 +577,7 @@ class BackendConfig:
             routes=str(data.get("routes", "")),
             type=str(data.get("type", "")),
             signedPrincipal=data.get("signedPrincipal") is True,  # noqa: N815
+            webOrigin=data.get("webOrigin") is True,  # noqa: N815
             hooks=hooks,
         )
 
@@ -542,6 +597,34 @@ def _granted_list(value: Any) -> list[str]:
     return [str(v) for v in value if v]
 
 
+#: The entries ``permissions.bots`` may hold; ``apps.bot_grants`` grants only these.
+BOT_SCOPE_NAMES = ("read", "wake")
+
+
+def _bot_scopes(value: Any) -> list[str]:
+    """The known ``permissions.bots`` entries, each once, in manifest order."""
+    out: list[str] = []
+    for entry in _granted_list(value):
+        if entry in BOT_SCOPE_NAMES and entry not in out:
+            out.append(entry)
+    return out
+
+
+#: The staged grant family the Bot scopes are stored under (``point_grants``).
+BOT_GRANT_FAMILY = "bots"
+BOT_GRANT_FAMILIES = (BOT_GRANT_FAMILY,)
+
+
+def bot_grant_entries(permissions: Any) -> dict[str, list[str]]:
+    """The ``bots`` family a manifest's ``permissions`` (parsed or a raw dict) declares."""
+    raw = (
+        permissions.get("bots")
+        if isinstance(permissions, dict)
+        else getattr(permissions, "bots", None)
+    )
+    return {BOT_GRANT_FAMILY: _bot_scopes(raw)}
+
+
 @dataclass
 class Permissions:
     """Declared permissions for an app."""
@@ -556,6 +639,13 @@ class Permissions:
     #: May send turns, choose response options, approve or deny pending tool
     #: requests, and change approval modes for user-owned sessions.
     sessionApproval: bool = False  # noqa: N815
+    #: Widens ``sessionApproval`` to a member's pinned DM thread (the live
+    #: ``member-*`` slot the owner opened): the same four actions, nothing else
+    #: about the Bot. Grants nothing without ``sessionApproval``, and a
+    #: manifest that newly declares it re-opens that grant's consent. Declared
+    #: rather than implied so "which apps can speak to my Bots" is
+    #: answerable from the manifest.
+    memberThreads: bool = False  # noqa: N815
     #: May spawn a background agent through the host's subagent manager.
     #: Declared rather than implicit so "which apps can start an agent" is
     #: auditable from the manifest instead of from an app's import graph.
@@ -568,6 +658,61 @@ class Permissions:
     #: May raise a ``crewmate.import`` owner card through ``ctx.crewmate``. The
     #: card creates nothing until the owner presses it.
     proposeCrewmate: bool = False  # noqa: N815
+    #: May run turns of agents on sessions under its own key prefix through
+    #: ``ctx.turns``: tool-gated under this app's identity, admitted as Crew
+    #: automation. Declared for the same reason as ``spawn``.
+    agentTurns: bool = False  # noqa: N815
+    #: May open and drive dashboard chat slots under its own key prefix through
+    #: ``ctx.chat_slots`` (``apps/chat_slot_sdk.py``): turns through the host's
+    #: chat runner, its queue, stop, archive and AutoNudge loops on those slots.
+    #: Shown at the trust prompt.
+    chatSlots: bool = False  # noqa: N815
+    #: Keeps the chats this app creates under its own id as their mode out of the
+    #: session lists (``apps/hidden_sessions.py``). Shown on the app's detail page.
+    #: Hides a list row only: approvals and questions still reach the owner.
+    hiddenSessions: bool = False  # noqa: N815
+    #: The one shape of the person's chat its page may create or reopen through
+    #: ``POST /api/chat/slots`` without declaring that path: a key prefix, the
+    #: agents, an optional folder and the memory modes (``apps/chat_launch.py``).
+    #: Shown at the trust prompt. ``None`` when absent or malformed.
+    chatLaunch: ChatLaunch | None = None  # noqa: N815
+    #: May hold a bounded, audited auto-approve grant on the app's OWN worker
+    #: slots through ``ctx.auto_approve`` (``apps/worker_auto_approve.py``).
+    #: Shown at the trust prompt and held back on a widening update like a new
+    #: API path; never above the approval ceiling.
+    workerAutoApprove: bool = False  # noqa: N815
+    #: The session-tool verbs (``"read"``, ``"send"``) the owner's own chats may use
+    #: on the sessions this app owns (``apps/user_session_reach.py``). Empty = none,
+    #: which is the default. Shown at the trust prompt and held back on a widening
+    #: update like a new API path.
+    reachableByUserSessions: list[str] = field(default_factory=list)  # noqa: N815
+    #: What the app's hosted desktop windows may ask the shell for
+    #: (``"screenCapture"``, ``"localFiles"``, ``"gatewayChoice"``;
+    #: ``apps/desktop_capabilities.py``). Empty = none, which is the default. Shown at
+    #: the trust prompt and held back on a widening update like a new API path.
+    desktopCapabilities: list[str] = field(default_factory=list)  # noqa: N815
+    #: Pages the app's OWN agent sessions may drive the ``browser`` tool on without a
+    #: per-step approval: ``https://<host>`` plus a path pattern each
+    #: (``apps/browser_sites.py``). Never approved by an install: the owner approves
+    #: them on the app's page. Validated by ``AppManifest.validate``.
+    browserSites: list[str] = field(default_factory=list)  # noqa: N815
+    #: ``browserSites`` present but not a list of strings. Not serialized.
+    bad_browser_sites: bool = False
+    #: The verbs (``"view"``, ``"read"``, ``"act"``) the app may use on the browser
+    #: tabs of its own slots through ``ctx.browser`` (``apps/browser_sdk.py``). Empty =
+    #: none, which is the default. Never approved by an install: the owner approves
+    #: each verb on the app's page. Behind the ``app_browser_sdk`` feature preview.
+    browser: list[str] = field(default_factory=list)
+    #: Takes inbound webhook deliveries on its own routes, governed as the
+    #: ``webhooks`` source named by the app's name (``webhook_sources``) and asked
+    #: through ``ctx.webhook_source``. Reaches nothing new: it lets the policy
+    #: answer for the app, and it is shown at the trust prompt.
+    webhookSource: bool = False  # noqa: N815
+    #: Bot scopes (``apps.bot_grants``): ``"read"`` lists the Bots the owner ticked
+    #: for this app with their status and goals, ``"wake"`` sends one of them the
+    #: gateway's fixed wake line. Any other entry is dropped. A staged grant family,
+    #: so an update that adds a scope waits for the owner.
+    bots: list[str] = field(default_factory=list)
     # WS cross-app visibility opt-in: app names (or ["*"]) allowed to use
     # slots:app:<this-app> / subagent:app:<this-app> declarations to observe
     # this app's slots and subagents. Empty list = no cross-app visibility.
@@ -591,12 +736,36 @@ class Permissions:
             d["cron"] = True
         if self.sessionApproval:
             d["sessionApproval"] = True
+        if self.memberThreads:
+            d["memberThreads"] = True
         if self.spawn:
             d["spawn"] = True
         if self.jobs:
             d["jobs"] = True
         if self.proposeCrewmate:
             d["proposeCrewmate"] = True
+        if self.agentTurns:
+            d["agentTurns"] = True
+        if self.chatSlots:
+            d["chatSlots"] = True
+        if self.hiddenSessions:
+            d["hiddenSessions"] = True
+        if self.chatLaunch is not None:
+            d["chatLaunch"] = self.chatLaunch.to_dict()
+        if self.workerAutoApprove:
+            d["workerAutoApprove"] = True
+        if self.reachableByUserSessions:
+            d["reachableByUserSessions"] = self.reachableByUserSessions
+        if self.desktopCapabilities:
+            d["desktopCapabilities"] = self.desktopCapabilities
+        if self.browserSites:
+            d["browserSites"] = list(self.browserSites)
+        if self.browser:
+            d["browser"] = list(self.browser)
+        if self.webhookSource:
+            d["webhookSource"] = True
+        if self.bots:
+            d["bots"] = self.bots
         if self.exposeToApps:
             d["exposeToApps"] = self.exposeToApps
         return d
@@ -614,6 +783,16 @@ class Permissions:
         # `admission.require_signature`): there, an unexpected value must keep the
         # restriction ON. Same defect class, mirrored fix — the safe default
         # follows what the field grants or withholds, not the field's type.
+        #
+        # The chat launch parser is imported here, not at the top: every MCP server
+        # imports this module before it lists its tools but parses no manifest there,
+        # and `test_mcp_listing_import_budget.py` caps the modules that listing loads.
+        # The browser verb reader is deferred for the same reason.
+        from kiro_crew.apps.browser_sdk import declared_verbs as browser_verbs
+        from kiro_crew.apps.chat_launch import parse_chat_launch
+
+        raw_sites = data.get("browserSites", [])
+        sites_ok = isinstance(raw_sites, list) and all(isinstance(e, str) for e in raw_sites)
         return cls(
             api=_granted_list(data.get("api")),
             events=_granted_list(data.get("events")),
@@ -623,11 +802,104 @@ class Permissions:
             memory=str(data.get("memory", "")),
             cron=data.get("cron") is True,
             sessionApproval=data.get("sessionApproval") is True,  # noqa: N815
+            memberThreads=data.get("memberThreads") is True,  # noqa: N815
             spawn=data.get("spawn") is True,
             jobs=data.get("jobs") is True,
             proposeCrewmate=data.get("proposeCrewmate") is True,  # noqa: N815
+            agentTurns=data.get("agentTurns") is True,  # noqa: N815
+            chatSlots=data.get("chatSlots") is True,  # noqa: N815
+            hiddenSessions=data.get("hiddenSessions") is True,  # noqa: N815
+            chatLaunch=parse_chat_launch(data.get("chatLaunch")),  # noqa: N815
+            workerAutoApprove=data.get("workerAutoApprove") is True,  # noqa: N815
+            reachableByUserSessions=declared_verbs(data.get("reachableByUserSessions")),
+            desktopCapabilities=declared_capabilities(data.get("desktopCapabilities")),
+            browserSites=list(raw_sites) if sites_ok else [],  # noqa: N815
+            bad_browser_sites=not sites_ok,
+            browser=browser_verbs(data.get("browser")),
+            webhookSource=data.get("webhookSource") is True,  # noqa: N815
+            bots=_bot_scopes(data.get("bots")),
             exposeToApps=_granted_list(data.get("exposeToApps")),  # noqa: N815
         )
+
+
+#: Seconds an ``onEnable`` / ``onDisable`` script gets when the manifest names none.
+LIFECYCLE_SCRIPT_TIMEOUT_DEFAULT = 30
+#: Most seconds a manifest may give ``onEnable`` / ``onDisable``: the same 300s the
+#: install transaction gives ``onInstall`` (``registry_pipeline/install.py``). Both
+#: scripts run while the app's lifecycle lock is held, so a larger value would let a
+#: manifest hold the enable or disable request and every same-app operation behind it.
+LIFECYCLE_SCRIPT_TIMEOUT_MAX = 300
+
+
+def lifecycle_timeout_error(field_name: str, value: Any) -> str:
+    """Return why ``value`` can never be a ``setup.<field_name>``, or ``""``.
+
+    Compatibility rule: everything the old bare ``int()`` accepted still parses, so
+    a manifest that installs today keeps installing. The only values refused are the
+    ones ``int()`` raised on, which already failed the install with a parse error:
+    a string that is not an integer (``"abc"``, ``"1.5"``), an explicit ``null``,
+    a list or object, and a NaN or infinite number. A value that parses but is out
+    of range, a bool or a fraction is clamped instead (:func:`clamp_lifecycle_timeout`).
+    """
+    try:
+        int(value)
+    except (TypeError, ValueError, OverflowError):
+        return (
+            f"setup.{field_name} must be a number of seconds "
+            f"(1-{LIFECYCLE_SCRIPT_TIMEOUT_MAX}), got {value!r}"
+        )
+    return ""
+
+
+def clamp_lifecycle_timeout(value: Any) -> tuple[int, str]:
+    """The seconds a lifecycle script gets for a manifest ``value``, and why it moved.
+
+    The reason is ``""`` when ``value`` is used as written (``60``, ``"60"``,
+    ``60.0``). Otherwise the seconds are clamped and the reason says how:
+
+    - ``int()`` refuses it (see :func:`lifecycle_timeout_error`): the default.
+    - a bool: the default, since ``int(True)`` is a 1-second timeout nobody meant.
+    - below 1 after ``int()``: the default, since a zero or negative timeout ends the
+      script before it starts.
+    - above ``LIFECYCLE_SCRIPT_TIMEOUT_MAX``: the cap.
+    - a fractional float: truncated, as ``int()`` always did, then the rules above.
+    """
+    if lifecycle_timeout_error("", value):
+        return LIFECYCLE_SCRIPT_TIMEOUT_DEFAULT, "not a number"
+    if isinstance(value, bool):
+        return LIFECYCLE_SCRIPT_TIMEOUT_DEFAULT, "a bool is not a duration"
+    seconds = int(value)
+    fraction = isinstance(value, float) and value != seconds
+    if seconds < 1:
+        return LIFECYCLE_SCRIPT_TIMEOUT_DEFAULT, "below 1 second"
+    if seconds > LIFECYCLE_SCRIPT_TIMEOUT_MAX:
+        return LIFECYCLE_SCRIPT_TIMEOUT_MAX, f"above the {LIFECYCLE_SCRIPT_TIMEOUT_MAX}s cap"
+    return seconds, ("fraction dropped" if fraction else "")
+
+
+def lifecycle_timeout_seconds(value: Any, *, app_name: str = "", field_name: str = "") -> int:
+    """:func:`clamp_lifecycle_timeout` where a script is about to run, logging a clamp.
+
+    This is the only place the bound is applied. ``SetupConfig`` keeps the value as
+    ``int()`` read it, because ``setup`` is part of ``AppManifest.signing_payload``:
+    clamping it there would change the signed bytes of a manifest published with,
+    say, ``600``, and its signature would stop verifying. The enable route and the
+    disable teardown call this once per script run, so the warning is not repeated
+    by listings. ``None`` (the key is absent) is the default with no warning.
+    """
+    if value is None:
+        return LIFECYCLE_SCRIPT_TIMEOUT_DEFAULT
+    seconds, reason = clamp_lifecycle_timeout(value)
+    if reason:
+        logger.warning(
+            "app %r setup.%s=%r: %s, running the script with a %ss timeout",
+            app_name,
+            field_name,
+            value,
+            reason,
+            seconds,
+        )
+    return seconds
 
 
 @dataclass
@@ -641,19 +913,31 @@ class SetupConfig:
     onInstall: str = ""  # shell command, registry install + every registry update  # noqa: N815
     # `onUpdate` is declared and round-trips but NOTHING dispatches it (see the
     # declared-not-wired paragraph in docs/system-specs/modules/app-kit-platform.md
-    # and test/test_setup_hooks_contract.py). Put update-time work in `onInstall`.
+    # and test/test_setup_hooks_contract.py). Put update-time work in `onEnable`,
+    # which an update of an enabled app re-runs, or in `onInstall`.
     onUpdate: str = ""  # declared, not executed: no code path dispatches it  # noqa: N815
     onUninstall: str = ""  # shell command run before removing app files  # noqa: N815
-    onEnable: str = ""  # shell command run when app is enabled  # noqa: N815
+    onEnable: str = ""  # run on enable, and after an enabled app's update  # noqa: N815
     onDisable: str = ""  # shell command run when app is disabled  # noqa: N815
     # onEnable / onDisable / onUninstall run through `/bin/bash` and are NOT run
     # on native Windows (no `/bin/bash`): the runner refuses them with an
     # unsupported-platform reason before any spawn. (`onInstall` runs in the
     # separate install transaction and is not covered by that refusal.) See
     # docs/app-kit/manifest-reference.md ("setup — Lifecycle Scripts").
-    onEnableTimeout: int = 30  # seconds; configurable per-app  # noqa: N815
-    onDisableTimeout: int = 30  # seconds; configurable per-app  # noqa: N815
+    # Seconds as `int()` reads the manifest value, NOT clamped: `setup` is signed
+    # (AppManifest.signing_payload), so the parsed value must stay what the publisher
+    # signed. lifecycle_timeout_seconds clamps it to 1..LIFECYCLE_SCRIPT_TIMEOUT_MAX
+    # where the script runs.
+    onEnableTimeout: int = LIFECYCLE_SCRIPT_TIMEOUT_DEFAULT  # noqa: N815
+    onDisableTimeout: int = LIFECYCLE_SCRIPT_TIMEOUT_DEFAULT  # noqa: N815
     configSchema: dict[str, Any] = field(default_factory=dict)  # noqa: N815
+    # One error per timeout `int()` cannot read. Parsing keeps the default in its
+    # place so nothing raises, and validate() refuses the manifest. Never serialized.
+    timeout_errors: list[str] = field(default_factory=list, compare=False, repr=False)
+
+    def validate(self) -> list[str]:
+        """Return an error for each lifecycle-script timeout that is not a number."""
+        return list(self.timeout_errors)
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {}
@@ -667,9 +951,9 @@ class SetupConfig:
             d["onEnable"] = self.onEnable
         if self.onDisable:
             d["onDisable"] = self.onDisable
-        if self.onEnableTimeout != 30:
+        if self.onEnableTimeout != LIFECYCLE_SCRIPT_TIMEOUT_DEFAULT:
             d["onEnableTimeout"] = self.onEnableTimeout
-        if self.onDisableTimeout != 30:
+        if self.onDisableTimeout != LIFECYCLE_SCRIPT_TIMEOUT_DEFAULT:
             d["onDisableTimeout"] = self.onDisableTimeout
         if self.configSchema:
             d["configSchema"] = self.configSchema
@@ -677,15 +961,26 @@ class SetupConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> SetupConfig:
+        timeouts: dict[str, int] = {}
+        timeout_errors: list[str] = []
+        for key in ("onEnableTimeout", "onDisableTimeout"):
+            raw = data.get(key, LIFECYCLE_SCRIPT_TIMEOUT_DEFAULT)
+            error = lifecycle_timeout_error(key, raw)
+            if error:
+                timeout_errors.append(error)
+                timeouts[key] = LIFECYCLE_SCRIPT_TIMEOUT_DEFAULT
+            else:
+                timeouts[key] = int(raw)
         return cls(
             onInstall=str(data.get("onInstall", "")),  # noqa: N815
             onUpdate=str(data.get("onUpdate", "")),  # noqa: N815
             onUninstall=str(data.get("onUninstall", "")),  # noqa: N815
             onEnable=str(data.get("onEnable", "")),  # noqa: N815
             onDisable=str(data.get("onDisable", "")),  # noqa: N815
-            onEnableTimeout=int(data.get("onEnableTimeout", 30)),  # noqa: N815
-            onDisableTimeout=int(data.get("onDisableTimeout", 30)),  # noqa: N815
+            onEnableTimeout=timeouts["onEnableTimeout"],  # noqa: N815
+            onDisableTimeout=timeouts["onDisableTimeout"],  # noqa: N815
             configSchema=dict(data.get("configSchema", {})),  # noqa: N815
+            timeout_errors=timeout_errors,
         )
 
 
@@ -1121,3 +1416,136 @@ class NotificationsConfig:
                     f"one of {_CHANNEL_PRIORITIES}, got {ch.defaultPriority!r}"
                 )
         return errors
+
+
+#: A locale key: a 2-3 letter language, optionally one region or script subtag
+#: (``de``, ``pt-BR``, ``zh-CN``). The dashboard looks a locale up by this key and then
+#: by its base language, both without case, so a key outside the grammar could never
+#: be read.
+L10N_LOCALE_RE = re.compile(r"^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})?$")
+MAX_L10N_LOCALES = 32
+MAX_L10N_HIGHLIGHTS = 12
+MAX_L10N_HIGHLIGHT_CHARS = 300
+#: The string fields an ``l10n`` entry may carry, each with its length cap.
+L10N_TEXT_CAPS: dict[str, int] = {"displayName": 120, "description": 1000, "pageLabel": 60}
+#: Drop warnings kept per block; the drops past it are counted in one summary line.
+MAX_L10N_WARNINGS = MAX_L10N_LOCALES
+#: Longest app-supplied key quoted in a drop warning, and how many unknown keys it names.
+_L10N_QUOTED_CHARS = 40
+_L10N_QUOTED_KEYS = 3
+
+
+def _l10n_quoted(text: str) -> str:
+    """*text* cut to :data:`_L10N_QUOTED_CHARS`: app-supplied keys are quoted in warnings."""
+    return text if len(text) <= _L10N_QUOTED_CHARS else text[: _L10N_QUOTED_CHARS - 3] + "..."
+
+
+@dataclass
+class L10nEntry:
+    """One locale's translation of an app's listing copy. Every field is optional."""
+
+    displayName: str = ""  # noqa: N815
+    description: str = ""
+    pageLabel: str = ""  # noqa: N815
+    highlights: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {}
+        if self.displayName:
+            d["displayName"] = self.displayName
+        if self.description:
+            d["description"] = self.description
+        if self.pageLabel:
+            d["pageLabel"] = self.pageLabel
+        if self.highlights:
+            d["highlights"] = list(self.highlights)
+        return d
+
+    @classmethod
+    def parse(cls, raw: Any) -> tuple[L10nEntry | None, str]:
+        """``(entry, "")`` for a well-formed object, else ``(None, reason)``."""
+        if not isinstance(raw, dict):
+            return None, "must be an object"
+        unknown = sorted(str(k) for k in raw if k not in L10N_TEXT_CAPS and k != "highlights")
+        if unknown:
+            named = ", ".join(_l10n_quoted(k) for k in unknown[:_L10N_QUOTED_KEYS])
+            more = len(unknown) - _L10N_QUOTED_KEYS
+            return None, f"unknown key(s) {named}" + (f" and {more} more" if more > 0 else "")
+        values: dict[str, str] = {}
+        for key, cap in L10N_TEXT_CAPS.items():
+            value = raw.get(key, "")
+            if not isinstance(value, str):
+                return None, f"{key} must be a string"
+            if len(value) > cap:
+                return None, f"{key} is longer than {cap} characters"
+            values[key] = value
+        highlights = raw.get("highlights", [])
+        if not isinstance(highlights, list) or not all(isinstance(h, str) for h in highlights):
+            return None, "highlights must be an array of strings"
+        if len(highlights) > MAX_L10N_HIGHLIGHTS:
+            return None, f"highlights has more than {MAX_L10N_HIGHLIGHTS} items"
+        if any(len(h) > MAX_L10N_HIGHLIGHT_CHARS for h in highlights):
+            return None, f"a highlight is longer than {MAX_L10N_HIGHLIGHT_CHARS} characters"
+        return (
+            cls(
+                displayName=values["displayName"],  # noqa: N815
+                description=values["description"],
+                pageLabel=values["pageLabel"],  # noqa: N815
+                highlights=list(highlights),
+            ),
+            "",
+        )
+
+
+@dataclass
+class L10nConfig:
+    """An app's optional ``l10n`` block: listing copy per locale.
+
+    Content, not trust: the dashboard shows it in place of the English
+    ``displayName`` / ``description`` / page label / highlights for the reader's
+    locale, for an app of any origin. A malformed locale is DROPPED rather than
+    refused, so a translation mistake never blocks an install; each drop is kept
+    in ``warnings`` for the install path to report, up to :data:`MAX_L10N_WARNINGS`
+    of them plus one line counting the rest.
+    """
+
+    entries: dict[str, L10nEntry] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list, compare=False, repr=False)
+
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for locale, entry in self.entries.items():
+            body = entry.to_dict()
+            if body:
+                out[locale] = body
+        return out
+
+    @classmethod
+    def from_value(cls, raw: Any) -> L10nConfig:
+        if raw is None:
+            return cls()
+        if not isinstance(raw, dict):
+            return cls(warnings=["l10n: must be an object; ignored"])
+        entries: dict[str, L10nEntry] = {}
+        warnings: list[str] = []
+        uncounted = 0
+        for locale, value in raw.items():
+            if not isinstance(locale, str) or not L10N_LOCALE_RE.fullmatch(locale):
+                warning = (
+                    f"l10n: locale key {_l10n_quoted(repr(locale))} is not a locale tag; dropped"
+                )
+            elif len(entries) >= MAX_L10N_LOCALES:
+                warning = f"l10n: more than {MAX_L10N_LOCALES} locales; {locale!r} dropped"
+            else:
+                entry, reason = L10nEntry.parse(value)
+                if entry is not None:
+                    entries[locale] = entry
+                    continue
+                warning = f"l10n.{locale}: {reason}; dropped"
+            if len(warnings) < MAX_L10N_WARNINGS:
+                warnings.append(warning)
+            else:
+                uncounted += 1
+        if uncounted:
+            warnings.append(f"l10n: {uncounted} more locale(s) dropped")
+        return cls(entries=entries, warnings=warnings)

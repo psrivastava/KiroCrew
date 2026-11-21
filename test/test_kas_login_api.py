@@ -16,8 +16,10 @@ import socket
 import aiohttp
 import pytest
 
+from kiro_crew.auth.login.builder_id import StartUrlRejectedError
 from kiro_crew.auth.login.portal import PortalAuthError, wait_for_callback
 from kiro_crew.auth.service import (
+    InvalidStartUrlError,
     KasLoginService,
     LoopbackUnavailableError,
     UnknownIdentityError,
@@ -92,6 +94,16 @@ class _StubService(KasLoginService):
             raise UnknownIdentityError(replaces)
         if provider_str == "facebook":
             raise ValueError(provider_str)
+        if start_url == "malformed":
+            malformed = InvalidStartUrlError("Start URL must use https.")
+            malformed.reason = "not_https"
+            raise malformed
+        if start_url == "refused-by-aws":
+            raise StartUrlRejectedError("AWS did not accept the start URL.")
+        if start_url == "refused-in-region":
+            bare = StartUrlRejectedError("AWS refused the sign-in.")
+            bare.names_start_url = False
+            raise bare
         return {
             "login_id": "lid-1",
             "user_code": "ABCD",
@@ -215,6 +227,35 @@ async def test_begin_device_missing_and_unknown_provider():
     assert _body(resp)["code"] == "invalid_provider"
 
 
+@pytest.mark.parametrize(
+    "start_url, reason", [("malformed", "not_https"), ("refused-by-aws", "aws_rejected")]
+)
+@pytest.mark.asyncio
+async def test_begin_device_bad_start_url_is_a_coded_400_with_the_reason(start_url, reason):
+    """Whether Crew or AWS refuses the start URL, the form gets a 400 it can fix
+    with the reason as the message, not a 502 that reads as an outage, and the
+    reason's name, which the form says in the user's language."""
+    resp = await api_kas_login_begin_device(
+        _FakeRequest(_StubService(), {"provider": "idc", "start_url": start_url})
+    )
+    assert resp.status == 400
+    body = _body(resp)
+    assert body["code"] == "invalid_start_url"
+    assert body.get("reason") == reason
+    assert "start url" in body["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_begin_device_bare_aws_refusal_names_the_start_url_or_the_region():
+    """AWS's bare "Invalid request" names neither field, so the form is told either
+    may be wrong instead of having the start URL blamed alone."""
+    resp = await api_kas_login_begin_device(
+        _FakeRequest(_StubService(), {"provider": "idc", "start_url": "refused-in-region"})
+    )
+    assert resp.status == 400
+    assert _body(resp)["code"] == "start_url_or_region_rejected"
+
+
 @pytest.mark.asyncio
 async def test_begin_device_malformed_json_is_400():
     resp = await api_kas_login_begin_device(_FakeRequest(_StubService(), None))
@@ -250,6 +291,18 @@ async def test_poll_answers_a_sign_out_during_the_login_as_the_begin_409():
     resp = await api_kas_login_poll(_FakeRequest(_SignedOut(), {"login_id": "lid-1"}))
     assert resp.status == 409
     assert _body(resp)["code"] == "signed_out_during_login"
+
+
+@pytest.mark.parametrize("code", ["no_kiro_profile", "profile_lookup_failed"])
+@pytest.mark.asyncio
+async def test_poll_passes_a_profile_failure_code_through_to_the_card(code):
+    class _NoProfile(_StubService):
+        async def poll_device(self, login_id):
+            return {"status": "error", "code": code}
+
+    resp = await api_kas_login_poll(_FakeRequest(_NoProfile(), {"login_id": "lid-1"}))
+    assert resp.status == 200
+    assert _body(resp) == {"status": "error", "code": code}
 
 
 @pytest.mark.asyncio

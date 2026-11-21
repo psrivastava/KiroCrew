@@ -13,7 +13,9 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from kiro_crew._sqlite_compat import is_cjk_char
 from kiro_crew.dashboard.handlers._shared import _redact_memory_field
+from kiro_crew.memory_history_stamps import is_history_day_header, is_history_stamp
 
 #: Most semantic rows one graph request reads, in key order with lessons excluded
 #: (they are drawn from ``get_lessons``), through the key index so the read stops
@@ -58,6 +60,8 @@ def _build_memory_graph(
             node_ids[f"{prefix}:{label}"] = nid
         return nid
 
+    # Each section below is optional: a store that fails to read stops adding its nodes, and the
+    # rest of the graph still draws.
     # --- Preferences ---
     try:
         pref_text = mem.read_preferences() or ""
@@ -107,6 +111,7 @@ def _build_memory_graph(
                     try:
                         val = json.loads(val)
                     except Exception:
+                        # A value that is not JSON is shown as its raw text.
                         pass
                 val_str = str(val) if not isinstance(val, str) else val
                 _add("sem", key, "semantic", f"{key} = {val_str[:120]}")
@@ -119,6 +124,7 @@ def _build_memory_graph(
         try:
             lessons_data = vs.get_lessons(limit=GRAPH_LESSON_LIMIT + 1) if vs else None
         except Exception:
+            # A failed read leaves no rows, so the lessons list passed in is used below.
             pass
         if lessons_data:
             # Deferred import: ``vector_memory`` pulls snowballstemmer plus the
@@ -133,6 +139,7 @@ def _build_memory_graph(
                     try:
                         rule = json.loads(rule)
                     except Exception:
+                        # A rule that is not JSON is shown as its raw text.
                         pass
                 # Rendered text for either storage shape; fall back to str() so a
                 # malformed row still surfaces in search rather than vanishing.
@@ -153,6 +160,10 @@ def _build_memory_graph(
             stripped = line.strip()
             m = re.match(r"^#{1,4}\s+(.+)", stripped)
             if m:
+                # ``append_history``'s day header and per-entry time stamp carry
+                # no content of their own, so drawing them only adds empty nodes.
+                if is_history_day_header(stripped) or is_history_stamp(stripped):
+                    continue
                 raw = str(_redact_memory_field(m.group(1).strip()))
                 _add("hist", raw[:80], "history", raw)
             elif stripped.startswith("[") and "]" in stripped and len(stripped) > 20:
@@ -212,7 +223,14 @@ def _build_memory_graph(
             for proj_id, short in project_matchers:
                 if n["id"] == proj_id:
                     continue
-                if re.search(r"\b" + re.escape(short) + r"\b", title_lower):
+                if any(map(is_cjk_char, short)):
+                    # CJK prose has no spaces, and Python's Unicode regex counts
+                    # ideographs and kana as ``\w``, so ``\b`` never splits two
+                    # of them ("查询账单服务接口"): match a plain substring.
+                    matched = short in title_lower
+                else:
+                    matched = re.search(r"\b" + re.escape(short) + r"\b", title_lower) is not None
+                if matched:
                     edges.append({"from": n["id"], "to": proj_id})
 
     return nodes, edges

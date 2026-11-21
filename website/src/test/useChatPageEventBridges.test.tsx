@@ -60,7 +60,7 @@ import { useChatEventBridges, useColdFileTabHydration } from '../pages/chat/page
 import { __resetBottomTerminal, useBottomTerminal } from '../hooks/useBottomTerminal'
 import { RUN_IN_TERMINAL_READY_DEADLINE_MS } from '../utils/fenceShell'
 import { openActivityPanel, setPendingInput } from '../store/chatSlice'
-import type { ChatMessage, ChatSlot } from '../types'
+import type { ChatMessage } from '../types'
 import { api, type SlotEnvironment } from '../api/client'
 import { slotEnvironmentQueryKey } from '../components/sessionEnvironmentHooks'
 import { i18nT } from '../i18n/t'
@@ -76,9 +76,7 @@ function harness(overrides: Partial<BridgeOpts> = {}, placement: SlotEnvironment
   const openView = vi.fn()
   const opts: BridgeOpts = {
     activeSlot: 'slot-a',
-    activeSlotRef: { current: 'slot-a' },
     messages: [{ role: 'assistant', content: 'hi' } as ChatMessage],
-    slots: [{ key: 'slot-a' }, { key: 'slot-b' }] as ChatSlot[],
     dispatch: vi.fn() as never,
     queryClient,
     showActionError: vi.fn(),
@@ -89,6 +87,7 @@ function harness(overrides: Partial<BridgeOpts> = {}, placement: SlotEnvironment
     terminalCfgUnsettledRef: { current: false },
     terminalCfgReadFailedRef: { current: false },
     inputRef: { current: '' },
+    composeSend: vi.fn(() => null),
     ...overrides,
   }
   const wrapper = ({ children }: { children: ReactNode }) => (
@@ -167,34 +166,6 @@ describe('Web Preview feed', () => {
   })
 })
 
-describe('Electron built-in browser bridges', () => {
-  it('tracks every open slot and untracks one that closed, without re-registering the rest', () => {
-    const trackSession = vi.fn().mockResolvedValue(undefined)
-    ;(window as { browserAPI?: unknown }).browserAPI = { trackSession }
-    const { opts, hook } = harness()
-    expect(trackSession.mock.calls).toEqual([['slot-a', true], ['slot-b', true]])
-    hook.rerender({ ...opts, slots: [{ key: 'slot-b' }] as ChatSlot[] })
-    expect(trackSession.mock.calls.slice(2)).toEqual([['slot-a', false]])
-  })
-
-  it('surfaces the panel on agent-opened for the active slot only', () => {
-    let fire: ((e: { panelId?: string }) => void) | undefined
-    const off = vi.fn()
-    ;(window as { browserAPI?: unknown }).browserAPI = {
-      onAgentOpened: (cb: typeof fire) => { fire = cb; return off },
-    }
-    const { opts, openView, hook } = harness()
-    act(() => { fire!({ panelId: 'slot-b' }) })
-    act(() => { fire!({}) })
-    expect(openView).not.toHaveBeenCalled()
-    act(() => { fire!({ panelId: 'slot-a' }) })
-    expect(opts.dispatch).toHaveBeenCalledWith(openActivityPanel())
-    expect(openView).toHaveBeenCalledWith('browser')
-    hook.unmount()
-    expect(off).toHaveBeenCalled()
-  })
-})
-
 describe('redaction-card bridges', () => {
   it('types a single-line command into a new dock terminal and answers with the reqId', () => {
     const dock = renderHook(() => useBottomTerminal())
@@ -246,6 +217,21 @@ describe('redaction-card bridges', () => {
     expect(opts.dispatch).toHaveBeenCalledWith(setPendingInput('draft so far\n\nplease fetch it'))
   })
 
+  it('hands a reply card\'s text, chat and outcome callback to the page send and reports what the page did', () => {
+    const composeSend = vi.fn((_text: string, slot: string, _onOutcome: (o: string) => void) => (slot === 'slot-a' ? 'staged' as const : null))
+    harness({ composeSend })
+    const onOutcome = vi.fn()
+    const mine = { text: '不用讨论了', slot: 'slot-a', result: null, onOutcome }
+    const other = { text: '不用讨论了', slot: 'slot-b', result: null, onOutcome }
+    const empty = { text: '', slot: 'slot-a', result: null, onOutcome }
+    const noSlot = { text: '不用讨论了', result: null, onOutcome }
+    const noCallback = { text: '不用讨论了', slot: 'slot-a', result: null }
+    const taken = { text: '不用讨论了', slot: 'slot-a', result: 'pending', onOutcome }
+    for (const detail of [mine, other, empty, noSlot, noCallback, taken]) act(() => { window.dispatchEvent(new CustomEvent('mc:compose-send', { detail })) })
+    expect(composeSend.mock.calls).toEqual([['不用讨论了', 'slot-a', onOutcome, []], ['不用讨论了', 'slot-b', onOutcome, []]])
+    expect([mine.result, other.result, empty.result, noSlot.result, noCallback.result, taken.result]).toEqual(['staged', null, null, null, null, 'pending'])
+  })
+
   it('reloads the named slot when a host is allowed, and ignores a malformed event', () => {
     const { opts } = harness()
     act(() => { window.dispatchEvent(new CustomEvent('mc:redaction-hosts-changed', { detail: {} })) })
@@ -255,7 +241,7 @@ describe('redaction-card bridges', () => {
     expect(opts.dispatch).toHaveBeenCalledWith(expect.any(Function))
   })
 
-  it('asks the reload to re-serve the card\'s own reply when the event names it (#17023)', () => {
+  it('asks the reload to re-serve the card\'s own reply when the event names it', () => {
     const { opts } = harness()
     act(() => { window.dispatchEvent(new CustomEvent('mc:redaction-hosts-changed', { detail: { slot: 'slot-b', messageTs: '2026-01-01T00:00:00Z' } })) })
     act(() => { window.dispatchEvent(new CustomEvent('mc:redaction-hosts-changed', { detail: { slot: 'slot-b', messageTs: 7 } })) })
@@ -378,14 +364,14 @@ describe('cold file tab hydration', () => {
     const { patchTab } = hydrate([{ id: 't1', kind: 'file', path: '/a.ts' }, { id: 't2', kind: 'file', path: '/b.ts', content: 'warm' }, { id: 'd', kind: 'diff', path: '/c' }])
     await waitFor(() => expect(patchTab).toHaveBeenCalledTimes(1))
     expect(fileRead.fetch).toHaveBeenCalledTimes(1)
-    expect(patchTab).toHaveBeenCalledWith('t1', expect.objectContaining({ content: 'body', savedContent: 'body', binary: false }))
+    expect(patchTab).toHaveBeenCalledWith('t1', expect.objectContaining({ content: 'body', savedContent: 'body', binary: false, placeholder: false }))
   })
 
   it('keeps a placeholder for a 404', async () => {
     fileRead.fetch.mockResolvedValue({ ok: false, status: 404 })
     const { patchTab, showActionError } = hydrate([{ id: 't1', kind: 'file', path: '/gone.ts' }])
     await waitFor(() => expect(patchTab).toHaveBeenCalledTimes(1))
-    expect(patchTab.mock.calls[0][1]).toMatchObject({ binary: false, partial: false })
+    expect(patchTab.mock.calls[0][1]).toMatchObject({ binary: false, partial: false, placeholder: true })
     expect(patchTab.mock.calls[0][1].content).toBe(patchTab.mock.calls[0][1].savedContent)
     expect(patchTab.mock.calls[0][1].content).toMatch(/./)
     expect(showActionError).not.toHaveBeenCalled()

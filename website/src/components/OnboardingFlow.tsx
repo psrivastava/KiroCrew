@@ -19,10 +19,11 @@ import { safeGetItem, safeRemoveItem, safeSetItem } from '../utils/safeStorage'
 
 import { i18nT } from '../i18n/t'
 import { useDocumentImeLatch, useImeGuard } from '../hooks/useImeGuard'
+import { RadioChipGroup, radioChip } from './RadioChipGroup'
 /**
  * First-run onboarding flow (5 steps) — the Customize chapter plus the feature
- * tour. It is the LAST of the three first-run chapters: Import setup runs first,
- * then the mandatory Privacy chapter (`PrivacyChapter`), then this.
+ * tour. It is the LAST of the two first-run chapters: Import setup runs first,
+ * then this.
  *   1. Pick your look   — centered modal, reuses the real theme picker.
  *   2. About you        — centered modal: role + technical comfort. Persisted
  *                         to dashboard.user_role / dashboard.user_technical_level
@@ -90,6 +91,14 @@ const POP_BODY_KEY: Record<string, string> = {
   chat: 'components.onboardingFlow.pop_chat_body',
 }
 
+/** Catalog key for each button of the look step's mode switch. Scheduled is
+ *  offered in Settings only: it needs two times, which first run does not ask for. */
+const MODE_LABEL_KEYS: Record<Exclude<ModePreference, 'schedule'>, string> = {
+  system: 'components.onboardingFlow.mode_system',
+  light: 'components.onboardingFlow.mode_light',
+  dark: 'components.onboardingFlow.mode_dark',
+}
+
 // Steps 1-2 are the centered Customize modals; 3-5 are the anchored tour
 // popovers. Popovers 3-4 show "Next"; popover 5 is the last step of first-run,
 // so it shows "Done", drops its Skip, and finishes the flow.
@@ -100,7 +109,8 @@ const LAST_STEP = 5
  * resumes it. `mc-onboarded` is written only when the tour ends, so without
  * this a reload anywhere in steps 2-5 reopened the flow at step 1 and the user
  * met "Pick your look" again on every reload until they reached "Done".
- * Removed when the flow ends; ignored once `mc-onboarded` is set, so a
+ * Removed when the flow ends and whenever the user becomes onboarded by any
+ * path; ignored once `mc-onboarded` is set, so a
  * `/onboarding` replay never resumes a stale step.
  */
 const TOUR_STEP_KEY = 'mc-onboarding-step'
@@ -215,9 +225,7 @@ export default function OnboardingFlow({
   initialOpen: boolean
   onComplete: () => void
   // Abandoning the tour early — "Skip all", a popover's "Skip", or Escape. Kept
-  // SEPARATE from onComplete because a skip must still pass through the mandatory
-  // Privacy chapter if that has not happened yet, while finishing the tour with
-  // "Done" cannot possibly need to (Privacy precedes this chapter). Falls back to
+  // apart from onComplete so a host can tell the two exits apart. Falls back to
   // onComplete when the host does not distinguish the two.
   onSkipAll?: () => void
 }) {
@@ -229,6 +237,7 @@ export default function OnboardingFlow({
     allThemes,
     preference: modePref,
     setTheme: setModePref,
+    onboarded,
   } = useTheme()
   const [open, setOpen] = useState(initialOpen)
   const [step, setStep] = useState(() => (initialOpen ? resumedStep() : 1))
@@ -370,6 +379,13 @@ export default function OnboardingFlow({
     }
   }, [initialOpen])
 
+  // Once the user is onboarded by any path (this flow's finish, Import setup's
+  // "Skip all", or the server saying so on this or another machine),
+  // the first run is over: a saved step must not resume a later first run.
+  useEffect(() => {
+    if (onboarded) safeRemoveItem(TOUR_STEP_KEY)
+  }, [onboarded])
+
   // Remember the first-run step so a reload resumes it (see TOUR_STEP_KEY).
   useEffect(() => {
     if (open && firstRunTour.current && !alreadyOnboarded()) safeSetItem(TOUR_STEP_KEY, String(step))
@@ -397,8 +413,8 @@ export default function OnboardingFlow({
   // informed dismissal, never a trap. Succeeding or no-op saves close in one
   // press (the await is a local loopback call, imperceptible).
   //
-  // `skipped` routes the exit: an abandoned tour goes to onSkipAll (which may
-  // still owe the user the Privacy chapter), a finished one to onComplete.
+  // `skipped` routes the exit: an abandoned tour goes to onSkipAll, a finished
+  // one to onComplete.
   const finish = useCallback(async (skipped: boolean) => {
     if (!skipDiscardArmed.current) {
       // Freeze inputs for this await too (same race as Next's save): the
@@ -517,7 +533,10 @@ export default function OnboardingFlow({
         node.querySelectorAll<HTMLElement>(
           'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
         ),
-      ).filter(el => !el.hasAttribute('disabled'))
+      // `tabIndex >= 0` drops the unchecked options of a RadioChipGroup: they
+      // are buttons, but Tab never reaches them, so the trap's first/last
+      // comparisons must not land on one.
+      ).filter(el => !el.hasAttribute('disabled') && el.tabIndex >= 0)
     // Focus the first control on ENTERING the dialog step — not on every
     // re-run. This effect re-runs whenever `finish` / `savingProfile` change
     // identity, which now includes every keystroke in the "Other" role field
@@ -528,8 +547,8 @@ export default function OnboardingFlow({
     // `savingProfile` IS part of the key: every step-2 control is disabled
     // during the save, so `getFocusable()` is empty and the browser drops focus
     // to <body>. Without re-seating focus when the freeze lifts, the failed-save
-    // path (modal stays open with an error) would leave the Tab trap's
-    // first/last comparisons unmatched and Tab would escape the dialog.
+    // path (modal stays open with an error) would leave focus on <body>,
+    // outside the dialog with no visible ring, until the next Tab re-enters it.
     const focusKey = `${step}:${shellHost?.sectionSlot ? 1 : 0}:${savingProfile ? 1 : 0}`
     if (initialFocusKeyRef.current !== focusKey) {
       initialFocusKeyRef.current = focusKey
@@ -548,8 +567,14 @@ export default function OnboardingFlow({
       if (items.length === 0) return
       const first = items[0]
       const last = items[items.length - 1]
-      const wrapsBackward = e.shiftKey && document.activeElement === first
-      const wrapsForward = !e.shiftKey && document.activeElement === last
+      // Focus outside the dialog (the chat composer behind the scrim) re-enters
+      // it on Tab, unless it sits in another modal, such as a theme pack's
+      // consent dialog, whose own trap owns the key.
+      const active = document.activeElement
+      const outside = !node.contains(active)
+      if (outside && active?.closest('[aria-modal="true"]')) return
+      const wrapsBackward = e.shiftKey && (outside || active === first)
+      const wrapsForward = !e.shiftKey && (outside || active === last)
       // A mid-dialog Tab is the browser's to move, so it is also not the
       // trap's to claim — claiming it would consume legitimate navigation
       // inside the post-composition latch window.
@@ -610,7 +635,7 @@ export default function OnboardingFlow({
         }
         onSkipAll={skipAll}
         dialogRef={dialogRef}
-        footer={<SendBtn type="button" onClick={next}>{i18nT('components.onboardingFlow.continue')}</SendBtn>}
+        footer={<SendBtn type="button" className="focus-ring-accent" onClick={next}>{i18nT('components.onboardingFlow.continue')}</SendBtn>}
       >
         {/* The product itself, scaled down, as the live preview of every pick
             (mode, Translucent panels, color theme), beside the two switches it
@@ -619,21 +644,23 @@ export default function OnboardingFlow({
         <div className="flex flex-col gap-4 sm:flex-row sm:items-center">
         <LookPreview className="w-full shrink-0 sm:w-[52%]" />
         <div className="min-w-0 flex-1">
-        <div className="flex gap-1 border border-border rounded-[10px] p-1" style={{ background: 'var(--panel-strong)' }}>
-          {(['system', 'light', 'dark'] as ModePreference[]).map(m => (
+        <RadioChipGroup className="flex gap-1 border border-border rounded-[10px] p-1" style={{ background: 'var(--panel-strong)' }} ariaLabel={i18nT('components.onboardingFlow.mode_switch_label')}>
+          {(['system', 'light', 'dark'] as const).map(m => (
             <button
               key={m}
+              type="button"
+              {...radioChip(modePref === m)}
               onClick={() => setModePref(m)}
-              className={`flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-[7px] text-[13px] cursor-pointer border-none transition-colors ${
+              className={`focus-ring-accent flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-[7px] text-[13px] cursor-pointer border-none transition-colors ${
                 modePref === m ? 'font-medium' : 'bg-transparent text-muted hover:text-text'
               }`}
               style={modePref === m ? { background: ACCENT_20, color: 'var(--accent)' } : undefined}
             >
               {m === 'system' ? <Monitor size={14} /> : m === 'light' ? <Sun size={14} /> : <Moon size={14} />}
-              {m[0].toUpperCase() + m.slice(1)}
+              {i18nT(MODE_LABEL_KEYS[m])}
             </button>
           ))}
-        </div>
+        </RadioChipGroup>
 
         {/* The same Translucent panels switch as Settings -> Display -> View
             (`useLiquidGlass`, browser-local `mc-liquid-glass`): the glass/solid
@@ -648,13 +675,14 @@ export default function OnboardingFlow({
         <div className="mt-3 text-[11px] uppercase tracking-wide text-muted mb-1.5">
           {i18nT('components.onboardingFlow.color_theme')}
         </div>
-        <div className="grid grid-cols-3 gap-1.5 sm:grid-cols-4" role="group" aria-label={i18nT('components.onboardingFlow.color_theme')}>
+        <RadioChipGroup className="grid grid-cols-3 gap-1.5 sm:grid-cols-4" ariaLabel={i18nT('components.onboardingFlow.color_theme')}>
           {allThemes.map(t => (
             <button
               key={t.value}
+              type="button"
               onClick={() => setColorTheme(t.value as ColorTheme)}
-              aria-pressed={colorTheme === t.value}
-              className={`flex min-w-0 items-center justify-center gap-1.5 truncate rounded-lg border px-2 py-1.5 text-[13px] cursor-pointer transition-colors ${
+              {...radioChip(colorTheme === t.value)}
+              className={`focus-ring-accent flex min-w-0 items-center justify-center gap-1.5 truncate rounded-lg border px-2 py-1.5 text-[13px] cursor-pointer transition-colors ${
                 colorTheme === t.value
                   ? 'border-accent font-medium'
                   : 'border-border bg-transparent text-text hover:text-text-strong'
@@ -664,7 +692,7 @@ export default function OnboardingFlow({
               {t.label}
             </button>
           ))}
-        </div>
+        </RadioChipGroup>
       </OnboardingChapterShell>
     )
   }
@@ -713,7 +741,7 @@ export default function OnboardingFlow({
             <Btn type="button" className="h-9 rounded-lg px-4" disabled={savingProfile} onClick={() => setStep(1)}>
               {i18nT('components.onboardingFlow.back')}
             </Btn>
-            <SendBtn type="button" disabled={savingProfile} onClick={next}>
+            <SendBtn type="button" className="focus-ring-accent" disabled={savingProfile} onClick={next}>
               {savingProfile ? i18nT('components.onboardingFlow.saving') : i18nT('components.onboardingFlow.continue')}
             </SendBtn>
           </>
@@ -725,14 +753,15 @@ export default function OnboardingFlow({
         >
           {i18nT('components.onboardingFlow.your_role')}
         </div>
-        <div className="flex flex-wrap gap-1.5" role="group" aria-labelledby="onboarding-role-label">
+        <RadioChipGroup className="flex flex-wrap gap-1.5" ariaLabelledBy="onboarding-role-label">
           {ROLE_OPTIONS.map(o => (
             <button
               key={o.value}
+              type="button"
               onClick={() => pickRole(o.value)}
               disabled={savingProfile}
-              aria-pressed={role === o.value}
-              className={`flex items-center gap-1 rounded-full px-3 py-1.5 text-[13px] cursor-pointer transition-colors border ${
+              {...radioChip(role === o.value)}
+              className={`focus-ring-accent flex items-center gap-1 rounded-full px-3 py-1.5 text-[13px] cursor-pointer transition-colors border ${
                 role === o.value
                   ? 'border-accent font-medium'
                   : 'border-border bg-transparent text-text hover:text-text-strong'
@@ -743,7 +772,7 @@ export default function OnboardingFlow({
               {i18nT(ROLE_LABEL_KEY[o.value])}
             </button>
           ))}
-        </div>
+        </RadioChipGroup>
 
         {/* "Other" is the only answer the six chips cannot express, so it
             reveals a free-text field instead of being a dead end. Optional:
@@ -777,18 +806,18 @@ export default function OnboardingFlow({
         >
           {i18nT('components.onboardingFlow.how_technical_are_you')}
         </div>
-        <div
+        <RadioChipGroup
           className="flex flex-col gap-1.5"
-          role="group"
-          aria-labelledby="onboarding-tech-label"
+          ariaLabelledBy="onboarding-tech-label"
         >
           {TECH_OPTIONS.map(o => (
             <button
               key={o.value}
+              type="button"
               onClick={() => pickTech(o.value)}
               disabled={savingProfile}
-              aria-pressed={techLevel === o.value}
-              className={`flex items-center gap-2 rounded-lg border px-3 py-2.5 text-[13px] cursor-pointer transition-colors ${
+              {...radioChip(techLevel === o.value)}
+              className={`focus-ring-accent flex items-center gap-2 rounded-lg border px-3 py-2.5 text-[13px] cursor-pointer transition-colors ${
                 techLevel === o.value
                   ? 'border-accent font-medium'
                   : 'border-border bg-transparent text-text hover:text-text-strong'
@@ -799,7 +828,7 @@ export default function OnboardingFlow({
               {i18nT(TECH_LABEL_KEY[o.value])}
             </button>
           ))}
-        </div>
+        </RadioChipGroup>
 
         {/* No hand-off: the onboarding answers (techLevel and the other
             chapter picks) are unsaved wizard state — this notice exists

@@ -1,12 +1,8 @@
 """``kiro_crew.agent`` composes its split-out spec code onto one namespace.
 
-The spec-file writes, the fresh-spec build, the launcher, the spec upgrades and lookups,
-the shared-home guard, the rebuild with its ceiling projection, and most prompt and grant
-text moved out of ``agent.py`` into the ``kiro_crew.agent_parts`` owners.
-:func:`kiro_crew._facade_compose.compose` runs every function they define on
-``kiro_crew.agent``'s module globals. The facade's own contract
-(``test/test_agent_refactor_facade.py``) passes unchanged because of that; these tests pin
-what the composition itself promises:
+:func:`kiro_crew._facade_compose.compose` runs every function the ``kiro_crew.agent_parts``
+owners define on ``kiro_crew.agent``'s module globals, which is why the facade contract
+(``test/test_agent_refactor_facade.py``) holds. These tests pin what the composition promises:
 
 * every owner function runs on the facade's globals, names the facade as its module, and is
   the object the facade binds, except the two functions wrapped where they are defined,
@@ -54,6 +50,13 @@ from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 pytestmark = pytest.mark.xdist_group(name="tree_scan_agent_parts")
 
+SHARED_FACADE_CHECKS = (
+    "the_sweep_reports_a_global_the_namespace_does_not_bind",
+    "the_package_init_defines_nothing",
+    "an_owner_imports_the_facade_only_for_type_checking_and_no_project_module",
+)
+
+
 FACADE = agent.__name__
 PACKAGE = agent_parts.__name__
 _PARTS_DIR = Path(agent_parts.__file__).resolve().parent
@@ -70,6 +73,8 @@ _OWNER_STEMS = (
     "spec_lookup",
     "spec_prompts",
     "spec_rebuild",
+    "spec_siblings",
+    "spec_unreadable",
     "spec_upgrades",
 )
 
@@ -117,12 +122,13 @@ _BASE_IMPORTS = frozenset("""
     is_markdown_spec is_registered_agent_name is_sensitive_path isolated_agents_dir
     iter_agent_spec_files Iterator json kiro_agents_dir kiro_hooks Literal loads_user_json
     logging managed_mcp mcp_aliases mcp_search_path mcp_sources mkdirs_owner_only ModuleType
-    MutableMapping os OWNED_KIRO_AGENT_FILES Path platform_compat project_agent_files
+    MutableMapping os OWNED_KIRO_AGENT_FILES Path platform_compat PlatformCompositionError
+    project_agent_files
     project_agent_name project_agent_names read_json_or redact redact_log replace_with_retry
     REQUIRED_KIRO_AGENT_FILES resolved_command_casing safe_context_call
     safe_read_file_bytes_nolink SecurityEvent sel service_agents shared_kiro_agents_writable
-    shutil skill_resources SKILL_URI_PREFIX spec_path_key stat sys tempfile threading time
-    timezone TYPE_CHECKING uuid worker_agent write_text_owner_only
+    shared_template_view shutil skill_resources SKILL_URI_PREFIX spec_path_key stat sys tempfile
+    threading time timezone TYPE_CHECKING uuid worker_agent write_text_owner_only
     """.split())
 
 #: The names the facade's composition glue imports.
@@ -239,15 +245,6 @@ def test_the_managed_server_table_holds_the_composed_spec_gate() -> None:
     assert gate.__globals__ is vars(agent)
 
 
-def test_the_sweep_reports_a_global_the_namespace_does_not_bind() -> None:
-    module_code = compile(
-        "def f():\n    def g():\n        return absent\n    return present, g\n", "probe", "exec"
-    )
-    code = next(c for c in module_code.co_consts if isinstance(c, types.CodeType))
-    probe = types.FunctionType(code, {"__name__": "probe", "present": 1})
-    assert _unbound_globals(probe) == ["absent"]
-
-
 def test_every_global_an_owner_function_reads_is_bound_on_the_facade() -> None:
     """Nested code included: ``_resolve_kirocrew_bin`` defines its ``_usable`` inline."""
     missing = {
@@ -301,23 +298,33 @@ def test_the_rewrapped_spec_lock_reads_the_facade_logger(
 # ── 2. a patch of the facade reaches every owner reader ─────────────────────
 
 
+@functools.lru_cache(maxsize=1)
 def _spellings() -> dict[str, str]:
     """The facade's dotted name, plus ``<module>.<alias>`` for each src module that binds it
-    at module level -- another spelling of the same object a test can patch through."""
+    at module level -- another spelling of the same object a test can patch through.
+
+    Built once per worker: ``"agent"`` matches most of the tree, so each build parses
+    it. Callers only read the result.
+    """
     spellings = {FACADE: FACADE}
-    for path, text in source_corpus.iter_candidate_sources(require_all=("agent",)):
-        if not path.is_relative_to(_SRC):
-            continue
-        module = ".".join(path.relative_to(_SRC.parent).with_suffix("").parts)
-        for node in ast.parse(text).body:
-            if isinstance(node, ast.ImportFrom) and node.module == "kiro_crew" and not node.level:
-                for alias in node.names:
-                    if alias.name == "agent":
-                        spellings[f"{module}.{alias.asname or alias.name}"] = FACADE
-            elif isinstance(node, ast.Import):
-                for alias in node.names:
-                    if alias.name == FACADE and alias.asname:
-                        spellings[f"{module}.{alias.asname}"] = FACADE
+    with source_corpus.untraced():
+        for path, text in source_corpus.iter_candidate_sources(require_all=("agent",)):
+            if not path.is_relative_to(_SRC):
+                continue
+            module = ".".join(path.relative_to(_SRC.parent).with_suffix("").parts)
+            for node in ast.parse(text).body:
+                if (
+                    isinstance(node, ast.ImportFrom)
+                    and node.module == "kiro_crew"
+                    and not node.level
+                ):
+                    for alias in node.names:
+                        if alias.name == "agent":
+                            spellings[f"{module}.{alias.asname or alias.name}"] = FACADE
+                elif isinstance(node, ast.Import):
+                    for alias in node.names:
+                        if alias.name == FACADE and alias.asname:
+                            spellings[f"{module}.{alias.asname}"] = FACADE
     return spellings
 
 
@@ -334,19 +341,23 @@ def _test_tree_files() -> list[Path]:
 
 @functools.lru_cache(maxsize=1)
 def _corpus_patched_names() -> frozenset[str]:
-    """Every name the test trees patch on the facade, scanned once per worker."""
+    """Every name the test trees patch on the facade, scanned once per worker.
+
+    The scan is test-side code that coverage does not report, so it runs untraced.
+    """
     spellings = _spellings()
     found: set[str] = set()
-    for path in _test_tree_files():
-        text = path.read_text(encoding="utf-8", errors="replace")
-        if not facade_mirror_scan._mentions(text, spellings):
-            continue
-        found |= facade_mirror_scan.text_patched_names(text, spellings).get(FACADE, set())
-        if facade_mirror_scan.needs_syntax_tree(text, spellings):
-            try:
-                found |= facade_mirror_scan.patched_names(text, spellings).get(FACADE, set())
-            except SyntaxError:
+    with source_corpus.untraced():
+        for path in _test_tree_files():
+            text = path.read_text(encoding="utf-8", errors="replace")
+            if not facade_mirror_scan._mentions(text, spellings):
                 continue
+            found |= facade_mirror_scan.text_patched_names(text, spellings).get(FACADE, set())
+            if facade_mirror_scan.needs_syntax_tree(text, spellings):
+                try:
+                    found |= facade_mirror_scan.patched_names(text, spellings).get(FACADE, set())
+                except SyntaxError:
+                    continue
     return frozenset(found)
 
 
@@ -358,7 +369,9 @@ def test_leaf_test_scope_derives_this_file_as_a_corpus_gate(
     monkeypatch.syspath_prepend(str(root / "scripts"))
     leaf_test_scope = importlib.import_module("leaf_test_scope")
     this_file = Path(__file__).resolve().relative_to(root).as_posix()
-    assert this_file in leaf_test_scope.corpus_gates(root)
+    with source_corpus.untraced():
+        gates = leaf_test_scope.corpus_gates(root)
+    assert this_file in gates
 
 
 def test_the_spellings_include_a_materialization_owner_binding_of_the_facade() -> None:
@@ -466,6 +479,19 @@ def test_a_facade_patch_reaches_the_rebuild(monkeypatch: pytest.MonkeyPatch) -> 
     assert agent.rebuild_agent_config() == "declined"
 
 
+def test_a_facade_patch_reaches_the_unreadable_episode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The episode flag rebound on the facade, and a patched step, both reach the owner."""
+    monkeypatch.setattr(agent, "_conductor_spec_held", False)
+    monkeypatch.setattr(agent, "_main_spec_unreadable", True)
+    assert agent._spec_hold_open() is True
+    monkeypatch.setattr(agent, "_install_sibling_specs", _raiser("siblings"))
+    unreadable = agent._AgentSpecUnreadable("PermissionError: denied")
+    with pytest.raises(_Reached):
+        agent._skip_unreadable_main_spec(
+            Path("kirocrew.json"), unreadable, False, clean=False, wrote_out=None, held_out=None
+        )
+
+
 # ── 3. what an owner may hold and import ────────────────────────────────────
 
 
@@ -526,15 +552,6 @@ def test_the_owner_import_check_sees_every_spelling(source: str, flagged: bool) 
     assert bool(_bad_owner_imports(ast.parse(source))) is flagged
 
 
-def test_an_owner_imports_the_facade_only_for_type_checking_and_no_project_module() -> None:
-    bad = {
-        stem: found
-        for stem, path in _owner_paths().items()
-        if (found := _bad_owner_imports(_tree(path)))
-    }
-    assert bad == {}
-
-
 def _module_values(tree: ast.Module) -> list[str]:
     """Names a module binds at its top level other than by an import or a ``def``."""
     found = []
@@ -585,12 +602,6 @@ def test_every_module_level_value_an_owner_defines_is_the_object_the_facade_bind
     assert sum(len(names) for names in values.values()) >= 40
 
 
-def test_the_package_init_defines_nothing() -> None:
-    init = _PARTS_DIR / "__init__.py"
-    assert _facade_mirror._defined_names(_tree(init)) == set()
-    assert [n for n in _tree(init).body if not isinstance(n, ast.Expr)] == []
-
-
 def _imports_an_owner(source: str) -> bool:
     """Whether *source* imports the package or one of its modules, in any spelling, absolute
     or relative; a sibling whose name merely contains ``agent_parts`` (``subagent_parts``)
@@ -626,14 +637,15 @@ def test_the_importer_check_sees_every_spelling(source: str, flagged: bool) -> N
 
 
 def _owner_importers(src: Path) -> list[str]:
-    return sorted(
-        path.relative_to(src.parent).as_posix()
-        for path in sorted(src.rglob("*.py"))
-        if path.parent.name != "agent_parts"
-        and path != src / "agent.py"
-        and "agent_parts" in (text := path.read_text(encoding="utf-8"))
-        and _imports_an_owner(text)
-    )
+    with source_corpus.untraced():
+        return sorted(
+            path.relative_to(src.parent).as_posix()
+            for path in sorted(src.rglob("*.py"))
+            if path.parent.name != "agent_parts"
+            and path != src / "agent.py"
+            and "agent_parts" in (text := path.read_text(encoding="utf-8"))
+            and _imports_an_owner(text)
+        )
 
 
 def test_nothing_but_the_facade_imports_an_owner() -> None:

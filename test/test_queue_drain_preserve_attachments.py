@@ -27,6 +27,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 from chat_test_helpers import _make_app, _make_state
+from redaction_structured_cases import github_classic
 
 from kiro_crew.dashboard.chat_delivery import (
     ATTACHMENT_LIST_MAX_ITEMS,
@@ -34,6 +35,9 @@ from kiro_crew.dashboard.chat_delivery import (
     MAX_PENDING_STEERS,
     attachment_meta,
 )
+
+#: A synthetic GitHub token with a valid checksum, which the credential plan redacts.
+_TOKEN = github_classic(seed=50)
 
 _PATH = "/tmp/My Report.pdf"
 _WIRE = f"summarize this\n[attached_file 1] {_PATH}"
@@ -60,6 +64,12 @@ async def _drain_once(state, slot) -> None:
         patch.object(chat_runner, "_run_chat", return_value=MagicMock()),
     ):
         assert await chat_runner._start_next_queued_turn(state, slot) is True
+
+
+def _sans_author(meta):
+    """*meta* without the server-stamped Shared Crew author, which every person's
+    send now carries (``shared_crew.attribution``); these tests pin the rest."""
+    return {k: v for k, v in (meta or {}).items() if k != "author"}
 
 
 def _user_rows(slot) -> list[dict]:
@@ -221,10 +231,22 @@ class TestQueuePushFrameCarriesTheLists:
 
     @pytest.mark.asyncio
     async def test_sub_agent_hold_frame(self, tmp_path, monkeypatch):
+        from kiro_crew.dashboard import chat_runner
+
         state, slot = _busy_state(tmp_path, monkeypatch)
-        # The idle-slot hold: no turn is running, but children are.
+        # The idle-slot hold branch: no turn is running and the only child is
+        # stalled, so a composer send joins the queue behind a message parked
+        # while that child was live (the parked one drains; this one waits).
         slot.task = None
-        state.subagents = MagicMock(running_agents_for=MagicMock(return_value=["agent-1"]))
+        state.subagents = MagicMock(
+            running_agents_for=MagicMock(return_value=[{"id": "agent-1", "stalled": True}])
+        )
+        slot.queue_append("parked while the child was live")
+        monkeypatch.setattr(chat_runner, "_run_chat", MagicMock(return_value=MagicMock()))
+        monkeypatch.setattr(chat_runner, "spawn_guarded_turn", lambda *a, **k: None)
+        load = MagicMock()
+        load.return_value.dashboard.merge_queued_messages = False
+        monkeypatch.setattr(chat_runner.KiroCrewConfig, "load", load)
         receipt = await _post_busy(state, "busy-chat", _WIRE, {"files": [_PATH]})
         (frame,) = _queue_push_frames(state)
         assert frame["queue_id"] == receipt["queue_id"]
@@ -253,7 +275,7 @@ class TestQueuePushFrameCarriesTheLists:
         (frame,) = _queue_push_frames(state)
         entry = next(i for i in slot._queue if i["content"] == _WIRE)
         assert frame["queue_id"] == entry["id"]
-        assert frame["meta"] == {"files": [_PATH], "dirs": [_DIR]}
+        assert frame["meta"] == {"files": [_PATH], "dirs": [_DIR], "requeuedSteer": True}
 
 
 class TestDrainedRow:
@@ -296,7 +318,11 @@ class TestDrainedRow:
             if c.args and c.args[0] == "queue_pop"
         ]
         pop = next(p for p in pops if p.get("content") == _WIRE)
-        assert pop.get("meta") == {"files": [_PATH], "dirs": [_DIR]}
+        # The author stamp rides beside the lists (test_shared_crew_queue_pop_author).
+        assert {k: v for k, v in pop["meta"].items() if k != "author"} == {
+            "files": [_PATH],
+            "dirs": [_DIR],
+        }
 
     @pytest.mark.asyncio
     async def test_queue_pop_frame_without_attachments_has_no_meta_key(self, tmp_path, monkeypatch):
@@ -313,7 +339,8 @@ class TestDrainedRow:
             if c.args and c.args[0] == "queue_pop"
         ]
         pop = next(p for p in pops if p.get("content") == "plain text")
-        assert "meta" not in pop
+        # Only the author stamp, never an empty attachment list.
+        assert set(pop.get("meta") or {}) <= {"author"}
 
 
 class TestSteeredAttachments:
@@ -378,7 +405,7 @@ class TestSteeredAttachments:
             assert slot._steer_send_ids[_WIRE] == "s-cap-last"
             assert slot._steer_user_origin[_WIRE] is True
             assert _WIRE in slot._steer_admissions
-            assert slot._steer_attachment_meta[_WIRE] == {
+            assert _sans_author(slot._steer_attachment_meta[_WIRE]) == {
                 "files": [_PATH],
                 "dirs": [_DIR],
             }
@@ -406,7 +433,7 @@ class TestSteeredAttachments:
 
         steer.assert_awaited_once_with(_WIRE)
         assert slot._pending_steers[-1] == _WIRE
-        assert slot._steer_attachment_meta[_WIRE] == {
+        assert _sans_author(slot._steer_attachment_meta[_WIRE]) == {
             "files": [_PATH],
             "dirs": [_DIR],
         }
@@ -435,7 +462,7 @@ class TestSteeredAttachments:
         echo = next(
             c.args[1] for c in state.broadcast_ws.call_args_list if c.args[0] == "steer_push"
         )
-        assert echo["meta"] == {"files": [_PATH], "dirs": [_DIR]}
+        assert _sans_author(echo["meta"]) == {"files": [_PATH], "dirs": [_DIR]}
         from kiro_crew.dashboard.chat_runner import _settle_consumed_steers
 
         _settle_consumed_steers(slot, f"<user_message>\n{_WIRE}\n</user_message>")
@@ -466,12 +493,15 @@ class TestSteeredAttachments:
             assert (await resp.json()).get("steered") is True
 
         assert slot._pending_steers == [_WIRE]
-        assert slot._steer_attachment_meta == {}
+        assert {k: _sans_author(v) for k, v in slot._steer_attachment_meta.items()} in (
+            {},
+            {_WIRE: {}},
+        )
         assert "files" not in _user_rows(slot)[-1].get("meta", {})
         echo = next(
             c.args[1] for c in state.broadcast_ws.call_args_list if c.args[0] == "steer_push"
         )
-        assert "meta" not in echo
+        assert _sans_author(echo.get("meta")) == {}
 
     @pytest.mark.asyncio
     async def test_unconsumed_steer_keeps_attachments_through_requeue_and_drain(
@@ -587,7 +617,7 @@ class TestAttachmentPathsAreRedacted:
     def test_credential_in_a_path_is_redacted_before_it_rides_the_entry(self):
         from kiro_crew.dashboard.chat_utils import redact_credentials
 
-        leaky = "/tmp/exports/AKIAIOSFODNN7EXAMPLE-report.pdf"
+        leaky = f"/tmp/exports/{_TOKEN}-report.pdf"
         expected, changed = redact_credentials(leaky)
         assert changed, "fixture must contain something the redactor rewrites"
         out = attachment_meta({"files": [leaky, _PATH]})
@@ -725,7 +755,7 @@ class TestQueueEditPrunesAttachmentMeta:
         must not drop the entry."""
         from kiro_crew.dashboard.chat_delivery import attachment_meta
 
-        raw = "/tmp/uploads/AKIAIOSFODNN7EXAMPLE-report.pdf"
+        raw = f"/tmp/uploads/{_TOKEN}-report.pdf"
         lists = attachment_meta({"files": [raw]})
         stored = lists["files"][0]
         assert stored != raw, "the fixture path must be one the redactor rewrites"
@@ -825,5 +855,5 @@ class TestQueueEditPrunesAttachmentMeta:
             for c in state.broadcast_ws.call_args_list
             if c.args and c.args[0] == "queue_edit"
         )
-        assert frame == {"slot": "busy-chat", "queue_id": qid, "content": "just text"}
+        assert frame == {"slot": "busy-chat", "queue_id": qid, "content": "just text", "editRev": 1}
         assert "files" not in slot._queue[0]["meta"]

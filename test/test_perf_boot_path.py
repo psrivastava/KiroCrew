@@ -54,9 +54,10 @@ def _probe(snippet: str) -> dict:
     # parse_dashboard_url honours KIROCREW_PORT; keep the probe deterministic.
     env.pop("KIROCREW_PORT", None)
     proc = subprocess.run(
-        [sys.executable, "-c", snippet],
+        [sys.executable, "-X", "utf8", "-c", snippet],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         env=env,
         timeout=120,
     )
@@ -96,7 +97,7 @@ class TestGatewayUpdateCheckIsBackgrounded:
         )
         handlers_src = inspect.getsource(GatewayOrchestrator._install_shutdown_signal_handlers)
         assert "for sig in (signal.SIGINT, signal.SIGTERM):" in handlers_src
-        assert "loop.add_signal_handler(sig, _on_signal)" in handlers_src
+        assert "loop.add_signal_handler(sig, _on_signal, sig)" in handlers_src
 
     def test_update_check_task_is_tracked_and_cancelled(self) -> None:
         run_src = inspect.getsource(GatewayOrchestrator.run)

@@ -7,8 +7,10 @@
  * the failure path that reports through onError and leaves the popover open.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { Provider } from 'react-redux'
+import { createConnectedTestStore } from './helpers'
 import type { ReactNode } from 'react'
 import { i18nT } from '../i18n/t'
 
@@ -28,10 +30,11 @@ vi.mock('../components/RegistryManager', () => ({
 }))
 
 import SourcesPopover from '../components/appstore/SourcesPopover'
+import { i18next } from '../i18n/all'
 
 const wrap = (ui: ReactNode) => {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
-  return render(<QueryClientProvider client={qc}>{ui}</QueryClientProvider>)
+  return render(<Provider store={createConnectedTestStore()}><QueryClientProvider client={qc}>{ui}</QueryClientProvider></Provider>)
 }
 
 const pathInput = () => screen.getByPlaceholderText(i18nT('components.appstore.sourcesPopover.path_to_app_directory'))
@@ -118,5 +121,25 @@ describe('SourcesPopover', () => {
     await waitFor(() => expect(onError).toHaveBeenCalledWith(
       i18nT('components.appstore.sourcesPopover.install_failed'),
     ))
+  })
+})
+
+// The Install-from-Path hint is one catalog sentence with the command in a
+// slot, so each language places the command and closes its own brackets.
+describe('SourcesPopover — install-from-path hint', () => {
+  afterEach(async () => { await act(async () => { await i18next.changeLanguage('en') }) })
+
+  const hint = () => screen.getByText((_, el) => el?.tagName === 'P' && !!el.querySelector('code'))
+
+  it('reads as one English sentence with the command in a code element', () => {
+    wrap(<SourcesPopover open onOpenChange={() => {}} onError={() => {}} />)
+    expect(hint()).toHaveTextContent('Developer install of a local app directory (equivalent to kirocrew app install <path>).')
+    expect(hint().querySelector('code')).toHaveTextContent('kirocrew app install <path>')
+  })
+
+  it('places the command before the Japanese verb and closes the full-width bracket', async () => {
+    await act(async () => { await i18next.changeLanguage('ja') })
+    wrap(<SourcesPopover open onOpenChange={() => {}} onError={() => {}} />)
+    expect(hint()).toHaveTextContent('ローカルアプリディレクトリの開発者インストール（kirocrew app install <path> と同等）。')
   })
 })

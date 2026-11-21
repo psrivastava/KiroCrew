@@ -3,8 +3,8 @@
 With the key on, the KAS handshake declares ``_meta.kiro.secretStorage`` and the
 engine stores each MCP server's OAuth state through ``_kiro/secret/*`` requests.
 These tests pin that the key is off by default and then declares nothing, that
-``client`` and ``tokens`` persist in a dedicated vault that is neither the user
-Secrets vault nor agent-readable, that ``verifier`` and ``discovery`` stay in
+``client``, ``kiro-path-client`` and ``tokens`` persist in a dedicated vault that
+is neither the user Secrets vault nor agent-readable, that ``verifier`` and ``discovery`` stay in
 memory, that only the engine's MCP key namespace is served, and that no stored
 value reaches a log or the raw-frame recorder.
 """
@@ -28,6 +28,8 @@ from kiro_crew.testing.wait import async_wait_until
 _HASH = "ab" * 32
 _TOKENS_KEY = f"kiro.mcp.{_HASH}.tokens"
 _CLIENT_KEY = f"kiro.mcp.{_HASH}.client"
+_PATH_CLIENT_KEY = f"kiro.mcp.{_HASH}.kiro-path-client"
+_ENGINE_KINDS = ("client", "kiro-path-client", "tokens", "verifier", "discovery")
 _VERIFIER_KEY = f"kiro.mcp.{_HASH}.verifier"
 _DISCOVERY_KEY = f"kiro.mcp.{_HASH}.discovery"
 _TOKEN_VALUE = (
@@ -43,7 +45,7 @@ def _server(tmp_path) -> kss.SecretStorageServer:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("key", [_TOKENS_KEY, _CLIENT_KEY])
+@pytest.mark.parametrize("key", [_TOKENS_KEY, _CLIENT_KEY, _PATH_CLIENT_KEY])
 async def test_client_and_tokens_outlive_the_engine_process(tmp_path, key):
     first = _server(tmp_path)
     assert await first.answer(kss.METHOD_SECRET_GET, {"key": key}) == {}
@@ -55,6 +57,47 @@ async def test_client_and_tokens_outlive_the_engine_process(tmp_path, key):
 
     assert await second.answer(kss.METHOD_SECRET_DELETE, {"key": key}) == {}
     assert await _server(tmp_path).answer(kss.METHOD_SECRET_GET, {"key": key}) == {}
+
+
+@pytest.mark.asyncio
+async def test_every_engine_key_kind_is_served_and_only_the_grants_persist(tmp_path):
+    server = _server(tmp_path)
+    refused = []
+    for kind in _ENGINE_KINDS:
+        key = f"kiro.mcp.{_HASH}.{kind}"
+        try:
+            await server.answer(kss.METHOD_SECRET_STORE, {"key": key, "value": kind})
+        except kss.SecretStorageRefused:
+            refused.append(kind)
+    assert refused == []
+
+    fresh = _server(tmp_path)
+    survivors = {
+        kind
+        for kind in _ENGINE_KINDS
+        if await fresh.answer(kss.METHOD_SECRET_GET, {"key": f"kiro.mcp.{_HASH}.{kind}"})
+    }
+    assert survivors == {"client", "kiro-path-client", "tokens"}
+
+
+@pytest.mark.asyncio
+async def test_a_client_registration_moves_to_the_path_client_key(tmp_path):
+    first = _server(tmp_path)
+    await first.answer(kss.METHOD_SECRET_STORE, {"key": _CLIENT_KEY, "value": "legacy"})
+    await first.answer(kss.METHOD_SECRET_STORE, {"key": _TOKENS_KEY, "value": _TOKEN_VALUE})
+
+    engine = _server(tmp_path)
+    assert await engine.answer(kss.METHOD_SECRET_GET, {"key": _PATH_CLIENT_KEY}) == {}
+    assert await engine.answer(kss.METHOD_SECRET_GET, {"key": _CLIENT_KEY}) == {"value": "legacy"}
+    await engine.answer(kss.METHOD_SECRET_STORE, {"key": _PATH_CLIENT_KEY, "value": "reg"})
+    await engine.answer(kss.METHOD_SECRET_DELETE, {"key": _CLIENT_KEY})
+
+    later = _server(tmp_path)
+    assert await later.answer(kss.METHOD_SECRET_GET, {"key": _CLIENT_KEY}) == {}
+    assert await later.answer(kss.METHOD_SECRET_GET, {"key": _PATH_CLIENT_KEY}) == {"value": "reg"}
+    assert await later.answer(kss.METHOD_SECRET_GET, {"key": _TOKENS_KEY}) == {
+        "value": _TOKEN_VALUE
+    }
 
 
 @pytest.mark.asyncio
@@ -77,6 +120,9 @@ async def test_verifier_and_discovery_stay_in_this_process(tmp_path, key):
     [
         {"key": "kiro.auth.refreshToken"},
         {"key": f"kiro.mcp.{_HASH}.other"},
+        {"key": f"kiro.mcp.{_HASH}.kiro-path-clientx"},
+        {"key": f"kiro.mcp.{_HASH}.path-client"},
+        {"key": f"kiro.mcp.{'AB' * 32}.kiro-path-client"},
         {"key": f"kiro.mcp.{'AB' * 32}.tokens"},
         {"key": f"kiro.mcp.{'ab' * 31}.tokens"},
         {"key": f"kiro.mcp.{_HASH}.tokens\n"},
@@ -262,16 +308,138 @@ async def test_a_vault_failure_is_a_value_free_refusal(tmp_path, monkeypatch, ca
 # ── the opt-in key and the handshake ──────────────────────────────────────────
 
 
-def test_the_key_is_off_by_default_and_read_from_config(tmp_path, monkeypatch):
+def _config_home(tmp_path, monkeypatch):
     from kiro_crew.config import loader as L
-    from kiro_crew.config.loader import KiroCrewConfig
 
     monkeypatch.setattr(L, "config_dir", lambda: tmp_path)
-    assert KiroCrewConfig.load().agent.kas_persist_mcp_sign_in is False
-    assert kss.persistence_enabled() is False
-    (tmp_path / "config.json").write_text(json.dumps({"agent": {"kas_persist_mcp_sign_in": True}}))
+    return tmp_path
+
+
+def test_the_key_is_on_by_default_and_read_from_config(tmp_path, monkeypatch):
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    home = _config_home(tmp_path, monkeypatch)
     assert KiroCrewConfig.load().agent.kas_persist_mcp_sign_in is True
     assert kss.persistence_enabled() is True
+    (home / "config.json").write_text(json.dumps({"agent": {"default_agent": ""}}))
+    assert kss.persistence_enabled() is True
+    (home / "config.json").write_text(json.dumps({"agent": {"kas_persist_mcp_sign_in": True}}))
+    assert kss.persistence_enabled() is True
+
+
+@pytest.mark.parametrize("stored", ["true", "false", 1, 0, None, [], {}])
+def test_only_a_real_true_keeps_sign_ins(tmp_path, monkeypatch, stored):
+    """A stored value that is not a JSON boolean never turns storage on.
+
+    ``_safe_bool`` would fold each of these into the true default, so a hand-edited
+    ``"false"`` would start storing tokens against what the owner wrote.
+    """
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    home = _config_home(tmp_path, monkeypatch)
+    (home / "config.json").write_text(json.dumps({"agent": {"kas_persist_mcp_sign_in": stored}}))
+    assert KiroCrewConfig.load().agent.kas_persist_mcp_sign_in is False
+    assert kss.persistence_enabled() is False
+
+
+def test_a_false_set_after_the_default_change_turns_it_off(tmp_path, monkeypatch):
+    """The opt-out holds once the one-shot adoption of the old default has run."""
+    home = _config_home(tmp_path, monkeypatch)
+    stored_false = json.dumps({"agent": {"kas_persist_mcp_sign_in": False}})
+    (home / "config.json").write_text(stored_false)
+    assert kss.persistence_enabled() is True  # the materialized old default, adopted
+    (home / "config.json").write_text(stored_false)
+    assert kss.persistence_enabled() is False
+    assert kss.persistence_enabled() is False
+
+
+@pytest.mark.asyncio
+async def test_the_settings_switch_saves_an_off_the_next_load_keeps(tmp_path, monkeypatch):
+    """Settings > Connections PATCHes the key. An off saved there, before the one-shot
+    adoption of the old default ever ran, is still the owner's choice."""
+    from unittest.mock import MagicMock
+
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from kiro_crew.dashboard.handlers import api_kirocrew_config_patch
+
+    home = _config_home(tmp_path, monkeypatch)
+    (home / "config.json").write_text("{}")
+
+    @web.middleware
+    async def _owner(request, handler):
+        request["user"] = "local-app"
+        request["app"] = ""
+        return await handler(request)
+
+    app = web.Application(middlewares=[_owner])
+    app["state"] = MagicMock(owner_id="")
+    app.router.add_patch("/api/config/kirocrew", api_kirocrew_config_patch)
+    async with TestClient(TestServer(app)) as client:
+        response = await client.patch(
+            "/api/config/kirocrew", json={"path": "agent.kas_persist_mcp_sign_in", "value": False}
+        )
+        assert response.status == 200, await response.text()
+
+    assert (
+        json.loads((home / "config.json").read_text())["agent"]["kas_persist_mcp_sign_in"] is False
+    )
+    assert kss.persistence_enabled() is False
+
+
+@pytest.mark.parametrize("name", ["config.json", "config.local.json"])
+def test_an_unreadable_config_file_keeps_sign_ins_in_memory(tmp_path, monkeypatch, name):
+    """A file the loader cannot parse builds the true default; that must not store tokens."""
+    home = _config_home(tmp_path, monkeypatch)
+    if name == "config.local.json":
+        (home / "config.json").write_text(json.dumps({"agent": {"default_agent": ""}}))
+    (home / name).write_text('{"agent": {"kas_persist_mcp_sign_in": false')
+    assert kss.persistence_enabled() is False
+
+
+def test_a_config_load_that_raises_keeps_sign_ins_in_memory(monkeypatch):
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    def _boom(*_a, **_k):
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(KiroCrewConfig, "load", classmethod(_boom))
+    assert kss.persistence_enabled() is False
+
+
+@pytest.mark.parametrize(
+    ("name", "overlay"),
+    [
+        ("config.local.json", {"agent": None}),
+        ("config.local.json", {"agent": ["kas_persist_mcp_sign_in", False]}),
+        ("config.json", {"agent": 5}),
+    ],
+)
+def test_a_non_object_agent_section_keeps_sign_ins_in_memory(tmp_path, monkeypatch, name, overlay):
+    """A non-object ``agent`` section is degraded, never read as unconfigured.
+
+    Repaired to absent, an overlay replacing the base file's ``agent`` with
+    ``null`` would drop a stored ``false`` and read as on. Preserved, the loader
+    records the section as degraded and the read keeps sign-ins in memory.
+    """
+    home = _config_home(tmp_path, monkeypatch)
+    base = {"agent": {"kas_persist_mcp_sign_in": False}} if name != "config.json" else overlay
+    (home / "config.json").write_text(json.dumps(base))
+    if name == "config.local.json":
+        (home / name).write_text(json.dumps(overlay))
+    assert kss.persistence_enabled() is False
+
+
+@pytest.mark.asyncio
+async def test_a_kas_handshake_with_no_config_declares_secret_storage(tmp_path, monkeypatch):
+    """The default reaches the wire: a KAS spawn on an unconfigured home keeps sign-ins."""
+    _config_home(tmp_path, monkeypatch)
+    runtime = AcpRuntime(acp_backend=ACP_BACKEND_KAS)
+    runtime._tool_search = None
+    caps = await runtime_spawn_launch._handshake_client_capabilities(runtime)
+    assert caps["_meta"]["kiro"]["secretStorage"] is True
+    assert runtime._mcp_secret_server is not None
 
 
 def test_the_shipped_declaration_never_carries_secret_storage():
@@ -465,3 +633,85 @@ async def test_with_the_key_off_nothing_is_declared_or_stored(
     assert seen["store"]["error"]["code"] == -32601
     assert seen["get"]["error"]["code"] == -32601
     assert not (data_home() / "kas" / "mcp-grants").exists()
+
+
+# ── what gateway.log says about a saved sign-in ───────────────────────────────
+
+_SERVER_ID = _HASH[:12]
+
+
+def _sign_in_lines(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.name == kss.logger.name]
+
+
+@pytest.mark.asyncio
+async def test_the_log_says_whether_a_saved_sign_in_was_found_missing_or_stored(tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger=kss.logger.name)
+    first = _server(tmp_path)
+    await first.answer(kss.METHOD_SECRET_GET, {"key": _TOKENS_KEY})
+    await first.answer(kss.METHOD_SECRET_STORE, {"key": _TOKENS_KEY, "value": _TOKEN_VALUE})
+    await _server(tmp_path).answer(kss.METHOD_SECRET_GET, {"key": _TOKENS_KEY})
+
+    assert _sign_in_lines(caplog) == [
+        f"MCP sign-in for server {_SERVER_ID}: no saved sign-in, the server will ask to sign in",
+        f"MCP sign-in for server {_SERVER_ID}: sign-in saved",
+        f"MCP sign-in for server {_SERVER_ID}: saved sign-in found",
+    ]
+    assert "SECRET" not in caplog.text and _HASH not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_repeated_get_with_the_same_answer_logs_once(tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger=kss.logger.name)
+    server = _server(tmp_path)
+    for _ in range(3):
+        await server.answer(kss.METHOD_SECRET_GET, {"key": _TOKENS_KEY})
+    assert len(_sign_in_lines(caplog)) == 1
+
+
+@pytest.mark.asyncio
+async def test_only_the_tokens_entry_is_logged(tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger=kss.logger.name)
+    server = _server(tmp_path)
+    for key in (_CLIENT_KEY, _PATH_CLIENT_KEY, _VERIFIER_KEY, _DISCOVERY_KEY):
+        await server.answer(kss.METHOD_SECRET_GET, {"key": key})
+        await server.answer(kss.METHOD_SECRET_STORE, {"key": key, "value": "v"})
+    assert _sign_in_lines(caplog) == []
+
+
+@pytest.mark.asyncio
+async def test_a_saved_sign_in_that_cannot_be_read_says_so(tmp_path, monkeypatch, caplog):
+    store = kss.McpGrantStore(tmp_path)
+
+    def boom(key):
+        raise ValueError(f"cannot read {tmp_path}")
+
+    monkeypatch.setattr(store, "get", boom)
+    caplog.set_level(logging.INFO, logger=kss.logger.name)
+    with pytest.raises(kss.SecretStorageRefused):
+        await kss.SecretStorageServer(store).answer(kss.METHOD_SECRET_GET, {"key": _TOKENS_KEY})
+    assert (
+        f"MCP sign-in for server {_SERVER_ID}: saved sign-in not read (store error)"
+        in _sign_in_lines(caplog)
+    )
+    assert str(tmp_path) not in caplog.text
+
+
+def test_saving_silently_off_warns_once_per_run(tmp_path, monkeypatch, caplog):
+    import threading
+
+    from kiro_crew import mcp_grant_kas
+
+    monkeypatch.setattr(mcp_grant_kas, "_OFF_WARNING_GIVEN", threading.Event())
+    home = _config_home(tmp_path, monkeypatch)
+    (home / "config.json").write_text('{"agent": {"kas_persist_mcp_sign_in": false')
+    caplog.set_level(logging.WARNING, logger=mcp_grant_kas.logger.name)
+    for _ in range(3):
+        assert kss.persistence_enabled() is False
+    warnings = [
+        r
+        for r in caplog.records
+        if r.name == mcp_grant_kas.logger.name and r.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 1
+    assert "remote MCP servers will ask to sign in again" in warnings[0].getMessage()

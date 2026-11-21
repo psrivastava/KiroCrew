@@ -2,6 +2,9 @@ import { describe, it, expect, vi, onTestFinished } from 'vitest'
 import { fireEvent, screen } from '@testing-library/react'
 import { renderWithProviders } from './helpers'
 import ChatInput from '../components/ChatInput'
+import { ComposerVoiceSliceOverride } from '../chat-core/composer/Composer'
+import { SlotProvider } from '../providers/SlotContext'
+import { addStashEntry, makeStashEntry } from '../utils/promptStash'
 
 /**
  * `inlineToolbarWhileFits` (#19608): the Crewmates DM composer is ONE row --
@@ -16,6 +19,15 @@ import ChatInput from '../components/ChatInput'
  * staged file, a quote, the default-off host -- while the wrap boundary itself
  * is the capture harness's (`capture-crew-composer-one-row.mjs`).
  */
+
+/** A DM composer whose voice slice says it is recording (or not), with no
+ *  dictation panel: the voice props reach ChatInput through the Composer
+ *  root's slice, which the override stands in for. */
+const recordingComposer = (recording: boolean) => (
+  <ComposerVoiceSliceOverride inputProps={{ voiceRecording: recording, onVoiceToggle: vi.fn() }}>
+    <ChatInput value="" onChange={vi.fn()} onSend={vi.fn()} inlineToolbarWhileFits />
+  </ComposerVoiceSliceOverride>
+)
 
 const wrapper = () => screen.getByTestId('input-wrapper')
 const inline = () => wrapper().getAttribute('data-inline-toolbar') === 'true'
@@ -99,11 +111,40 @@ describe('ChatInput inlineToolbarWhileFits: the one-row shape', () => {
     expect(inline()).toBe(false)
   })
 
+  // Without the dictation panel (setting off, no WebGL2, or reduced motion) a
+  // recording draws the voice bar's Recording strip; on the single row it would
+  // sit beside the text and squeeze both.
+  it('opens to two rows while recording draws the Recording strip', () => {
+    renderWithProviders(recordingComposer(true))
+    expect(screen.getByText('Recording')).toBeInTheDocument()
+    expect(inline()).toBe(false)
+  })
+
+  it('returns to one row once the recording ends', () => {
+    const { rerender } = renderWithProviders(recordingComposer(true))
+    expect(inline()).toBe(false)
+    rerender(recordingComposer(false))
+    expect(screen.queryByText('Recording')).toBeNull()
+    expect(inline()).toBe(true)
+  })
+
   it('opens to two rows while a quote is staged', () => {
     renderWithProviders(
       <ChatInput value="" onChange={vi.fn()} onSend={vi.fn()} inlineToolbarWhileFits pendingQuote={{ text: 'quoted', role: 'assistant' }} onRemoveQuote={vi.fn()} />,
     )
     expect(inline()).toBe(false)
+  })
+
+  // The prompt stash's status line (here, a stashed count) is a strip like
+  // the send-held notice: on the single row it would squeeze the text.
+  it('opens to two rows while the prompt stash shows its status line', () => {
+    localStorage.clear()
+    expect(addStashEntry('chat-1', makeStashEntry('saved draft', []))).toBe(true)
+    renderWithProviders(
+      <SlotProvider slotId="chat-1"><ChatInput value="" onChange={vi.fn()} onSend={vi.fn()} inlineToolbarWhileFits /></SlotProvider>,
+    )
+    expect(inline()).toBe(false)
+    localStorage.clear()
   })
 
   it('mounts the fit probe only for an opted-in host, hidden and out of the accessibility tree', () => {

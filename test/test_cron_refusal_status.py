@@ -1,14 +1,10 @@
 """A cron run's security-gate refusals must reach its status, not just the audit log.
 
-The model still returns plausible prose when the security gate blocks a tool it
-tries, so the reply text cannot carry the verdict. Two arms follow from that. A
-run whose EVERY call was blocked records a failure: a success resets
-``consecutive_failures`` and clears ``auto_paused``, so recording one would keep
-the auto-pause guard permanently out of reach for a job that is structurally
-incapable of succeeding. A run whose SOME call was blocked is reported -- its
-status is not ``ok`` and its delivery names the lost call -- but spends no
-failure budget, because the calls that ran prove the job can work. These tests
-pin both verdicts and the guard they depend on.
+The model still returns plausible prose when a tool is blocked, so the reply text
+cannot carry the verdict. A run whose EVERY call was blocked records a failure (a
+success would reset ``consecutive_failures`` and keep auto-pause out of reach). A
+run whose SOME call was blocked is reported as not ``ok`` and names the lost call,
+but spends no failure budget, since the calls that ran prove the job can work.
 """
 
 from __future__ import annotations
@@ -16,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -24,8 +21,8 @@ import pytest
 
 from kiro_crew.cron import _AUTO_PAUSE_THRESHOLD, CronJob, CronSchedule
 
-# (title, approved, security_blocked) triples a turn's tool gate reports.
-GateScript = list[tuple[str, bool, bool]]
+# (title, approved, security_blocked[, reason]) entries a turn's tool gate reports.
+GateScript = list[tuple[str, bool, bool] | tuple[str, bool, bool, str]]
 
 # The two refusal classes the verdict must treat differently.
 BLOCKED = ("rm -rf /", False, True)
@@ -45,16 +42,10 @@ def _run_cron_runs(
 ) -> CronJob:
     """Drive the real ``_cron_callback`` *runs* times, replaying *gate* each turn.
 
-    *per_agent* overrides *gate* for named agents, so a sequence can be scripted
-    asymmetrically — replaying one script for every agent makes a per-agent tally
-    and a run-scoped one reach the same verdict, so nothing distinguishes them.
-
-    *job* reuses an existing job across calls, which is what makes a recovery
-    assertion meaningful: a fresh job's counter reads 0 either way.
-
-    *dashboard* stands in for ``dashboard_state`` so a test can read what the
-    bell was told; ``_slotless_dashboard`` builds the shape the delivery path
-    expects.
+    *per_agent* overrides *gate* for named agents, so a per-agent tally and a
+    run-scoped one can be told apart. *job* reuses a job across calls, since a
+    fresh job's counter reads 0 either way. *dashboard* stands in for
+    ``dashboard_state`` so a test can read what the bell was told.
     """
     from kiro_crew.slack.gateway import GatewayOrchestrator
 
@@ -71,6 +62,7 @@ def _run_cron_runs(
     gw._owner_id = "U000"
     gw.subagent_mgr = None
     gw._cron_injecting = {}
+    gw._cron_runs_holding = set()
     gw._no_crons = False
     gw.sessions.get_or_create = AsyncMock(return_value=(MagicMock(), True, False))
     gw.sessions.release = MagicMock()
@@ -86,6 +78,8 @@ def _run_cron_runs(
         # counted. This is the reachable shape of the double count.
         ds = MagicMock()
         ds.has_slot = MagicMock(return_value=True)
+        # No tab bound yet: prefetch_cron_history skips the read for a bound one.
+        ds.get_slot = MagicMock(return_value=None)
         ds.conversation_log.read_messages = MagicMock(
             side_effect=RuntimeError("history read failed")
         )
@@ -95,14 +89,14 @@ def _run_cron_runs(
     turn = {"n": 0}
 
     async def fake_stream(client, msg, **kwargs):
-        report: Callable[[str, bool, bool], None] | None = kwargs.get("on_tool_gate")
+        report: Callable[..., None] | None = kwargs.get("on_tool_gate")
         assert report is not None, "the cron path must observe its tool-gate decisions"
         script = gate
         if per_agent and seq:
             script = per_agent.get(seq[turn["n"] % len(seq)], gate)
         turn["n"] += 1
-        for title, approved, blocked in script:
-            report(title, approved, blocked)
+        for entry in script:
+            report(*entry)
         # A blocked turn still produces prose — that is the whole problem.
         return "I was unable to complete the requested changes."
 
@@ -187,10 +181,11 @@ def test_an_unapproved_run_is_not_a_failure() -> None:
     five runs durably auto-pause — a job whose only problem is that no approver
     was present, and the fire-time governance denials in the same function
     deliberately keep policy state out of the failure counter for this reason.
+    The run is still not ``ok``: no call ran, so it did not succeed.
     """
     job = _run_cron_runs([UNAPPROVED], runs=_AUTO_PAUSE_THRESHOLD)
 
-    assert job.last_status != "error"
+    assert job.last_status == "error"
     assert job.consecutive_failures == 0
     assert job.auto_paused is False
     assert job.enabled is True
@@ -199,11 +194,8 @@ def test_an_unapproved_run_is_not_a_failure() -> None:
 def test_a_mixed_refusal_run_is_not_a_failure() -> None:
     """A security block ALONGSIDE an unresolved refusal proves nothing.
 
-    The unresolved tool might have run under a looser policy or with an approver
-    present, so the run does not evidence a job that cannot work — and counting
-    it would auto-pause a healthy one. The block itself is still named (the
-    status is the partial-block one, not ``ok``); only the counter is pinned
-    here.
+    The unresolved tool might run under a looser policy or with an approver, so
+    counting the run would auto-pause a healthy job. Only the counter is pinned here.
     """
     job = _run_cron_runs([BLOCKED, UNAPPROVED], runs=_AUTO_PAUSE_THRESHOLD)
 
@@ -216,15 +208,11 @@ def test_a_mixed_refusal_run_is_not_a_failure() -> None:
 def test_a_blocked_run_counts_once_even_when_delivery_fails() -> None:
     """One run must move the failure counter by exactly one.
 
-    The gate verdict and the enclosing exception handler are two writers to the
-    same counter. A blocked turn whose dashboard history read then fails reaches
-    both — that read sits after the verdict and, unlike the Slack post below it,
-    carries no local handler. Counting twice would trip the auto-pause threshold
-    in three runs instead of five, pausing a job on arithmetic rather than on
-    five distinct failures.
+    A blocked turn whose dashboard history read then fails reaches both the gate
+    verdict and the enclosing handler; counting twice would auto-pause in three runs.
 
-    The handler re-raises after counting (that is how ``CronScheduler._execute``
-    learns the run failed), so the job is created here to survive the raise.
+    The handler re-raises after counting (so ``CronScheduler._execute`` learns the
+    run failed), so the job is created here to survive the raise.
     """
     job = CronJob(
         id="g1",
@@ -357,11 +345,8 @@ REFUSED_WRITE = ("Write /vault/daily/2026-08-28.md", False, True)
 class TestPartialBlock:
     """A run that lost ONE call among many must say so.
 
-    The prose a run returns is the model's account, and a model whose final
-    write was refused reports the write as done. Recording ``ok`` for that run
-    left the refusal only in the SEL audit row and the document silently
-    unwritten. The verdict now has a middle arm: the status is not ``ok`` and
-    the delivery names the refused call, but the failure budget does not move.
+    A model whose final write was refused reports it as done, so the status must
+    not be ``ok`` and the delivery names the refused call; the budget does not move.
     """
 
     def test_a_partially_blocked_run_is_not_ok(self) -> None:
@@ -409,11 +394,11 @@ class TestPartialBlock:
 
         assert ds.notify.call_count == 1
         _kind, _title, body = ds.notify.call_args.args[:3]
-        assert body.startswith("⛔ 1 of 2 tool call(s) blocked by the security gate")
+        assert body.startswith("Blocked: 1 of 2 tool call(s) blocked by the security gate")
         assert "Write /vault/daily/2026-08-28.md" in body
         assert "I was unable to complete" in body, "the model's own prose was dropped"
         assert job.last_result is not None
-        assert job.last_result.startswith("⛔"), "the stored result lost the banner"
+        assert job.last_result.startswith("Blocked: "), "the stored result lost the banner"
 
     def test_an_all_approved_run_is_unchanged(self) -> None:
         """The control: a clean run stays ``ok``, records a success, and its
@@ -425,7 +410,7 @@ class TestPartialBlock:
         assert job.last_error is None
         assert job.consecutive_failures == 0
         body = ds.notify.call_args.args[2]
-        assert not body.startswith("⛔")
+        assert not body.startswith("Blocked: ")
         assert "blocked by the security gate" not in body
 
     def test_an_all_blocked_run_keeps_the_failure_path(self) -> None:
@@ -440,7 +425,7 @@ class TestPartialBlock:
         assert job.last_error is not None
         assert job.last_error.startswith("all 2 tool call(s) blocked")
         body = ds.notify.call_args.args[2]
-        assert not body.startswith("⛔")
+        assert not body.startswith("Blocked: ")
 
     def test_a_partial_block_reaches_the_sequential_path(self) -> None:
         """Both agent paths share the verdict AND the banner."""
@@ -454,7 +439,7 @@ class TestPartialBlock:
         assert job.last_error is not None
         assert "1 of 2 tool call(s) blocked" in job.last_error
         assert job.last_result is not None
-        assert job.last_result.startswith("⛔ 1 of 2 tool call(s) blocked")
+        assert job.last_result.startswith("Blocked: 1 of 2 tool call(s) blocked")
         assert job.consecutive_failures == 0
 
     def test_the_reason_is_capped_and_names_at_most_three(self) -> None:
@@ -518,6 +503,149 @@ class TestPartialBlock:
         total = _run_cron_runs([BLOCKED, ("cat ~/.ssh/id_rsa", False, True)])
         assert total.last_status == "error"
         assert total.last_error is not None and not pattern.match(total.last_error)
+
+
+# Refusals that arrive unapproved but not security-blocked, each with the
+# reason the gate records for it. A rejected or timed-out approval records none.
+POLICY_DENIED = ("Write /vault/a.md", False, False, "Denied by governance profile: no writes\nnote")
+HOOK_REFUSED = ("Bash ls /vault", False, False, "Refused by the agent spec's PreToolUse hook")
+TIMED_OUT = ("Read /vault/b.md", False, False, "")
+
+
+class TestUnapprovedRun:
+    """A run whose every call was refused, none of them by the security gate,
+    did nothing, so it is not ``ok``. A policy state or an absent approver says
+    nothing about the job, so the failure budget does not move either."""
+
+    @pytest.mark.parametrize(
+        "gate",
+        [[UNAPPROVED], [POLICY_DENIED], [HOOK_REFUSED], [TIMED_OUT, POLICY_DENIED, HOOK_REFUSED]],
+        ids=["unapproved", "policy-deny", "spec-hook", "mixed"],
+    )
+    def test_a_run_with_no_approved_call_records_error(self, gate: GateScript) -> None:
+        job = _run_cron_runs(gate)
+
+        assert job.last_status == "error", "a run in which no call ran recorded ok"
+        assert job.consecutive_failures == 0
+
+    def test_it_spends_no_failure_budget(self) -> None:
+        job = _run_cron_runs([POLICY_DENIED, HOOK_REFUSED], runs=_AUTO_PAUSE_THRESHOLD)
+
+        assert job.consecutive_failures == 0
+        assert job.auto_paused is False
+        assert job.enabled is True
+
+    def test_it_does_not_reset_a_failure_streak(self) -> None:
+        """Not a success: a streak of fully blocked runs survives it."""
+        job = _run_cron_runs([BLOCKED], runs=2)
+        assert job.consecutive_failures == 2
+
+        _run_cron_runs([POLICY_DENIED], job=job)
+
+        assert job.consecutive_failures == 2
+        assert job.last_status == "error"
+
+    def test_the_reason_names_each_call_with_its_refusal_text(self) -> None:
+        job = _run_cron_runs([POLICY_DENIED, HOOK_REFUSED, TIMED_OUT])
+
+        assert job.last_error is not None
+        assert "Write /vault/a.md (Denied by governance profile: no writes)" in job.last_error
+        assert "Bash ls /vault (Refused by the agent spec's PreToolUse hook)" in job.last_error
+        assert "Read /vault/b.md (not approved)" in job.last_error
+        assert "note" not in job.last_error, "only the first line of a reason is the rule"
+
+    def test_the_reason_names_at_most_three(self) -> None:
+        many = [(f"Write /vault/note-{i}.md", False, False, "") for i in range(6)]
+        job = _run_cron_runs(many)
+
+        assert job.last_error is not None
+        assert "6 tool call(s)" in job.last_error
+        assert "note-2.md" in job.last_error
+        assert "note-3.md" not in job.last_error
+        assert len(job.last_error) <= 500
+
+    def test_the_schedule_page_shows_it_as_error_not_partial(self) -> None:
+        phrases = json.loads(
+            (Path(__file__).resolve().parents[1] / "website/src/lib/backendPhrases.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        pattern = re.compile(phrases["cronPartialGateBlockPattern"])
+
+        job = _run_cron_runs([POLICY_DENIED, TIMED_OUT])
+
+        assert job.last_error is not None
+        assert not pattern.match(job.last_error), job.last_error
+        assert "blocked by the security gate" not in job.last_error
+
+    def test_the_notification_names_the_refused_calls(self) -> None:
+        ds = _slotless_dashboard()
+        job = _run_cron_runs([POLICY_DENIED, TIMED_OUT], dashboard=ds)
+
+        assert ds.notify.call_count == 1
+        body = ds.notify.call_args.args[2]
+        assert job.last_error is not None
+        assert body.startswith(f"Blocked: {job.last_error}"), "the banner and last_error disagree"
+        assert "I was unable to complete" in body, "the model's own prose was dropped"
+        assert job.last_result is not None and job.last_result.startswith("Blocked: ")
+
+    def test_it_reaches_the_sequential_path(self) -> None:
+        job = _run_cron_runs(
+            [],
+            agent_sequence=["researcher", "writer"],
+            per_agent={"researcher": [TIMED_OUT], "writer": [POLICY_DENIED]},
+        )
+
+        assert job.last_status == "error"
+        assert job.consecutive_failures == 0
+        assert job.last_error is not None and "Write /vault/a.md" in job.last_error
+        assert job.last_result is not None and job.last_result.startswith("Blocked: ")
+
+    def test_one_approved_call_keeps_the_run_ok(self) -> None:
+        """The control: an approved call beside an unapproved one is unchanged."""
+        ds = _slotless_dashboard()
+        job = _run_cron_runs([APPROVED, POLICY_DENIED], dashboard=ds)
+
+        assert job.last_status != "error"
+        assert job.last_error is None
+        assert not ds.notify.call_args.args[2].startswith("Blocked: ")
+
+    def test_a_tool_free_run_stays_ok(self) -> None:
+        job = _run_cron_runs([])
+
+        assert job.last_status != "error"
+        assert job.last_error is None
+
+
+@pytest.mark.parametrize("security_blocked", [True, False], ids=["security-blocked", "unresolved"])
+def test_the_tally_counts_every_call_but_keeps_three_bounded_names(security_blocked: bool) -> None:
+    """Titles are LLM-authored and a run can note any number of calls, so
+    the tally keeps the exact count but only the calls the summary names,
+    each field cut to the line it can appear in, and the summary says how
+    many it left out."""
+    from kiro_crew.slack.gateway import _CRON_FAILURE_DETAIL_CAP, _GateTally
+
+    tally = _GateTally()
+    for i in range(10):
+        title = f"Write /vault/{i}-" + "x" * 100_000
+        tally.note(title, False, security_blocked, "rule " + "y" * 100_000 + "\nnote")
+
+    if security_blocked:
+        count, kept, head = tally.refused, tally.refused_calls, "all 10 tool call(s) blocked"
+    else:
+        count, kept, head = tally.unresolved, tally.unresolved_calls, "none of 10 tool call(s)"
+    assert count == 10
+    assert len(kept) == 3
+    for i, (title, rule) in enumerate(kept):
+        assert title.startswith(f"Write /vault/{i}-")
+        assert len(title) <= _CRON_FAILURE_DETAIL_CAP
+        assert rule.startswith("rule ") and "note" not in rule
+        assert len(rule) <= _CRON_FAILURE_DETAIL_CAP
+
+    summary = tally.refusal_summary()
+    assert summary.startswith(head)
+    assert summary.endswith(", and 7 more"), "the summary hid the calls it did not name"
+    assert len(summary) <= _CRON_FAILURE_DETAIL_CAP
 
 
 class TestMultiAgentSequence:
@@ -645,3 +773,30 @@ class TestSchedulerContract:
         assert svc._history.append.await_count == 1
         record = svc._history.append.await_args.args[0]
         assert record.status == "success"
+
+    @pytest.mark.asyncio
+    async def test_an_unapproved_one_shot_is_kept_and_auto_paused(self, tmp_path) -> None:
+        """A ``delete_after_run`` one-shot whose every call was refused by
+        policy did nothing, so it is kept and auto-paused instead of consumed."""
+        from kiro_crew.cron import CronService
+        from kiro_crew.slack.gateway import _apply_gate_verdict, _GateTally
+
+        svc = CronService(base_dir=tmp_path)
+        svc._history.append = AsyncMock()
+
+        async def unapproved_cb(job):
+            tally = _GateTally()
+            tally.note(*POLICY_DENIED)
+            _apply_gate_verdict(job, tally)
+            return "prose"
+
+        svc._on_job = unapproved_cb
+        job = svc.add_job("once", "go", at_ts=time.time() - 1, delete_after_run=True)
+        await svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled"))
+
+        kept = svc.get_job(job.id)
+        assert kept is not None, "a one-shot that did nothing was consumed"
+        assert kept.last_status == "error"
+        assert kept.auto_paused is True
+        assert kept.enabled is False
+        assert kept.consecutive_failures == 0

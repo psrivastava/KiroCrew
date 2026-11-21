@@ -7,9 +7,13 @@ import hashlib
 import pytest
 from acp_client_helpers import _native_projection_for_fake_processes  # noqa: F401 - fixture
 from acp_client_helpers import _pin_the_installed_kiro_cli_version  # noqa: F401 - fixture
+from redaction_structured_cases import github_classic
 
 import kiro_crew.acp.client as acp_client
 from kiro_crew.acp.client import AcpClient
+
+#: A credential the plan redacts: a GitHub classic token with a valid checksum.
+_SECRET = github_classic(seed=21)
 
 # ── _extract_tool_call_update tests ──
 
@@ -151,11 +155,8 @@ class TestExtractToolCallUpdate:
     def test_credential_straddling_the_bound_is_still_redacted(self):
         """The 8000-char bound must be applied AFTER redaction, not before.
 
-        A cut taken first splits a connection URI into fragments the credential
-        prefilter (``://user:pass@``) does not match: the head slice keeps
-        ``://admin:<password>`` and drops the ``@``, so the password would reach
-        the dashboard in clear text. The padding here puts the ``@`` exactly on
-        byte 8000 of the serialised output, which is the worst case.
+        A cut first drops the ``@`` the ``://user:pass@`` prefilter needs, leaking the
+        password. The padding puts the ``@`` on byte 8000, the worst case.
         """
         import json as _json
 
@@ -346,12 +347,12 @@ class TestExtractToolCallUpdate:
                 "sessionUpdate": "tool_call_update",
                 "toolCallId": "tc-8",
                 "content": [
-                    {"content": {"type": "text", "text": "key=AKIAIOSFODNN7EXAMPLE secret"}},
+                    {"content": {"type": "text", "text": f"key={_SECRET} secret"}},
                 ],
             }
         )
         event = client._extract_tool_call_update(msg)
-        assert "AKIAIOSFODNN7EXAMPLE" not in event.tool_output
+        assert _SECRET not in event.tool_output
 
     def test_ignores_non_dict_content_blocks(self):
         client = self._client()
@@ -485,10 +486,7 @@ class TestDispatchToolResultContentShapes:
 
         from kiro_crew.acp._dispatch import _build_tool_result_event
 
-        # Split so this file holds no literal-looking key; matches
-        # (?:AKIA|ASIA)[A-Z0-9]{16}, the same shape as
-        # test_core_path_redact_before_bound.
-        token = "AKIA" + "SHAPELEAK0123456"
+        token = _SECRET
 
         with caplog.at_level(logging.WARNING, logger="kiro_crew.acp._dispatch"):
             assert (
@@ -591,13 +589,9 @@ class TestDispatchToolResultContentShapes:
         assert len(unrenderable_content_shapes(padded)) == 4000
 
     def test_collection_stops_early_rather_than_building_the_whole_join(self):
-        """The final ``[:4000]`` alone still VISITS every entry and allocates the
-        full join before cutting, so a near-limit frame could OOM the gateway on the
-        way to a bounded string.
+        """A final ``[:4000]`` alone would build the whole join first and could OOM.
 
-        Asserted by counting entry visits, not by inspecting the output: a
-        length/content assertion passes either way, because the tail is cut off
-        regardless of whether the loop broke early. Counting is what discriminates.
+        Counts entry visits, because the output is cut the same either way.
         """
         from kiro_crew.acp._dispatch import unrenderable_content_shapes
 
@@ -676,13 +670,9 @@ class TestDispatchToolResultContentShapes:
         assert "AKIAIOSFODNN7SECRET" not in out
 
     def test_a_wrapped_inner_block_carrying_no_text_stays_silent(self):
-        """The negative control for the inner check, and the reason it is an
-        allowlist rather than "anything but text".
+        """The negative control: an image, audio or resource block is not a defect.
 
-        An image, audio or resource block renders no text and is NOT a defect, so
-        reporting it would fire this warning on a healthy backend -- the exact
-        false positive `test_content_free_frame_is_not_warned_about` guards at the
-        frame level.
+        Hence an allowlist; see `test_content_free_frame_is_not_warned_about`.
         """
         from kiro_crew.acp._dispatch import unrenderable_content_shapes
 
@@ -933,12 +923,12 @@ class TestExtractToolCallRefinement:
                 "sessionUpdate": "tool_call_update",
                 "toolCallId": "tc-5",
                 "title": "Bash",
-                "rawInput": {"command": "echo AKIAIOSFODNN7EXAMPLE"},
+                "rawInput": {"command": f"echo {_SECRET}"},
             }
         )
         event = client._extract_tool_call_refinement(msg)
         assert event is not None
-        assert "AKIAIOSFODNN7EXAMPLE" not in event.tool_input
+        assert _SECRET not in event.tool_input
 
     def test_kind_only_emits_refinement(self):
         # Even a lone `kind` update is worth surfacing — avoids losing the
@@ -999,7 +989,7 @@ class TestExtractToolCallRefinement:
                 "toolCallId": "tc-10",
                 "rawInput": {
                     "command": "aws s3 ls",
-                    "__tool_use_purpose": "Use AKIAIOSFODNN7EXAMPLE to list buckets",
+                    "__tool_use_purpose": f"Use {_SECRET} to list buckets",
                 },
             }
         )
@@ -1007,7 +997,7 @@ class TestExtractToolCallRefinement:
         assert event is not None
         assert event.tool_purpose.startswith("Use ")
         assert event.tool_purpose.endswith("to list buckets")
-        assert "AKIAIOSFODNN7EXAMPLE" not in event.tool_purpose
+        assert _SECRET not in event.tool_purpose
 
 
 class TestAcpClientIsShellSignal:

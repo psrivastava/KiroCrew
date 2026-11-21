@@ -3,8 +3,8 @@ title: MCP resource subscriptions -- wake a session when an MCP resource it subs
 status: draft
 author: unstablebrainiac
 created: 2026-10-13
-last-audited: 2026-10-27
-audited-at: 8a518e121b
+last-audited: 2026-11-19
+audited-at: fc89562d69
 doc-pr: null
 implementation-prs: []
 tracking-issues: [19694]

@@ -24,7 +24,7 @@ from kiro_crew.dashboard.slot_projection import live_trust_scope
 from kiro_crew.safety_override import safety_override
 from kiro_crew.slack import gateway as gw
 
-_SCOPE = "crew:slack-radar:autoapprove"
+_SCOPE = "app:test-app:grant:crew-slack-radar:autoapprove"
 _SO = type(safety_override())
 
 
@@ -119,6 +119,21 @@ class TestSubagentApprovalHonoursScope:
         assert "subagent.scoped_trust_blocked_low_fidelity_child" in ops
 
     @pytest.mark.asyncio
+    async def test_a_held_bot_limit_blocks_a_trusted_slot_under_its_own_audit_name(
+        self, monkeypatch
+    ) -> None:
+        """A call under a Bot limit its move could not apply is refused auto-approval
+        on a trusted slot, and the audit row names that cause, not a low-fidelity child."""
+        from kiro_crew import mate_held_rules
+
+        monkeypatch.setattr(mate_held_rules, "held_for", lambda *a, **k: ["deny shell"])
+        approved, ops, _log, prompt, _renew = await _decide(_slot(trust=True), scope_live=False)
+        assert approved is False
+        prompt.assert_awaited_once()
+        assert "subagent.bot_limit_held" in ops
+        assert "subagent.scoped_trust_blocked_low_fidelity_child" not in ops
+
+    @pytest.mark.asyncio
     async def test_session_flag_keeps_its_audit_name(self) -> None:
         approved, ops, _log, prompt, _renew = await _decide(_slot(trust=True), scope_live=False)
         assert approved is True
@@ -126,20 +141,38 @@ class TestSubagentApprovalHonoursScope:
         assert ops == ["subagent.scoped_trust_auto_approve"]
 
     @pytest.mark.asyncio
-    async def test_G1_a_crew_card_trust_does_not_auto_approve_its_spawn_or_subagents(
+    async def test_G1_a_crew_card_trust_auto_approves_its_spawn_and_subagents(
         self,
     ) -> None:
-        """A card-scoped trust ("Trust this crew member") covers the worker's own tools only.
-        Its spawn prompt and its subagents' tools still ask, so they reach the card."""
+        """A card-scoped trust ("Trust this crew member") covers the worker's subagents:
+        its spawn prompt and its subagents' tools auto-approve like a session trust."""
         slot = _slot(trust=True)
         slot._trust_card_scoped = True
         approved, ops, _log, prompt, _renew = await _decide(slot, scope_live=False)
+        assert approved is True
+        prompt.assert_not_awaited()
+        assert ops == ["subagent.scoped_trust_auto_approve"]
+        assert chat_runner._slot_is_trusted(slot) is True
+
+    @pytest.mark.asyncio
+    async def test_G1_a_crew_card_trust_still_blocks_a_low_fidelity_child(self) -> None:
+        slot = _slot(trust=True)
+        slot._trust_card_scoped = True
+        approved, ops, _log, prompt, _renew = await _decide(
+            slot, scope_live=False, low_fidelity=True
+        )
         assert approved is False
         prompt.assert_awaited_once()
-        assert ops[0] == "subagent.card_trust_not_inherited"
-        assert "subagent.scoped_trust_auto_approve" not in ops
-        # The worker's own tools still auto-approve per event.
-        assert chat_runner._slot_is_trusted(slot) is True
+        assert "subagent.scoped_trust_blocked_low_fidelity_child" in ops
+
+    @pytest.mark.asyncio
+    async def test_G1_a_revoked_crew_card_trust_asks_again(self) -> None:
+        slot = _slot(trust=False)
+        slot._trust_card_scoped = True  # left set by the grant; _trust is what counts
+        approved, ops, _log, prompt, _renew = await _decide(slot, scope_live=False)
+        assert approved is False
+        prompt.assert_awaited_once()
+        assert "subagent.scoped_trust_not_trusted" in ops
 
 
 class TestProjection:
@@ -168,7 +201,8 @@ class TestProjection:
             patch.object(_SO, "scope_remaining_secs", return_value=5),
             patch.object(_SO, "is_scope_active") as enforce,
         ):
-            live_trust_scope(_slot(scope=_SCOPE))
+            # A grant with seconds left still shows as Trust, read without enforcing.
+            assert live_trust_scope(_slot(scope=_SCOPE)) == _SCOPE
         enforce.assert_not_called()
 
     def test_slot_dict_carries_the_field(self) -> None:

@@ -17,11 +17,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import ntpath
 import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from dev_fleet_app_helpers import _checkout
 
 from kiro_crew import platform_compat
 from kiro_crew.apps.builtins.dev_fleet import (
@@ -35,9 +37,7 @@ from kiro_crew.apps.builtins.dev_fleet import (
 )
 
 
-# --------------------------------------------------------------------------
 # doubles
-# --------------------------------------------------------------------------
 class _FakeProc:
     """Subprocess stand-in for the two spawn call sites in this module."""
 
@@ -158,9 +158,7 @@ def _isolate(monkeypatch):
     monkeypatch.setattr(runtime, "_SHUTDOWN_ADMISSION_LOCK", asyncio.Lock())
 
 
-# --------------------------------------------------------------------------
 # _run_cmd -- the sandboxed spawn chokepoint
-# --------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_run_cmd_refuses_unresolvable_bare_tool(monkeypatch):
     """A bare command name that resolves to no trusted binary never spawns."""
@@ -172,6 +170,22 @@ async def test_run_cmd_refuses_unresolvable_bare_tool(monkeypatch):
     assert (rc, out) == (-1, "")
     assert err.startswith(runtime._UNRESOLVED_TOOL_PREFIX)
     assert "'git'" in err
+
+
+@pytest.mark.asyncio
+async def test_run_cmd_spawns_a_windows_absolute_interpreter_as_given(monkeypatch):
+    """The pod verbs run our own interpreter, which on Windows is a ``C:\\`` path,
+    often under the user's home. Resolving it as a bare tool name refused it."""
+    monkeypatch.setattr(runtime.os.path, "isabs", ntpath.isabs)
+    monkeypatch.setattr(runtime, "_trusted_bin", lambda name: None)
+    _passthrough_sandbox(monkeypatch)
+    calls = _spawn_returns(monkeypatch, _FakeProc(rc=0))
+    exe = r"C:\Users\me\kc\.venv\Scripts\python.exe"
+
+    rc, _out, _err = await runtime._run_cmd([exe, "-m", "kiro_crew", "pod", "ls"])
+
+    assert rc == 0
+    assert calls[0][0][0] == exe
 
 
 @pytest.mark.asyncio
@@ -240,9 +254,7 @@ async def test_kill_tree_swallows_process_lookup_error(monkeypatch):
     assert await runtime._kill_tree(999999) is None
 
 
-# --------------------------------------------------------------------------
 # _start_run -- background streaming worker
-# --------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_start_run_records_spawn_failure(monkeypatch):
     _spawn_raises(monkeypatch, OSError("no fork"))
@@ -335,9 +347,7 @@ async def test_start_run_stream_error_tolerates_already_reaped_child(monkeypatch
     assert rec["output"] == ["[error] boom"]
 
 
-# --------------------------------------------------------------------------
 # PR query layer (gh / git through _run_cmd)
-# --------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_repo_owner_name_none_when_remote_lookup_fails(monkeypatch):
     monkeypatch.setattr(repository, "_upstream_remote", AsyncMock(return_value="origin"))
@@ -539,9 +549,7 @@ async def test_pr_status_cached_skips_base_branch(monkeypatch):
     assert await fleet_state._pr_status_cached("") is None
 
 
-# --------------------------------------------------------------------------
 # trusted binary resolution
-# --------------------------------------------------------------------------
 def test_trusted_bin_honours_operator_absolute_override(monkeypatch, tmp_path):
     """An absolute executable named in the service env wins outright."""
     tool = tmp_path / "gh-override"
@@ -616,9 +624,7 @@ def test_trusted_bin_tolerates_filesystem_error(monkeypatch, tmp_path):
     assert runtime._trusted_bin("git") is None
 
 
-# --------------------------------------------------------------------------
 # credential helper loading
-# --------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_sanitize_helper_rejects_gh_shape_without_trusted_gh(monkeypatch):
     """The gh helper shape is only accepted when gh itself resolves trusted."""
@@ -685,9 +691,7 @@ async def test_load_trusted_helpers_empty_when_no_config(monkeypatch):
     assert runtime._GIT_TRUSTED_HELPERS == {}
 
 
-# --------------------------------------------------------------------------
 # live-checkout resolution
-# --------------------------------------------------------------------------
 def test_same_path_false_on_oserror(monkeypatch):
     """An unresolvable path compares unequal instead of raising."""
     real_resolve = Path.resolve
@@ -749,17 +753,16 @@ async def test_live_worktree_path_none_without_systemd(monkeypatch):
     monkeypatch.setattr(live.sys, "platform", "win32")
     monkeypatch.setattr(live.shutil, "which", lambda name: None)
     monkeypatch.setattr(runtime, "_run_cmd", AsyncMock(side_effect=RuntimeError))
+    # A packaged install: no checkout to fall back on either.
+    monkeypatch.setattr(live, "_running_checkout", lambda: None)
 
     assert await live._live_worktree_path(fresh=True) is None
 
 
 @pytest.mark.asyncio
-async def test_live_worktree_path_falls_back_to_execstart(monkeypatch):
+async def test_live_worktree_path_falls_back_to_execstart(monkeypatch, tmp_path):
     """An older unit with no WorkingDirectory is read off ExecStart's path=."""
-    # A fabricated, space-free path: the regex the product uses truncates at the
-    # first space, so a tmp_path containing one would make this assert the wrong
-    # thing on some runners.
-    checkout = Path("/opt/kirocrew-checkouts/co")
+    checkout = _checkout(tmp_path / "co")
     exe = checkout / ".venv" / "bin" / "kirocrew"
     monkeypatch.setattr(live.live_target, "read_target", lambda: None)
     monkeypatch.setattr(live.sys, "platform", "linux")
@@ -777,12 +780,13 @@ async def test_live_worktree_path_falls_back_to_execstart(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_live_worktree_path_prefers_working_directory(monkeypatch, tmp_path):
+    checkout = _checkout(tmp_path / "co")
     monkeypatch.setattr(live.live_target, "read_target", lambda: None)
     monkeypatch.setattr(live.sys, "platform", "linux")
     monkeypatch.setattr(live.shutil, "which", lambda name: "/bin/systemctl")
-    seen = _run_cmd_queue(monkeypatch, [(0, f"{tmp_path}\n", "")])
+    seen = _run_cmd_queue(monkeypatch, [(0, f"{checkout}\n", "")])
 
-    assert await live._live_worktree_path(fresh=True) == str(tmp_path.resolve())
+    assert await live._live_worktree_path(fresh=True) == str(checkout.resolve())
     # The ExecStart fallback is not consulted when WorkingDirectory answers.
     assert len(seen) == 1
 
@@ -798,9 +802,7 @@ async def test_live_worktree_path_serves_cache_until_ttl(monkeypatch):
     assert await live._live_worktree_path() == "/cached"
 
 
-# --------------------------------------------------------------------------
 # _find_worktree_by_path
-# --------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_find_worktree_by_path_rejects_empty(monkeypatch):
     monkeypatch.setattr(repository, "_discover_worktrees", AsyncMock(side_effect=RuntimeError))
@@ -837,14 +839,12 @@ async def test_find_worktree_by_path_refuses_unknown_path(monkeypatch, tmp_path)
     assert err is not None and err.startswith("path is not a known worktree:")
 
 
-# --------------------------------------------------------------------------
 # _dropin_path
-# --------------------------------------------------------------------------
 def test_dropin_path_honours_xdg_config_home(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     got = live._dropin_path()
     assert got.name == "make-live.conf"
-    assert got.parent.name == f"{live._LIVE_GATEWAY_UNIT}.d"
+    assert got.parent.name == f"{live._live_gateway_unit()}.d"
     assert got.is_relative_to(tmp_path / "xdg")
 
 
@@ -854,13 +854,11 @@ def test_dropin_path_falls_back_to_home_config(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
     assert live._dropin_path() == (
-        home / ".config" / "systemd" / "user" / f"{live._LIVE_GATEWAY_UNIT}.d" / "make-live.conf"
+        home / ".config" / "systemd" / "user" / f"{live._live_gateway_unit()}.d" / "make-live.conf"
     )
 
 
-# --------------------------------------------------------------------------
 # _restart_gateway
-# --------------------------------------------------------------------------
 class _FakeBackend:
     """Service-backend double for the restart paths."""
 
@@ -1053,9 +1051,7 @@ def test_kill_tree_sync_tolerates_primary_kill_failure(monkeypatch):
     assert killed == [9, 21]
 
 
-# --------------------------------------------------------------------------
 # pod config + request-body validation
-# --------------------------------------------------------------------------
 def test_load_cfg_none_when_pod_config_unloadable(monkeypatch):
     """A pod config that will not load degrades to None, never an exception."""
     monkeypatch.setattr(runtime, "_POD_AVAILABLE", True)
@@ -1082,7 +1078,7 @@ async def test_worktree_remove_handler_rejects_unparseable_body(monkeypatch):
     resp = await http_api.api_dev_fleet_worktree_remove(_body_request(b"[1, 2]"))
 
     assert resp.status == 400
-    assert json.loads(resp.text) == {"error": "body must be an object"}
+    assert json.loads(resp.text) == {"error": "body must be an object", "code": "body_not_object"}
 
 
 @pytest.mark.asyncio
@@ -1091,7 +1087,7 @@ async def test_pod_name_action_rejects_unparseable_body(monkeypatch):
     resp = await http_api._pod_name_action(_body_request(b"nope"), action)
 
     assert resp.status == 400
-    assert json.loads(resp.text) == {"error": "invalid JSON body"}
+    assert json.loads(resp.text) == {"error": "invalid JSON body", "code": "invalid_json"}
     action.assert_not_awaited()
 
 
@@ -1109,9 +1105,7 @@ async def test_pod_name_action_requires_known_worktree(monkeypatch):
     action.assert_not_awaited()
 
 
-# --------------------------------------------------------------------------
 # service drivability probes
-# --------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_gateway_service_reason_none_when_drivable(monkeypatch):
     monkeypatch.setattr(live, "_gateway_service_active", AsyncMock(return_value=True))
@@ -1396,9 +1390,7 @@ def test_completed_cutover_undo_target_hides_non_actionable_history(
     assert out is None
 
 
-# --------------------------------------------------------------------------
-# _fetch_pr_head_oid -- survives a deleted head branch (Defect 2)
-# --------------------------------------------------------------------------
+# _fetch_pr_head_oid -- survives a deleted head branch
 @pytest.mark.asyncio
 async def test_fetch_pr_head_oid_uses_list_not_view(monkeypatch):
     """The lookup uses ``gh pr list --head`` (which resolves a merged PR after
@@ -1457,6 +1449,39 @@ async def test_fetch_pr_head_oid_reused_head_with_open_pr_refuses(monkeypatch):
     )
     _run_cmd_queue(monkeypatch, [(0, payload, "")])
     assert await fleet_state._fetch_pr_head_oid("reused/branch", repo="o/r") is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_pr_head_oid_closed_gate_returns_closed_head(monkeypatch):
+    """state="CLOSED" resolves the CLOSED PR's head, and the
+    default stays MERGED-only for the removal paths."""
+    payload = json.dumps([{"state": "CLOSED", "headRefOid": "c" * 40}])
+    _run_cmd_queue(monkeypatch, [(0, payload, ""), (0, payload, "")])
+    assert await fleet_state._fetch_pr_head_oid("feat/x", repo="o/r", state="CLOSED") == "c" * 40
+    assert await fleet_state._fetch_pr_head_oid("feat/x", repo="o/r") is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_pr_head_oid_closed_gate_keeps_refusals(monkeypatch):
+    """The CLOSED gate keeps every refusal the MERGED one has: an OPEN PR on a
+    reused head, a saturated batch, a MERGED-only head, and an OPEN *state*."""
+    closed = {"state": "CLOSED", "headRefOid": "c" * 40}
+    open_pr = {"state": "OPEN", "headRefOid": "n" * 40}
+    saturated = [closed] * (fleet_state._PR_HEAD_LOOKUP_LIMIT + 1)
+    merged_only = [{"state": "MERGED", "headRefOid": "m" * 40}]
+    seen = _run_cmd_queue(
+        monkeypatch,
+        [
+            (0, json.dumps([open_pr, closed]), ""),
+            (0, json.dumps(saturated), ""),
+            (0, json.dumps(merged_only), ""),
+        ],
+    )
+    for _ in range(3):
+        assert await fleet_state._fetch_pr_head_oid("feat/x", repo="o/r", state="CLOSED") is None
+    # A non-terminal state is refused before gh is ever asked.
+    assert await fleet_state._fetch_pr_head_oid("feat/x", repo="o/r", state="OPEN") is None
+    assert len(seen) == 3
 
 
 @pytest.mark.asyncio

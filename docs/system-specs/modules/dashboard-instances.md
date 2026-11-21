@@ -1,8 +1,8 @@
-# Mate dashboard instances
+# Bot dashboard instances
 
-A template is shared. An **instance** is one mate's copy of one template, and the
+A template is shared. An **instance** is one Bot's copy of one template, and the
 copy is the whole design. A built-in template shipping a new version does not change
-what a mate's Dashboard tab shows, and a mate editing its page is editing its
+what a Bot's Dashboard tab shows, and a Bot editing its page is editing its
 own copy rather than everybody's template.
 
 The instance store is two modules and one route, each with one job:
@@ -10,10 +10,10 @@ The instance store is two modules and one route, each with one job:
 | Piece | Where | What it owns |
 |---|---|---|
 | registry | `dashboard_templates/catalog.py` | the built-in templates and the operator's own, one loader |
-| instance | `dashboard_templates/instance.py` | the copy, its versions, rollback, state, history |
+| instance | `dashboard_templates/instance.py`, with `instance_adopt.py` for the adopt-only-while-empty form, `instance_read.py` for the link-refusing opens of a reader without the lock, and `instance_remove.py` for the import card's Undo of an adopted page | the copy, its versions, rollback, state, history |
 | route | `dashboard/handlers/member_dashboard.py` | what the frame reads |
 
-The agent-facing surface is separate and MCP-only: `dashboard/handlers/agent_panel_dashboard.py`, behind the `dashboard/handlers/agent_panel.py` facade, serves the `/api/agent-panel/dashboard/{fields,write,templates,preview,apply,rollback}` routes, `dashboard_agentic.py` checks and records agentic field writes and the mistake book, and `dashboard_feed.py` is the O(fields) subscription channel a filled page reads fold values through.
+The agent-facing surface is separate and MCP-only: `dashboard/handlers/agent_panel_dashboard.py`, behind the `dashboard/handlers/agent_panel.py` facade, serves the `/api/agent-panel/dashboard/{fields,types,write,save,templates,preview,apply,rollback}` routes (`record` and `snapshot` have their own modules, `agent_panel_record.py` and `agent_panel_snapshot.py`), `dashboard_agentic.py` checks and records agentic field writes and the mistake book, and `dashboard_feed.py` is the O(fields) subscription channel a filled page reads fold values through.
 
 An array or object field is emptied with `dashboard_write` `clear: true` and no
 `value`. The MCP server (`mcp_panel.py`) reads the field's declared type from the
@@ -49,7 +49,7 @@ Each is spelled out and none is called "the" version, because conflating any two
 produces a page a reader cannot place:
 
 **Template version** is the version of the template that was copied. Frozen at adopt.
-An edit never moves it: editing a copy does not make the mate the template's author,
+An edit never moves it: editing a copy does not make the Bot the template's author,
 and advancing it would make the instance claim a parity with a template it no longer
 matches.
 
@@ -89,41 +89,41 @@ an unbumped fix reaches new adoptions alone, and every page adopted before it ke
 old behaviour while the frame says `live`.
 
 `empty` and `error` are deliberately separate, and that distinction is the reason the
-read does not 404. A mate that never adopted a template answers 200 with `empty`,
-because having no dashboard yet is the ordinary first state of every mate and the
+read does not 404. A Bot that never adopted a template answers 200 with `empty`,
+because having no dashboard yet is the ordinary first state of every Bot and the
 frame's empty state IS that answer. `error` is a record that was damaged or hand-edited
-after it landed. The two need opposite answers from a human -- one is a fresh mate,
+after it landed. The two need opposite answers from a human -- one is a fresh Bot,
 the other is a dashboard that stopped working -- so a 404, or one word for both, would
 hide the second behind the first.
 
-An `empty` mate is SHOWN a page only when one is named for it, from
-`default_instance(slug)`: the shipped page whose id is the mate's slug. Any other
-`empty` mate has no page in force: a generic page nobody chose would read as the
-mate's own. An `empty` root session is shown `DEFAULT_TEMPLATE_ID`. Only shipped pages
+An `empty` Bot is SHOWN a page only when one is named for it, from
+`default_instance(slug)`: the shipped page whose id is the Bot's slug. Any other
+`empty` Bot has no page in force: a generic page nobody chose would read as the
+Bot's own. An `empty` root session is shown `DEFAULT_TEMPLATE_ID`. Only shipped pages
 match by name; an operator's page never does. The read route and the `[DASHBOARD]` turn
 block both resolve through it, and nothing is written. No shipped page may be named
 `default`.
-A ROOT session running the Crew Mode conductor template (`crew_mode.runs_crew_mode`) gets the same
+A ROOT session running the conductor template of conductor mode (`crew_mode.runs_crew_mode`) gets the same
 `[DASHBOARD]` block on every dashboard turn, keyed by its own store key
 (`session_turn_block`), but only once a page is ADOPTED: the default page it is shown
 while `empty` asks nothing of it, so it gets no block. A root session on any other agent
-(not in Crew Mode) or on a mate (`agent_kind == "member"`), a dispatched or adopted
-session, and a mate DM get no session block; the page itself is left as it is.
-Switching a root session to the Crew Mode conductor template (Crew Mode on) adopts `goal-board` through the ordinary
+(not in conductor mode) or on a Bot (`agent_kind == "member"`), a dispatched or adopted
+session, and a Bot DM get no session block; the page itself is left as it is.
+Switching a root session to the conductor template of conductor mode (conductor mode on) adopts `goal-board` through the ordinary
 `adopt` (`adopt_crew_mode_board_on_switch`, called by `switch_slot_agent`), only while the
 page is `empty`, so a page already chosen is kept and switching away changes nothing.
 It applies to a Persistent chat only (an unset memory mode counts as one): an Incognito
 or Temporary chat may not open sessions, so switching it to the conductor adopts nothing.
-With no page in force, the mate's Dashboard tab on `/members` shows the suggestions
+With no page in force, the Bot's Dashboard tab on `/members` shows the suggestions
 page (`CrewDashboardEmpty`), and the turn block says so and lists no fields and no upkeep
-pointer. A shipped page named for the mate is drawn as before. The decision is made
+pointer. A shipped page named for the Bot is drawn. The decision is made
 ONCE, by `dashboard_agentic.shows_suggestions` (template instance served, record `empty`,
 no page named for the slug, no package on screen): the read route sends it as
 `suggestions: true` and the website draws what that says, and `turn_block` asks the same
-function, with the same package lookup (`dashboard_agentic.bound_package`) and the same
-lock rule as the route. There is no field to write either: `dashboard_fields` says the
-mate has no dashboard yet, `dashboard_write` is refused `no_instance`, and the
-profile's upkeep view shows nothing. A value written before a mate lost its default
+function, with the same package lookup (`dashboard_agentic.bound_package`) as the
+route. There is no field to write either: `dashboard_fields` says the
+Bot has no dashboard yet, `dashboard_write` is refused `no_instance`, and the
+profile's upkeep view shows nothing. A value written before a Bot lost its default
 stays in the crew log; nothing here deletes or migrates it.
 
 `stale` covers two cases with different sentences: the template moved ahead of the copy,
@@ -137,7 +137,7 @@ act on `stale`.
 ## The history is a fold, the record is a file
 
 `instance.json` is the current value. Every accepted change ALSO appends one
-`dashboard/instance_changed` entry to the mate's own DM session crew log, and the
+`dashboard/instance_changed` entry to the Bot's own DM session crew log, and the
 history is a fold over those entries, resumed from a savepoint beside the record.
 
 The entry carries what CHANGED and never the page. That is what makes it bounded by
@@ -169,7 +169,7 @@ a directory the registry then has to report as broken.
 
 An import does not overwrite. A colliding id is refused and names the collision, and
 `as_id` is how both are kept. Overwriting silently would replace the template a
-mate's dashboard was copied from -- and because the instance holds its own copy, the
+Bot's dashboard was copied from -- and because the instance holds its own copy, the
 dashboard would keep rendering while the registry no longer held what it was made from,
 which is the one failure nothing downstream could detect.
 
@@ -188,6 +188,11 @@ a set stops working the first time somebody hand-edits a file, and a directory o
 rather than reported makes a template somebody just got wrong indistinguishable from one
 that was never written.
 
+**One leading byte-order mark is not a break.** Windows editors save UTF-8 "with BOM"
+by default, so `manifest.json` is parsed through `user_json.loads_user_json` both where
+the catalog loads it and where an instance copies it on preview and adopt. Any other
+encoding, and invalid JSON after the mark, is still a problem.
+
 **The directory name is the id.** A directory holding a manifest naming a different id
 is two names for one template, and a lookup would find or miss it depending on which
 name the caller happened to hold.
@@ -198,9 +203,9 @@ Without that check the field would be worth nothing to a surface reading it to m
 "this shipped in the product".
 
 **Two roots are scanned, and no agent can write either.** A page that renders runs its
-own script against the mate's values inside a frame that can navigate itself, so a
+own script against the Bot's values inside a frame that can navigate itself, so a
 registry that scanned an agent-writable directory would let the agent choose what a
-mate's dashboard executes. The two roots:
+Bot's dashboard executes. The two roots:
 
 | Root | Origin | Why a person put the page there |
 |---|---|---|
@@ -232,11 +237,13 @@ Three more rules hold for the operator root only:
 A live dashboard answers "what is true now", which is the wrong tool for "what was true
 when this went wrong". A snapshot is the second question, and it is the field values plus
 everything needed to know what they meant: template id, template version, instance
-version, values, seq.
+version, values, seq. This store is the RFC design and is not in the tree; the agent
+panel's `snapshot` route (`agent_panel_snapshot.py`) is a different thing, a PNG of the
+page in force kept under the data home.
 
 Each is required. A bag of numbers with no template is a page nobody can redraw; a page
 with no seq cannot be placed against the log it came from; values with no instance
-version cannot be told from values the mate's next edit would have laid out
+version cannot be told from values the Bot's next edit would have laid out
 differently. A snapshot that cannot name one is refused rather than stored with a gap a
 later reader fills in by guessing.
 
@@ -254,61 +261,43 @@ listing a chronology without opening every file.
 
 `GET /api/members/{slug}/dashboard` is the one route the frame reads, and its body is
 `{instance_version, template: {id, version}, html, manifest, state}` plus
-`state_reason` and `structure_locked`.
+`state_reason`.
 
 `?member=` is REQUIRED on every route, exactly as the briefing and rules reads require
 it. Slugification is lossy, so two crew names can reach one slug; an instance is one
-directory per slug, so for a colliding slug the instance belongs to neither mate, and
+directory per slug, so for a colliding slug the instance belongs to neither Bot, and
 serving it to both -- with an editor -- would let them overwrite each other's dashboard.
 The exact name must derive this slug, exist in config, and be the only name that does.
 
-Both the READ and every WRITE are owner-gated, the same boundary `work_ledger_board`
-draws: the body carries this mate's work-ledger and crew-log data (task titles,
-summaries, PR links), so arriving as rendered html does not make it a wider audience's. A
-non-owner is refused rather than served an empty read, which would show its numbers as
-stale when the truth is that they were withheld. A write mutates a stored page the
-gateway later renders. App tokens are denied outright -- an app
+Every WRITE is owner-gated, and so is the READ for everyone but one caller -- the same
+boundary `work_ledger_board` draws: the body carries this Bot's work-ledger and crew-log
+data (task titles, summaries, PR links), so arriving as rendered html does not make it a
+wider audience's. Any other non-owner is refused rather than served an empty read, which
+would show its numbers as stale when the truth is that they were withheld. A write
+mutates a stored page the gateway later renders. App tokens are denied outright -- an app
 token scoped to `/api/members` reaches these by prefix.
+
+The one caller is a team Crew teammate the Kiro relay verified, on a Bot in their roster
+(`member_dashboard._teammate_reader`, which calls `members_access._teammate_admitted` and
+audits `members.dashboard` under `resources="relay_teammate"`). They already run that
+Bot's turns and can ask it for any value its page shows, so they read the APPLIED page
+only: a staged page (`?preview=1`) and its Keep and Discard stay owner-only. Their read is
+one-shot. It never arms, replaces or evicts the live page the owner's tabs are pushed
+from, so the owner keeps its own language and version counter; the teammate's page is
+armed and disarmed in one worker call. A teammate's tab therefore gets no pushed frames
+and refreshes through its own timed re-read, and `/refetch`, which recovers a gap in
+those pushes, stays owner-only.
 
 All five rules live in one `_resolve` chokepoint, so a route added later cannot forget
 one of them, and a test reads the handlers' own syntax trees to assert every one calls it
 and every write calls the owner gate.
 
 The page is scrubbed before it is served, in both halves of the body (the raw `html` and the
-composed `rendered_html`), by `_template_text_safe`. Markup, attributes and prose get every
-redaction pass. The text of a `<script>` or `<style>` element gets every pass but the
-bare-secret guess for two shapes, so a page's code arrives as its author wrote it (a long alphabet to index
-into, a base64 data URI) while a key id, PEM block, JWT or prefixed token written into that
-code is still masked.
-
-`dashboard_frame.map_page_text` takes the full pass over the whole page as its baseline, and the
-one change it allows is to put the code pass's result for a script or style element's text where
-the baseline had the full pass's. So the page differs from the baseline only inside that text,
-and only by an ordered alphabet and a data URI payload, the two shapes the code pass spares. The baseline is cut at that text and the pieces are
-scrubbed one by one; a rule that reaches across a cut (a PEM block, a labelled value) makes them
-differ from the baseline, and then the baseline is the answer. The browser reads the page that
-comes out, so the result is scanned again, and unless the kept text is still exactly its script
-and style text the baseline is the answer as well. A page the full pass leaves alone, or with no
-such text, is the baseline.
-
-`dashboard_frame.code_spans` finds that text, and what it finds is a licence to apply a
-weaker rule, so it reads the page the way the HTML tokenizer does where that decides what is
-code: a `<script` inside a comment, a quoted attribute value or a `<textarea>` opens nothing,
-a `>` inside a quoted value does not end its tag, a bare value runs to white space or `>`, a
-script that holds `<!--` ends where the tokenizer's escape states end it (a `</script>` that
-closes a nested `<script>` does not), and names fold ASCII case and split on ASCII white space
-only. Where the tree builder decides
-instead, the scan reads a simple `<svg>` or `<select>` (text and ordinary tags up to its end
-tag) whole and goes on; any other `<svg>` or `<select>`, and every `<math>` and `<template>`
-(a column group inside one ignores a `<style>`), ends the scan.
-A frame may run with scripting on or off, and `<noscript>` holds text in one and markup in the
-other, so the scan ends at it too. It also ends at anything it cannot read (an element or tag
-that never ends, `<script/>` in HTML, `<plaintext>`) and after `_MAX_SCAN_STEPS` constructs.
-Everything after that point keeps every pass, as does every element past the first
-`MAX_CODE_PIECES`, so a page the scan doubts gets more masking, never less. A key in any other shape, labelled or not, is masked as it is anywhere. A key-shaped window inside
-a data URI payload of 64 characters or more is served as written, and a shuffled table is rewritten
-as before. A base64 data URI in an attribute (an `img` `src`) is markup, so it still gets every
-pass.
+composed `rendered_html`), by `_template_text_safe`: `redact_via_context` over the whole page,
+markup, attributes, prose and the text of every `<script>` and `<style>` element alike. The rule
+table masks only values that are credentials by themselves, so a page's code arrives as its author
+wrote it (a long alphabet to index into, a base64 data URI) while a PEM block, a signed JWT or a
+vendor token written into that code is masked.
 
 ## The staged preview is beside the record, never in it
 
@@ -354,14 +343,14 @@ them, and the parity rule is about the pair being committed.
 
 **One size ceiling, and it is the frame's.** `MAX_INSTANCE_HTML_BYTES` reads
 `dashboard_frame.MAX_PAGE_BYTES` (3 MiB) rather than stating a number of its own. The
-`MAX_RETAINED_VERSIONS` (20) versions one mate keeps therefore hold at most 60 MiB
+`MAX_RETAINED_VERSIONS` (20) versions one Bot keeps therefore hold at most 60 MiB
 of pages. A page passes
 two size checks -- this store's before it becomes a version, and the frame's before the
-document that renders it is assembled -- and two independent numbers meant the store
-could refuse a page the frame would happily draw. It did: `project-report` is over
-147,000 bytes and is `DEFAULT_TEMPLATE_ID`, so under a private 64 KiB ceiling no
-mate could adopt it, and a root session that adopted anything else could never come
-back to the page it starts on. The frame is where the cost is actually paid, which
+document that renders it is assembled -- and two independent numbers would let the
+store refuse a page the frame would happily draw: `project-report` is over 170,000
+bytes and is `DEFAULT_TEMPLATE_ID`, so under a smaller store ceiling no Bot could
+adopt it, and a root session that adopted anything else could never come back to the
+page it starts on. The frame is where the cost is actually paid, which
 makes it the honest place for the number; `test_dashboard_templates_builtin.py` asserts
 the identity and takes every shipped template through preview and apply.
 
@@ -372,7 +361,7 @@ describe a change the existing three already name.
 The preview is discarded once the version lands, so "keep this one" cannot be answered
 twice and quietly write two versions of one page.
 
-**The person can answer from the tab too.** A mate's staged page is drawn under
+**The person can answer from the tab too.** A Bot's staged page is drawn under
 **Keep** and **Discard** buttons in the host chrome (the Dashboard tab on `/members`
 and the chat side panel's preview tab), outside the sandboxed frame, so a page can
 never press them. Keep posts `POST /api/members/{slug}/dashboard/preview/apply` with
@@ -380,77 +369,40 @@ the `staged_ms` the preview read returned; the route calls `apply_preview(...,
 expected_staged_ms=...)`, which refuses `PreviewChanged` (409 `preview_changed`)
 inside the instance lock when a different page was staged after the one shown. That
 is the button's version of `dashboard_apply`'s guarantee: what lands is what was
-drawn. Nothing staged answers 404 `no_preview` and a locked layout 423
-`dashboard_locked`. Discard posts `.../preview/discard` with the same `staged_ms`;
+drawn. Nothing staged answers 404 `no_preview`. Discard posts `.../preview/discard` with the same `staged_ms`;
 `discard_shown_preview` drops only that page, refuses `preview_changed` for one staged
 since, and answers ok when nothing is staged any more. The route reads back and
 answers 500 `dashboard_failed` if a page is still there. The `staged_ms` the host sends
 is the one of the document the frame has MOUNTED, never a newer read still being
 minted, so both buttons stay disabled until the frame shows the page they would act
-on. Both carry the lock route's gates: an internal-secret caller is
+on. Both are person-only: an internal-secret caller is
 refused `human_only` first, then the owner gate, then the CSRF middleware every
 cookie POST passes. On a successful Keep the host leaves preview mode at once
 (dropping `?dashboard=preview`) and refetches the live page, with one line saying
-the page was kept and that the mate can roll it back. When the staged page goes
+the page was kept and that the Bot can roll it back. When the staged page goes
 any other way (the agent's `dashboard_apply`, a discard, expiry), the preview view
 hands over to the live page the same way, with a line that says so. Template
 previews only: a session's page has no person route.
 
-## The structure lock is the person's, and only theirs
+## There is no structure lock
 
-The person's structure lock freezes WHICH page the tab shows. They set it with the
-**Lock dashboard layout** switch on the mate's Profile tab (the settings
-rows under Permissions, Model and Effort); the Dashboard tab carries only a small
-**Layout locked — unlock on Profile** badge-button that opens the Profile tab when clicked, never a toggle. While it is set,
-`_commit` refuses every new version with `InstanceLocked`, so adopt, apply, edit
-and rollback all fail, and the agent surface answers `dashboard_locked` (423) with a
-sentence telling the agent to ask the person. The check sits in `_commit`, under the
-instance lock every writer already holds, so a lock set between a caller's read and
-its write still refuses it. Staging a preview and writing agentic values are not
-structure changes and keep working.
+A Bot's page changes only through its own `dashboard_apply`, `dashboard_rollback` and
+the person's Keep, and every version stays on disk, so `dashboard_rollback` is how a
+change is undone. There is no lock switch, lock route or LOCKED turn-block line.
 
-`set_structure_lock` is the only writer of the flag for a live mate, and
-`POST /api/members/{slug}/dashboard/lock` is its only caller: owner-gated, and it
-refuses an internal-secret caller (`human_only`) before anything else, because that
-caller is an MCP server acting for an agent. No MCP tool sets the lock.
+A leftover `crew-panels/<slug>.dashboard-lock` file is neither read nor rewritten, and
+no migration runs: `read` serves `instance.json`, every commit goes through, and the
+page in force is the record. A record written before the `package` key existed follows
+the older package rule (`keeps_older_package_rule`) whether or not a lock file is
+beside it. Deleting a Bot leaves such a file where it is.
 
-Deleting a mate (`DELETE /api/agents/{name}`) removes its lock file through
-`structure_lock_removal.remove_structure_lock`, so a later mate deriving the same slug does not start
-out locked to the old one's page. The slug comes from the config captured while the
-record existed, and the removal is decided the way the crew-log reclaim is: under
-`memory_store_namespace_lock` and the lock's own guard, and only while no crew in the
-roster on disk still derives that slug. A slug a live mate still claims keeps its
-lock. Only the lock file goes; its `.guard` file stays, because another writer may be
-holding it. A mate that never locked creates nothing in `crew-panels` on delete.
-
-The lock is a file, `crew-panels/<slug>.dashboard-lock`, and NOT a field of
-`instance.json`: `members/<slug>/` is writable by the mate's own sandboxed shell,
-so a flag there could be cleared by editing a file. `crew-panels` is masked in the
-sandbox, fenced by the file-tool gate and refused when aliased, and the gateway is its
-only reader and writer. Locking SNAPSHOTS the current record into that file, and
-while it exists `read` serves the snapshot, so copying an old version over
-`instance.json` cannot change the locked page. Only a missing file is unlocked; any
-other read error reads as locked, and a lock file with no readable snapshot serves
-the error state rather than `instance.json`. Unlocking removes the lock file and
-writes nothing under `members/<slug>/`, which the mate's shell can redirect.
-It is never part of a version, so a rollback cannot restore an old lock state, and
-it holds for a mate that never adopted. A lock change is NOT a history row: the
-history savepoint lives under `members/<slug>/`, and the lock file is the record.
-
-The lock is keyed by the member slug, which is the mate's immutable `member_id`
-wherever one is persisted, so a rename keeps it. It is no part of any DM session or
-of `members/<slug>/`, so a cleared chat, a new DM, a wiped member dashboard folder
-and a gateway restart all leave it set. The member record does not grow.
-While locked, the mate's `[DASHBOARD]` turn block carries a LOCKED line telling
-it not to apply, roll back or propose another page, while noting that previewing for
-the person to look at still works.
 ## Every commit syncs the upkeep helpers
 
-A fold field fills itself from the crew log; an agentic field is the mate's to
+A fold field fills itself from the crew log; an agentic field is the Bot's to
 write. `dashboard_upkeep` supplies two things for the agentic fields, from the field's
 `upkeep` key (`means`, `when`, `how`, optional `helper`): the TEXT, which
 `dashboard_fields` puts on each agentic row of its reply when it is called
-(`dashboard_upkeep.upkeep_rows`), so it cannot go stale and a mate with no file
+(`dashboard_upkeep.upkeep_rows`), so it cannot go stale and a Bot with no file
 tools reads it; and the HELPER SCRIPTS, copies of the shipped
 `builtin/<id>/helpers/<file>` under `<skills dir>/.dashboard-upkeep/<slug>/scripts/`,
 which fetch data the crew log does not hold (PR checks via `gh`) and print a ready
@@ -459,34 +411,62 @@ directory keeps the scripts out of the skills index, and it holds nothing else.
 
 `_commit` calls `dashboard_upkeep.sync` with the record it just wrote, so adopt, apply,
 rollback and edit each copy the helpers the new page names and drop one it does not.
-`turn_block` calls it too -- a mate on the page named for it never commits, and a gateway
+`turn_block` calls it too -- a Bot on the page named for it never commits, and a gateway
 upgrade can change a shipped helper -- and, when the page has fields to write, adds the
 one pointer line saying `dashboard_fields` carries the upkeep text, which rides the
 member section through every compaction. `sync` writes only what differs, so it also
 puts back a hand edit. A root session's own dashboard (`is_session_key`) has no
-mate shell and gets no scripts and no helper path.
+Bot shell and gets no scripts and no helper path.
 
-The text and the helpers are read from the SHIPPED catalog entry. The mate's copy
+The text and the helpers are read from the SHIPPED catalog entry. The Bot's copy
 of the manifest is on the agent-writable side and `edit` may change it, so its `upkeep`
 is never read; only a `builtin` template may name a helper. The profile's Notes tab
 shows the same text (`GET /api/members/{slug}/briefing` `upkeep`). Decision:
 `rfc-crewmate-dashboard-upkeep-skill.md`.
 
 
-## A field that does not resolve is the mate's to fix, and only the mate is told
+## A field that does not resolve is the Bot's to fix; the person sees only that it is not current
 
 The Dashboard frame (`dashboard_frame.compose`) draws NO band about field values, in any
 state: no "Some numbers are older" line, no `data-dashboard-stale` attribute. A cell
-whose value did not resolve keeps the last value the page drew and is dimmed through
-`data-dashboard-missing`; a cell that never resolved stays empty and dimmed. `missing`
-wins over presence on every fill, because a patch carries the fields it did not move
-forward from the read before it: a cell named in the patch's `missing` is dimmed even
-though its old value is still in `window.kirocrew.fields`. The person
-cannot fix a binding, so telling them about one only teaches them to ignore the page.
+whose value did not resolve keeps the last value the page drew, is dimmed through
+`data-dashboard-missing`, and carries `data-dashboard-missing-label`: a "not current"
+marker in the reader's language (`dashboard_frame._MISSING_LABELS`) that the host CSS
+draws after the value. A cell that never resolved keeps the template's placeholder and
+carries the same marker, which is why it says "not current" and not "older value".
+`missing` wins over presence on every fill, because a patch carries the fields it did
+not move forward from the read before it: a cell named in the patch's `missing` is
+marked even though its old value is still in `window.kirocrew.fields`. A
+`window.kirocrew.subscribe` callback is called `cb(value, name, meta)` with
+`meta = {missing}`: when a field it was given goes missing it is called again with the
+value it already had and `missing: true`, and once more with `missing: false` when the
+field resolves (a patch that only drops it from `missing` counts). A field it was never
+given does not call back. The person cannot fix a binding, so the marker says only
+that the value is not current, never why; the reason goes to the mate.
 The read carries no `stale` key, and no shipped template draws a freshness or
 staleness message of its own: no badge from a read flag, no quiet band from a fold
 stamp, no live/"no new entry" indicator (`test_no_shipped_page_reads_stale` and
-`test_no_shipped_page_draws_its_own_staleness_band` pin it). A task's own "gone quiet"
+`test_no_shipped_page_draws_its_own_staleness_band` pin it). One exception, behind the
+opt-in feature preview `dashboard_stale_fields` and drawn by the HOST, never by a page:
+an agentic field the Bot has not rewritten within its `stale_after_s` (24 hours by
+default, `0` for never) carries an "updated <age> · the Bot is asked to update it" label
+on its bound element, from the read's `stale_after` map, while the Bot's `[DASHBOARD]`
+turn names the same field. It covers only values the Bot itself asserts, which no fold
+keeps current; fold fields keep the rule above. That turn block, and the Daily Goal
+Reminder and Heartbeat wakes, reach only a Bot that has a turn; a Bot with neither
+check-in on would keep an out-of-date field until someone talks to it. A second opt-in
+preview, `dashboard_stale_wake` (it needs `dashboard_stale_fields`), closes that: one
+gateway-owned cron job (installer key `dashboard-stale-wake`, every 10 minutes, present
+only while the preview is on) looks at every Bot and starts one hidden turn in its own
+thread naming the stale fields and asking it to write them with `dashboard_write`
+(`dashboard/stale_wake.py`). One wake per field per stale period: a book under the data
+home keeps the write stamp each field was woken for, so only a new write re-arms it;
+fields stale at the same tick share one wake; and no Bot is woken twice within 30
+minutes. A Bot mid-turn, with a turn already queued in its thread, held by a crew pause
+or driven by a monitor loop is tried again on the next tick. Each wake is a model turn the person pays for, so it is recorded on the
+Bot's log as `dashboard/stale_wake` (actor `gateway`, reason `stale_fields`, the field
+names). A tick that wakes no one writes no row in the cron run history, so the
+ten-minute job does not fill the shared history index. A task's own "gone quiet"
 status on a row is the task's state, not the page's freshness, and stays; a read that cannot be
 serialized is sent as an empty one, and the page draws its own empty state.
 
@@ -497,33 +477,33 @@ value without the field, which resolved at an earlier read on this slot, so a pa
 drew it still shows the older number). A fold with no value on this read is always
 `fold_unseen`, even for a field that resolved before: the cell may only be cold (a unit
 rollover with no savepoint, an evicted cell, a prime still running), and the turn block
-must not tell the mate to rebind a working field. `older_value` is decided from a process-wide record of
+must not tell the Bot to rebind a working field. `older_value` is decided from a process-wide record of
 which fields resolved per slot (`dashboard_feed.remember_resolved`), because a tab is
 refilled from a fresh feed per request. It holds at most 256 slots and 256 names per
 slot, a read forgets every name the page in force no longer declares, and it is lost on
 a restart, which turns an older value into one of the other two reasons for the same
 binding. An agentic
 field never written is absent, not unresolved: it is in `missing` only, and its upkeep
-text already asks the mate to write it. A TREE-keyed fold has no bus scope, so the feed
+text already asks the Bot to write it. A TREE-keyed fold has no bus scope, so the feed
 reports its fields unresolved and each reader that reads the tree
 (`LivePage._resolve_trees`, the turn block) takes them back out when they resolve.
 
-The mate hears about it in its `[DASHBOARD]` turn block. `build_member_section` passes the
+The Bot hears about it in its `[DASHBOARD]` turn block. `build_member_section` passes the
 crew name to `turn_block`, which reads the page in force the way the tab does
 (`member_dashboard.read_fields`) and adds one line (`dashboard.unresolved` in
 `crewmate_prompts.json`) naming up to three fields with their reason and counting the
 rest, then saying what to do: check the folds with `dashboard_types`, then
 `dashboard_save` a page that binds a path that exists or drops the field, and
 `dashboard_apply` it. Only `path_missing` and `older_value` are named. `fold_unseen` is
-left out: a fold with no value yet is not a broken binding, and a fresh mate on its
+left out: a fold with no value yet is not a broken binding, and a fresh Bot on its
 shipped page is in that state; once the fold has a value, a wrong path shows as
-`path_missing`. A `panel` field reads `fold_unseen` until the mate has published, since
+`path_missing`. A `panel` field reads `fold_unseen` until the Bot has published, since
 the empty record has none of a published record's paths. The line is absent when nothing
-fixable is left, so it leaves on the first turn after the fix. No read is made on a
-locked page or with `agent.crew_panel` off, where the mate cannot call the tools the line
-names. A V1 mate (no `member_id`) carries its member section only at session start,
+fixable is left, so it leaves on the first turn after the fix. No read is made with
+`agent.crew_panel` off, where the Bot cannot call the tools the line
+names. A V1 Bot (no `member_id`) carries its member section only at session start,
 resume or re-injection, so on its WARM turns `turn_message` adds the line alone through
-`dashboard_agentic.unresolved_notice`, under the same gates and the desk gate; a V2 mate's
+`dashboard_agentic.unresolved_notice`, under the same gates and the desk gate; a V2 Bot's
 essentials rebuild the whole section every turn; a read that fails adds nothing; and the apply reply, which builds the block
 without a crew name, makes no read.
 
@@ -531,12 +511,12 @@ without a crew name, makes no read.
 
 The link `dashboard_preview` hands back (`instance.preview_url`) is a PAGE:
 `/members?member=<exact crew name>&dashboard=preview`. The Members page opens that
-mate, opens the side panel on its Dashboard tab, and draws the staged page in the
+Bot, opens the side panel on its Dashboard tab, and draws the staged page in the
 same sandboxed frame as the live one, under the one preview label the chat's side
 panel also uses (`DashboardPreviewLabel`: **Preview, not applied**, and that nothing
 changes until the person answers in chat). The label drops once the staged page is
 applied or expires, and the tab says the preview has closed. Switching
-mate drops the query, so the preview never follows a person to another mate.
+Bot drops the query, so the preview never follows a person to another mate.
 The tab shows the dynamic dashboard for a preview whether or not the Dynamic Dashboard
 Feature Preview is on: the staged page exists only in that form, and the person was
 sent to look at it.
@@ -551,7 +531,7 @@ live one, with `preview: true` in the body and `instance_version` left at the cu
 version. Nothing staged answers 404 `no_preview`, which the tab says in words (the page
 was kept, discarded or expired) with the same way back to the live page.
 
-One route and not two. A staged page carries the same mate's fold values as the page
+One route and not two. A staged page carries the same Bot's fold values as the page
 it would replace, so a route of its own would be a second place to get that owner gate
 right; and a capability token would be a second credential for data its holder can
 already read. Serving it through a different renderer would be worse than either: the

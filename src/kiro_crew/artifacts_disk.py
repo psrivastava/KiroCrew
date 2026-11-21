@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import re
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator
@@ -58,31 +59,20 @@ if TYPE_CHECKING:
 logger = logging.getLogger("kiro_crew.artifacts")
 
 
-# ── Constants ────────────────────────────────────────────────────────────────
-
-#: Maximum number of versions retained per artifact (older versions are pruned
-#: when the cap is exceeded).
+#: Maximum number of versions retained per artifact; older ones are pruned.
 MAX_VERSIONS = 50
 
-#: Maximum size of an artifact's content blob, in bytes. Locally-authored
-#: widget HTML rarely tops a few KB, but cloned/pulled remote artifacts (rich
-#: HTML reports, CSVs) routinely exceed 1 MiB — at 1 MiB clone/pull would
-#: silently fail on exactly the shared-HTML artifacts bidirectional sync
-#: targets. 25 MiB is large enough to bring those down locally while still
-#: refusing truly unbounded content. Owned by
-#: ``constants.ARTIFACT_MAX_CONTENT_BYTES`` (a leaf) so
-#: ``validation.ARTIFACT_CONTENT_MAX`` -- the MCP tool-arg cap -- reads the same
-#: name without importing this module; re-exported here for the store's callers.
+#: Maximum size of an artifact's content blob, in bytes. Cloned or pulled remote
+#: artifacts (rich HTML reports, CSVs) often exceed 1 MiB, so the cap is large
+#: enough for them while still refusing unbounded content. Defined in the leaf
+#: ``constants.ARTIFACT_MAX_CONTENT_BYTES`` so ``validation.ARTIFACT_CONTENT_MAX``
+#: (the MCP tool-arg cap) reads the same value without importing this module.
 MAX_CONTENT_BYTES = ARTIFACT_MAX_CONTENT_BYTES
 
 #: Retention cap for auto-registered widget artifacts (see
-#: :mod:`kiro_crew.widget_artifacts`). Every chat-emitted ``<mcwidget>`` becomes
-#: an artifact automatically, so without a cap a chat-heavy user accumulates one
-#: three-file directory per throwaway widget forever and every library listing
-#: is an O(N) scan over them. Past this many, the oldest STILL-UNPINNED
-#: auto-registered widgets are deleted; pinning one exempts it permanently. Sized
-#: so a long working session's widgets all remain addressable for later
-#: iteration while the tail is reclaimed.
+#: :mod:`kiro_crew.widget_artifacts`). Every chat-emitted ``<mcwidget>`` becomes an
+#: artifact, so without a cap they pile up and every listing scans them all. Past
+#: this many, the oldest still-unpinned ones are deleted; pinning exempts one.
 MAX_AUTO_WIDGET_ARTIFACTS = 200
 
 #: Maximum number of comments retained per artifact (FIFO, like versions/events).
@@ -92,16 +82,11 @@ MAX_AUTO_WIDGET_ARTIFACTS = 200
 #: are dropped (a thread root + its replies together), never a reply orphaned.
 MAX_COMMENTS_PER_ARTIFACT = 500
 
-#: Max lifecycle events retained per artifact. FIFO eviction keeps meta.json
-#: bounded — at ~150 bytes per event entry, this caps each meta file at
-#: roughly 75KB on top of the static metadata, which is well within the
-#: tolerable read cost.
+#: Max lifecycle events retained per artifact (FIFO). At ~150 bytes per event this
+#: keeps the events in meta.json to about 75KB.
 MAX_EVENTS_PER_ARTIFACT = 500
 
 _VERSION_FILE_RE = re.compile(r"^v(\d+)\.html$")
-
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
 
 
 def _now_iso() -> str:
@@ -128,18 +113,10 @@ def _validate_content(content: str) -> str:
     try:
         encoded = content.encode("utf-8")
     except UnicodeEncodeError as exc:
-        # The MEASUREMENT is an encode, and content holding an unpaired surrogate
-        # cannot be encoded at all. So the one line that asks how big the content
-        # is also decides whether it can exist, and this function's whole job is
-        # to answer "can this be stored" with an ``ArtifactValidationError`` when
-        # the answer is no. Letting ``UnicodeEncodeError`` escape instead turns an
-        # artifact a caller can fix into a 500 at every caller that answers a bad
-        # artifact with a 400, and a file write meets the same wall: nothing
-        # storable comes out of such content.
-        #
-        # Answered HERE rather than per kind or per route, because the promise is
-        # this function's and every path through the store makes it -- ``create``,
-        # ``update`` and ``settle_blank`` all open with this call.
+        # An unpaired surrogate cannot be encoded, so it can never be stored.
+        # Raise ``ArtifactValidationError`` (a 400) rather than let
+        # ``UnicodeEncodeError`` escape as a 500. Answered here because
+        # ``create``, ``update`` and ``settle_blank`` all open with this call.
         raise ArtifactValidationError(
             "content holds an unpaired surrogate code point "
             f"({content[exc.start:exc.start + 1]!r} at index {exc.start}) that UTF-8 "
@@ -198,16 +175,20 @@ def _open_pinned_for_read(resolved: Path) -> int:
     )
 
 
-def _owner_only_tmp_opener(path: str, flags: int) -> int:
-    """:func:`_owner_only_opener` for a fixed-name ``.tmp`` that a crash can leave behind.
+def _owner_only_tmp_opener(path: str, flags: int, *, dir_fd: int | None = None) -> int:
+    """:func:`_owner_only_opener` for a write's staging ``.tmp``, narrowed to ``0600``.
 
-    ``os.open`` applies the mode only when it creates the file, so a ``.tmp`` an
-    earlier version left at ``0644`` would be truncated, reused and then
-    published at that mode by the rename. The descriptor belongs to this write
-    alone (no lock is ever taken on a ``.tmp``), so it is narrowed here before
-    any byte is written.
+    The staging name is fresh and created ``O_EXCL`` (:func:`_write_tmp_then_publish`),
+    so the mode applies at creation; the narrowing below still holds the
+    ``0600`` promise should an opener ever be handed an existing file. The
+    descriptor belongs to this write alone (no lock is ever taken on a ``.tmp``),
+    so it is narrowed before any byte is written. *dir_fd* anchors the open to
+    the writer's pinned parent.
     """
-    fd = _owner_only_opener(path, flags)
+    if dir_fd is None:
+        fd = _owner_only_opener(path, flags)
+    else:
+        fd = os.open(path, flags, 0o600, dir_fd=dir_fd)
     if not platform_compat.IS_POSIX:
         return fd
     try:
@@ -221,15 +202,11 @@ def _owner_only_tmp_opener(path: str, flags: int) -> int:
 
 
 # The errnos that mean "this descriptor or filesystem has no fsync", as opposed
-# to "the writeback failed". Only the first class may be ignored: a descriptor
-# that cannot be synced on a given platform must not make the store unusable
-# there. Built with ``getattr`` because the errno module only defines the name
-# the host's C library has, and the set collapses duplicates on the platforms
-# where ENOTSUP and EOPNOTSUPP share a value.
+# to "the writeback failed"; only these may be ignored. Built with ``getattr``
+# because the errno module only defines the names the host's C library has.
 #
-# The import is aliased private (``_errno``) as in :mod:`kiro_crew.artifacts`:
-# the facade's ``__all__`` is derived from what it binds, so a bare ``import
-# errno`` would publish the errno module as part of the store's facade.
+# ``errno`` is imported as ``_errno`` because the facade's ``__all__`` is derived
+# from what it binds, and a bare ``import errno`` would publish the module.
 _SYNC_UNSUPPORTED_ERRNOS = frozenset(
     code
     for code in (
@@ -242,24 +219,13 @@ _SYNC_UNSUPPORTED_ERRNOS = frozenset(
 def _sync_before_publish(fh: Any) -> None:
     """Flush *fh* to the device before its temp file is renamed into place.
 
-    A temp file plus a rename makes the SWAP atomic; it does not make the bytes
-    durable. The rename can land while the content is still only in the page
-    cache, so a crash leaves the artifact's name pointing at a file the kernel
-    never finished writing -- a torn read that the atomic rename was supposed to
-    rule out. Flushing the Python buffer and then ``fsync`` is what makes "the
-    rename published real bytes" true rather than likely.
+    A rename makes the swap atomic but not durable: without ``fsync`` a crash can
+    leave the name pointing at bytes still only in the page cache.
 
-    The failure this raises on is the one that matters. A filesystem with delayed
-    allocation reports a full disk or a failing device at ``fsync``, not at
-    ``write``; treating that as advisory would let the caller's rename replace
-    the last good file with a partial one and report success, which is the exact
-    data loss the sync is here to prevent. So a writeback error propagates, the
-    caller never reaches its rename, and the previous version stays published.
-
-    An errno in :data:`_SYNC_UNSUPPORTED_ERRNOS` says the platform has no sync
-    for this descriptor rather than that the write failed, and that is logged and
-    ignored: the atomicity the rename gives still holds where the durability
-    cannot be had.
+    A writeback error propagates, because delayed-allocation filesystems report a
+    full disk at ``fsync``, not ``write``; the caller then skips its rename and the
+    previous version stays published. An errno in :data:`_SYNC_UNSUPPORTED_ERRNOS`
+    means the platform has no sync for this descriptor, and is logged and ignored.
     """
     fh.flush()
     try:
@@ -271,38 +237,137 @@ def _sync_before_publish(fh: Any) -> None:
 
 
 def _write_tmp_then_publish(
-    tmp: Path,
     resolved: Path,
     write_body: Callable[[Any], None],
     mode: str,
     **open_kwargs: Any,
 ) -> None:
-    """Write *tmp*, sync it to the device, then rename it onto *resolved*.
+    """Write a fresh staging file, sync it to the device, then rename it onto *resolved*.
 
     The temp file is the write's alone; nothing publishes it until the rename, so
     a failure before the rename must not leave it behind. A writeback error
     reported at ``fsync`` (:func:`_sync_before_publish`) is exactly such a
     failure: on a full disk the sync raises, the rename is skipped, and the
-    half-written ``meta.json.tmp`` would otherwise sit on a disk that is already
+    half-written temp file would otherwise sit on a disk that is already
     out of room. Unlink it on any error before the rename, best-effort -- the
     original error is what the caller must see, so a failure to clean up is
     swallowed.
+
+    Where the platform can pin (:func:`pinned_fs.supports_pinned_walk`), the
+    parent the caller judged is pinned ONCE, and the temp file's creation and the
+    rename both run relative to that descriptor. Addressing them by name re-walked
+    every ancestor twice after the fence and the root check had answered, so an
+    agent that swapped a directory inside its artifact for a link to the scratch
+    root between the two published the write over the tree index. The kernel's
+    own path for the pinned parent is asked of :func:`_fence_refuses` whenever it
+    differs from the judged one, as the read side does.
+
+    The staging name is unpredictable (``atomic_write_at``'s ``.<name>.<random>.tmp``
+    shape) and created ``O_CREAT|O_EXCL`` on every platform. A fixed
+    ``<name>.tmp`` in an agent-writable directory let a link planted there be
+    followed and truncated -- onto the tree index -- and ``O_NOFOLLOW`` only
+    refused that where the platform has it, which Windows does not. An exclusive
+    create never opens an existing entry, link or reparse point included, so it
+    holds on every platform; a planted name fails the write instead.
+    """
+    opener = open_kwargs.pop("opener", None)
+    exclusive = os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    tmp_name = f".{resolved.name}.{os.urandom(8).hex()}.tmp"
+    legacy_tmp = f"{resolved.name}.tmp"
+    if not pinned_fs.supports_pinned_walk():
+        try:
+            parent_pin = platform_compat.pinned_directory(resolved.parent)
+        except OSError as exc:
+            if exc.errno not in (_errno.ELOOP, _errno.ENOTDIR):
+                raise
+            raise ArtifactError(
+                f"refusing to write the artifact store file: the directory {resolved.parent!s} "
+                "is a link or not a directory"
+            ) from exc
+        with parent_pin:
+            pinned_parent = resolved.parent.resolve(strict=True)
+            if os.path.normcase(str(pinned_parent)) != os.path.normcase(str(resolved.parent)):
+                if _fence_refuses(pinned_parent / resolved.name):
+                    raise ArtifactError(f"refusing to write sensitive path: {pinned_parent}")
+            tmp = resolved.parent / tmp_name
+            by_name = opener or (lambda path, flags: os.open(path, flags, 0o666))
+            try:
+                with open(
+                    tmp, mode, opener=lambda p, f: by_name(p, f | exclusive), **open_kwargs
+                ) as fh:
+                    write_body(fh)
+                    _sync_before_publish(fh)
+                tmp.replace(resolved)
+                legacy = resolved.parent / legacy_tmp
+                _drop_legacy_tmp(legacy.lstat, legacy.unlink)
+            except FileExistsError:
+                raise  # the name is not ours: never unlink what this write did not create
+            except BaseException:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                raise
+        return
+
+    dir_fd = pinned_fs.pin_parent(
+        str(resolved.parent), what="artifact store file", refusal=ArtifactError
+    )
+    try:
+        pinned_real = pinned_fs.fd_real_path(dir_fd)
+        if pinned_real is None:
+            raise ArtifactError(f"refusing to write an unverifiable directory: {resolved.parent}")
+        if os.path.normcase(pinned_real) != os.path.normcase(str(resolved.parent)):
+            if _fence_refuses(Path(pinned_real) / resolved.name):
+                raise ArtifactError(f"refusing to write sensitive path: {pinned_real}")
+
+        def at_parent(path: str, flags: int) -> int:
+            if opener is None:
+                return os.open(path, flags | exclusive, 0o666, dir_fd=dir_fd)
+            return opener(path, flags | exclusive, dir_fd=dir_fd)
+
+        try:
+            with open(tmp_name, mode, opener=at_parent, **open_kwargs) as fh:
+                write_body(fh)
+                _sync_before_publish(fh)
+            os.replace(tmp_name, resolved.name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        except FileExistsError:
+            raise  # the name is not ours: never unlink what this write did not create
+        except BaseException:
+            try:
+                os.unlink(tmp_name, dir_fd=dir_fd)
+            except OSError:
+                pass
+            raise
+        _drop_legacy_tmp(
+            lambda: os.stat(legacy_tmp, dir_fd=dir_fd, follow_symlinks=False),
+            lambda: os.unlink(legacy_tmp, dir_fd=dir_fd),
+        )
+    finally:
+        os.close(dir_fd)
+
+
+def _drop_legacy_tmp(lstat: Callable[[], os.stat_result], unlink: Callable[[], None]) -> None:
+    """Remove a regular ``<name>.tmp`` an earlier version staged through.
+
+    A crash there could leave earlier content at the umask's mode, and the
+    random staging name above never opens it again. Only a regular file is
+    that leftover; a link planted at the name is not this store's and is left
+    alone. Neither call follows a link, so a swap between them is harmless.
     """
     try:
-        with open(tmp, mode, opener=open_kwargs.pop("opener", None), **open_kwargs) as fh:
-            write_body(fh)
-            _sync_before_publish(fh)
-    except BaseException:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-        raise
-    tmp.replace(resolved)
+        if stat.S_ISREG(lstat().st_mode):
+            unlink()
+    except OSError:
+        logger.debug("artifacts: could not remove a legacy staging file", exc_info=True)
 
 
-def _prepare_store_write(resolved: Path, *, owner_only: bool) -> Callable[[str, int], int] | None:
-    """Create *resolved*'s parent and return the opener for its tmp file."""
+def _prepare_store_write(resolved: Path, *, owner_only: bool) -> Callable[..., int] | None:
+    """Create *resolved*'s parent and return the opener for its tmp file.
+
+    The opener takes ``(path, flags, *, dir_fd=None)``: the pinned publish in
+    :func:`_write_tmp_then_publish` anchors it to the parent it pinned.
+    """
     if owner_only:
         _mkdirs_owner_only(resolved.parent)
         return _owner_only_tmp_opener
@@ -408,12 +473,9 @@ def _write_artifact(self: ArtifactStore, art: Artifact, content: str) -> None:
 def _write_image_artifact(self: ArtifactStore, art: Artifact, data: bytes) -> None:
     """Write an image artifact: empty text body + the raster asset sidecar.
 
-    Mirrors :meth:`_write_artifact` so image records share the exact same
-    directory shape (``current.html`` + ``versions/`` + ``meta.json``) and
-    every text-store helper — ``get``, version snapshotting, ``_rmtree``
-    delete — works on them unchanged. ``current.html`` is written empty per
-    the image-kind contract; the bytes go to ``asset.<ext>`` through the
-    gated byte writer.
+    Mirrors :meth:`_write_artifact` so image records share the same directory
+    shape and every text-store helper works on them unchanged. The bytes go to
+    ``asset.<ext>`` through the gated byte writer.
     """
     adir = self._artifact_dir(art.slug)
     self._mkdirs(adir / "versions")  # creates adir too
@@ -513,12 +575,11 @@ def _write_text(self: ArtifactStore, path: Path, text: str) -> None:
         raise ArtifactError(reason)
     self._refuse_write_outside_root(path, resolved)
     # Atomic write: tmp file + rename. Inside the data home the tmp is 0600
-    # before the first byte is written (created so, or narrowed when a crash
-    # left one behind), so the published file is never readable by others.
+    # before the first byte is written (created so, exclusively, under a fresh
+    # name), so the published file is never readable by others.
     opener = _prepare_store_write(resolved, owner_only=self._owner_only)
-    tmp = resolved.with_suffix(resolved.suffix + ".tmp")
     _write_tmp_then_publish(
-        tmp, resolved, lambda fh: fh.write(text), "w", encoding="utf-8", opener=opener
+        resolved, lambda fh: fh.write(text), "w", encoding="utf-8", opener=opener
     )
 
 
@@ -613,8 +674,7 @@ def _write_bytes(self: ArtifactStore, path: Path, data: bytes) -> None:
         raise ArtifactError(reason)
     self._refuse_write_outside_root(path, resolved)
     opener = _prepare_store_write(resolved, owner_only=self._owner_only)
-    tmp = resolved.with_suffix(resolved.suffix + ".tmp")
-    _write_tmp_then_publish(tmp, resolved, lambda fh: fh.write(data), "wb", opener=opener)
+    _write_tmp_then_publish(resolved, lambda fh: fh.write(data), "wb", opener=opener)
 
 
 def _prune_versions(self: ArtifactStore, slug: str) -> None:

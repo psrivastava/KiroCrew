@@ -371,11 +371,29 @@ def _collect_active_pids(sessions: "dict") -> tuple[set[int], bool]:
 
     If any session's PID is not an int or extraction fails,
     returns ``(partial_set, False)`` — caller should skip the sweep.
+
+    A provider is one of three known shapes: an ACP ``client`` whose ``_pid``
+    is read here; a lease on a shared runtime (``_runtime``: the
+    ``AcpSessionProvider`` a task-runner step session holds directly), whose
+    process the caller shields from the runtime's own owner, the pool and
+    companion sources, so nothing is read from the session; or the ``_proc`` /
+    ``_active_proc`` subprocess attributes. A provider of none of these shapes (a
+    proxy, or a type added later) hides its live process, which would then look
+    like an orphan, so that also returns ``ok=False``: the sweep runs only when
+    every session's process is accounted for.
     """
     pids: set[int] = _protected_pids()  # shared _bg / subagent runtimes shielded from the sweep
     for sess in sessions.values():
         # ACP provider: long-lived process PID via client._pid
         client = getattr(sess.provider, "client", None)
+        if client is None and not any(
+            hasattr(sess.provider, attr) for attr in ("_runtime", "_proc", "_active_proc")
+        ):
+            logger.warning(
+                "Session provider %s exposes no process PID — skipping orphan sweep this cycle",
+                type(sess.provider).__name__,
+            )
+            return pids, False
         if client is not None:
             try:
                 pid = client._pid  # type: ignore[attr-defined]
@@ -557,11 +575,11 @@ def _track_pid(pid: int) -> None:
 def _track_child_pids(pids: Mapping[int, object], parent_pid: int = 0) -> None:
     """Append descendant PIDs to the tracking file as ``child:parent[:start-id]``.
 
-    The third field is the child's process-start identity
-    (:func:`_pid_start_token` -- colon-free, in-process and non-blocking on
-    every platform), recorded so the orphan sweep can prove a PID was
-    recycled before killing it. A child whose identity cannot be read at
-    track time is written in the legacy two-field shape.
+    The third field is the child's process-start identity as the caller
+    captured it (``(start_id, basename)`` records, carried through
+    :func:`_recorded_start_token`), never read again here: a fresh read could
+    be a stranger's that took the number since. A child the caller holds no
+    identity for is written in the legacy two-field shape.
     """
     if not pids:
         return
@@ -574,7 +592,7 @@ def _track_child_pids(pids: Mapping[int, object], parent_pid: int = 0) -> None:
                 key = f"{pid}:{parent_pid}"
                 if any(e == key or e.startswith(key + ":") for e in existing):
                     continue
-                token = _pid_start_token(pid)
+                token = _recorded_start_token(pids[pid])
                 entry = f"{key}:{token}" if token else key
                 f.write(f"{entry}\n")
                 existing.add(entry)

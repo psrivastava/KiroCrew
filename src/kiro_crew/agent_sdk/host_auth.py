@@ -64,6 +64,7 @@ from pathlib import PurePosixPath
 from typing import Dict, FrozenSet, Mapping, Optional, Protocol, Tuple, runtime_checkable
 
 from kiro_crew.agent_sdk.backends import (
+    ACP_BACKEND_ANTIGRAVITY,
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
     ACP_BACKEND_COPILOT,
@@ -71,8 +72,10 @@ from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_MIMOCODE,
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
+    ACP_BACKEND_STRANDS,
     ACP_BACKENDS_KNOWN,
 )
 from kiro_crew.kiro_cli_bundle import KIRO_CLI_LOGIN_COMMAND, spawn_login_command
@@ -180,12 +183,14 @@ class AgentAuthDeclaration:
     #: EXFILTRATION -- a shell the model spawns inside the harness can read the file
     #: and send the secret somewhere. That is a real residual risk and it is carried
     #: knowingly, because the alternative is a harness that cannot sign in at all.
-    #: Four harnesses carry it today -- codex, OpenCode, pi and goose -- and the
-    #: maintainer weighed and accepted this exact trade rather than it being an
-    #: oversight. What bounds it is the subset rule above: the exclusion can only
-    #: re-open a file this same declaration put on the floor, so no harness can reach
-    #: another harness's credential or anything the floor fences for a different
-    #: reason.
+    #: Six harnesses carry it today -- codex, OpenCode, pi, goose, Copilot and
+    #: Antigravity. For codex, OpenCode, pi and goose the maintainer weighed and
+    #: accepted this exact trade rather than it being an oversight. Antigravity
+    #: declares the same exclusion for its own token files, and the maintainer
+    #: accepted it in review when the harness was added. What bounds it is the
+    #: subset rule above: the exclusion can only re-open a file this same
+    #: declaration put on the floor, so no harness can reach another harness's
+    #: credential or anything the floor fences for a different reason.
     #:
     #: It is NOT the only shape an enforced harness can take. A harness declaring
     #: :data:`ENTITLEMENT_HOST_VAULT` is fed its key as an environment variable at
@@ -391,32 +396,44 @@ UNKNOWN_AGENT_AUTH = AgentAuthDeclaration(
 )
 
 
+#: Where a dashboard user finds the terminal a harness's own sign-in runs in. It
+#: follows the sentence naming "a terminal on the gateway host". Conditional on
+#: purpose: the Terminal panel is owner-only, absent from first-run setup, and off
+#: when a security policy (``boot.allow_terminal``) or ``dashboard.terminal.enabled``
+#: turns it off.
+HOST_TERMINAL_NOTE = (
+    "After setup, the gateway owner can open such a terminal from the dashboard's "
+    "Terminal panel, where that panel is on."
+)
+
+
 #: kiro-cli's action, and its signed-out statement, kept separate for the reason on
 #: the two fields. The statement is the string the auth-required path raises: that
-#: path reaches it on the harness's own stderr evidence.
+#: path reaches it on the harness's own stderr evidence. Both end at sending again:
+#: signing in again keeps the chat, so its next message succeeds.
 #:
 #: Each names :data:`KIRO_CLI_LOGIN_COMMAND`, the form that works for a kiro-cli
 #: on the user's ``PATH``. :func:`sign_in_remedy` and :func:`signed_out_message`
 #: swap it for the absolute-path form when the spawn runs a copy the user's shell
 #: does not find, such as the desktop app's bundled one.
-_KIRO_REMEDY = f"Run {KIRO_CLI_LOGIN_COMMAND} in your terminal, then start a new chat."
+_KIRO_REMEDY = f"Run {KIRO_CLI_LOGIN_COMMAND} in your terminal, then send your message again."
 _KIRO_SIGNED_OUT = (
     f"kiro-cli is not logged in. Run `{KIRO_CLI_LOGIN_COMMAND}` in your terminal, then "
-    "start a new chat."
+    "send your message again."
 )
-# KAS can run under either auth owner -- Crew's own vault (the dashboard's Kiro
-# sign-in card) or kiro-cli's store -- and the formatter cannot see which one a
-# process had, so its messages name both remedies. Plain prose (no backticks, no
-# "--") in the remedy: the panel renders it as text.
-_KAS_REMEDY = (
-    f"Sign in from Settings → Agent Harness → Kiro sign-in, or run {KIRO_CLI_LOGIN_COMMAND} "
-    "in your terminal if kiro-cli owns the sign-in, then start a new chat."
-)
-_KAS_SIGNED_OUT = (
-    "Not signed in to Kiro. Sign in again from Settings → Agent Harness → Kiro sign-in, "
-    f"or run `{KIRO_CLI_LOGIN_COMMAND}` in your terminal if kiro-cli owns the sign-in, "
-    "then start a new chat."
-)
+# Choosing KAS means Kiro Crew's own sign-in: the Kiro sign-in card is the remedy
+# on every KAS route. A spawn takes Crew's sign-in through kiro-cli's relay or on
+# Crew's own engine, whichever runs here (``acp/kas_route.py``), so the remedy never
+# sends the user to kiro-cli. :func:`sign_in_remedy` and :func:`signed_out_message`
+# name the route of the running engine in front of it once a spawn has chosen one.
+# Plain prose (no backticks, no "--") in the remedy: the panel renders it as text.
+# The path names the Kiro account tab, which holds the card on every harness.
+_KAS_CARD = "Settings → Kiro account"
+_KAS_REMEDY = f"Sign in from {_KAS_CARD}, then send your message again."
+_KAS_SIGNED_OUT = f"Not signed in to Kiro. Sign in from {_KAS_CARD}, then send your message again."
+#: The same sign-in as a terminal names it: the command first, because a host
+#: reached by ssh may have no browser to open the dashboard in.
+KAS_TERMINAL_SIGN_IN = f"Sign in with `kirocrew kas login` (or in the dashboard: {_KAS_CARD})"
 
 
 #: Every harness this build knows, and how it signs in. Table order is projection
@@ -453,8 +470,9 @@ AGENT_AUTH_DECLARATIONS: Tuple[AgentAuthDeclaration, ...] = (
         # account's credentials. In the Crew-owned spawn a recycle on kiro-cli
         # logout is harmless -- the replacement re-probes the vault and comes back
         # Crew-owned -- so the answer stays conservative rather than becoming
-        # spawn-dependent. Its messages name BOTH sign-ins because the formatter
-        # cannot tell which owner a given process had.
+        # spawn-dependent. Its messages name the Kiro sign-in alone: where kiro-cli
+        # cannot run a session, the spawn moves onto Crew's own engine
+        # (``acp/kas_route.py``), so Crew's sign-in is the remedy on every route.
         credential_leaves=(),
         home_override_env_vars=(),
         adapter_own_leaves=(),
@@ -462,6 +480,42 @@ AGENT_AUTH_DECLARATIONS: Tuple[AgentAuthDeclaration, ...] = (
         signed_out_message=_KAS_SIGNED_OUT,
         host_logout_retires_children=True,
         entitlement_source=ENTITLEMENT_HOST_IDENTITY_STORE,
+    ),
+    AgentAuthDeclaration(
+        backend=ACP_BACKEND_STRANDS,
+        # The Strands CLI stores no credential of its own: its config keeps provider
+        # settings and strips every key name (``normalizeStoredProviderEnvironment``
+        # deletes the ``PROVIDER_CREDENTIAL_KEYS``). A key reaches it from the process
+        # environment, which Crew fills from its own vault (``agent.strands_env``). The
+        # sandbox masks ``~/.aws``, so Bedrock needs a mapped Bedrock API key too.
+        credential_leaves=(),
+        home_override_env_vars=(),
+        # Nothing spared: the routing is ``VERIFIED_GATE_EXTENSION`` (enforced), so the
+        # mask denies the child the whole floor. The vault keys never enter a launch
+        # environment: they reach the gate module through a one-time owner-only file
+        # (``acp/harness/strands_keys.py``), which it loads into its own runtime
+        # environment, removes, and withholds from every shell and code child the
+        # agent runs; the worker then goes non-dumpable -- proved per spawn by its
+        # load marker (agent-host-contract.md, "No provider key is in any launch
+        # environment").
+        adapter_own_leaves=(),
+        sign_in_remedy=(
+            "The Strands harness reaches its model with the provider settings Kiro Crew "
+            "holds for it. Pick a provider and save what it needs under Settings → "
+            "Agent Harness → Strands → Model provider, which keeps each key in "
+            "Settings → Secrets. For Bedrock, that is AWS_BEARER_TOKEN_BEDROCK and "
+            "AWS_REGION: the harness runs sandboxed without ~/.aws or the host's AWS "
+            "environment."
+        ),
+        signed_out_message=(
+            "The Strands harness has no model credential. Pick a provider and save its "
+            "key under Settings > Agent Harness > Strands > Model provider, which keeps "
+            "it in Settings > Secrets (for Bedrock, `AWS_BEARER_TOKEN_BEDROCK` and "
+            "`AWS_REGION`), then start a new chat."
+        ),
+        # Its credential is not the host's: a kiro-cli logout cannot bear on it.
+        host_logout_retires_children=False,
+        entitlement_source=ENTITLEMENT_HOST_VAULT,
     ),
     AgentAuthDeclaration(
         backend=ACP_BACKEND_CODEX,
@@ -476,13 +530,14 @@ AGENT_AUTH_DECLARATIONS: Tuple[AgentAuthDeclaration, ...] = (
         sign_in_remedy=(
             "Codex is a separate tool that signs in on its own — complete its "
             "sign-in, or name a model provider in ~/.codex/config.toml "
-            "(CODEX_HOME moves that folder). Neither is checked here: the adapter "
-            "reads them."
+            "(CODEX_HOME moves that folder), in a terminal on the gateway host. "
+            f"{HOST_TERMINAL_NOTE} Neither is checked here: the adapter reads them."
         ),
         signed_out_message=(
-            "Codex is not signed in. Complete Codex's own sign-in, or name a "
-            "model provider in ~/.codex/config.toml (CODEX_HOME moves that "
-            "folder), then start a new chat."
+            "Codex is not signed in. In a terminal on the gateway host, complete "
+            "Codex's own sign-in, or name a model provider in ~/.codex/config.toml "
+            "(CODEX_HOME moves that folder), then start a new chat. "
+            f"{HOST_TERMINAL_NOTE}"
         ),
         # Excluded deliberately: it signs in through its own credentials file, so
         # a ``kiro-cli logout`` says nothing about whether a running codex session
@@ -502,11 +557,12 @@ AGENT_AUTH_DECLARATIONS: Tuple[AgentAuthDeclaration, ...] = (
         adapter_own_leaves=(),
         sign_in_remedy=(
             "Claude Code is a separate app you sign into yourself — run claude in "
-            "your terminal and complete its sign-in. It is not checked here."
+            "a terminal on the gateway host and complete its sign-in. "
+            f"{HOST_TERMINAL_NOTE} It is not checked here."
         ),
         signed_out_message=(
-            "Claude Code is not signed in. Run `claude` in your terminal and "
-            "complete its sign-in, then start a new chat."
+            "Claude Code is not signed in. Run `claude` in a terminal on the gateway "
+            f"host and complete its sign-in, then start a new chat. {HOST_TERMINAL_NOTE}"
         ),
         host_logout_retires_children=False,
         entitlement_source=ENTITLEMENT_OWN_CREDENTIAL_FILE,
@@ -535,20 +591,32 @@ AGENT_AUTH_DECLARATIONS: Tuple[AgentAuthDeclaration, ...] = (
         # own machine needs no sign-in at all.
         sign_in_remedy=(
             "OpenCode signs in on its own — run opencode auth login in a terminal "
-            "to reach a hosted model. A model served locally on this machine needs "
+            f"on the gateway host to reach a hosted model. {HOST_TERMINAL_NOTE} "
+            "A model served locally on this machine needs "
             "no sign-in: name it in the project's opencode.json instead. Neither is "
             "checked here: the harness reads them."
         ),
         signed_out_message=(
-            "OpenCode is not signed in. Run `opencode auth login` in your terminal "
-            "and complete its sign-in, or name a locally served model in the "
-            "project's opencode.json, then start a new chat."
+            "OpenCode has no model provider it can use: none is signed in, or its "
+            "key was refused. Run `opencode auth login` in a terminal on "
+            "the gateway host and complete its sign-in, or name a locally served "
+            "model in the project's opencode.json, then start a new chat. "
+            f"{HOST_TERMINAL_NOTE}"
         ),
         # Excluded deliberately: it signs in through its own credential file, so a
         # ``kiro-cli logout`` says nothing about whether a running opencode session
         # is still authenticated.
         host_logout_retires_children=False,
         entitlement_source=ENTITLEMENT_OWN_CREDENTIAL_FILE,
+        # opencode 1.19.1, driven live against a provider that answers 401, drops
+        # the status and answers ``session/prompt`` with -32603 ``Internal error:
+        # Incorrect API key provided.`` (data ``errorName: "APIError"``, which it
+        # also uses for other provider faults). The phrase is the OpenAI-style
+        # provider's own, relayed verbatim; a provider worded otherwise keeps the
+        # raw text. A signed-out host gives no error at all: opencode starts on its
+        # own hosted model instead, which the start-time model check refuses
+        # (``acp/no_model_provider.py``).
+        signed_out_signature="Incorrect API key provided",
     ),
     AgentAuthDeclaration(
         backend=ACP_BACKEND_GOOSE,
@@ -560,29 +628,43 @@ AGENT_AUTH_DECLARATIONS: Tuple[AgentAuthDeclaration, ...] = (
         # ``GOOSE_DISABLE_KEYRING`` selects file storage, which the harness itself
         # describes as plain text. The keyring half is fenced by the OS rather than
         # by a path, so a floor can only name this one -- which is the half an
-        # agent's file tools could otherwise read.
-        credential_leaves=(".config/goose/secrets.yaml",),
+        # agent's file tools could otherwise read. On Windows goose keeps the same
+        # file in ``%APPDATA%\Block\goose\config`` instead (its ``etcetera`` app
+        # strategy, which reads no XDG variable there; read from goose's source,
+        # not measured on a Windows host), so that folder's default under the home
+        # is the second leaf.
+        credential_leaves=(
+            ".config/goose/secrets.yaml",
+            "AppData/Roaming/Block/goose/config/secrets.yaml",
+        ),
         # Only the CONFIG home, because on this harness that IS where the secret
         # store lives -- the inverse of the opencode declaration above, whose token
         # sits under the data home and whose config home is therefore deliberately
         # absent. The data and state homes are excluded here for that same reason:
         # they hold this harness's session database and logs, and anchoring a
-        # credential on them would fence files that carry no secret.
-        home_override_env_vars=("XDG_CONFIG_HOME",),
-        # ``XDG_CONFIG_HOME`` replaces ``.config``, not the leaf's parent, so the
-        # relocated file keeps both remaining segments.
-        override_relative_leaves=("goose/secrets.yaml",),
+        # credential on them would fence files that carry no secret. ``APPDATA`` is
+        # the Windows config home. Each leaf is anchored under both variables, so
+        # each also gains one target under the other platform's root that goose
+        # never writes; a fence on an empty path refuses nothing anyone reads.
+        home_override_env_vars=("XDG_CONFIG_HOME", "APPDATA"),
+        # ``XDG_CONFIG_HOME`` replaces ``.config`` and ``APPDATA`` replaces
+        # ``AppData/Roaming``, not the leaf's parent, so each relocated file keeps
+        # the segments after its root.
+        override_relative_leaves=("goose/secrets.yaml", "Block/goose/config/secrets.yaml"),
         # The one leaf the mask must spare: this harness is enforced, so the mask
         # denies it the whole credential floor, and it resolves its own provider
         # secret from this file. The read gate still refuses the same leaf to the
-        # AGENT's file tools, so the two controls cover different readers.
+        # AGENT's file tools, so the two controls cover different readers. The
+        # Windows leaf is not spared: a goose session is refused on native Windows,
+        # where no OS sandbox applies the mask (``agent_sdk.tool_gate``).
         adapter_own_leaves=(".config/goose/secrets.yaml",),
         # Action only, and no state, because for this harness there may be no state
         # to assert: a model served locally on the operator's own machine needs no
         # provider secret at all.
         sign_in_remedy=(
-            "goose signs in on its own — run goose configure in a terminal to name a "
-            "provider and store its key. A model served locally on this machine "
+            "goose signs in on its own — run goose configure in a terminal on the "
+            "gateway host to name a provider and store its key. "
+            f"{HOST_TERMINAL_NOTE} A model served locally on this machine "
             "needs no key: name it as the provider instead. Neither is checked here: "
             "the harness reads them."
         ),
@@ -597,9 +679,9 @@ AGENT_AUTH_DECLARATIONS: Tuple[AgentAuthDeclaration, ...] = (
         signed_out_message=(
             "goose has no provider it can use here: none is configured, or its key "
             "is in the system keyring, which Kiro Crew's sandbox cannot open. Run "
-            "`GOOSE_DISABLE_KEYRING=true goose configure` in your terminal so the key "
-            "is saved to goose's secrets.yaml, or configure a locally served model, "
-            "then start a new chat."
+            "`GOOSE_DISABLE_KEYRING=true goose configure` in a terminal on the gateway "
+            "host so the key is saved to goose's secrets.yaml, or configure a locally "
+            f"served model, then start a new chat. {HOST_TERMINAL_NOTE}"
         ),
         # Excluded deliberately: it resolves its own provider secret, so a
         # ``kiro-cli logout`` says nothing about whether a running goose session can
@@ -632,15 +714,16 @@ AGENT_AUTH_DECLARATIONS: Tuple[AgentAuthDeclaration, ...] = (
         # Action only, no state: a model served locally on the operator's own
         # machine needs no sign-in, only a provider entry.
         sign_in_remedy=(
-            "Pi signs in on its own — run pi in a terminal and use its /login command "
-            "to reach a hosted model. A model served locally on this machine needs no "
+            "Pi signs in on its own — run pi in a terminal on the gateway host and use "
+            f"its /login command to reach a hosted model. {HOST_TERMINAL_NOTE} "
+            "A model served locally on this machine needs no "
             "sign-in: name it in pi's models.json instead. Neither is checked here: "
             "the harness reads them."
         ),
         signed_out_message=(
-            "Pi is not signed in. Run `pi` in your terminal and complete `/login`, or "
-            "name a locally served model in `~/.pi/agent/models.json`, then start a "
-            "new chat."
+            "Pi is not signed in. Run `pi` in a terminal on the gateway host and "
+            "complete `/login`, or name a locally served model in "
+            f"`~/.pi/agent/models.json`, then start a new chat. {HOST_TERMINAL_NOTE}"
         ),
         # Excluded deliberately: it signs in through its own credential file, so a
         # ``kiro-cli logout`` says nothing about whether a running pi session is
@@ -777,14 +860,15 @@ AGENT_AUTH_DECLARATIONS: Tuple[AgentAuthDeclaration, ...] = (
         # (``COPILOT_PROVIDER_BASE_URL``) needs no GitHub sign-in at all.
         sign_in_remedy=(
             "GitHub Copilot CLI signs in on its own — run copilot login in a "
-            "terminal, or sign the GitHub CLI in with gh auth login, which Copilot "
-            "CLI falls back to. A model provider of your own "
+            "terminal on the gateway host, or sign the GitHub CLI in there with gh "
+            f"auth login, which Copilot CLI falls back to. {HOST_TERMINAL_NOTE} "
+            "A model provider of your own "
             "(COPILOT_PROVIDER_BASE_URL) needs no GitHub sign-in."
         ),
         signed_out_message=(
-            "GitHub Copilot CLI is not signed in. Run `copilot login` in your "
-            "terminal (or `gh auth login`, which Copilot CLI falls back to), then "
-            "start a new chat."
+            "GitHub Copilot CLI is not signed in. Run `copilot login` in a terminal "
+            "on the gateway host (or `gh auth login`, which Copilot CLI falls back "
+            f"to), then start a new chat. {HOST_TERMINAL_NOTE}"
         ),
         # Excluded deliberately: it signs in with a GitHub credential of its own, so a
         # ``kiro-cli logout`` says nothing about whether a running session can still
@@ -795,6 +879,88 @@ AGENT_AUTH_DECLARATIONS: Tuple[AgentAuthDeclaration, ...] = (
         # GitHub CLI to fall back to), answers ``session/new`` with -32000
         # ``Authentication required`` and creates no session.
         signed_out_signature="Authentication required",
+    ),
+    AgentAuthDeclaration(
+        backend=ACP_BACKEND_MIMOCODE,
+        # Verified on disk rather than read off documentation: a
+        # ``mimo providers login --provider xiaomi`` run against a scratch home wrote
+        # this file (mode 600) holding a platform API key, and nothing under
+        # ``.config``, ``.cache`` or ``.local/state``.
+        credential_leaves=(".local/share/mimocode/auth.json",),
+        # ``XDG_DATA_HOME`` is the one override declared. The harness's other
+        # relocation, ``MIMOCODE_HOME``, moves the file to
+        # ``$MIMOCODE_HOME/data/auth.json`` -- a spelling no single override suffix
+        # can share with this one -- so the launch refuses a session whose
+        # environment sets it (``acp.harness.mimocode``) instead of leaving the relocated
+        # token outside the floor.
+        home_override_env_vars=("XDG_DATA_HOME",),
+        # ``XDG_DATA_HOME`` replaces ``.local/share``, so the file keeps two segments.
+        override_relative_leaves=("mimocode/auth.json",),
+        # The harness authenticates ITSELF from this file, so the mask spares it to
+        # its own child, as for opencode. A vault-fed key (the DeepSeek shape) is
+        # reachable through ``MIMOCODE_AUTH_CONTENT``, which the harness withholds
+        # from the children it spawns; until that is wired, the carve-out stands.
+        adapter_own_leaves=(".local/share/mimocode/auth.json",),
+        # Action only, no state: a provider configured in the project's
+        # mimocode.json may need no sign-in at all.
+        sign_in_remedy=(
+            "MiMo Code signs in on its own — run mimo providers login in a terminal "
+            "on the gateway host to reach a hosted model, or name a provider in the "
+            f"project's mimocode.json. {HOST_TERMINAL_NOTE} Neither is checked here: "
+            "the harness reads them."
+        ),
+        signed_out_message=(
+            "MiMo Code is not signed in. Run `mimo providers login` in a terminal on "
+            "the gateway host and complete its sign-in, or name a provider in the "
+            f"project's mimocode.json, then start a new chat. {HOST_TERMINAL_NOTE}"
+        ),
+        # Excluded deliberately: it signs in through its own credential file, so a
+        # ``kiro-cli logout`` says nothing about whether a running mimocode session is
+        # still authenticated.
+        host_logout_retires_children=False,
+        entitlement_source=ENTITLEMENT_OWN_CREDENTIAL_FILE,
+    ),
+    AgentAuthDeclaration(
+        backend=ACP_BACKEND_ANTIGRAVITY,
+        # The standalone ACP runtime owns authentication and keeps both consumer
+        # and Gemini Enterprise tokens under its private profile. On macOS it also
+        # mirrors them into the login keychain under the ``antigravity-acp`` and
+        # ``antigravity-acp-business`` accounts; the file forms are the readable
+        # leaves that belong on Crew's credential floor. Its 1.4.4 settings loader
+        # states that ``settings.json`` holds only ``auth.type`` and
+        # ``gcp.project``/``gcp.location``; credentials are never written there.
+        # API-key auth reads ``GEMINI_API_KEY`` from the launch environment.
+        credential_leaves=(
+            ".gemini/antigravity-acp/acp_token.json",
+            ".gemini/antigravity-acp/acp_business_token.json",
+        ),
+        home_override_env_vars=("GEMINI_HOME",),
+        override_relative_leaves=(
+            "antigravity-acp/acp_token.json",
+            "antigravity-acp/acp_business_token.json",
+        ),
+        # This runtime authenticates itself from those files, so its child is the
+        # same trust carve-out as the other enforced FILE-authenticated harnesses.
+        adapter_own_leaves=(
+            ".gemini/antigravity-acp/acp_token.json",
+            ".gemini/antigravity-acp/acp_business_token.json",
+        ),
+        sign_in_remedy=(
+            "Google Antigravity ACP signs in on its own. In a terminal on the gateway "
+            "host, set auth.type to oauth-personal in "
+            "$GEMINI_HOME/antigravity-acp/settings.json and start a new chat; the "
+            f"runtime opens Google sign-in in the browser. {HOST_TERMINAL_NOTE} Kiro "
+            "Crew verifies Google Antigravity ACP 1.4.4 only and refuses other versions."
+        ),
+        signed_out_message=(
+            "Google Antigravity ACP is not signed in. In a terminal on the gateway host, "
+            "set auth.type to `oauth-personal` in "
+            "`~/.gemini/antigravity-acp/settings.json`, then start a new chat to open "
+            f"Google sign-in. {HOST_TERMINAL_NOTE}"
+        ),
+        signed_out_signature="No authentication method selected",
+        host_logout_retires_children=False,
+        entitlement_source=ENTITLEMENT_OWN_CREDENTIAL_FILE,
     ),
 )
 
@@ -924,6 +1090,39 @@ def _with_spawn_login_command(
     return text.replace(KIRO_CLI_LOGIN_COMMAND, command)
 
 
+def _with_kas_route(backend: str, text: str, *, quoted: bool) -> str:
+    """*text*, led by the route the running KAS engine took, for a KAS message.
+
+    The route is the one the last KAS spawn in this process recorded
+    (``acp.kas_route.last_spawn_route``), so the message names the engine that
+    answered, and nothing is said before any spawn chose one. A plain read of a
+    module slot: no file or network IO, so a message raised on the event loop
+    stays cheap.
+    """
+    route = None
+    if backend == ACP_BACKEND_KAS:
+        # Read from ``sys.modules``, never imported here: importing it would load
+        # the whole ACP package into callers that only want a string, and a
+        # process that never loaded it has spawned no KAS engine to name.
+        import sys
+
+        kas_route = sys.modules.get("kiro_crew.acp.kas_route")
+        route = kas_route.last_spawn_route() if kas_route is not None else None
+        if route is not None and route.reason == "kiro_cli_launcher":  # REASON_KIRO_CLI_LAUNCHER
+            # A relay pinned to kiro-cli's launcher: only kiro-cli's own sign-in
+            # starts it, so that is the remedy. *quoted* is the message form; the
+            # panel renders the remedy as plain text.
+            command = f"`{KIRO_CLI_LOGIN_COMMAND}`" if quoted else KIRO_CLI_LOGIN_COMMAND
+            if route.crew_auth:
+                # Crew's vault answers the engine too: either sign-in can be the
+                # one that failed, so both remedies are named.
+                return f"{route.describe()}. Run {command} in your terminal, or: {text}"
+            return (
+                f"{route.describe()}. Run {command} in your terminal, then send your message again."
+            )
+    return text if route is None else f"{route.describe()}. {text}"
+
+
 def sign_in_remedy(
     backend: str,
     environ: Optional[Mapping[str, str]] = None,
@@ -937,8 +1136,41 @@ def sign_in_remedy(
     """
     declaration = declaration_for(backend)
     return _with_spawn_login_command(
-        declaration, declaration.sign_in_remedy, environ, platform_name
+        declaration,
+        _with_kas_route(backend, declaration.sign_in_remedy, quoted=False),
+        environ,
+        platform_name,
     )
+
+
+def bedrock_auth_remedy(backend: str) -> str:
+    """The Bedrock auth-failure text for a harness whose remedy is not the host's AWS
+    sign-in, or ``""`` for the shared one.
+
+    Strands runs under the enforced sandbox, whose mask hides ``~/.aws``, so the
+    host's AWS profiles never reach it: the remedy is the Strands Model provider card,
+    which keeps the Bedrock key in the vault.
+
+    kiro-cli and KAS sign in with Kiro's own login, never the host's AWS profile,
+    so no AWS step can fix their refusal. The frame does not say whether the
+    account lacks the chosen model or the Kiro sign-in expired (an expired login
+    is also ``AccessDeniedException: "Invalid token"``), so both remedies are named.
+    """
+    if backend in (ACP_BACKEND_KIRO, ACP_BACKEND_KAS):
+        return (
+            "Kiro refused access to the model. Either the selected model is not "
+            "available to this account, or the Kiro sign-in has expired. Pick a "
+            "different model in the model picker. If every model is refused, sign in "
+            f"to Kiro again. {sign_in_remedy(backend)}"
+        )
+    if backend == ACP_BACKEND_STRANDS:
+        return (
+            "Bedrock authentication failed. Strands runs sandboxed and cannot read ~/.aws "
+            "profiles: pick Bedrock under Settings > Agent Harness > Strands > Model "
+            "provider and save its AWS_BEARER_TOKEN_BEDROCK (a Bedrock API key) and "
+            "AWS_REGION there, then start a new chat."
+        )
+    return ""
 
 
 def signed_out_message(
@@ -955,8 +1187,54 @@ def signed_out_message(
     """
     declaration = declaration_for(backend)
     return _with_spawn_login_command(
-        declaration, declaration.signed_out_message, environ, platform_name
+        declaration,
+        _with_kas_route(backend, declaration.signed_out_message, quoted=True),
+        environ,
+        platform_name,
     )
+
+
+def for_terminal(text: str) -> str:
+    """*text* as a terminal prints it: a KAS sign-in names ``kirocrew kas login`` first.
+
+    The messages above name the dashboard's sign-in card, and the panel matches
+    that exact sentence to translate it, so the sentence stays as it is and a
+    terminal surface swaps in :data:`KAS_TERMINAL_SIGN_IN`. Any other text is
+    returned unchanged.
+    """
+    return text.replace(f"Sign in from {_KAS_CARD}", KAS_TERMINAL_SIGN_IN)
+
+
+def _leads_with(text: str, sentence: str) -> bool:
+    """Whether *text* is *sentence*, alone or followed by more text after a space."""
+    return text == sentence or text.startswith(f"{sentence} ")
+
+
+def kas_signed_out_route(text: str) -> Optional[str]:
+    """The route a KAS signed-out sentence names, for a translated copy of it.
+
+    ``""`` for the bare sentence (no spawn has chosen a route), the route's name
+    (``"relay"`` or ``"bundle"``) for the sentence led by the route the last spawn
+    took, and ``None`` for anything else: the launcher form that names
+    ``kiro-cli login``, any other wording, or a route that changed since the
+    sentence was written. ``None`` keeps the English, so a translation never says
+    something the sentence did not.
+
+    The sentence may be followed by more text after a space: the ACP error
+    formatter appends its model-switch note and a request id. The translated copy
+    drops that tail; the row's own text keeps it.
+    """
+    if _leads_with(text, _KAS_SIGNED_OUT):
+        return ""
+    if not _leads_with(text, signed_out_message(ACP_BACKEND_KAS)):
+        return None
+    import sys
+
+    kas_route = sys.modules.get("kiro_crew.acp.kas_route")
+    route = kas_route.last_spawn_route() if kas_route is not None else None
+    if route is None or route.reason == "kiro_cli_launcher":
+        return None
+    return route.name
 
 
 def reports_signed_out(backend: str, text: str) -> bool:

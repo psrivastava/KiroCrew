@@ -63,7 +63,7 @@ describe('usePanelTabs', () => {
     act(() => result.current.openView('browser'))
     expect(result.current.tabs).toHaveLength(1)
     expect(result.current.activeTab).toMatchObject({
-      id: 'browser', kind: 'browser', title: 'Browser',
+      id: 'browser', kind: 'browser', title: 'Preview',
     })
     // Not a pinned view — closes like any dynamic tab.
     act(() => result.current.closeTab('browser'))
@@ -100,6 +100,51 @@ describe('usePanelTabs', () => {
     rerender({ slot: 'pane-b' })
     expect(result.current.tabs.map(t => t.id)).toEqual(['file:/x/spec.md'])
     expect(result.current.activeTab).toMatchObject({ slot: 'pane-b', content: 'body' })
+  })
+
+  it('routes the folder tab into the NAMED slot bucket, not the bound one (split panes, side chat)', () => {
+    // The folder twin of the #9921 file case: a folder chip in split pane B
+    // goes through the opener bound to the active slot A.
+    const { result, rerender } = renderHook(({ slot }: { slot: string | null }) => usePanelTabs(slot, mock.descriptors), {
+      initialProps: { slot: 'pane-a' as string | null },
+    })
+    act(() => result.current.openFolder('/x/dir', 'pane-b'))
+    expect(result.current.tabs).toEqual([]) // A's bucket is untouched
+    act(() => result.current.openFolder('/x/own')) // a null slot keeps the bound bucket
+    expect(result.current.tabs.map(t => t.id)).toEqual(['folder:/x/own'])
+
+    rerender({ slot: 'pane-b' })
+    expect(result.current.tabs.map(t => t.id)).toEqual(['folder:/x/dir'])
+    expect(result.current.activeTab).toMatchObject({ kind: 'folder', title: 'dir', slot: 'pane-b' })
+  })
+
+  it('a folder opened held in another slot keeps the focus against that slot\'s discovery open', () => {
+    // A split pane's folder chip opens in its own chat's strip, held, then the
+    // panel switches to that chat, whose history (and PR link) loads after.
+    const { result, rerender } = renderHook(({ slot }: { slot: string | null }) => usePanelTabs(slot, mock.descriptors), {
+      initialProps: { slot: 'pane-a' as string | null },
+    })
+    act(() => result.current.openFolder('/x/dir', 'pane-b', { hold: true }))
+    act(() => result.current.openFolder('/x/plain', 'pane-c'))
+    rerender({ slot: 'pane-b' })
+    act(() => result.current.openView('changes', { automatic: true }))
+    expect(result.current.tabs.map(t => t.id)).toEqual(['folder:/x/dir', 'changes'])
+    expect(result.current.activeId).toBe('folder:/x/dir')
+    // Without the hold, the same discovery open takes the focus.
+    rerender({ slot: 'pane-c' })
+    act(() => result.current.openView('changes', { automatic: true }))
+    expect(result.current.activeId).toBe('changes')
+  })
+
+  it('a file opened held in another slot keeps the focus against that slot\'s discovery open', () => {
+    // The file twin of the held folder: a split pane's file chip or diff Open.
+    const { result, rerender } = renderHook(({ slot }: { slot: string | null }) => usePanelTabs(slot, mock.descriptors), {
+      initialProps: { slot: 'pane-a' as string | null },
+    })
+    act(() => result.current.openFile('/x/held.md', 'body', 'pane-b', { hold: true }))
+    rerender({ slot: 'pane-b' })
+    act(() => result.current.openView('changes', { automatic: true }))
+    expect(result.current.activeId).toBe('file:/x/held.md')
   })
 
   it('evictDocumentBodies drops clean file bodies and diff tabs, keeps dirty buffers, in every slot', () => {
@@ -399,7 +444,7 @@ describe('usePanelTabs', () => {
   })
 
   it('keeps a folder tab while files open in separate de-duplicated tabs', () => {
-    const { result } = renderHook(() => usePanelTabs(null, mock.descriptors))
+    const { result } = renderHook(() => usePanelTabs('chat-a', mock.descriptors))
     act(() => result.current.openFolder('/Users/me/workspace/KiroCrew', 'chat-a'))
     expect(result.current.activeTab).toMatchObject({
       id: 'folder:/Users/me/workspace/KiroCrew', kind: 'folder', title: 'KiroCrew', slot: 'chat-a',
@@ -796,6 +841,35 @@ describe('usePanelTabs — per-slot isolation', () => {
     // Nothing is shown after the reset, so this report ends no show.
     notePanelShown('other-slot')
     expect(takePlainPanelShow('plain-slot')).toBe(false)
+  })
+
+  it('a held view keeps the focus against a discovery open until the next tab choice', () => {
+    // The conductor mode board opens a worker with Workers held in front; the
+    // worker's history then loads and its PR link opens Changes for discovery.
+    act(() => openPanelView('worker-slot', 'workers', { hold: true }))
+    const { result } = renderHook(() => usePanelTabs('worker-slot', mock.descriptors))
+    act(() => result.current.syncPinned(['changes', 'artifacts', 'files']))
+    act(() => result.current.openView('changes', { automatic: true }))
+    expect(result.current.activeId).toBe('workers')
+    expect(result.current.tabs.map(t => t.id)).toContain('changes')
+    // A tab the person picks ends the hold: discovery focuses again.
+    act(() => result.current.setActive('files'))
+    act(() => result.current.setActive('workers'))
+    act(() => result.current.openView('issues', { automatic: true }))
+    expect(result.current.activeId).toBe('issues')
+  })
+
+  it('a held view is released when its show ends, and an unheld open does not hold', () => {
+    act(() => openPanelView('worker-slot', 'workers', { hold: true }))
+    notePanelShown('worker-slot')
+    notePanelShown('other-slot')
+    const { result } = renderHook(() => usePanelTabs('worker-slot', mock.descriptors))
+    act(() => result.current.openView('changes', { automatic: true }))
+    expect(result.current.activeId).toBe('changes')
+    act(() => openPanelView('plain-slot', 'workers'))
+    const plain = renderHook(() => usePanelTabs('plain-slot', mock.descriptors))
+    act(() => plain.result.current.openView('changes', { automatic: true }))
+    expect(plain.result.current.activeId).toBe('changes')
   })
 
   it('counts asked-for tabs, the one already shown included, but not store writes or automatic opens', () => {

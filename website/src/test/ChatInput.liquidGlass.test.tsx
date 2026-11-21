@@ -128,9 +128,11 @@ describe('composer liquid glass', () => {
     // a bright band under the pane), above the transcript and below the chips;
     // that wrapper is also its containing block, so it spans the dock root --
     // which stops short of the scrollbar gutter -- and ChatInput hands it the
-    // shelf's height. Nothing paints inside the pane.
+    // shelf's height. Nothing paints inside the pane. While an on-screen
+    // keyboard lifts the composer, the fade's bottom rises by the same lift
+    // (`--glass-shelf-lift`, 0 otherwise) so it stays under the shelf.
     expect(INDEX_CSS).not.toMatch(/\.glass-shelf \{/)
-    expect(INDEX_CSS).toMatch(/\.glass-shelf::before \{[^}]*position: absolute; left: 0; right: 0; bottom: 0; height: calc\(var\(--glass-shelf-h, 32px\) \+ 4px\);[^}]*linear-gradient\(to bottom, transparent, var\(--bg\) 6px\);[^}]*z-index: -1;/)
+    expect(INDEX_CSS).toMatch(/\.glass-shelf::before \{[^}]*position: absolute; left: 0; right: 0; bottom: var\(--glass-shelf-lift, 0px\); height: calc\(var\(--glass-shelf-h, 32px\) \+ 4px\);[^}]*linear-gradient\(to bottom, transparent, var\(--bg\) 6px\);[^}]*z-index: -1;/)
     expect(INDEX_CSS).not.toMatch(/\.glass-shelf::before \{[^}]*100vw/)
     // The containing-block contract: neither the shelf nor ChatInput's
     // `input-area` root may become positioned, or the fade would resolve
@@ -199,7 +201,7 @@ describe('composer liquid glass', () => {
     // On the View card beside the interface style, not at the foot of the
     // Theme card (stacked fields under captions, where a switch row read as a
     // different kind of control). The user-facing name is never the primitive's.
-    expect(DISPLAY_PANEL_SRC).toMatch(/onChange=\{v => setUIMode\(v as 'chat' \| 'cli'\)\} \/>\n(?:\s+\{\/\*[\s\S]*?\*\/\}\n)?\s+<SettingsToggle\n\s+label=\{i18nT\('pages\.settings\.displayPanel\.translucent_panels'\)/)
+    expect(DISPLAY_PANEL_SRC).toMatch(/onChange=\{v => setUIMode\(v as 'chat' \| 'cli'\)\} \/>\n(?:\s+\{\/\*[\s\S]*?\*\/\}\n)?(?:\s+<div>\n)?\s+<SettingsToggle\n\s+label=\{i18nT\('pages\.settings\.displayPanel\.translucent_panels'\)/)
     expect(DISPLAY_PANEL_SRC).toMatch(/<SettingsToggle\n\s+label=\{i18nT\('pages\.settings\.displayPanel\.translucent_panels'\)\}\n\s+hint=\{i18nT\('pages\.settings\.displayPanel\.translucent_panels_desc'\)\}\n\s+checked=\{liquidGlass\}\n\s+onChange=\{setLiquidGlass\}/)
     expect(DISPLAY_PANEL_SRC).not.toMatch(/liquid_glass/)
     // The live preview follows the row: the real primitive over a skeleton transcript.

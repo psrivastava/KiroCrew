@@ -285,6 +285,34 @@ class TestSendDocument:
         assert client.pushed == [("Wei", "Q3 numbers")]
 
     @pytest.mark.asyncio
+    async def test_an_over_cap_caption_is_cut_on_a_whole_character_and_logged(self, caplog) -> None:
+        # A direct upload-file call can post a caption past WeCom's byte cap. The
+        # file still lands; the caption is cut at the last whole UTF-8 character,
+        # ends in "…" so the reader sees it was cut, and the cut is logged.
+        from kiro_crew.wecom.client import WECOM_MAX_REPLY_BYTES
+
+        client = FakeClient()
+        transport = WeComTransport(client, allowed_users=["Wei"])
+        caption = "\u20ac" * (WECOM_MAX_REPLY_BYTES // 3 + 1)
+        with caplog.at_level("INFO", logger="kiro_crew.wecom.transport"):
+            result = await transport.send_document("Wei", self._doc(), caption=caption)
+        assert result == "mid-1"
+        [(_, pushed)] = client.pushed
+        assert pushed.endswith("…") and pushed[:-1] == "\u20ac" * len(pushed[:-1])
+        assert len(pushed.encode("utf-8")) <= WECOM_MAX_REPLY_BYTES
+        assert len(pushed.encode("utf-8")) > WECOM_MAX_REPLY_BYTES - 6
+        assert "caption cut" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_a_caption_at_the_cap_is_pushed_whole(self) -> None:
+        from kiro_crew.wecom.client import WECOM_MAX_REPLY_BYTES
+
+        client = FakeClient()
+        transport = WeComTransport(client, allowed_users=["Wei"])
+        await transport.send_document("Wei", self._doc(), caption="x" * WECOM_MAX_REPLY_BYTES)
+        assert client.pushed == [("Wei", "x" * WECOM_MAX_REPLY_BYTES)]
+
+    @pytest.mark.asyncio
     async def test_an_empty_caption_sends_no_companion_push(self) -> None:
         client = FakeClient()
         transport = WeComTransport(client, allowed_users=["Wei"])
@@ -348,11 +376,11 @@ class TestSendDocument:
         assert client.files_sent == [("Wei", "mid-1", "file")]
         assert client.pushed == []  # the caption was withheld from the revoked peer
 
-    def test_files_outbound_stays_false(self) -> None:
-        # The flag gates renderer inline-image EXTRACTION, which WeCom has no path
-        # for; the file_send document path is gated by DOCUMENT_CHANNELS instead,
-        # so it must not be declared True (GPT finding).
-        assert WECOM_CAPABILITIES.files_outbound is False
+    def test_files_outbound_is_declared(self) -> None:
+        # The flag gates renderer inline-image EXTRACTION, which WeComRenderer
+        # does (_uploads_enabled); the file_send document path is gated by
+        # DOCUMENT_CHANNELS instead and never reads it.
+        assert WECOM_CAPABILITIES.files_outbound is True
 
 
 class TestAuthorize:

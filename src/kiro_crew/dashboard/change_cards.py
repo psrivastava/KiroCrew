@@ -587,7 +587,7 @@ class CardStore:
         )
         if live >= MAX_LIVE_CARDS_PER_SLOT:
             raise CardError(429, "too_many_cards", "this conversation has too many open cards")
-        same = self._open_duplicate(slot_key, kind, params)
+        same = self.open_duplicate(slot_key, kind, params)
         if same is not None:
             raise CardError(
                 409,
@@ -629,7 +629,7 @@ class CardStore:
         self.sweep()
         return rec
 
-    def _open_duplicate(
+    def open_duplicate(
         self, slot_key: str, kind: str, params: dict[str, Any]
     ) -> dict[str, Any] | None:
         """A card in *slot_key* still waiting on the person that proposes exactly this.
@@ -997,6 +997,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _goal_state,
         _hunk_separator,
         _import_after_is_written,
+        _import_dashboard_state,
         _import_rules_digest,
         _import_state,
         _mcp_detail,
@@ -1011,6 +1012,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _secret_revision,
         _server_reach,
         _sync_read_state,
+        _template_server_state,
         _template_state_with_skills,
         _unified_hunks,
         _unified_range,
@@ -1035,6 +1037,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         template_auto_approved_servers,
         undo_snapshot_changed,
         undo_survivors,
+        workflow_source_diff,
     )
     from kiro_crew.dashboard.change_cards_records import (  # noqa: F401
         _ALL_STATUSES,
@@ -1053,6 +1056,8 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _DIAGNOSE_VALUE_MAX,
         _FIND_LIMIT,
         _FIND_LIST_ITEMS,
+        _FIND_STOPWORDS,
+        _FIND_TAILS,
         _FINDING_RANK,
         _KIROCREW_STORE,
         _REGISTRY_PATH,
@@ -1067,16 +1072,21 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _dashboard_target,
         _editable_config,
         _finding_hits,
+        _fit,
         _flatten_like,
         _help_text,
         _key_withheld,
         _kirocrew_target,
         _ranked,
+        _reaches,
+        _refuse_locked,
         _registry_by_config_key,
         _registry_entry,
         _row_hits,
+        _schema_sensitive,
         _scrub,
         _stem,
+        _stems,
         _token_hits,
         _topic_tokens,
         _value_withheld,
@@ -1098,6 +1108,9 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
 if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     from kiro_crew.config.schema import (  # noqa: F401
         requires_restart,
+    )
+    from kiro_crew.update_deferral import (  # noqa: F401
+        with_skip_list,
     )
 
 # This module is the facade of the change cards: every name is reached through it as

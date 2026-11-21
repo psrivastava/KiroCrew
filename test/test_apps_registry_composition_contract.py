@@ -38,26 +38,12 @@ from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest import mock
 
+import composition_contract_checks
 import pytest
 
 from kiro_crew.apps import registry
 from kiro_crew.apps.manifest import AppManifest
-from kiro_crew.apps.registry_pipeline import (
-    caches,
-    catalog,
-    checkout,
-    git_targets,
-    indexes,
-    install,
-    install_clone,
-    install_desktop_gate,
-    install_rollback,
-    manifests,
-    recovery,
-    sources,
-    store_art,
-    subprocess_env,
-)
+from kiro_crew.apps.registry_pipeline import caches, sources, subprocess_env
 
 # One group per file, the shape every tree-scan file takes: the cases below parse
 # the facade's and every owner's source.
@@ -67,30 +53,21 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 _PIPELINE_DIR = _REPO_ROOT / "src/kiro_crew/apps/registry_pipeline"
 _PIPELINE_PACKAGE = "kiro_crew.apps.registry_pipeline"
 
-#: The owners in the facade's declared layer order, lowest first.
-PARTS: tuple[ModuleType, ...] = (
-    subprocess_env,
-    git_targets,
-    caches,
-    sources,
-    recovery,
-    checkout,
-    store_art,
-    indexes,
-    manifests,
-    catalog,
-    install_desktop_gate,
-    install_rollback,
-    install_clone,
-    install,
+#: The owners in the facade's declared layer order, lowest first. Read from the
+#: facade, so adding an owner needs no edit here; the package-membership check below
+#: still fails when an owner on disk is missing from that order.
+PARTS: tuple[ModuleType, ...] = tuple(
+    importlib.import_module(name) for name in registry._PART_MODULES
 )
 
 #: The registry's module-level surface: every name the one-module ``registry.py``
 #: bound, dunders excluded. A name leaves this list only when the symbol it names is
-#: deliberately deleted.
+#: deliberately deleted; a name added since needs no line here.
 FROZEN_NAMES: tuple[str, ...] = (
     "Any",
     "AppManifest",
+    "Awaitable",
+    "Callable",
     "DESKTOP_BUILD_STEP_UNSUPPORTED",
     "FIRST_PARTY_AUTHORS",
     "IPv6Address",
@@ -99,6 +76,7 @@ FROZEN_NAMES: tuple[str, ...] = (
     "Iterator",
     "Literal",
     "NATIVE_WINDOWS_HOOK_REFUSAL",
+    "NATIVE_WINDOWS_SHELL_REFUSAL",
     "Path",
     "PinnedPathRefusal",
     "PlatformCompositionError",
@@ -212,6 +190,7 @@ FROZEN_NAMES: tuple[str, ...] = (
     "_looks_like_git_url",
     "_manifest_cache_dir",
     "_manifest_cache_path",
+    "_manifest_shell_platform_refusal",
     "_manifest_source_coordinates",
     "_merge_manifest",
     "_move_checkout_aside",
@@ -291,6 +270,7 @@ FROZEN_NAMES: tuple[str, ...] = (
     "get_registry_app",
     "get_registry_app_by_repo",
     "get_server_platform",
+    "git_unavailable_refusal",
     "importlib",
     "install_app",
     "install_from_registry",
@@ -305,6 +285,7 @@ FROZEN_NAMES: tuple[str, ...] = (
     "list_catalog_apps",
     "list_installed_apps",
     "list_registry",
+    "loads_user_json",
     "logger",
     "logging",
     "minimal_env",
@@ -324,6 +305,7 @@ FROZEN_NAMES: tuple[str, ...] = (
     "runtime_provisions_requirements",
     "sandboxed_spawn_argv",
     "sandboxed_spawn_argv_async",
+    "sanitize_links",
     "scrub_env",
     "sel",
     "set_app_provenance",
@@ -434,15 +416,10 @@ def _source(module: ModuleType) -> str:
     return Path(module.__file__ or "").read_text(encoding="utf-8")
 
 
-# ---------------------------------------------------------------------------
 # The surface
-# ---------------------------------------------------------------------------
 
 
-class TestTheSurfaceSurvivesTheSplit:
-    def test_the_frozen_inventory_is_not_empty(self) -> None:
-        # An emptied list would make the case below pass while checking nothing.
-        assert len(FROZEN_NAMES) > 200
+class TestTheSurfaceSurvivesTheSplit(composition_contract_checks.TheFrozenInventoryIsNotEmpty):
 
     @pytest.mark.parametrize("name", FROZEN_NAMES)
     def test_every_name_the_module_bound_still_resolves_to_its_owners_object(
@@ -458,7 +435,8 @@ class TestTheSurfaceSurvivesTheSplit:
     def test_the_part_order_is_the_facades_and_covers_the_package(self) -> None:
         # The facade resolves a read from the first owner in this order that holds the
         # name, so an owner missing from it is one whose names the facade cannot reach.
-        assert registry._PART_MODULES == tuple(part.__name__ for part in PARTS)
+        assert PARTS, "the facade declares no owners"
+        assert len(set(registry._PART_MODULES)) == len(registry._PART_MODULES)
         on_disk = {path.stem for path in _PIPELINE_DIR.glob("*.py") if path.stem != "__init__"}
         assert on_disk == {part.__name__.rpartition(".")[2] for part in PARTS}
 
@@ -493,15 +471,23 @@ class TestTheSurfaceSurvivesTheSplit:
     def test_dir_lists_the_exported_names(self) -> None:
         assert set(FROZEN_NAMES) <= set(dir(registry))
 
-    def test_a_star_import_carries_exactly_the_public_names_of_the_inventory(
+    def test_a_star_import_carries_exactly_the_public_names_of_the_family(
         self, tmp_path: Path
     ) -> None:
         # ``__all__`` is derived, and a star import consults it and never the module
         # ``__getattr__``. The machinery binds only private names, so nothing it needs
         # leaks into a star importer's namespace and nothing public goes missing. The
-        # star import runs in a real module loaded from ``tmp_path``, the one place a
-        # star import is legal.
-        public = {name for name in FROZEN_NAMES if not name.startswith("_")}
+        # public names are read from the facade's and the owners' own namespaces, so a
+        # new public name needs no edit here, and every public name of the inventory is
+        # among them. The star import runs in a real module loaded from ``tmp_path``,
+        # the one place a star import is legal.
+        public = {
+            name
+            for module in (registry, *PARTS)
+            for name in vars(module)
+            if not name.startswith("_")
+        }
+        assert {name for name in FROZEN_NAMES if not name.startswith("_")} <= public
         assert set(registry.__all__) == public
         probe_path = tmp_path / "registry_star_probe.py"
         probe_path.write_text("from kiro_crew.apps.registry import *\n", encoding="utf-8")
@@ -539,9 +525,7 @@ class TestTheSurfaceSurvivesTheSplit:
             assert "KEBAB_RE" not in source, f"{part.__name__} gates index names itself"
 
 
-# ---------------------------------------------------------------------------
 # One symbol per name, and writes that reach every binding of it
-# ---------------------------------------------------------------------------
 
 #: An exported name several owners import: defined in ``git_targets``.
 _MULTI_HOLDER = "_strip_git_target_userinfo"
@@ -689,9 +673,7 @@ class TestOneNamespaceForWrites:
         assert registry.logger.name == registry.__name__ == "kiro_crew.apps.registry"
 
 
-# ---------------------------------------------------------------------------
 # A patch on the facade reaches the call site in whichever owner makes the call
-# ---------------------------------------------------------------------------
 
 
 class _SpawnRefused(OSError):
@@ -731,6 +713,7 @@ class TestAPatchOnTheFacadeReachesEveryCallSite:
             # catalog: a detectInstalled probe (its spawn failure reads as absent).
             probe = [{"name": "demo-app", "detectInstalled": "true"}]
             patched.setattr(registry, "app_execution_denied", lambda *a, **k: None)
+            patched.setattr(registry, "_manifest_shell_platform_refusal", lambda: None)
             assert await registry._detect_installed_probe(probe, {}) == set()
             # indexes: an external index fetch (its spawn failure reads as None).
             assert (
@@ -885,9 +868,7 @@ class TestAPatchOnTheFacadeReachesEveryCallSite:
         assert seen == ["fetched:acme", "cached"]
 
 
-# ---------------------------------------------------------------------------
 # Layering and placement
-# ---------------------------------------------------------------------------
 
 
 def _engine_imports(source: str) -> set[str]:
@@ -934,7 +915,7 @@ def _facade_reads(source: str) -> set[tuple[str, str]]:
     return found
 
 
-class TestLayering:
+class TestLayering(composition_contract_checks.TheFacadeHelperIsOnlyEverCalledInPlace):
     def test_the_import_reader_sees_every_spelling_of_an_engine_import(self) -> None:
         # A reader that saw only absolute module strings would pass an owner importing
         # the facade lazily or relatively, which is the violation it exists to catch.
@@ -979,24 +960,6 @@ class TestLayering:
             }
             assert registry.__name__ not in constants, f"{part.__name__} spells the facade"
 
-    def test_the_facade_helper_is_only_ever_called_in_place(self) -> None:
-        # An alias (``f = _facade``) or a stored module would hide a fourth call site
-        # from the reader above, so every reference to ``_facade`` in an owner is its
-        # import or the callee of a call.
-        for part in PARTS:
-            tree = ast.parse(_source(part))
-            callees = {
-                id(node.func)
-                for node in ast.walk(tree)
-                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-            }
-            stray = [
-                node.lineno
-                for node in ast.walk(tree)
-                if isinstance(node, ast.Name) and node.id == "_facade" and id(node) not in callees
-            ]
-            assert stray == [], f"{part.__name__} refers to _facade at lines {stray}"
-
     def test_the_call_site_reader_can_fail(self) -> None:
         assert _facade_reads("def f():\n    return _facade()._run_app_build(1)\n") == {
             ("f", "_run_app_build")
@@ -1020,9 +983,7 @@ class TestLayering:
         assert importlib.import_module(registry._PART_MODULES[0]) is subprocess_env
 
 
-# ---------------------------------------------------------------------------
 # The facade's own code, as a type checker and a patched importlib see it
-# ---------------------------------------------------------------------------
 
 
 def _bare_loads(source: str) -> list[tuple[int, str]]:
@@ -1168,9 +1129,7 @@ class TestTheFacadesOwnCode:
         assert built["error"] == "fake build"
 
 
-# ---------------------------------------------------------------------------
 # A reload of the facade re-executes the whole registry
-# ---------------------------------------------------------------------------
 
 _RELOAD_PROBE = """
 import importlib, json, sys

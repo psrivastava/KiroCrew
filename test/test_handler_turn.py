@@ -39,6 +39,7 @@ import pytest
 from source_corpus import repo_root
 
 from kiro_crew.slack import handler
+from kiro_crew.testing.synthetic_credentials import github_classic
 
 _FACADE_PATH = Path(handler.__file__).resolve()
 _RUNTIME_DIR = _FACADE_PATH.parent / "handler_runtime"
@@ -779,10 +780,12 @@ def _module_level_imports(tree: ast.Module) -> dict[str, int]:
 #: so they are the facade's surface, exported at the base. Frozen: a re-export added
 #: later is read by the facade or an owner, or it is dead, and this test says which.
 _SURFACE_ONLY_REEXPORTS = frozenset("""
-    _get_agent_for_session _review_drafts_get _review_drafts_pop adopt_default_agent
-    adopt_slack_config cancel_background_tasks enable_yolo_with_ttl get_orch_cfg
+    OUTCOME_REJECTED_TRANSPORT_FLOOR
+    _get_agent_for_session _review_drafts_get _review_drafts_pop adopt_dashboard_thread_agent
+    adopt_default_agent adopt_slack_config cancel_background_tasks enable_yolo_with_ttl get_orch_cfg
     handle_interaction is_open_channel is_slack_session_trusted is_tracked_channel
-    post_linked_approval refresh_phase_emojis resolve_linked_approval set_allowed_users
+    link_agent_mismatch post_linked_approval read_config_text read_link_record
+    refresh_phase_emojis resolve_linked_approval set_allowed_users
     set_dashboard_state set_open_channels set_orch_cfg set_owner_id set_tracking_channels
     set_yolo_mode
     """.split())
@@ -888,7 +891,7 @@ def test_the_slack_messages_sink_redacts_what_its_render_let_through(
     from conftest import MockSlackClient
     from kiro_crew.providers.base import LLMEvent
 
-    key = "AKIAIOSFODNN7EXAMPLE"
+    key = github_classic(seed=175)  # a token; a bare 40-character run stays visible
     monkeypatch.setattr(
         handler,
         "render_one_for_slack",
@@ -934,6 +937,7 @@ _OWNER_COROUTINES = (
     ("turn", "_replay_abandoned"),
     ("turn", "book_failure"),
     ("turn", "clear_working_indicators"),
+    ("turn", "fire_stop_hooks"),
     ("permission_ladder", "_screen_tool_call"),
     ("permission_ladder", "_answer_permission_request"),
     ("permission_ladder", "_reject_orphaned_tool"),

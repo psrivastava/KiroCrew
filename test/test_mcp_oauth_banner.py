@@ -23,10 +23,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from oauth_url_corpus import LEGIT_OAUTH_URLS
+from redaction_structured_cases import github_classic
 
 from kiro_crew import mcp_discovery
 from kiro_crew.connections import get_all_registry_providers, get_visible_providers
-from kiro_crew.dashboard import chat_runner
+from kiro_crew.dashboard import chat_runner, mcp_oauth_provenance
 from kiro_crew.dashboard.chat_runner import (
     _connections_managed_mcp_names,
     _drain_session_init_oauth_requests,
@@ -44,6 +45,8 @@ from kiro_crew.dashboard.chat_utils import (
 from kiro_crew.dashboard.state import _ChatSlot
 from kiro_crew.mcp_utils import mcp_server_alias
 from kiro_crew.security import oauth_url_contains_credential
+
+SECRET = github_classic(seed=145)
 
 # ── _is_safe_oauth_url ──
 
@@ -72,16 +75,30 @@ class TestIsSafeOAuthUrl:
 
 
 class TestRedactMetaForRole:
+    """The shape gates, on rows whose URL the child did send.
+
+    A URL no child sent is withheld before these gates run
+    (``test_mcp_oauth_provenance.py``); each row here is recorded first so the
+    scheme and credential gates are what is measured.
+    """
+
+    @staticmethod
+    def _emitted(meta: dict) -> dict:
+        mcp_oauth_provenance.record_emitted("live-child", meta["oauth_url"])
+        return {**meta, "child": "live-child"}
+
     def test_mcp_oauth_preserves_https_url(self):
         url = "https://mcp.linear.app/authorize?client_id=abc"
-        out = _redact_meta_for_role("mcp_oauth", {"server_name": "linear", "oauth_url": url})
+        out = _redact_meta_for_role(
+            "mcp_oauth", self._emitted({"server_name": "linear", "oauth_url": url})
+        )
         assert out["oauth_url"] == url
         assert out["server_name"] == "linear"
 
     def test_mcp_oauth_drops_unsafe_url(self):
         out = _redact_meta_for_role(
             "mcp_oauth",
-            {"server_name": "evil", "oauth_url": "javascript:alert(1)"},
+            self._emitted({"server_name": "evil", "oauth_url": "javascript:alert(1)"}),
         )
         # Unsafe scheme is replaced with empty string, not preserved as-is.
         assert out["oauth_url"] == ""
@@ -92,10 +109,12 @@ class TestRedactMetaForRole:
         Mirrors the live-emission gate in _emit_mcp_oauth_request."""
         out = _redact_meta_for_role(
             "mcp_oauth",
-            {
-                "server_name": "linear",
-                "oauth_url": "https://evil.com/auth?key=AKIAIOSFODNN7EXAMPLE",
-            },
+            self._emitted(
+                {
+                    "server_name": "linear",
+                    "oauth_url": "https://evil.com/auth?key=AKIAIOSFODNN7EXAMPLE",
+                }
+            ),
         )
         assert out["oauth_url"] == ""
 
@@ -104,15 +123,17 @@ class TestRedactMetaForRole:
         url = "https://mcp.example.com/authorize"
         out = _redact_meta_for_role(
             "mcp_oauth",
-            {
-                "server_name": "ex",
-                "oauth_url": url,
-                "error": "AKIAIOSFODNN7EXAMPLE leaked",
-            },
+            self._emitted(
+                {
+                    "server_name": "ex",
+                    "oauth_url": url,
+                    "error": f"{SECRET} leaked",
+                }
+            ),
         )
         assert out["oauth_url"] == url
-        # _redact_value is invoked for non-preserved fields, so AKIA pattern is scrubbed.
-        assert "AKIAIOSFODNN7EXAMPLE" not in out["error"]
+        # _redact_value is invoked for non-preserved fields, so the token is scrubbed.
+        assert SECRET not in out["error"]
 
     def test_other_role_uses_default_redaction(self):
         # An assistant-meta URL pointing at an exfil-eligible domain should
@@ -126,11 +147,14 @@ class TestRedactMetaForRole:
         # a special-case preserved field.
         assert "oauth_url" in out  # key still present, value may differ
 
-    def test_non_string_oauth_url_redacted_as_value(self):
-        # If a tampered history line stored a non-string for oauth_url, fall
-        # through to _redact_value so the carve-out can't be exploited.
-        out = _redact_meta_for_role("mcp_oauth", {"oauth_url": 123})
-        assert out["oauth_url"] == 123  # _redact_value passes through non-str/non-container
+    @pytest.mark.parametrize("value", [123, ["https://mcp.linear.app/authorize"]])
+    def test_non_string_oauth_url_is_withheld(self, value):
+        # A tampered history line that stored a non-string for oauth_url is no
+        # URL any child sent, so it never reaches a client (a list would be
+        # stringified into a link by some renderers).
+        out = _redact_meta_for_role("mcp_oauth", {"oauth_url": value, "child": "live-child"})
+        assert "oauth_url" not in out
+        assert out["expired"] is True
 
 
 # ── _emit_mcp_oauth_request ──
@@ -197,13 +221,8 @@ class TestEmitMcpOAuthRequest:
     def test_rejection_banner_names_the_operator_remedy(self):
         """A rejected URL must name ``oauth_endpoints.json``.
 
-        The endpoint allowlist means a legitimate consent URL at an unlisted
-        self-hosted IdP lands in this same branch, and its remedy — the
-        operator keystone extension — is agent-fenced with no dashboard
-        writer and is documented only in an internal spec. If the banner does
-        not name it, the failure is indistinguishable from unfixable: two
-        users independently root-caused this from source rather than
-        finding the one-line config fix.
+        A valid URL at an unlisted self-hosted IdP lands here too, and its fix (the
+        operator keystone extension) has no dashboard writer, so the banner must name it.
         """
         slot = _ChatSlot("s1")
         state = MagicMock()
@@ -459,16 +478,16 @@ class TestEmitMcpOAuthRequest:
         and the meta.server_name (used as the dedupe correlation key)."""
         slot = _ChatSlot("s1")
         state = MagicMock()
-        # AKIA pattern is on the credential-redaction list.
+        # A GitHub token is on the credential-redaction list.
         _emit_mcp_oauth_request(
             state,
             slot,
-            "evil-AKIAIOSFODNN7EXAMPLE",
+            f"evil-{SECRET}",
             "https://mcp.example.com/authorize",
         )
         m = slot.messages[0]
-        assert "AKIAIOSFODNN7EXAMPLE" not in m["content"]
-        assert "AKIAIOSFODNN7EXAMPLE" not in m["meta"]["server_name"]
+        assert SECRET not in m["content"]
+        assert SECRET not in m["meta"]["server_name"]
 
     def test_completed_path_redacts_error_string(self):
         """error string is also kiro-cli-controlled and lands in the live WS
@@ -481,13 +500,13 @@ class TestEmitMcpOAuthRequest:
             slot,
             "linear",
             success=False,
-            error="leaked AKIAIOSFODNN7EXAMPLE in error",
+            error=f"leaked {SECRET} in error",
         )
         m = slot.messages[0]
-        assert "AKIAIOSFODNN7EXAMPLE" not in (m["meta"].get("error") or "")
+        assert SECRET not in (m["meta"].get("error") or "")
         # The broadcast payload also went through redacted meta.
         payload = state.broadcast_ws.call_args[0][1]
-        assert "AKIAIOSFODNN7EXAMPLE" not in (payload["meta"].get("error") or "")
+        assert SECRET not in (payload["meta"].get("error") or "")
 
 
 # ── _mark_mcp_oauth_completed ──
@@ -601,10 +620,8 @@ class TestMarkMcpOAuthCompleted:
         """A superseded banner is terminal: a later success must patch the LIVE
         banner, never walk back into the retired one.
 
-        Without the `superseded` arm in the matcher's terminal test, the loop
-        walking backwards would still skip it (it stops at the first open
-        banner) — but a completion arriving when the newest banner is itself
-        retired would reopen history instead of no-oping.
+        The backward walk skips it anyway, but a completion when the newest banner is
+        itself retired would reopen it unless `superseded` counts as terminal.
         """
         slot = _ChatSlot("s1")
         _emit_mcp_oauth_request(MagicMock(), slot, "linear", "https://mcp.linear.app/one")
@@ -624,12 +641,8 @@ class TestMarkMcpOAuthCompleted:
 class TestSupersededOAuthBanners:
     """A newer authorize request kills the older flow's loopback listener.
 
-    kiro-cli mints the callback port and the PKCE verifier inside the flow it
-    announces, so a second announcement for the same server leaves the first
-    banner pointing at a port that cannot redeem anything. Left rendered
-    as a live "Authorize" button, it walks the user through a full provider
-    login and dead-ends on `http://127.0.0.1:<dead-port>/?code=…` — a page that
-    looks like success and consumes nothing.
+    kiro-cli mints the callback port and PKCE verifier per flow, so the first banner
+    would send the user through a full login to a dead `http://127.0.0.1:<port>/`.
     """
 
     def test_second_request_retires_the_first_banner(self):
@@ -652,21 +665,12 @@ class TestSupersededOAuthBanners:
     def test_a_different_server_does_not_retire_this_ones_live_banner(self):
         """Two servers whose names both redact to one sentinel are still two servers.
 
-        `server_name` is stored REDACTED, and `_redact_acp_string` maps every
-        credential-shaped name onto the same `[REDACTED: credential]` string. So
-        the stored name cannot tell these two servers apart, and retiring on it
-        would pop an `oauth_url` that is still live and still redeemable.
-
-        The resolution is to retire NOTHING once redaction has fired, rather than
-        to persist a digest of the raw name so the two can be told apart -- that
-        digest would be an unsalted, offline-testable verifier for a credential,
-        published to the same transcript and broadcast the redaction exists to
-        keep it out of. Declining to act is the same posture the rejected-URL
-        branches take, and it costs only a stale banner, which is what main does
-        anyway.
+        `_redact_acp_string` maps every credential-shaped name to one sentinel, so
+        retiring on the stored name could pop a live `oauth_url`. Nothing is retired
+        once redaction fired: a digest of the raw name would leak a credential verifier.
         """
-        name_a = "ghp_" + "A" * 36
-        name_b = "ghp_" + "B" * 36
+        name_a = github_classic(seed=146)
+        name_b = github_classic(seed=147)
         # Precondition: the redaction really does collapse both onto one value,
         # otherwise this test would pass for the wrong reason.
         assert chat_runner._redact_acp_string(name_a) == chat_runner._redact_acp_string(name_b)
@@ -698,7 +702,7 @@ class TestSupersededOAuthBanners:
         banner stays. Documented in the PR body and on the issue: narrow, confined
         to credential-shaped names, and no worse than main.
         """
-        name = "ghp_" + "C" * 36
+        name = github_classic(seed=148)
         slot = _ChatSlot("s1")
         _emit_mcp_oauth_request(MagicMock(), slot, name, "https://mcp.c.example/a?port=1")
         state = MagicMock()
@@ -711,11 +715,8 @@ class TestSupersededOAuthBanners:
     def test_a_server_name_with_a_lone_surrogate_does_not_crash_the_banner(self):
         """An ACP server name is untrusted text, and JSON can carry a lone surrogate.
 
-        `json.loads` accepts `"\\ud800"`, so `serverName` can reach us holding a
-        character that has no UTF-8 encoding. Nothing on this path may encode it:
-        an earlier revision hashed the raw name and a plain `.encode("utf-8")`
-        raised `UnicodeEncodeError`, taking the whole OAuth event handler down so
-        the user got no banner at all for a server whose only sin is a bad name.
+        `json.loads` accepts `"\\ud800"`, so nothing on this path may encode the name:
+        a `UnicodeEncodeError` would take the whole OAuth event handler down.
         """
         name = json.loads('"bad\\ud800name"')
         slot = _ChatSlot("s1")
@@ -760,11 +761,8 @@ class TestSupersededOAuthBanners:
     def test_broadcast_blanks_the_url_even_though_persisted_meta_omits_it(self):
         """The client MERGES an incoming meta over the row's existing one.
 
-        Omitting `oauth_url` would leave the live URL on the client row, so a tab
-        still running pre-upgrade JS -- which does not know `superseded` -- would
-        keep rendering the dead link. An empty string fails that client's own
-        safe-URL check, so the banner withdraws. The PERSISTED meta still omits
-        the key entirely.
+        So the broadcast sends `oauth_url` as "": a tab on older JS that does not know
+        `superseded` then fails its safe-URL check. The PERSISTED meta omits the key.
         """
         slot = _ChatSlot("s1")
         _emit_mcp_oauth_request(MagicMock(), slot, "miro", "https://mcp.miro.com/a")
@@ -849,17 +847,10 @@ class TestSupersededOAuthBanners:
     def test_colliding_timestamps_still_retire_every_banner(self):
         """`ts` is not a row identity, so retirement must not resolve rows by it.
 
-        `_ChatSlot.append` preserves an explicitly supplied `ts` verbatim -- a row
-        replayed from a channel transcript keeps its own -- and its docstring notes
-        a coarse OS clock stamps two same-tick rows identically, which is why every
-        row also carries a random id. A ts-keyed patch resolves the FIRST match, so
-        on a collision it would rewrite one row twice and leave the second banner
-        open, still offering the dead link this function exists to withdraw.
-
-        Two replayed banners sharing a `ts` is the reachable shape, so they are
-        appended directly here: going through `_emit_mcp_oauth_request` twice would
-        have the second call retire the first, leaving only one row open and never
-        exercising the collision at all.
+        Replayed rows keep their own `ts` and a coarse clock can repeat it; a ts-keyed
+        patch would rewrite the first match twice and leave the second banner open.
+        Rows are appended directly: two `_emit_mcp_oauth_request` calls would retire
+        the first and never hit the collision.
         """
         slot = _ChatSlot("s1")
         collided = "2026-09-01T00:00:00.000000+00:00"
@@ -910,13 +901,9 @@ class TestSupersededOAuthBanners:
 class TestExpiredByDeadChild:
     """A banner outlives the process whose listener made its URL redeemable.
 
-    The entity whose death invalidates the Authorize link is the ACP child that
-    minted it: that process holds the loopback callback listener and the PKCE
-    verifier. Every way it can die is silent to the banner — a gateway restart,
-    a session reset, the idle sweep, the RSS recycle, or the child exiting on
-    its own — so no write-time site can enumerate them. The read-time gate
-    compares the process-instance identity stamped at mint against the child
-    CURRENTLY serving the slot, resolved by the caller of `_prepare_messages`.
+    The ACP child that minted the link holds its listener, and its death is silent
+    to the banner. So the read-time gate compares the instance identity stamped at
+    mint with the child serving the slot now, resolved by `_prepare_messages`'s caller.
     """
 
     def _slot_with_banner(self, minted_by="child-a"):
@@ -1074,12 +1061,9 @@ class TestExpiredByDeadChild:
 class TestLiveChildInstance:
     """`_live_child_instance` is the caller-side half of the read-time gate.
 
-    `_prepare_messages` is synchronous, may run in a worker thread, and has no
-    ACP access, so its three async callers resolve the live child's identity on
-    the event loop — where the session pool is in scope — and pass the verdict
-    in. `""` is the one answer for every no-live-child case, which is exactly
-    what makes the idle sweep and the RSS recycle covered without either path
-    knowing banners exist: both end in the session being popped from the pool.
+    `_prepare_messages` is sync with no ACP access, so its async callers resolve the
+    child on the event loop. `""` answers every no-live-child case, which covers the
+    idle sweep and RSS recycle: both pop the session from the pool.
     """
 
     def _state_with_provider(self, provider):
@@ -1143,12 +1127,9 @@ class TestLiveChildInstance:
 class TestBroadcastExpiredOauthBanners:
     """The freshness push for already-open tabs.
 
-    The read-time gate runs only when a client fetches, so a tab left open
-    across a teardown keeps rendering the dead Authorize link it already has.
-    `_broadcast_expired_oauth_banners` closes that window at the teardowns the
-    dashboard can see. It is verdict-driven — it re-resolves the live child and
-    applies the read gate's own predicate — so callers invoke it
-    unconditionally: no pre-teardown snapshot, no outcome gating.
+    The read gate runs only on fetch, so an open tab keeps its dead link.
+    `_broadcast_expired_oauth_banners` re-resolves the live child and applies the read
+    gate's predicate, so callers invoke it unconditionally.
     """
 
     def _state(self, provider):
@@ -1262,11 +1243,8 @@ class TestBroadcastExpiredOauthBanners:
 class TestProcessInstanceContract:
     """The identity the banner stamp and the read gate both stand on.
 
-    A token names ONE spawn of a child process: minted with the process,
-    masked the moment the process object is gone. The property must never
-    answer with a previous spawn's token — that equality is exactly the
-    fail-open the design removes (a resumed session id surviving onto a new
-    process).
+    A token names ONE spawn and is masked once the process object is gone. A previous
+    spawn's token must never match: that is the resumed-session fail-open.
     """
 
     def _bare_client(self):
@@ -1463,10 +1441,8 @@ class TestBannerGateIsCanonicalSecurityPredicate:
     """The banner's credential gate must be security.oauth_url_contains_credential
     itself — never a dashboard-local copy that can drift from the tested one.
 
-    A pure delegating wrapper is behaviourally indistinguishable from a direct
-    call, so these tests pin the *structure* instead: the local symbol must not
-    exist, the name chat_runner calls must be the canonical function object, and
-    the emit path must consult exactly that binding.
+    A delegating wrapper behaves the same as a direct call, so these tests pin the
+    structure: no local symbol, and the emit path uses the canonical function object.
     """
 
     def test_no_local_copy_of_the_gate_exists(self):

@@ -52,9 +52,9 @@ test.describe('Projects (Task Runner) Page', () => {
     await expect(page.getByText('Task Runner').first()).toBeVisible({ timeout: 10000 })
 
     // Three mode tabs are visible as buttons
-    await expect(page.getByRole('button', { name: /Compose/i })).toBeVisible()
-    await expect(page.getByRole('button', { name: /From Spec/i })).toBeVisible()
-    await expect(page.getByRole('button', { name: /From YAML/i })).toBeVisible()
+    await expect(page.getByRole('radio', { name: /Compose/i })).toBeVisible()
+    await expect(page.getByRole('radio', { name: /From Spec/i })).toBeVisible()
+    await expect(page.getByRole('radio', { name: /From YAML/i })).toBeVisible()
   })
 
   test('compose tab (default) has textarea and action buttons', async ({ page }) => {
@@ -75,7 +75,7 @@ test.describe('Projects (Task Runner) Page', () => {
     await expect(page.getByText('Task Runner').first()).toBeVisible({ timeout: 10000 })
 
     // Switch to From Spec tab
-    await page.getByRole('button', { name: /From Spec/i }).click()
+    await page.getByRole('radio', { name: /From Spec/i }).click()
 
     // The spec textarea appears with its placeholder as aria-label
     const textarea = page.getByRole('textbox', { name: /Paste spec content/i })
@@ -95,7 +95,7 @@ test.describe('Projects (Task Runner) Page', () => {
     await expect(page.getByText('Task Runner').first()).toBeVisible({ timeout: 10000 })
 
     // Switch to From YAML tab
-    await page.getByRole('button', { name: /From YAML/i }).click()
+    await page.getByRole('radio', { name: /From YAML/i }).click()
 
     // YAML textarea with its placeholder
     const textarea = page.getByRole('textbox', { name: /Paste YAML workflow/i })
@@ -163,8 +163,8 @@ test.describe('Projects (Task Runner) Page', () => {
       await expect(headerName).toBeVisible({ timeout: 5000 })
       await expect(headerName).toHaveText(taskName)
 
-      // Status badge shows "planned" (use exact: true to avoid sidebar substring match)
-      await expect(page.getByText('planned', { exact: true })).toBeVisible()
+      // Status badge shows the "Planned" label (exact: true to avoid the sidebar row's substring match)
+      await expect(page.getByText('Planned', { exact: true })).toBeVisible()
 
       // Execute button is present for planned runs
       await expect(page.getByRole('button', { name: /Execute/i })).toBeVisible()

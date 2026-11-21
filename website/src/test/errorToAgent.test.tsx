@@ -26,13 +26,16 @@ import {
 import { mergeIntoDraft } from '../utils/chatDrafts'
 import { buildErrorPrompt } from '../utils/errorReport.prompt'
 import {
+  APP_POPOUT_STORAGE_OWNED_KEY,
   ERROR_HANDOFF_KEY,
   MAX_DETAIL,
   MAX_JOURNAL,
   MAX_MESSAGE,
   consumeChatHandoff,
+  dropInheritedChatHandoffs,
   findReport,
   handoffToChat,
+  installHardExit,
   installSoftNavigate,
   isGatewayConnected,
   parseErrorCode,
@@ -50,6 +53,7 @@ import {
   __resetNavSeamForTests,
 } from '../utils/errorReport'
 
+const ERROR_HANDOFF_CLAIMED_KEY = 'kirocrew_error_handoff_claimed'
 const navigated: string[] = []
 
 function GuardedErrorNotice({ allow }: { allow: boolean }) {
@@ -437,6 +441,101 @@ describe('chat hand-off channel', () => {
     expect(consumeChatHandoff()).toBeNull()
   })
 
+  it('drops hand-offs copied into the first document of an app pop-out', () => {
+    const originalUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`
+    window.history.replaceState(null, '', '/popout/app/dev-fleet')
+    try {
+      // Staged the way main stages it, so the entry carries the real stamp.
+      expect(handoffToChat('main ingress')).toBe(true)
+      sessionStorage.setItem(ERROR_HANDOFF_CLAIMED_KEY, JSON.stringify([{ prompt: 'main claimed' }]))
+
+      dropInheritedChatHandoffs()
+
+      expect(sessionStorage.getItem(ERROR_HANDOFF_KEY)).toBeNull()
+      expect(sessionStorage.getItem(ERROR_HANDOFF_CLAIMED_KEY)).toBeNull()
+      expect(sessionStorage.getItem(APP_POPOUT_STORAGE_OWNED_KEY)).toBe('1')
+      recoverClaimedChatHandoffs()
+      expect(consumeChatHandoff()).toBeNull()
+    } finally {
+      window.history.replaceState(null, '', originalUrl)
+    }
+  })
+
+  it('keeps and recovers an app pop-out reload’s own claimed hand-off', () => {
+    const originalUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`
+    window.history.replaceState(null, '', '/popout/app/dev-fleet')
+    try {
+      sessionStorage.setItem(APP_POPOUT_STORAGE_OWNED_KEY, '1')
+      sessionStorage.setItem(ERROR_HANDOFF_CLAIMED_KEY, JSON.stringify([{ prompt: 'pop-out claimed' }]))
+
+      dropInheritedChatHandoffs()
+
+      expect(sessionStorage.getItem(ERROR_HANDOFF_CLAIMED_KEY)).toContain('pop-out claimed')
+      recoverClaimedChatHandoffs()
+      expect(consumeChatHandoff()).toBe('pop-out claimed')
+      expect(consumeChatHandoff()).toBeNull()
+    } finally {
+      window.history.replaceState(null, '', originalUrl)
+    }
+  })
+
+  it('leaves main-window hand-offs untouched and writes no app pop-out marker', () => {
+    const originalUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`
+    window.history.replaceState(null, '', '/chat')
+    const claimed = JSON.stringify([{ prompt: 'main claimed' }])
+    try {
+      expect(handoffToChat('main ingress')).toBe(true)
+      const queued = sessionStorage.getItem(ERROR_HANDOFF_KEY)
+      expect(queued).toContain('main ingress')
+      sessionStorage.setItem(ERROR_HANDOFF_CLAIMED_KEY, claimed)
+
+      dropInheritedChatHandoffs()
+
+      expect(sessionStorage.getItem(ERROR_HANDOFF_KEY)).toBe(queued)
+      expect(sessionStorage.getItem(ERROR_HANDOFF_CLAIMED_KEY)).toBe(claimed)
+      expect(sessionStorage.getItem(APP_POPOUT_STORAGE_OWNED_KEY)).toBeNull()
+    } finally {
+      window.history.replaceState(null, '', originalUrl)
+    }
+  })
+
+  it('clears a stale marker when a former pop-out tab loads the dashboard', () => {
+    const originalUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`
+    try {
+      // The tab was an app pop-out, then Return loaded the dashboard in place.
+      sessionStorage.setItem(APP_POPOUT_STORAGE_OWNED_KEY, '1')
+      window.history.replaceState(null, '', '/chat')
+      dropInheritedChatHandoffs()
+      expect(sessionStorage.getItem(APP_POPOUT_STORAGE_OWNED_KEY)).toBeNull()
+
+      // Its next pop-out inherits main's pending diagnostic and must drop it.
+      sessionStorage.setItem(ERROR_HANDOFF_CLAIMED_KEY, JSON.stringify([{ prompt: 'main claimed' }]))
+      window.history.replaceState(null, '', '/popout/app/file-explorer')
+      dropInheritedChatHandoffs()
+      expect(sessionStorage.getItem(ERROR_HANDOFF_CLAIMED_KEY)).toBeNull()
+      recoverClaimedChatHandoffs()
+      expect(consumeChatHandoff()).toBeNull()
+    } finally {
+      window.history.replaceState(null, '', originalUrl)
+    }
+  })
+
+  it('drops an inherited claim before module-load recovery can promote it', async () => {
+    const originalUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`
+    window.history.replaceState(null, '', '/popout/app/dev-fleet')
+    try {
+      sessionStorage.setItem(ERROR_HANDOFF_CLAIMED_KEY, JSON.stringify([{ prompt: 'main claimed' }]))
+      vi.resetModules()
+
+      const loaded = await import('../utils/errorReport')
+
+      expect(loaded.consumeChatHandoff()).toBeNull()
+      expect(sessionStorage.getItem(loaded.APP_POPOUT_STORAGE_OWNED_KEY)).toBe('1')
+    } finally {
+      window.history.replaceState(null, '', originalUrl)
+    }
+  })
+
   it('drops a stale hand-off instead of ambushing a later visit', () => {
     sessionStorage.setItem(ERROR_HANDOFF_KEY, JSON.stringify({ prompt: 'old', ts: Date.now() - 600_000 }))
     expect(consumeChatHandoff()).toBeNull()
@@ -498,6 +597,76 @@ describe('chat hand-off channel', () => {
     const assign = vi.fn()
     vi.spyOn(window.location, 'assign').mockImplementation(assign)
     sendErrorToChat('please fix')
+    expect(assign).toHaveBeenCalledWith('/chat')
+  })
+})
+
+describe('hard-exit seam', () => {
+  // A window that must never load the dashboard itself (the app pop-out)
+  // installs where a hard exit goes instead of `location.assign`.
+  it('a hard hand-off stages the prompt, then calls the installed sink instead of loading a page', () => {
+    const assign = vi.fn()
+    vi.spyOn(window.location, 'assign').mockImplementation(assign)
+    // The sink sees the prompt already staged: it is what drains the queue.
+    const drained: (string | null)[] = []
+    const sink = vi.fn(() => { drained.push(consumeChatHandoff()) })
+    installHardExit(sink)
+    expect(sendErrorToChat('p', { hard: true })).toBe(true)
+    expect(sink).toHaveBeenCalledTimes(1)
+    expect(drained).toEqual(['p'])
+    expect(assign).not.toHaveBeenCalled()
+    expect(navigated).toEqual([])
+  })
+
+  it('a hard hand-off with no navigator installed at all still goes to the sink', () => {
+    __resetNavSeamForTests()
+    const assign = vi.fn()
+    vi.spyOn(window.location, 'assign').mockImplementation(assign)
+    const sink = vi.fn()
+    installHardExit(sink)
+    expect(sendErrorToChat('p', { hard: true })).toBe(true)
+    expect(sink).toHaveBeenCalledTimes(1)
+    expect(sessionStorage.getItem(ERROR_HANDOFF_KEY)).toContain('"prompt":"p"')
+    expect(assign).not.toHaveBeenCalled()
+  })
+
+  it('does not call the sink when staging fails, and reports the hand-off as not made', () => {
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new DOMException('full', 'QuotaExceededError')
+    })
+    const sink = vi.fn()
+    installHardExit(sink)
+    expect(sendErrorToChat('p', { hard: true })).toBe(false)
+    expect(sink).not.toHaveBeenCalled()
+  })
+
+  it('a soft hand-off keeps the soft navigator; the sink is only for hard exits', () => {
+    const sink = vi.fn()
+    installHardExit(sink)
+    expect(sendErrorToChat('p')).toBe(true)
+    expect(navigated).toEqual(['/chat'])
+    expect(sink).not.toHaveBeenCalled()
+  })
+
+  it('installHardExit(null) restores the full-load path', () => {
+    const assign = vi.fn()
+    vi.spyOn(window.location, 'assign').mockImplementation(assign)
+    const sink = vi.fn()
+    installHardExit(sink)
+    installHardExit(null)
+    expect(sendErrorToChat('p', { hard: true })).toBe(true)
+    expect(sink).not.toHaveBeenCalled()
+    expect(assign).toHaveBeenCalledWith('/chat')
+  })
+
+  it('__resetNavSeamForTests clears the sink', () => {
+    const assign = vi.fn()
+    vi.spyOn(window.location, 'assign').mockImplementation(assign)
+    const sink = vi.fn()
+    installHardExit(sink)
+    __resetNavSeamForTests()
+    sendErrorToChat('p', { hard: true })
+    expect(sink).not.toHaveBeenCalled()
     expect(assign).toHaveBeenCalledWith('/chat')
   })
 })
@@ -608,16 +777,15 @@ describe('ErrorNotice', () => {
     expect(screen.getByRole('button', { name: 'Dismiss' })).toHaveAttribute('title', 'Dismiss')
   })
 
-  it('is always the alert in the danger tone: there is no muted or status register for an error', () => {
-    // `errors-use-error-notice`: a failure toned down to a polite status is
-    // still a failure. Whatever a caller passes, the notice renders as
-    // `role="alert"` in the danger tone; a caller that does not want it seen
-    // does not render it.
+  it('without an impact is the alert in the danger tone: a missing prop never quiets a failure', () => {
+    // `errors-use-error-notice`: a calmer look goes through `impact` only. A
+    // caller that passes none gets the loud default, `role="alert"` in the
+    // danger tone, so forgetting the prop never hides a real failure.
     for (const variant of ['block', 'inline'] as const) {
       const { unmount } = render(<ErrorNotice message="disk is full" askAgent onDismiss={() => {}} variant={variant} />)
       expect(screen.queryByRole('status')).not.toBeInTheDocument()
       const alert = screen.getByRole('alert')
-      expect(alert.className).toContain('text-danger')
+      expect(alert.className).toMatch(variant === 'block' ? /\bbg-danger-subtle\b/ : /\btext-danger-ink\b/)
       expect(alert.className).not.toContain('text-muted')
       expect(alert).not.toHaveAttribute('data-tone')
       unmount()
@@ -749,18 +917,13 @@ describe('ErrorNotice', () => {
     expect(labelled).toHaveAttribute('aria-label', 'Dismiss notice and re-enable Install')
     expect(labelled).toHaveAttribute('title', 'Dismiss notice and re-enable Install')
     expect(screen.queryByRole('button', { name: /^dismiss$/i })).not.toBeInTheDocument()
-    // A labelled control is wide, and shares the row with the message and the
-    // agent hand-off: at 320px the three cannot stand side by side, so the row
-    // wraps and the label takes a full-width line of its own below the message
-    // (rejoining the row at `md`) -- one node for the action at every width.
-    const alert = screen.getByRole('alert')
-    expect(alert.className).toContain('flex-wrap')
-    expect(alert.className).toContain('md:flex-nowrap')
+    // A labelled control is wide, so it ends the action row, after the
+    // hand-off, instead of squeezing the message -- one node at every width.
     const line = labelled.parentElement!
-    expect(line.className).toContain('basis-full')
-    expect(line.className).toContain('md:basis-auto')
-    expect(line.className).toContain('justify-end')
-    expect(alert.lastElementChild).toBe(line)  // below the message and the hand-off
+    const row = line.parentElement!
+    expect(row).toHaveAttribute('data-notice-actions')
+    expect(line.className).toContain('ml-auto')
+    expect(row.lastElementChild).toBe(line)
     expect(screen.getAllByRole('button', { name: 'Dismiss notice and re-enable Install' })).toHaveLength(1)
     await userEvent.click(labelled)
     expect(onDismiss).toHaveBeenCalledOnce()

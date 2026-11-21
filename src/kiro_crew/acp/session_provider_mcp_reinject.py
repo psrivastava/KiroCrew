@@ -27,7 +27,8 @@ the eviction -- is ``acp/runtime_session_registry.py``.
 
 Instance fields written: ``_handle``, ``_mcp_reinject_pending``.
 
-Instance fields read: ``_channel_id``, ``_handle``, ``_runtime``, ``_session_key``.
+Instance fields read: ``_channel_id``, ``_handle``, ``_runtime``, ``_session_key``,
+``kas_memory_mode``.
 """
 
 from __future__ import annotations
@@ -71,7 +72,21 @@ def mark_mcp_config_changed(self: AcpSessionProvider) -> None:
         # left set here would make the first turn on it attempt a verb the host
         # was never measured to take.
         return
+    if _mcp_independent(self):
+        return
     self._mcp_reinject_pending = True
+
+
+def _mcp_independent(self: AcpSessionProvider) -> bool:
+    """Whether a local MCP config change has nothing to change in this session.
+
+    A Kiro Cloud session (``AcpRuntime.set_cloud_sandbox``) sends no MCP
+    servers, so the writer's change is already applied to it: there is no
+    projection to re-send. Re-loading it anyway would also run outside the
+    cloud start's ``hold_cloud_resume``, and the approvals KAS replays on that
+    load would be rejected as unroutable instead of reaching the user's card.
+    """
+    return self._runtime.is_cloud_sandbox is True
 
 
 async def apply_pending_mcp_reinjection(self: AcpSessionProvider) -> None:
@@ -108,6 +123,11 @@ async def apply_pending_mcp_reinjection(self: AcpSessionProvider) -> None:
     """
     if not getattr(self, "_mcp_reinject_pending", False):
         return
+    if _mcp_independent(self):
+        # Nothing to re-send (see ``_mcp_independent``); a mark that reached it
+        # some other way is dropped rather than turned into a reload.
+        self._mcp_reinject_pending = False
+        return
     old = self._handle
     sid = old.session_id
     runtime = self._runtime
@@ -133,8 +153,12 @@ async def apply_pending_mcp_reinjection(self: AcpSessionProvider) -> None:
         "session %s: MCP config changed; re-sending its projection before this turn",
         sid,
     )
+    # The reload keeps the batch kind the session was projected for.
+    from kiro_crew.agent_sdk.kas_project_hooks import person_turn_claim
+
+    person = getattr(old, "kas_folder_hooks_projected", False) is True
     try:
-        with runtime.keep_record_on_teardown(sid):
+        with runtime.keep_record_on_teardown(sid), person_turn_claim(person):
             await runtime.evict_session(sid)
             new_handle = await runtime.load_session(
                 "",
@@ -145,6 +169,8 @@ async def apply_pending_mcp_reinjection(self: AcpSessionProvider) -> None:
                 member_session_key=member_session_key,
                 session_key=self._session_key,
                 channel_id=self._channel_id or "",
+                kas_memory_mode=self.kas_memory_mode,
+                harness_options=self._harness_options,
             )
     except BaseException as exc:
         # Restored on EVERY exit that is not a loaded session, a cancel included,
@@ -168,11 +194,32 @@ async def apply_pending_mcp_reinjection(self: AcpSessionProvider) -> None:
     # wire travel with the swap.
     new_handle.keep_transcript = old.keep_transcript
     new_handle.memory_mode = old.memory_mode
+    # A task-runner or workflow session's delete delay (``released_sessions``): a new
+    # handle defaults to 0, which would delete the record at once when it ends.
+    new_handle.delete_delay_secs = getattr(old, "delete_delay_secs", 0.0)
     # Set by this turn's admission on the OLD handle before the apply ran; a new
     # handle defaults to the fail-closed False, which would auto-reject a routed
     # child permission request the dashboard can present.
     new_handle.child_fidelity_aware = old.child_fidelity_aware
+    # The keepalive route's mark: the registry holds this provider, not the handle.
+    new_handle.keepalive_routed = getattr(old, "keepalive_routed", False) is True
+    # The load restores the session's model; the mark that it was inherited, not
+    # pinned, travels with it so a later fresh conversation re-applies it. One the
+    # load itself re-applied (``ensure_served_default``) stands when the old had none.
+    new_handle.inherited_model = getattr(old, "inherited_model", "") or getattr(
+        new_handle, "inherited_model", ""
+    )
+    # Accumulated, not replaced: the old handle's KAS launch snapshots are this
+    # session's too, and only this provider's shutdown removes them.
+    new_handle.kas_launch_snapshots = [
+        *getattr(old, "kas_launch_snapshots", []),
+        *getattr(new_handle, "kas_launch_snapshots", []),
+    ]
     self._handle = new_handle
+    self._rewatch_agent_turns()
+    # Whoever follows this session's MCP report follows the reloaded one, and is
+    # told at once: the server set it describes has changed.
+    old.mcp_session_report().hand_over(new_handle.mcp_session_report())
     # The load relaunched this session's stubs with a fresh token nothing has
     # named yet; claim it against the session this provider serves.
     try:

@@ -23,12 +23,9 @@ if TYPE_CHECKING:
 
 
 #: How recent a loop-stall dump stays a CURRENT issue whatever restarted after it.
-#: File ordering alone cannot answer that question on the shipped `Restart=always`
-#: unit (docs/guides/assets/kirocrew.service): the supervisor restarts a wedged
-#: gateway within seconds, and the replacement's pre-created dump file supersedes
-#: the stall almost immediately -- so a gateway wedging hourly would report every
-#: stall as a past incident. Within a day a stall is still the operator's news,
-#: restarts notwithstanding.
+#: File ordering cannot decide it under the shipped `Restart=always` unit
+#: (docs/guides/assets/kirocrew.service): the replacement's dump file supersedes the
+#: stall within seconds, so an hourly wedge would always read as a past incident.
 _STALL_CURRENT_SECS = 24 * 3600
 
 #: Ceiling on the loopback read of the running gateway's controller snapshot,
@@ -42,27 +39,13 @@ _LOOPBACK_HOST = "127.0.0.1"
 
 
 # ── cron job health ───────────────────────────────────────────────────────────
-# The dashboard already surfaces a failing job per-row (an `err` badge on
-# `last_status === 'error'`, with `last_error` on hover), and the gateway
-# re-alerts on a still-failing job hourly. Both of those run INSIDE the
-# gateway, so neither can speak when the gateway is the thing that is wedged.
-# Doctor is a separate process the user runs by hand, which is why the scan
-# reads `crons.json` off disk rather than asking the gateway's HTTP API: a check
-# whose purpose is to survive a down gateway must not depend on one.
-#
-# It also covers a gap the dashboard has by construction: the status badge is
-# rendered under an `enabled` guard, so a job that auto-paused shows only
-# "paused" and its error state is not displayed at all.
-#
-# The scan itself lives in `cron.unhealthy_jobs_from_disk` so the pause-state
-# predicates keep their single owner (`_record_user_paused` / `_record_is_enabled`
-# in `cron_service/store.py`); this module owns only the presentation.
-#
-# Read-only, like the rest of doctor: an auto-paused job has failed
-# `_AUTO_PAUSE_THRESHOLD` times in a row and is usually paused for a good
-# reason, so silently resuming it during a diagnostic would hide the very
-# problem the user ran doctor to find. The remediation is a `Fix:` hint naming
-# a cron verb that already exists.
+# The dashboard badge and the hourly re-alert both run inside the gateway, so the
+# scan reads `crons.json` off disk to survive a wedged gateway. It also shows the
+# error of an auto-paused job, which the dashboard hides behind its `enabled` guard.
+# The scan lives in `cron.unhealthy_jobs_from_disk` so the pause-state predicates
+# keep one owner (`cron_service/store.py`). Read-only: an auto-paused job failed
+# `_AUTO_PAUSE_THRESHOLD` times in a row, so resuming it here would hide the problem;
+# the remedy is a `Fix:` hint naming an existing cron verb.
 _CRON_REPORT_CAP = 5
 
 #: How long past its ``next_run_at`` an unleased, non-terminal task row must be
@@ -225,14 +208,10 @@ def _report_stranded_rows(rows: list[Any], now: float, issues: list[str]) -> Non
 def _doctor_ledger_backlog() -> None:
     """Count the ledgers ``kirocrew ledger-sweep`` would list, and name that command.
 
-    Advisory and read-only, so it takes no ``issues`` list: an old finished ledger
-    is housekeeping, not a broken install, and an entry there would fail the
-    doctor run. It runs the sweep's own :func:`ledger_sweep.scan` at the module's
-    default window, so the count includes every entry the dry run lists: finished
-    stores plus unreadable, linked or unaddressable stores listed for a human.
-    It never purges. Per-ledger detail stays in the dry run. A ledger root that
-    exists but cannot be read makes ``scan`` raise ``OSError``; that becomes one
-    "could not check" row so the rest of the report still runs.
+    Advisory, so it takes no ``issues`` list: an old finished ledger is
+    housekeeping, not a broken install. It runs :func:`ledger_sweep.scan` at the
+    default window, so the count matches the dry run, and never purges. An
+    unreadable ledger root (``OSError``) becomes one "could not check" row.
     """
     from kiro_crew import ledger_sweep
     from kiro_crew.terminal_safe import safe_terminal_line
@@ -441,8 +420,10 @@ def _liveness_platform_line() -> str:
         )
     if sys.platform.startswith("win"):
         return (
-            "windows — no process-tree backend; shell and MCP tool calls read "
-            "UNKNOWN platform_limited and are bounded by the no-progress budget"
+            "windows Toolhelp — shell-tool CPU movement proves life only; "
+            "command exit, STUCK_INPUT and socket evidence absent (a flat shell "
+            "tree, an unreadable tree and every MCP tool call read UNKNOWN "
+            "platform_limited and are bounded by the no-progress budget)"
         )
     return f"{sys.platform} — no process-tree backend; UNKNOWN platform_limited"
 
@@ -528,7 +509,8 @@ def _doctor_cron_health(issues: list[str]) -> None:
 
 def _doctor_crash_dumps(issues: list[str]) -> None:
     """Render the ``Loop-stall Crash Dumps`` section: the newest dump with stacks,
-    where the loop wedged, and who it was working for."""
+    where the loop wedged, who it was working for, and the gateways that died
+    with neither stacks nor a clean shutdown."""
     print("\nLoop-stall Crash Dumps")
     try:
         dumps_dir = cli_doctor.get_dumps_dir()
@@ -536,23 +518,16 @@ def _doctor_crash_dumps(issues: list[str]) -> None:
         if _latest is not None:
             _age_s = cli_doctor.dump_age_seconds(_latest)
             # Every gateway start pre-creates its own dump file, so a dump WITH
-            # stacks that a later local session's header file sits after was
-            # written by a session another one has already replaced without
-            # wedging. That is a past incident: counting it as something to fix
-            # makes `doctor` report a fault for a week after one stall, on a
-            # gateway that has been healthy the whole time — and the real
-            # finding in that run gets read as one more line of the same noise.
+            # stacks followed by a later session's header file came from a
+            # session since replaced without wedging: a past stall. Counting it
+            # would make `doctor` report a fault for a week after one stall and
+            # bury the real finding in noise.
             #
-            # Ordering alone is not enough to conclude it, though. Under the
-            # shipped `Restart=always` unit a wedged gateway is replaced within
-            # seconds, so the successor supersedes the stall almost at once and
-            # a gateway wedging hourly would downgrade every stall forever —
-            # under-reporting exactly the chronic case an operator needs. Two
-            # further terms keep that case visible: a stall inside
-            # `_STALL_CURRENT_SECS` is still current news whatever restarted
-            # since, and two or more stalls on record is a gateway wedging
-            # repeatedly, which no amount of successful restarting makes
-            # historical.
+            # Ordering alone is not enough. Under the shipped `Restart=always`
+            # unit a wedged gateway is replaced in seconds, so an hourly wedge
+            # would always look past. Two terms keep that chronic case visible:
+            # a stall inside `_STALL_CURRENT_SECS` is still current, and two or
+            # more stalls on record mean a gateway that keeps wedging.
             #
             # The stacks are printed either way, because they are what anyone
             # investigating that stall needs; only the issue verdict changes.
@@ -564,8 +539,17 @@ def _doctor_crash_dumps(issues: list[str]) -> None:
             )
             if _age_s < 7 * 86400:  # Less than 7 days old
                 _age_h = _age_s / 3600
-                _icon = "ℹ️ " if _superseded else "⚠️ "
-                print(f"  last dump:   {_icon} {_latest.name} ({_age_h:.1f}h ago)")
+                # The name is when that gateway STARTED (the file is opened at
+                # startup); when the alarm fired is the file's last write.
+                _attribution = cli_doctor.attribute_dump(_latest, cli_doctor.config_dir())
+                # A host-wide pause is a fault of the host, not of the gateway:
+                # shown, never counted as an issue to fix here.
+                _host_pause = _attribution.host_pause_secs is not None
+                _icon = "ℹ️ " if _superseded or _host_pause else "⚠️ "
+                print(
+                    f"  last dump:   {_icon} {_latest.name} "
+                    f"(fired {cli_doctor.dump_fired_at(_latest)}, {_age_h:.1f}h ago)"
+                )
                 if _superseded:
                     print(
                         "               a later gateway session started after it and did "
@@ -583,7 +567,6 @@ def _doctor_crash_dumps(issues: list[str]) -> None:
                 # stack and the cron in-flight markers on disk -- no gateway
                 # needed -- and phrased as evidence plus the one action it
                 # supports, or the statement that it supports none.
-                _attribution = cli_doctor.attribute_dump(_latest, cli_doctor.config_dir())
                 print("  attribution:")
                 for _line in cli_doctor.describe(_attribution):
                     print(f"    {_line}")
@@ -593,13 +576,13 @@ def _doctor_crash_dumps(issues: list[str]) -> None:
                     _paused_job = cli_doctor.job_pause_state_from_disk(_attribution.job.job_id)
                     if _paused_job is not None:
                         print(f"    job is currently {_paused_job}")
-                    if not _superseded:
+                    if not _superseded and not _host_pause:
                         issues.append(
                             "loop-stall dump attributed to cron job "
                             f"{render._safe_display(_attribution.job.name)} "
                             f"({render._safe_display(_attribution.job.job_id)})"
                         )
-                if not _superseded:
+                if not _superseded and not _host_pause:
                     issues.append(f"recent loop-stall crash dump ({_age_h:.0f}h ago)")
             else:
                 print(
@@ -607,6 +590,49 @@ def _doctor_crash_dumps(issues: list[str]) -> None:
                 )
         else:
             print("  dumps:       ✅ no crash dumps found (healthy)")
+        # Gateways that ended with neither a stall dump nor an orderly shutdown.
+        # A hard kill is an ordinary way to end one, so the row informs and never
+        # adds an issue.
+        _unclean = cli_doctor.unexplained_exits(dumps_dir)
+        if _unclean:
+            _newest_h = cli_doctor.dump_age_seconds(_unclean[-1]) / 3600
+            print(
+                f"  unclean:     ℹ️  {len(_unclean)} earlier gateway session(s) ended "
+                "without a clean shutdown and left no stacks"
+            )
+            print(
+                f"               newest last written {_newest_h:.1f}h ago: "
+                f"{render._safe_display(_unclean[-1].name)}"
+            )
         print(f"  dump dir:    {dumps_dir}")
     except Exception as exc:
         print(f"  crash dumps: ⚠️  check failed ({exc})")
+
+
+def _doctor_session_tree_checkpoint(issues: list[str]) -> None:
+    """Render the ``Session Tree Checkpoint`` section: whether the last save of the
+    checkpoint was refused or failed, which leaves the next start replaying the crew log
+    from an older one. Reads the marker the projection leaves beside the checkpoint, so
+    it needs no running gateway."""
+    from kiro_crew.crew_log.session_tree_projection import checkpoint_refusal
+
+    print("\nSession Tree Checkpoint")
+    try:
+        refusal = checkpoint_refusal()
+        if refusal is None:
+            print("  checkpoint:  ✅ the last save landed, or none has been refused")
+            return
+        reason = refusal.get("reason")
+        if reason == "over_ceiling":
+            what = (
+                f"the tree is {refusal.get('bytes')} bytes, "
+                f"past the {refusal.get('ceiling')}-byte ceiling"
+            )
+        else:
+            what = "the write failed; the gateway log has the error"
+        print(f"  checkpoint:  ⚠  not being saved: {render._safe_display(what)}")
+        print("               The next start replays the crew log from the last checkpoint that")
+        print("               was written, or rebuilds the session tree from scratch.")
+        issues.append("session tree checkpoint is not being saved")
+    except Exception as exc:
+        print(f"  checkpoint:  ⚠  check failed ({exc})")

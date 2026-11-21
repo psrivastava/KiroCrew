@@ -133,8 +133,16 @@ cross-home flake three tests later.
      shutdown, which would keep the next boot's writer from starting.
    * ``sandbox._SHIM_ARGV_CACHE`` -- the spawn shim's resolved argv, derived
      from the boot's config and home.
+   * ``apps.credential_masks._cache`` -- the parsed ``credentialMasks`` of
+     every app manifest the boot's spawns read, keyed on the home's paths.
+   * ``apps.manager_records._recorded_names_cache`` -- the apps folder's
+     recorded entry names that a boot's listings reuse, keyed on its path.
+   * ``apps.routes_proxy`` app-secret cache and its invalidation counts -- the
+     secret the reverse proxy signs each app's requests with, keyed by app name
+     only. A later home with an app of the same name would have its requests
+     signed with the earlier home's secret, which its backend refuses.
    * ``config.loader`` materialized-agent snapshot (``_MATERIALIZED_AGENTS``,
-     ``_MATERIALIZED_STEMS``, ``_MATERIALIZED_SEEN``, ``_MATERIALIZED_COMPLETE``,
+     ``_MATERIALIZED_STEMS``, ``_MATERIALIZED_SEEN``, ``_MATERIALIZED_COMPLETE``, ``_MATERIALIZED_MEMO``,
      ``_MATERIALIZED_AGENTS_READY``) -- the declared names, file-name map,
      removal evidence and scan completeness of the home's
      ``kiro/agents`` directory, which the next boot would read as its own until
@@ -143,9 +151,6 @@ cross-home flake three tests later.
      ``auto_update_effect``, read from the boot's install root and policy; a
      stale one is served on the next boot's status frames, and it is also what
      arms the status path's background re-derivation.
-   * ``browser_cli.launch._warned_lifecycle_losses`` -- the warn-once set for
-     browser-socket lifecycle losses; carried across boots it would silence
-     the second boot's first diagnostic.
    * ``sandbox`` cgroup-counter baselines (``_SLICE_THROTTLE_PROBE_SEEN``,
      ``_SLICE_THROTTLE_EDGE_AT``, ``_SLICE_MEMHIGH_EVENTS_SEEN``,
      ``_SLICE_OOM_SEEN``) -- each is "seeded from the first read in this
@@ -184,6 +189,10 @@ cross-home flake three tests later.
      Grant writers and gate checks fill it whenever no live snapshot is up,
      so whether a boot leaves one, and from which home, depends on timing; a
      fresh process has none.
+   * ``recall_pool._settings_cache`` -- the home's ``memory.recall_pool_*``
+     settings with the time they were read, reused for one second. Every
+     recall read refreshes it, so whether a boot leaves one, and how old, depends
+     on timing; a fresh process has none.
    * ``config.loader_credentials._boot_raw_env`` -- the raw ``.env`` map the
      first ``load_credentials`` of the process recorded, which the live watcher
      seeds its credential diff baseline from. It is home-derived and
@@ -194,6 +203,18 @@ cross-home flake three tests later.
      what ``.env`` owns, never an inherited value it merely matched). A boot's
      credential propagation grows it, so a fresh boot in a different home must
      start with none of the prior home's keys; a fresh process has none.
+   * ``agent._main_spec_unreadable`` and ``agent._main_spec_skip_generation``
+     -- whether the home's ``kirocrew.json`` could not be read, and the
+     governance generation the episode's last sibling pass ran under. Both
+     describe the previous home's spec, whose hold must not carry over to the
+     next home's rebuild; a fresh process has neither. The episode revision and
+     its warning state belong to the same episode and are cleared with it.
+   * ``apps.hidden_sessions`` published sets (``_hiding_apps``, ``_app_ids``),
+     its dashboard bindings and its trust-config subscription handle -- the apps
+     of the home that may hide their chats, and every app id it has seen. A
+     refresh that lands after a boot's snapshot would otherwise publish the
+     previous home's apps into the next boot; the handle would keep the next
+     boot from subscribing again once ``config.live`` dropped the subscription.
 
 2. **Snapshot and restore** around the boot by ``booted_gateway``, on every
    exit: the SIGINT/SIGTERM handlers ``run()`` installs; the event loop's
@@ -204,12 +225,20 @@ cross-home flake three tests later.
 
 3. **Waited for** by ``_teardown_boot``: the memory-preparation worker is a
    THREAD behind a process-wide fence (``kiro_crew.memory_startup``) that
-   ``_shutdown()`` cannot join, so teardown polls until the fence drops.
+   ``_shutdown()`` cannot join, so teardown polls until the fence drops. Each
+   MCP probe runs on a pooled ``mc-mcpprobe`` thread too, which outlives the
+   reap's cancel until the server it spawned has exited. That server got this
+   home as its ``KIROCREW_HOME`` and creates the directory as it starts, so
+   one still starting would put ``<tmp_path>/home`` back after the test
+   removed it; after the reap, teardown shuts that pool down and joins it.
+   The hidden-chat refresh startup asks for runs on the loop's default executor,
+   which nothing joins, so teardown waits until none is queued or running before
+   the reset clears what it publishes.
 
 4. **Reaped** by ``_teardown_boot``: every asyncio task the boot created that
    ``_shutdown()`` did not end. Production never needs to -- ``os._exit``
-   follows -- so the MCP probe, the terminal-title poller, the browser-snapshot
-   pruner, the follow-up sweep and their kin keep running against a home the
+   follows -- so the MCP probe, the terminal-title poller, the follow-up sweep
+   and their kin keep running against a home the
    test has discarded. Teardown snapshots ``asyncio.all_tasks()`` before the
    boot, cancels every survivor the boot added, and fails the test if one
    refuses to end within ``TASK_REAP_SECS``.
@@ -263,6 +292,7 @@ import re
 import secrets
 import signal
 import sys
+import threading
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -271,20 +301,32 @@ from typing import Any, AsyncIterator, Callable, Iterator, NoReturn
 import pytest
 from aiohttp import ClientSession, ClientTimeout
 
+from kiro_crew import agent as agent_mod
 from kiro_crew import (
     autonudge,
     crash_guard,
     embeddings,
+    executors,
     github_runner,
     memory_startup,
     onboarding_sources,
+    recall_pool,
     safety_override,
     sandbox,
     shutdown_event,
+    update_next_start,
+    vector_memory_member,
 )
 from kiro_crew.acp import client as acp_client
 from kiro_crew.agent_sdk import host_auth
-from kiro_crew.browser_cli import launch as browser_launch
+from kiro_crew.apps import (
+    credential_masks,
+    execution,
+    hidden_sessions,
+    manager_records,
+    routes_proxy,
+)
+from kiro_crew.apps.builtin_adoption_pins import HARNESS_PINS_ENV, load_adoption_pins
 from kiro_crew.config import live as config_live
 from kiro_crew.config import loader as config_loader
 from kiro_crew.config.loader import CREDENTIAL_KEYS
@@ -306,7 +348,7 @@ from kiro_crew.platform import context as platform_context
 from kiro_crew.platform import governance
 from kiro_crew.security import paths as security_paths
 from kiro_crew.testing import fake_acp_backend
-from kiro_crew.testing.wait import async_wait_until, finished
+from kiro_crew.testing.wait import FALLBACK_TIMEOUT_SECS, async_wait_until, finished
 
 try:  # POSIX only; the layer is Linux-only in CI, but keep the import honest.
     import resource as _resource
@@ -780,6 +822,7 @@ def _reset_home_bound_globals() -> None:
     token_auth._revoked_store_singleton = None
     token_auth._state.clear_all()
     token_auth._app_perms_cache.clear()
+    token_auth._app_perms_denied.clear()
     revocation_gen._gen = None
     crash_guard._CRASH_LOG = None
     config_live.reset_for_tests()
@@ -801,16 +844,33 @@ def _reset_home_bound_globals() -> None:
     sandbox._SLICE_MEMHIGH_EVENTS_SEEN = None
     sandbox._SLICE_OOM_SEEN = None
     sandbox._SHIM_ARGV_CACHE.clear()
+    credential_masks.clear_cache()
+    manager_records._recorded_names_cache.clear()
+    with routes_proxy._app_secret_lock:
+        routes_proxy._app_secret_cache.clear()
+        routes_proxy._app_secret_generation.clear()
+    execution.invalidate_shipped_builtin_apps()
+    vector_memory_member._IDENTITY_CACHE.clear()
+    # Under the refresh lock, so a refresh still publishing finishes first and
+    # cannot write the old home's sets back after this clears them.
+    with hidden_sessions._refresh_lock:
+        hidden_sessions.bind_listing(None, None)
+        hidden_sessions._hiding_apps = None
+        hidden_sessions._app_ids = frozenset()
+        # ``config_live.reset_for_tests`` above dropped the subscription itself.
+        hidden_sessions._trust_config_sub = None
     config_loader._MATERIALIZED_AGENTS = frozenset()
     config_loader._MATERIALIZED_STEMS.clear()
     config_loader._MATERIALIZED_SEEN.clear()
     config_loader._MATERIALIZED_COMPLETE = False
+    config_loader._MATERIALIZED_MEMO = None
     config_loader._MATERIALIZED_AGENTS_READY = False
     governance._CONFIRM_PATTERNS_MEMO = None
+    recall_pool._settings_cache = None
     dashboard_updates._auto_effect = None
     dashboard_updates._auto_effect_task = None
     dashboard_updates._shape_effect = None
-    browser_launch._warned_lifecycle_losses.clear()
+    update_next_start._differs_memo = None
     # Cleared in place, never rebound: the security facade re-exports
     # ``_path_resolve_degraded`` by identity, and the second-boot witness
     # compares each container's identity.
@@ -827,14 +887,25 @@ def _reset_home_bound_globals() -> None:
     inventory_gauges.reset_for_testing()
     with diag_threads._prev_lock:
         diag_threads._prev_reading.clear()
+    agent_mod._main_spec_unreadable = False
+    agent_mod._main_spec_episode_revision = 0
+    agent_mod._main_spec_skip_generation = None
+    agent_mod._main_spec_warned.clear()
     live_nudge = autonudge._INSTANCE
     if live_nudge is not None:
         with contextlib.suppress(Exception):
             live_nudge.stop()
         autonudge._INSTANCE = None
-    # Shared crew: the boot's admission host hooks.
+    # Shared crew: the tailnet allowlist snapshot, the access set read from the
+    # home, what this boot's tailnet setup resolved to, and the boot's host hooks.
+    from kiro_crew.dashboard import tailnet_live_allowlist
+    from kiro_crew.shared_crew import access as shared_crew_access
+    from kiro_crew.shared_crew import access_set as shared_crew_access_set
     from kiro_crew.shared_crew import admission_gate as shared_crew_admission
 
+    tailnet_live_allowlist.reset_for_tests()
+    shared_crew_access_set.reset_for_tests()
+    shared_crew_access._reset_setup_paths_for_tests()
     shared_crew_admission.install_host_hooks(None)
     # Shared crew: the admission service a boot builds from its home's limits and
     # work store. Left in place, the next boot on the same loop keeps it (and the
@@ -858,6 +929,7 @@ def home_bound_globals_are_clear() -> bool:
         and token_auth._revoked_store_singleton is None
         and revocation_gen._gen is None
         and not token_auth._app_perms_cache
+        and not routes_proxy._app_secret_cache
         and crash_guard._CRASH_LOG is None
         and autonudge._INSTANCE is None
         and platform_context._ACTIVE is None
@@ -868,15 +940,21 @@ def home_bound_globals_are_clear() -> bool:
         and sandbox._SLICE_THROTTLE_EDGE_AT is None
         and not sandbox._SHIM_ARGV_CACHE
         and not config_loader._MATERIALIZED_AGENTS
+        and hidden_sessions._hiding_apps is None
+        and not hidden_sessions._app_ids
         and not config_loader._MATERIALIZED_STEMS
         and not config_loader._MATERIALIZED_SEEN
         and not config_loader._MATERIALIZED_COMPLETE
+        and config_loader._MATERIALIZED_MEMO is None
         and not config_loader._MATERIALIZED_AGENTS_READY
         and governance._CONFIRM_PATTERNS_MEMO is None
         and config_loader._boot_raw_env is None
         and not config_loader._env_owned_keys
         and dashboard_updates._auto_effect is None
-        and not browser_launch._warned_lifecycle_losses
+        and not agent_mod._main_spec_unreadable
+        and agent_mod._main_spec_episode_revision == 0
+        and agent_mod._main_spec_skip_generation is None
+        and not agent_mod._main_spec_warned
     )
 
 
@@ -909,6 +987,67 @@ async def _drain_memory_fence() -> None:
             f"{MEMORY_FENCE_DRAIN_SECS}s after shutdown; it may still be writing "
             "to the discarded home"
         ) from exc
+
+
+#: Hidden-chat refreshes inside ``refresh_hiding_apps`` right now, so teardown can
+#: wait for one that has left the queue but not yet published.
+_hiding_refreshes_running = 0
+_hiding_refreshes_lock = threading.Lock()
+_real_refresh_hiding_apps = hidden_sessions.refresh_hiding_apps
+
+
+def _counted_hiding_refresh() -> None:
+    """``refresh_hiding_apps``, counted while it runs; ``_boot`` installs it for the boot.
+
+    The gateway calls the refresh through the module attribute
+    (``slots_push.refresh_app_state``), so this sees every refresh a boot runs.
+    """
+    global _hiding_refreshes_running
+    with _hiding_refreshes_lock:
+        _hiding_refreshes_running += 1
+    try:
+        _real_refresh_hiding_apps()
+    finally:
+        with _hiding_refreshes_lock:
+            _hiding_refreshes_running -= 1
+
+
+async def _drain_hidden_chat_refresh() -> None:
+    """Wait for every hidden-chat refresh the boot asked for to finish publishing.
+
+    ``bind_serving_loop`` asks for one at startup and it runs on the loop's default
+    executor, where nothing joins it. One still queued or running when the reset
+    clears the published sets would write this home's apps back into the next boot.
+    A queued refresh holds ``_refresh_queued`` until it is inside
+    ``refresh_hiding_apps``, where ``_counted_hiding_refresh`` already counts it, so
+    the two together leave no gap. A boot asks for one refresh per built-in app it
+    registers, and they run one at a time. A refresh still pending at the deadline
+    fails the teardown by name.
+    """
+    try:
+        await async_wait_until(
+            lambda: not hidden_sessions._refresh_queued and not _hiding_refreshes_running,
+            timeout=FALLBACK_TIMEOUT_SECS,
+        )
+    except AssertionError as exc:
+        raise RuntimeError(
+            "the hidden-chat refresh the boot queued had not finished "
+            f"{FALLBACK_TIMEOUT_SECS}s after shutdown"
+        ) from exc
+
+
+async def _drain_mcp_probes() -> None:
+    """Shut the MCP probe pool down and join its threads (docstring, item 3).
+
+    The next boot's first probe creates a fresh pool.
+    """
+    with executors._lock:
+        pool, executors._mcp_probe_pool = executors._mcp_probe_pool, None
+    if pool is not None:
+        await finished(
+            asyncio.to_thread(pool.shutdown, wait=True, cancel_futures=True),
+            "the MCP probe threads",
+        )
 
 
 def _live_tasks() -> set["asyncio.Task[Any]"]:
@@ -1004,6 +1143,15 @@ async def _teardown_boot(
         await _reap_boot_tasks(tasks_before)
     except BaseException as exc:  # noqa: BLE001 -- re-raised below, after the reset
         failure = failure or exc
+    try:
+        await _drain_mcp_probes()
+    except BaseException as exc:  # noqa: BLE001 -- re-raised below, after the reset
+        failure = failure or exc
+    try:
+        await _drain_hidden_chat_refresh()
+    except BaseException as exc:  # noqa: BLE001 -- re-raised below, after the reset
+        failure = failure or exc
+    hidden_sessions.refresh_hiding_apps = _real_refresh_hiding_apps
     _reset_home_bound_globals()
     if failure is not None:
         raise failure
@@ -1025,6 +1173,7 @@ async def _boot(home: Path, *, boot_secs: float) -> IntegrationGateway:
 
     shutdown_event.clear()
     _reset_home_bound_globals()
+    hidden_sessions.refresh_hiding_apps = _counted_hiding_refresh
     tasks_before = frozenset(_live_tasks())
 
     cfg = KiroCrewConfig.load()
@@ -1262,7 +1411,7 @@ def isolate_credentials(monkeypatch: pytest.MonkeyPatch, home: Path) -> None:
 @pytest.fixture
 def integration_home(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unpinned_agent_spec_home: Any
-) -> Path:
+) -> Iterator[Path]:
     """A fresh, isolated ``KIROCREW_HOME`` with the fake model wired in.
 
     Modelled on ``kiro_crew.testing.harness.spawn_feature_gateway``'s
@@ -1316,9 +1465,16 @@ def integration_home(
     # raise instead of warn, the same discipline the other gateway-booting jobs
     # enforce.
     monkeypatch.setenv("KIROCREW_STRICT_ON_LOOP_PERSIST", "1")
+    # The adoption pin table is this test's own (``harness_environment`` sets the
+    # same name for a subprocess gateway): absent, so empty, unless the test
+    # writes a fixture pin to ``tmp_path / "adoption-pins.json"``. Read once per
+    # process, so the cache is cleared on the way in and on the way out.
+    monkeypatch.setenv(HARNESS_PINS_ENV, str(tmp_path / "adoption-pins.json"))
+    load_adoption_pins.cache_clear()
     # Nor any credential the environment carries (``isolate_credentials``).
     isolate_credentials(monkeypatch, home)
-    return home
+    yield home
+    load_adoption_pins.cache_clear()
 
 
 @pytest.fixture

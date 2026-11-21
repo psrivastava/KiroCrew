@@ -62,13 +62,16 @@ from kiro_crew.frontmatter import SKILL_UPDATE, frontmatter_value
 from kiro_crew.history_consolidation_skills import _session_touched_sensitive
 from kiro_crew.history_consolidation_span import (
     _CONSOLIDATION_EMPTY,
+    _CONSOLIDATION_STALE,
     AttemptedSpan,
+    PrefsWindow,
     _LeaseLostMidRun,
     _no_pass_ran,
     _persistence_disabled,
     _PersistenceDisabledMidRun,
     _RunCommitState,
 )
+from kiro_crew.history_files import transcript_stems
 from kiro_crew.history_projection import DISPLAY_ONLY_ROLES
 from kiro_crew.image_refs import strip_image_refs
 from kiro_crew.lesson_validation import (
@@ -91,6 +94,7 @@ from kiro_crew.skills_dedupe import (
 )
 from kiro_crew.skills_script_validator import validate_skill_script
 from kiro_crew.vector_memory_constants import (
+    _MAX_CONSOLIDATION_SEMANTIC_VALUE_CHARS,
     _MAX_EPISODIC_PER_CONSOLIDATION,
     _MAX_LESSONS_PER_CONSOLIDATION,
     _MAX_SEMANTIC_PER_CONSOLIDATION,
@@ -113,9 +117,18 @@ _CONSOLIDATION_THRESHOLD = 30
 _CONSOLIDATION_MAX_ATTEMPTS = 5
 _CONSOLIDATION_BACKOFF_BASE_SECS = 900.0
 _CONSOLIDATION_BACKOFF_MAX_SECS = 86400.0
+# How long a preference-only window waits after a pass whose result the live
+# conversation outran (``_CONSOLIDATION_STALE``) before the next turn may start one.
+_CONSOLIDATION_STALE_RETRY_SECS = 300.0
 # Seeded sessions (restored from disk after a restart) examined per idle sweep:
 # a large backlog drains a few per heartbeat instead of all at once.
 _SEEDED_PER_SWEEP = 3
+# Idle keys one sweep examines (a stat and a metadata read each, on the event loop).
+# The rest wait their turn: each examined key moves to the back of the queue.
+_IDLE_EXAMINED_PER_SWEEP = 64
+# Passes and off-loop counts in flight at which a sweep starts nothing more, so a
+# backlog of idle sessions drains a few at a time instead of all at once.
+_IDLE_MAX_IN_FLIGHT = 8
 # Oldest transcript the restart seed backfills: older stranded work is left to a
 # manual ``kirocrew consolidate``, so one boot cannot bill a long-idle backlog.
 _SEED_MAX_AGE_SECS = 7 * 86400
@@ -231,6 +244,12 @@ class HistoryConsolidator:
         self._last_lifecycle: float = 0.0
         self._running: set[str] = set()
         self._tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
+        # True while a session may still carry an environment-failure backoff
+        # from a host that could not run turns. Starts True: the backoff is on
+        # disk and survives the restart (or upgrade) that fixed the host. The
+        # first turn that reaches a provider releases it, once, through
+        # :meth:`_release_environment_backoff`.
+        self._env_backoff_pending = True
         # Transcript files whose rows are being counted off the loop, keyed by
         # file name like _busy so alias spellings of one transcript share one
         # claim. See _claim_count and _release_count.
@@ -265,6 +284,10 @@ class HistoryConsolidator:
         self._idle_clean: dict[str, tuple[CacheIdentity, int]] = {}
         # Separate offset for prefs-only consolidation (doesn't advance main offset)
         self._prefs_offset: dict[str, int] = {}
+        # key -> the rotation_generation _prefs_offset was counted under. A
+        # rotation or rewrite replaces the rows it counts, so an offset from
+        # another generation is dropped rather than skipped past.
+        self._prefs_generation: dict[str, int] = {}
         # key -> (consecutive prefs passes with no usable answer, retry-at wall
         # time). In memory like _prefs_offset: the preference-only window has no
         # durable failure record, so this only spaces out re-sends of a prompt
@@ -588,6 +611,7 @@ class HistoryConsolidator:
             return
         if failures < 1:
             return
+        self._env_backoff_pending = True
         self._logger.warning(
             "Consolidation for %s could not reach the LLM (%s; environment "
             "failure #%d, nothing billed); retrying in %.0fs without consuming "
@@ -598,10 +622,65 @@ class HistoryConsolidator:
             max(0.0, retry_at - _time.time()),
         )
 
+    def _release_environment_backoff(self) -> None:
+        """Release the environment backoff of every tracked session, once per recovery.
+
+        Called when a consolidation turn has reached a provider, which proves the
+        host can run turns again. Sessions refused while it could not (a missing
+        kiro-cli, a background session refused before it started) would
+        otherwise keep their widened deadline, up to a day, after the fix.
+
+        Runs off the event loop as a tracked task and never raises into the pass
+        that reached the provider. The keys are the sessions the idle sweep
+        already tracks (live activity plus the startup seed), so the cost is one
+        metadata read each. :meth:`ConversationLog.clear_consolidation_environment_backoff`
+        leaves a session with a billed attempt alone.
+        """
+        if not self._env_backoff_pending:
+            return
+        self._env_backoff_pending = False
+        keys = list(self._last_activity)
+
+        def _release() -> int:
+            released = 0
+            for key in keys:
+                try:
+                    if self._log.clear_consolidation_environment_backoff(key):
+                        released += 1
+                except Exception:
+                    self._logger.debug(
+                        "Could not release the environment backoff for %s", key, exc_info=True
+                    )
+            return released
+
+        async def _run() -> None:
+            try:
+                released = await asyncio.to_thread(_release)
+            except Exception:
+                self._env_backoff_pending = True
+                self._logger.warning("Releasing the environment backoff failed", exc_info=True)
+                return
+            if released:
+                self._logger.info(
+                    "Consolidation reached the LLM again; released the environment "
+                    "backoff of %d session(s)",
+                    released,
+                )
+
+        t = asyncio.ensure_future(_run())
+        self._tasks.add(t)
+        t.add_done_callback(self._tasks.discard)
+
     def _busy(self, key: str) -> bool:
-        """True when *key*, or any other key naming the same transcript file, is running."""
-        target = self._log._path(key).name
-        return any(self._log._path(running).name == target for running in self._running)
+        """True when *key*, or any other key that can name the same transcript file, is running.
+
+        Decided from the key strings alone, never the disk: it runs on the event loop,
+        once per running key, from every entry point. Two keys whose possible
+        filenames (:func:`transcript_stems`) overlap count as one, so a pass is
+        deferred, never doubled.
+        """
+        stems = set(transcript_stems(key))
+        return any(not stems.isdisjoint(transcript_stems(running)) for running in self._running)
 
     def _transcript_stamp(self, key: str) -> tuple[CacheIdentity, int] | None:
         """Return *key*'s transcript stamp from a stat with no read, or ``None``.
@@ -686,6 +765,9 @@ class HistoryConsolidator:
             if _safe_key(key) not in tracked:
                 self._last_activity[key] = mtime
                 self._seeded_keys.add(key)
+                # A turn may have reached a provider before this scan finished
+                # and spent the startup release on the live keys alone.
+                self._env_backoff_pending = True
 
     def maybe_consolidate(self, key: str) -> None:
         """Fire preferences/projects consolidation if message threshold exceeded.
@@ -719,15 +801,20 @@ class HistoryConsolidator:
     async def _threshold_pass(self, key: str, claim: _CountClaim) -> None:
         """Count *key*'s rows off the loop, then run a prefs pass at the threshold."""
         try:
-            counted = await self._count_off_loop(key, claim, floor=self._prefs_offset.get(key, 0))
+            counted = await self._count_off_loop(
+                key,
+                claim,
+                floor=self._prefs_offset.get(key, 0),
+                floor_generation=self._prefs_generation.get(key),
+            )
             if counted is None:
                 return
-            total = counted[0]
+            total, pending = counted
             # Re-checked after the await: an idle or session-end pass may have
             # claimed this transcript, or finished one, while the count ran.
             if self._busy(key):
                 return
-            if total - self._prefs_offset.get(key, 0) < _CONSOLIDATION_THRESHOLD:
+            if pending < _CONSOLIDATION_THRESHOLD:
                 return
             # Cheap pre-check mirroring the other automatic entry points. During
             # a backoff window every message past the threshold would otherwise
@@ -742,8 +829,9 @@ class HistoryConsolidator:
             self._running.add(key)
         finally:
             self._release_count(claim)
+        window = PrefsWindow(self._prefs_offset.get(key, 0), self._prefs_generation.get(key))
         try:
-            result = await self._consolidate(key, include_history=False)
+            result = await self._consolidate(key, include_history=False, prefs_window=window)
         except Exception:
             # _consolidate has already logged it and released its claim; a
             # failed pass leaves the offset alone so the window is retried.
@@ -772,8 +860,23 @@ class HistoryConsolidator:
                 delay,
             )
             return
+        if result is _CONSOLIDATION_STALE:
+            # The user spoke while the model read the window, so its answer was
+            # discarded. In a live chat that is every pass: without a wait, each
+            # later turn would start (and bill) another pass that ends the same way.
+            # Keep the window pending and the failure count as it is, and try again
+            # once the wait is over.
+            failures = self._prefs_retry.get(key, (0, 0.0))[0]
+            self._prefs_retry[key] = (failures, _time.time() + _CONSOLIDATION_STALE_RETRY_SECS)
+            return
         if not _no_pass_ran(result):
-            self._prefs_offset[key] = total
+            # To the count the pass prompted, which a tail over the prompt
+            # budget leaves short of ``total``: the next threshold pass starts
+            # there. ``end`` is unset only when nothing reported a span (a
+            # stand-in for ``_consolidate``); the scheduled count stands then.
+            self._prefs_offset[key] = total if window.end is None else window.end
+            if window.snapshot_generation is not None:
+                self._prefs_generation[key] = window.snapshot_generation
             self._prefs_retry.pop(key, None)
 
     def _claim_count(self, key: str) -> _CountClaim | None:
@@ -808,7 +911,12 @@ class HistoryConsolidator:
         del self._counting[claim.name]
 
     async def _count_off_loop(
-        self, key: str, claim: _CountClaim, *, floor: int | None
+        self,
+        key: str,
+        claim: _CountClaim,
+        *,
+        floor: int | None,
+        floor_generation: int | None = None,
     ) -> tuple[int, int] | None:
         """``(total, total - floor)`` for *key*, counted in a worker thread.
 
@@ -817,9 +925,13 @@ class HistoryConsolidator:
         to finish, and *claim* covers it until then. *floor* None means the
         transcript's consolidated offset. None means nothing was counted: the
         key is inside its retry deadline, or the read failed (logged as a
-        warning), so the check is skipped.
+        warning), so the check is skipped. *floor_generation* is the
+        ``rotation_generation`` *floor* was counted under; under another one
+        the transcript's consolidated offset is the floor instead.
         """
-        claim.reader = asyncio.ensure_future(asyncio.to_thread(self._count_rows, key, floor))
+        claim.reader = asyncio.ensure_future(
+            asyncio.to_thread(self._count_rows, key, floor, floor_generation)
+        )
         try:
             return await asyncio.shield(claim.reader)
         except Exception:
@@ -828,7 +940,9 @@ class HistoryConsolidator:
             )
             return None
 
-    def _count_rows(self, key: str, floor: int | None) -> tuple[int, int] | None:
+    def _count_rows(
+        self, key: str, floor: int | None, floor_generation: int | None = None
+    ) -> tuple[int, int] | None:
         """Worker thread: count *key*'s rows one line at a time.
 
         A key inside its retry deadline is refused by ``retry_eligible`` after
@@ -842,6 +956,9 @@ class HistoryConsolidator:
         """
         if self._inside_retry_deadline(key):
             return None
+        if floor is not None and floor_generation is not None:
+            if self._log.rotation_generation(key) != floor_generation:
+                floor = None  # counted rows a rotation or rewrite replaced
         if floor is None:
             floor = self._log.consolidated_offset(key)
         total = self._log._count_messages(key, hold_writer_lock=False)
@@ -901,16 +1018,25 @@ class HistoryConsolidator:
                 self._activity_seeded = True
         now = _time.time()
         seeded_budget = _SEEDED_PER_SWEEP
+        # Both bounds keep one sweep's loop-thread work flat however many sessions
+        # are tracked: each key examined costs a stat and a metadata read here.
+        examine_budget = _IDLE_EXAMINED_PER_SWEEP
         for key, last in list(self._last_activity.items()):
             if now - last < self._history_idle_secs:
                 continue
+            if (
+                examine_budget < 1
+                or len(self._running) + len(self._counting) >= _IDLE_MAX_IN_FLIGHT
+            ):
+                break
             seeded = key in self._seeded_keys
             if seeded:
                 if seeded_budget < 1:
                     continue
                 seeded_budget -= 1
-                # Re-queue at the end so a seed that keeps being skipped cannot starve the rest.
-                self._last_activity[key] = self._last_activity.pop(key)
+            examine_budget -= 1
+            # Re-queue at the end, so the next sweep starts with the keys this one did not reach.
+            self._last_activity[key] = self._last_activity.pop(key)
             # A key whose last count found nothing left is skipped while its transcript's
             # stamp is unchanged, so a finished session costs a stat, not a read, per
             # sweep. The stamp is taken here, before the off-loop count, so a row that
@@ -1161,6 +1287,7 @@ _BOUND_FOR_IMPORTERS = (
     VERDICT_DUP,
     VERDICT_NEW,
     VERDICT_UPDATE,
+    _MAX_CONSOLIDATION_SEMANTIC_VALUE_CHARS,
     _MAX_EPISODIC_PER_CONSOLIDATION,
     _MAX_LESSONS_PER_CONSOLIDATION,
     _MAX_SEMANTIC_PER_CONSOLIDATION,
@@ -1227,19 +1354,30 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _EMBED_BUDGET_SECS_PER_PASS,
         _INHERIT_GLOBAL,
         _LESSON_PASSTHROUGH_FIELDS,
+        _MAX_REFUSED_SEMANTIC_NOTES,
         _PLACEHOLDER_BODIES,
+        _REFUSED_SEMANTIC_NOTE_DAYS,
+        _REFUSED_SEMANTIC_NOTE_PREFIX,
         _SEMANTIC_OMISSION_NOTICE,
         _SEMANTIC_SNAPSHOT_PAGE,
+        _audit_oversized_semantic,
         _bounded_semantic_table,
         _BoundedTable,
         _EmbedBudget,
         _InheritGlobal,
         _is_plausible_memory_file,
         _LessonDeleteDecision,
+        _OversizedItem,
         _recency,
+        _refuse_oversized_semantic,
+        _refused_semantic_note,
+        _refused_semantic_notice,
         _reroute_lesson_semantic_keys,
         _semantic_snapshot_in_pages,
         _session_facets,
+        _update_refused_semantic_note,
+        _v1_consolidation_confidence,
+        _v1_consolidation_metadata,
         _withhold_unseen_deletes,
     )
     from kiro_crew.history_consolidation_pass import (  # noqa: F401

@@ -27,23 +27,40 @@ from dashboard_approval_helpers import (
     _permission_event,
     _set_stream,
 )
+from real_session_manager import open_session, real_sessions
+from redaction_structured_cases import github_classic
 
 from kiro_crew.dashboard import chat_runner
 from kiro_crew.dashboard.chat import _run_chat
 from kiro_crew.dashboard.state import _ChatSlot, parse_cls_meta, row_mid
 from kiro_crew.hooks import (
     HOOK_EVENT_PRE_TOOL_USE,
+    TOOL_ALLOW,
     TOOL_AUTO_APPROVE,
     ScriptHookResult,
     ToolHookResult,
 )
 from kiro_crew.name_grant import SHADOWED, Refusal
 from kiro_crew.providers.base import EVENT_PERMISSION_REQUEST, LLMEvent
+from kiro_crew.sel import SecurityEventLog
 from kiro_crew.testing.wait import await_until, finished
 
 
 def _tool_messages(slot: _ChatSlot) -> list[dict]:
     return [m for m in slot.messages if m.get("role") in ("tool", "permission")]
+
+
+def _real_sel(tmp_path):
+    """A real, synchronous security event log under *tmp_path*, read back by a test.
+
+    The log is a process singleton: cleared around the construction, so the test
+    owns this log and no other caller is handed it.
+    """
+    with (
+        patch.object(SecurityEventLog, "_instance", None),
+        patch.object(SecurityEventLog, "_initialized", False),
+    ):
+        return SecurityEventLog(base_dir=tmp_path / "sel", sync=True)
 
 
 # ── Tests ──
@@ -90,7 +107,8 @@ class TestApprovalModes:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "purpose", ["Inspect the isolated workspace", "", "Inspect token ghp_" + "a" * 36]
+        "purpose",
+        ["Inspect the isolated workspace", "", "Inspect token " + github_classic(seed=67)],
     )
     async def test_pending_permission_persists_its_own_redacted_purpose(self, tmp_path, purpose):
         state, client = _make_state(tmp_path, context_builder=_context_builder())
@@ -469,6 +487,78 @@ class TestApprovalModes:
         assert any("hook blocked" in m.get("content", "").lower() for m in msgs), (label, msgs)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "label,result_kwargs",
+        [
+            ("killed", {"exit_code": -9, "stderr": ""}),
+            ("timeout", {"exit_code": -1, "error": "Timed out after 3s"}),
+        ],
+    )
+    async def test_auto_approve_allowed_when_a_spec_hook_fails(
+        self, tmp_path, label, result_kwargs
+    ):
+        """An agent spec's own hook keeps kiro-cli's contract: a killed or
+        timed-out spec hook warns and the tool runs, so one broken hook cannot
+        stop every tool call."""
+        cb = _context_builder(ToolHookResult.auto_approve())
+        hook_store = _make_hook_store()
+        hook_store.fire = AsyncMock(
+            return_value=[
+                ScriptHookResult(
+                    hook_id="spec:a1:PreToolUse:0",
+                    hook_name="a1 spec hook (PreToolUse #1)",
+                    event=HOOK_EVENT_PRE_TOOL_USE,
+                    from_spec=True,
+                    **result_kwargs,
+                )
+            ]
+        )
+        state, client = _make_state(tmp_path, context_builder=cb, hook_store=hook_store)
+        slot = _make_slot()
+        _set_stream(client, [_permission_event(), _complete_event()])
+
+        audit = _real_sel(tmp_path)
+        with _patch_stats(), patch.object(chat_runner, "sel", return_value=audit):
+            await _run_chat(state, slot, "hello")
+
+        client.approve_tool.assert_called_once()
+        client.reject_tool.assert_not_called()
+        # The audit records the grant, and no refusal.
+        outcomes = [r["outcome"] for r in audit.recent() if r["event_type"] == "tool_invocation"]
+        assert outcomes == ["auto_approved"], (label, outcomes)
+
+    @pytest.mark.asyncio
+    async def test_a_refused_spec_hook_blocks_with_the_refusal(self, tmp_path):
+        """P0-12: a spec hook a policy refused to run gave no verdict; the tool is
+        blocked, and the refusal is the reason."""
+        cb = _context_builder(ToolHookResult.auto_approve())
+        hook_store = _make_hook_store()
+        hook_store.fire = AsyncMock(
+            return_value=[
+                ScriptHookResult(
+                    hook_id="spec:a1:PreToolUse:0",
+                    hook_name="a1 spec hook (PreToolUse #1)",
+                    event=HOOK_EVENT_PRE_TOOL_USE,
+                    from_spec=True,
+                    exit_code=2,
+                    refused=True,
+                    error="Blocked by security policy: x",
+                )
+            ]
+        )
+        state, client = _make_state(tmp_path, context_builder=cb, hook_store=hook_store)
+        slot = _make_slot()
+        _set_stream(client, [_permission_event(), _complete_event()])
+
+        with _patch_stats():
+            await _run_chat(state, slot, "hello")
+
+        client.reject_tool.assert_called_once()
+        client.approve_tool.assert_not_called()
+        msgs = _tool_messages(slot)
+        assert any("hook blocked" in m.get("content", "").lower() for m in msgs), msgs
+
+    @pytest.mark.asyncio
     async def test_auto_approve_allowed_when_pretooluse_hook_exits_zero(self, tmp_path):
         """Exit 0 is a delivered "allow" verdict and must still approve.
 
@@ -521,7 +611,7 @@ class TestApprovalModes:
         # Deny-by-default: auto-approve must NOT silently approve on bad hook output.
         client.approve_tool.assert_not_called()
         client.reject_tool.assert_called_once_with("req-1")
-        assert [m["content"] for m in _tool_messages(slot)] == ["🚫 fs_write (hook error)"]
+        assert [m["content"] for m in _tool_messages(slot)] == ["Refused: fs_write (hook error)"]
 
     @pytest.mark.asyncio
     @pytest.mark.xdist_group(name="serial")
@@ -546,7 +636,7 @@ class TestApprovalModes:
         assert [json.loads(m["cls"])["resolved"] for m in msgs if m["role"] == "permission"] == [
             "rejected"
         ]
-        assert "🚫 fs_write (rejected)" in [m["content"] for m in msgs]
+        assert "Refused: fs_write (rejected)" in [m["content"] for m in msgs]
 
     @pytest.mark.asyncio
     async def test_interactive_approve_with_empty_hooks(self, tmp_path):
@@ -620,26 +710,61 @@ class TestApprovalModes:
         assert shown == (["system", "permission"] if expect_note else []), slot.messages
         client.approve_tool.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_gate_ask_note_is_shown_ahead_of_the_card(self, tmp_path):
+        """The gate's reason for asking (an allowedCommands entry kept off by shell
+        composition) reaches the person as a note right before the card."""
+        note = "This command matches allowedCommands, but commands with | always ask."
+        cb = _context_builder(ToolHookResult(action=TOOL_ALLOW, reason=note))
+        state, client = _make_state(tmp_path, context_builder=cb)
+        slot = _make_slot()
+        _set_stream(client, [_permission_event(), _complete_event()])
+
+        async def _approve() -> None:
+            await _answer_approval(slot, "req-1", "approved")
+
+        approver = asyncio.get_running_loop().create_task(_approve())
+        try:
+            with _patch_stats():
+                await finished(_run_chat(state, slot, "hello"), "the chat turn completing")
+        finally:
+            await _drain(approver)
+
+        shown = [
+            (m.get("role"), m.get("content", ""))
+            for m in slot.messages
+            if m.get("role") in ("system", "permission")
+        ]
+        assert [role for role, _ in shown] == ["system", "permission"], slot.messages
+        assert note in shown[0][1]
+        client.approve_tool.assert_called_once()
+
 
 class TestTrustYoloPropagation:
-    """Trust/YOLO mode propagates approval policy to session manager."""
+    """Trust/YOLO mode leaves its approval policy on the real session."""
+
+    @staticmethod
+    def _real_state(tmp_path):
+        state, client = _make_state(tmp_path, context_builder=_context_builder())
+        state.sessions = real_sessions(client)
+        return state, client
 
     @pytest.mark.asyncio
     async def test_run_chat_propagates_trust_to_session(self, tmp_path):
         """When slot has _trust=True, _run_chat sets session approval policy to auto."""
-        state, client = _make_state(tmp_path, context_builder=_context_builder())
+        state, client = self._real_state(tmp_path)
         slot = _make_slot(trust=True)
         _set_stream(client, [_complete_event()])
 
         with _patch_stats():
             await _run_chat(state, slot, "hello")
 
-        state.sessions.set_approval_policy.assert_called_with(f"dashboard:{slot.key}", "auto")
+        assert state.sessions.get_approval_policy(f"dashboard:{slot.key}") == "auto"
 
     @pytest.mark.asyncio
     async def test_run_chat_propagates_yolo_to_session(self, tmp_path):
         """When state._yolo=True, _run_chat sets session approval policy to auto."""
-        state, client = _make_state(tmp_path, context_builder=_context_builder())
+        state, client = self._real_state(tmp_path)
         state.enable_yolo()
         slot = _make_slot()
         _set_stream(client, [_complete_event()])
@@ -647,20 +772,23 @@ class TestTrustYoloPropagation:
         with _patch_stats():
             await _run_chat(state, slot, "hello")
 
-        state.sessions.set_approval_policy.assert_called_with(f"dashboard:{slot.key}", "auto")
+        assert state.sessions.get_approval_policy(f"dashboard:{slot.key}") == "auto"
 
     @pytest.mark.asyncio
     @pytest.mark.xdist_group(name="serial")
     async def test_run_chat_no_propagation_without_trust_or_yolo(self, tmp_path):
-        """Without trust or YOLO, set_approval_policy clears to default."""
-        state, client = _make_state(tmp_path, context_builder=_context_builder())
+        """Without trust or YOLO, a session left on auto is cleared to default."""
+        state, client = self._real_state(tmp_path)
         slot = _make_slot()
+        key = f"dashboard:{slot.key}"
+        await open_session(state.sessions, key)
+        state.sessions.set_approval_policy(key, "auto")
         _set_stream(client, [_complete_event()])
 
         with _patch_stats():
             await _run_chat(state, slot, "hello")
 
-        state.sessions.set_approval_policy.assert_called_once_with(f"dashboard:{slot.key}", "")
+        assert state.sessions.get_approval_policy(key) == ""
 
 
 class TestResolveApprovalSlotFallback:
@@ -686,7 +814,7 @@ class TestResolveApprovalSlotFallback:
             "approval_resolved",
             # ``slot`` keys the frame for the slot-scoped WS gate — it must name
             # the slot that actually owned the resolved future.
-            {"id": "req-42", "approved": True, "slot": "chat-1-test"},
+            {"id": "req-42", "approved": True, "slot": "chat-1-test", "origin": "native"},
         )
         state.push_slots_update.assert_called_once()
 
@@ -709,7 +837,7 @@ class TestResolveApprovalSlotFallback:
         # decision in the frame.
         state.broadcast_ws.assert_called_with(
             "approval_resolved",
-            {"id": "req-43", "approved": False, "slot": "chat-1-test"},
+            {"id": "req-43", "approved": False, "slot": "chat-1-test", "origin": "native"},
         )
 
     @pytest.mark.asyncio

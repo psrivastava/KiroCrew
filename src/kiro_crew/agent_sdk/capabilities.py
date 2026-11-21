@@ -15,7 +15,8 @@ So this module carries one frozen record per session, with one field per questio
 a consumer OUTSIDE ``kiro_crew.agent_sdk`` actually asks, and consumers read the
 field. The identity of the backend is still in :attr:`SessionCapabilities.backend`
 because a log line and an error message need to name it — but nothing branches on
-it, and ``test_agent_sdk_capabilities`` pins that.
+it. ``test_agent_sdk_capabilities`` pins that the migrated consumers do not
+read the old backend-identity checks.
 
 Every field is a TRANSLATION of a table that already existed in
 :mod:`kiro_crew.agent_sdk.backends`, not a new judgement. That is deliberate and
@@ -56,11 +57,17 @@ from kiro_crew.agent_sdk.backends import (
     ACP_BACKENDS_ACP_CLIENT_SPAWNABLE,
     ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
     ACP_BACKENDS_CREW_FIRES_SPEC_HOOKS,
+    ACP_BACKENDS_CREW_FIRES_SPEC_OBSERVER_HOOKS,
     ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
+    ACP_BACKENDS_HARNESS_OWNED_SLASH_COMMANDS,
     ACP_BACKENDS_HONOR_ZERO_TOOL_BAN,
     ACP_BACKENDS_INLINE_COMPACTION,
     ACP_BACKENDS_KIRO_SLASH_COMMANDS,
     ACP_BACKENDS_NATIVE_TODOS,
+    ACP_BACKENDS_NATIVE_WORKFLOWS,
+    ACP_BACKENDS_PLAN_CHECKLIST,
+    ACP_BACKENDS_REMOTE_MCP_OAUTH,
+    ACP_BACKENDS_TOOL_TITLE_REFINEMENT,
     model_registry_namespace,
 )
 from kiro_crew.agent_sdk.provider_identity import PROVIDER_ACP, PROVIDER_CLAUDE_CODE
@@ -155,12 +162,39 @@ class SessionCapabilities:
     #: itself, and firing them here too would run each one twice.
     crew_fires_spec_hooks: bool
 
+    #: Whether Crew's turn loop must fire the agent spec's hooks on the events that
+    #: cannot refuse a tool call (``postToolUse``, ``userPromptSubmit``,
+    #: ``agentSpawn``, ``stop``).
+    #:
+    #: True wherever :attr:`crew_fires_spec_hooks` is, and on claude and codex,
+    #: whose harnesses are handed no spec but approve some calls without asking, so
+    #: only these events are fired there and ``preToolUse`` runs nowhere. False
+    #: where the harness runs the field itself.
+    crew_fires_spec_observer_hooks: bool
+
     #: Whether this harness interprets ``/todos`` as its native task-list command.
     #:
     #: This is deliberately narrower than general slash-command transport: the
     #: kiro-cli has a native slash RPC but does not implement this command.
     #: Unknown and newly registered backends remain False until they opt in.
     supports_native_todos: bool
+
+    #: Whether this harness keeps the agent's checklist itself and sends it as an
+    #: ACP ``plan`` (:data:`ACP_BACKENDS_PLAN_CHECKLIST`), rather than through
+    #: kiro-cli's ``todo_list`` tool.
+    #:
+    #: True means the dashboard's checklist sync and recovery blocks, which tell the
+    #: agent to call ``todo_list``, are never prepended to its prompt: it has no such
+    #: tool. False keeps them, which is right for kiro-cli and harmless elsewhere.
+    keeps_own_checklist: bool
+
+    #: Whether this harness runs ANY leading-slash prompt as one of its own commands.
+    #:
+    #: True where the adapter resolves the name itself (Claude Code's ``/review``,
+    #: ``/init``, skills, ``.claude/commands``), so the dashboard forwards every
+    #: leading-slash word raw instead of only kiro-cli's command names. Unknown and
+    #: newly registered backends remain False until they opt in.
+    runs_own_slash_commands: bool
 
     #: Whether an agent spec's ``"tools": []`` is honoured as a total ban -- no
     #: MCP server AND no harness-native tool -- on this backend.
@@ -171,8 +205,10 @@ class SessionCapabilities:
     #: member mounts from the same spec parse). False for claude, whose routing is
     #: declared but not enforced by this core -- an inherited ``~/.claude``
     #: pre-approval can skip ``session/request_permission`` entirely, so the refusal
-    #: never runs. False for codex, whose sessions are served by ``AcpRuntime``,
-    #: which carries no zero-tool refusal at all. A consumer that
+    #: never runs. False for codex: its ``AcpSessionHandle`` refuses every permission
+    #: request of a zero-tool session (``_deny_zero_tools``), but codex reads files,
+    #: searches the web, runs sandboxed commands and calls self-approved tools of the MCP servers in the
+    #: operator's ``config.toml`` without asking. A consumer that
     #: spawns a zero-tool agent (the knowledge/research pool) asks this before
     #: trusting a resolved backend, rather than enumerating identities itself.
     honors_zero_tool_ban: bool
@@ -188,6 +224,34 @@ class SessionCapabilities:
     #: a provider that already routes by this fact) asks it before passing a
     #: resolved backend on.
     acp_client_spawnable: bool
+
+    #: Whether a remote MCP entry's ``oauth`` block reaches the engine, so a
+    #: provider whose OAuth client is pre-registered (no dynamic client
+    #: registration) can sign in on this backend.
+    #:
+    #: False on KAS: its agent schema has no slot for the block, and the engine
+    #: falls back to registering a client the provider refuses. The Connections
+    #: page reads it to mark those providers kiro-cli only rather than offer a
+    #: Connect that cannot finish.
+    honors_remote_mcp_oauth: bool
+
+    #: Whether the harness brings its own workflow engine
+    #: (:data:`ACP_BACKENDS_NATIVE_WORKFLOWS`), so that workflow definitions, runs
+    #: and controls go to it over ``_kiro/workflow/*`` instead of to Crew's
+    #: ``ctx``-script engine. False routes to Crew's engine, which serves every
+    #: harness, so an unknown backend loses nothing.
+    native_workflows: bool
+
+    #: Whether a ``tool_call_update`` carries a call's real title after a first
+    #: ``tool_call`` that named it before its input had streamed
+    #: (:data:`ACP_BACKENDS_TOOL_TITLE_REFINEMENT`), so a Crew-spawned subagent's
+    #: Subagents card takes the refined title for that call's row.
+    #:
+    #: True for claude, whose first frame of a call carries the tool's generic title
+    #: ("Terminal", "Read File"). False keeps the card on the titles of the call and
+    #: its permission request, which is right for kiro-cli: the update that ends its
+    #: failed call carries the bare tool name, a worse title than the first.
+    refines_tool_call_titles: bool
 
 
 def capabilities_for(backend: str) -> SessionCapabilities:
@@ -211,9 +275,15 @@ def capabilities_for(backend: str) -> SessionCapabilities:
         effort_via_slash_command=backend in ACP_BACKENDS_KIRO_SLASH_COMMANDS,
         compacts_inline=backend in ACP_BACKENDS_INLINE_COMPACTION,
         crew_fires_spec_hooks=backend in ACP_BACKENDS_CREW_FIRES_SPEC_HOOKS,
+        crew_fires_spec_observer_hooks=backend in ACP_BACKENDS_CREW_FIRES_SPEC_OBSERVER_HOOKS,
         supports_native_todos=backend in ACP_BACKENDS_NATIVE_TODOS,
+        keeps_own_checklist=backend in ACP_BACKENDS_PLAN_CHECKLIST,
+        runs_own_slash_commands=backend in ACP_BACKENDS_HARNESS_OWNED_SLASH_COMMANDS,
         honors_zero_tool_ban=backend in ACP_BACKENDS_HONOR_ZERO_TOOL_BAN,
         acp_client_spawnable=backend in ACP_BACKENDS_ACP_CLIENT_SPAWNABLE,
+        honors_remote_mcp_oauth=backend in ACP_BACKENDS_REMOTE_MCP_OAUTH,
+        native_workflows=backend in ACP_BACKENDS_NATIVE_WORKFLOWS,
+        refines_tool_call_titles=backend in ACP_BACKENDS_TOOL_TITLE_REFINEMENT,
     )
 
 
@@ -239,9 +309,15 @@ UNKNOWN_BACKEND_CAPABILITIES = SessionCapabilities(
     effort_via_slash_command=False,
     compacts_inline=False,
     crew_fires_spec_hooks=False,
+    crew_fires_spec_observer_hooks=False,
     supports_native_todos=False,
+    keeps_own_checklist=False,
+    runs_own_slash_commands=False,
     honors_zero_tool_ban=False,
     acp_client_spawnable=False,
+    honors_remote_mcp_oauth=False,
+    native_workflows=False,
+    refines_tool_call_titles=False,
 )
 
 

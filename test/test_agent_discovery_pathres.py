@@ -1,28 +1,10 @@
 """The agent-spec reader asks the sensitive-path fence off the resolver pool.
 
-``agent_discovery._read_agent_spec`` (and its raising twin
-``read_agent_spec_strict``) canonicalises the spec path with
-``Path.resolve(strict=True)`` and then asks the fence. Asking through the
-bounded ``is_sensitive_path`` submits the same path to the two-worker
-``mc-pathres`` pool again, so when that pool is saturated the gate fails closed,
-the reader returns ``None`` at DEBUG level, and every surface built on it loses
-the agent silently: the native skill projection skips the spec with a bare
-``continue`` and later raises ``no prepared skill discovery view``.
-
-The fix hands the fence the resolved path through ``_fence_refuses``, which
-delegates to ``security.is_sensitive_canonical_path``: ``is_sensitive_resolved_path``
-off the event loop (no submission) and the bounded gate on the loop. These tests
-pin:
-
-* the gate receives the ``Path.resolve`` result, never the raw spelling;
-* off the loop a spec read completes with the pool refusing every submission and
-  never touches the bounded gate;
-* the two gates agree on canonical fenced and unfenced controls, and both -- with
-  no injected verdict -- refuse a link whose resolved target is a crew secret
-  leaf (the home-dirs class) or a keystone publish temp, as do both readers;
-* a fenced verdict still refuses (``None`` plus the audit row; the strict twin
-  raises ``SensitiveAgentSpecPathError``);
-* on the loop the bounded gate answers, on a worker the pre-resolved gate does.
+``_read_agent_spec`` and ``read_agent_spec_strict`` resolve the path first, so asking
+the bounded ``is_sensitive_path`` would resubmit it to the two-worker ``mc-pathres``
+pool; a saturated pool then fails closed and the agent silently disappears.
+``_fence_refuses`` calls ``security.is_sensitive_canonical_path``, which uses
+``is_sensitive_resolved_path`` off the loop and the bounded gate on it.
 """
 
 from __future__ import annotations
@@ -189,13 +171,9 @@ class TestTheTwoGatesAgree:
     ) -> None:
         """The ``evil.json -> <credential file>`` shape, real gates only.
 
-        The reader resolves the link, so the gate is asked about the TARGET. The
-        sibling tests inject a verdict at the reader's gate name, which proves the
-        wiring; this one proves the decision on the ``_SENSITIVE_HOME_DIRS`` class.
-        The target is the crew home's ``.env`` (a bare secret leaf, fenced through
-        the crew-prefix entries of that list): the suite pins ``KIROCREW_HOME`` to a
-        per-test tmp dir, so the file is test-owned and the real home, its anchors
-        and ``~/.aws`` are never touched or redirected.
+        Proves the decision on the ``_SENSITIVE_HOME_DIRS`` class with no injected
+        verdict. The target is the crew home's ``.env``; ``KIROCREW_HOME`` is a per-test
+        tmp dir, so the real home and ``~/.aws`` are never touched.
         """
         crew_home = Path(os.environ["KIROCREW_HOME"])
         crew_home.mkdir(parents=True, exist_ok=True)
@@ -339,11 +317,13 @@ class TestTheSpecReadIsPinnedAndCapped:
 
     @requires_symlinks
     def test_a_link_planted_at_the_resolved_name_is_refused_not_followed(
-        self, tmp_path: Path, caplog
+        self, tmp_path: Path, caplog, monkeypatch
     ) -> None:
         # The reader judged ``real`` while it was a regular file; by the time the
         # open runs the name is a link (the swap a stale realpath cannot see).
-        # ``_read_spec_bytes`` receives the judged name and must refuse.
+        # ``_read_spec_bytes`` receives the judged name and must refuse. On
+        # Windows the link screen judges first, so it is made just as stale.
+        monkeypatch.setattr(hooks, "_screen_windows_links", lambda target, *a, **k: target)
         target = tmp_path / "protected.json"
         target.write_text(json.dumps({"name": "linked", "model": "leaked"}), encoding="utf-8")
         agents = tmp_path / "agents"
@@ -421,15 +401,71 @@ class TestTheSpecReadIsPinnedAndCapped:
             ad_mod._read_spec_bytes(alias.resolve(strict=True))
         assert _read_agent_spec(alias, operation="t", source="test") is None
 
+    def test_a_hardlink_refusal_warns_once_per_path(self, tmp_path: Path, caplog) -> None:
+        # A hard-linked install tree is refused on every read; the WARNING says so
+        # once per resolved path, and the repeats go to DEBUG.
+        agents = tmp_path / "agents"
+        agents.mkdir()
+        aliases = []
+        for name in ("one", "two"):
+            target = tmp_path / f"{name}-target.json"
+            target.write_text(json.dumps({"name": name}), encoding="utf-8")
+            alias = agents / f"{name}.json"
+            os.link(target, alias)
+            aliases.append(alias)
+        one, two = aliases
+
+        def warnings_for(alias: Path) -> list[logging.LogRecord]:
+            return [
+                r
+                for r in caplog.records
+                if r.levelno == logging.WARNING
+                and alias.name in r.getMessage()
+                and "refusing to read a hardlinked file" in r.getMessage()
+            ]
+
+        with caplog.at_level(logging.DEBUG, logger=ad_mod.logger.name):
+            for _ in range(3):
+                assert _read_agent_spec(one, operation="t", source="test") is None
+            assert len(warnings_for(one)) == 1, caplog.text
+            repeats = [
+                r
+                for r in caplog.records
+                if r.levelno == logging.DEBUG and "Skipping agent config" in r.getMessage()
+            ]
+            assert len(repeats) == 2, caplog.text
+
+            assert _read_agent_spec(two, operation="t", source="test") is None
+            assert len(warnings_for(two)) == 1, caplog.text
+
+    def test_the_warn_once_record_is_capped(self, tmp_path: Path, caplog, monkeypatch) -> None:
+        # Past the cap one WARNING names the overflow; every later path logs at DEBUG.
+        monkeypatch.setattr(ad_mod, "_HARDLINK_WARNED_MAX", 1)
+        agents = tmp_path / "agents"
+        agents.mkdir()
+        aliases = []
+        for name in ("one", "two", "three"):
+            target = tmp_path / f"{name}-target.json"
+            target.write_text(json.dumps({"name": name}), encoding="utf-8")
+            alias = agents / f"{name}.json"
+            os.link(target, alias)
+            aliases.append(alias)
+
+        with caplog.at_level(logging.DEBUG, logger=ad_mod.logger.name):
+            for alias in aliases:
+                assert _read_agent_spec(alias, operation="t", source="test") is None
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 2, caplog.text
+        assert "one.json" in warnings[0]
+        assert "More than 1 hardlinked agent configs refused" in warnings[1]
+        assert len(ad_mod._HARDLINK_WARNED) == 2
+
 
 class TestTheUncTrustedRootGateStays:
     """A UNC spelling outside the trusted roots is refused before and after ``resolve``.
 
-    ``hooks.validate_file_path`` applied this gate to every spec read before the
-    readers left ``safe_read_file_bytes``; the pinned read keeps it, and asks it
-    before ``Path.resolve`` too, because on Windows that resolve is itself the
-    outbound SMB probe. Modelled on POSIX by flipping the module's platform flag
-    and the trusted-root predicate; ``is_unc_shape`` itself is the real one.
+    On Windows ``Path.resolve`` is itself the outbound SMB probe. Modelled on POSIX by
+    flipping the platform flag and trusted-root predicate; ``is_unc_shape`` is real.
     """
 
     @staticmethod
@@ -478,6 +514,55 @@ class TestTheUncTrustedRootGateStays:
         # The audit row carries the resolved spelling as the platform spells it
         # (backslashes on Windows), so compare against str(Path), not a literal.
         assert [row["resources"] for row in audited] == [str(share)] * 2
+
+    def test_a_local_link_naming_a_share_is_refused_before_the_resolve_probe(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        audited = self._arm(monkeypatch)
+        from kiro_crew.hook_runtime import windows_paths
+
+        monkeypatch.setattr(windows_paths, "unc_probe_allowed", lambda raw: False)
+        agents = tmp_path / "agents"
+        agents.mkdir()
+        link = agents / "x.json"
+        link.symlink_to("//evil/share/x.json")
+
+        class ProbingPath(type(Path())):
+            """A link whose ``resolve`` is the probe the screen must prevent."""
+
+            def resolve(self, strict: bool = False) -> Path:
+                pytest.fail("resolve followed a link whose target names an untrusted share")
+
+        assert _read_agent_spec(ProbingPath(link), operation="op", source="src") is None
+        assert [row["error"] for row in audited] == ["untrusted link target rejected"]
+        assert audited[0]["resources"] == str(link)
+
+    def test_the_screened_target_is_resolved_not_the_original_links(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(ad_mod, "_WINDOWS", True)
+        monkeypatch.setattr(ad_mod, "unc_probe_allowed", lambda raw: False)
+        audited: list[dict[str, str]] = []
+        monkeypatch.setattr(ad_mod, "_audit_denied", lambda **kw: audited.append(kw))
+        vetted = _spec(tmp_path / "vetted")
+        screened: list[str] = []
+
+        def screen(target: str, *args, **kwargs) -> str:
+            screened.append(target)
+            return str(vetted)
+
+        monkeypatch.setattr(hooks, "_screen_windows_links", screen)
+
+        class Retargeted(type(Path())):
+            """A link retargeted after the screen: following it again is the probe."""
+
+            def resolve(self, strict: bool = False) -> Path:
+                pytest.fail("resolve re-followed the original links after the screen")
+
+        original = Retargeted(tmp_path / "agents" / "a.json")
+        assert _read_agent_spec(original, operation="op", source="src") == {"name": "a"}
+        assert screened == [str(original)]
+        assert audited == []
 
     def test_a_trusted_share_and_a_local_path_pass(self, tmp_path: Path, monkeypatch) -> None:
         monkeypatch.setattr(ad_mod, "_WINDOWS", True)

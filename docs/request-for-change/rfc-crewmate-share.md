@@ -1,12 +1,12 @@
 ---
 title: Share one crewmate — a `.crewmate` bundle with Export and Import in the owner's crewmate UI
-status: accepted
+status: partial
 author: gjjnn
 created: 2026-10-17
-last-audited: 2026-10-22
-audited-at: b835fe9ca7
-doc-pr:
-implementation-prs: [21721]
+last-audited: 2026-11-20
+audited-at: fc89562d69
+doc-pr: 21508
+implementation-prs: [21721, 23424, 23223, 26601, 29962]
 tracking-issues: []
 supersedes: []
 superseded-by: []
@@ -14,11 +14,13 @@ superseded-by: []
 
 # RFC: Share one crewmate — a `.crewmate` bundle with Export and Import in the owner's crewmate UI
 
-- Status: accepted. [#21508](https://github.com/kirodotdev/KiroCrew/pull/21508) was merged on 2026-10-17 by the maintainer iamwhatever, who records the acceptance here. Partly built: [#21721](https://github.com/kirodotdev/KiroCrew/pull/21721) shipped the bundle reader (`crewmate_import_params` in `crewmate_bundle.py`), the `crewmate.import` card kind (`KIND_CREWMATE_IMPORT` in `change_card_catalog_kinds.py`) and an app path (`ctx.crewmate` in `apps/crewmate_sdk.py`) held off by `PREVIEW_ENABLED = False`. No export route and no owner Import entry exist. Every "exists" claim cites a symbol verified against `origin/main` at `b835fe9ca7`.
+- Status: partial. Since this line was written, owner Import ([#23424](https://github.com/kirodotdev/KiroCrew/pull/23424)) and Export from the profile card ([#23223](https://github.com/kirodotdev/KiroCrew/pull/23223); `src/kiro_crew/crewmate_bundle_export.py`, `dashboard/handlers/member_export.py`) merged; [#26601](https://github.com/kirodotdev/KiroCrew/pull/26601) later moved export to `.crewjam`, and [#29962](https://github.com/kirodotdev/KiroCrew/pull/29962) to `.kirobot` (`FILE_SUFFIX` in `crewmate_bundle.py`; import still takes `.crewjam` and `.crewmate`). Phase 3 (round trip) is open: import refuses a bundle with `mcpServers` or `skills` (`needs_mate_config` in `crewmate_bundle.py`). Checked at `fc89562d69`. Accepted: [#21508](https://github.com/kirodotdev/KiroCrew/pull/21508) was merged on 2026-10-17 by the maintainer iamwhatever, who records the acceptance here. Partly built: [#21721](https://github.com/kirodotdev/KiroCrew/pull/21721) shipped the bundle reader (`crewmate_import_params` in `crewmate_bundle.py`), the `crewmate.import` card kind (`KIND_CREWMATE_IMPORT` in `change_card_catalog_kinds.py`) and an app path (`ctx.crewmate` in `apps/crewmate_sdk.py`) held off by `PREVIEW_ENABLED = False`. No export route and no owner Import entry exist. Every "exists" claim cites a symbol verified against `origin/main` at `b835fe9ca7`.
 - Author: gjjnn
 - Amended 2026-10-18 on the product owner's ruling, and accepted with the 2026-10-22 amendment below by the maintainer iamwhatever in [this comment](https://github.com/kirodotdev/KiroCrew/pull/21746#issuecomment-6329962507): there is no Crewmate Share app. Export is a button on the crewmate's profile card and Import is an item in the crewmate dropdown, both core owner UI. The `propose_crewmate` App SDK capability, its two permissions and the `app:` card slot are dropped (§5.5). The bundle format and every security rule are unchanged.
 - Amended 2026-10-22 on review ([#21746](https://github.com/kirodotdev/KiroCrew/pull/21746)): an imported crewmate must not arrive hollow. Crons travel by default, each `script` cron with its script file. Skills the sender wrote travel as files. Lessons may travel only as a skill the owner reads and edits. A `user:` dashboard id stays home. Every added file is shown in full on the `crewmate.import` card, the way rules already are.
 - Amended 2026-10-23 on the owner's ruling (pending the owner's acceptance of this text): a card cannot hold the files a bundle carries, so raising an import card keeps one owner-only staged copy of the checked file on the local backend, and one new owner route writes the carried files on the press (§5.4, "The staged copy"). Bundled skills land in `.kiro/skills/<name>/` of the member's workspace, the tree its sessions read.
+- Amended 2026-10-31 by the maintainer iamwhatever, who decided that the share file follows the Crew Jam rename ([#26601](https://github.com/kirodotdev/KiroCrew/pull/26601)): export writes `<name>.crewjam`, with the manifest entry `crewjam.json` and `"format": "kirocrew.crewjam"`. Import still takes the old `.crewmate` form (`crewmate.json`, `kirocrew.crewmate`) through the same checks, so files already shared keep importing. A file holding both manifest entries is refused (§5.2, "File names").
+- Amended 2026-11-04 by the maintainer CrysisDeu, after the product name became Bot ([2026-11-04 decision](../decisions/2026-11-04-the-share-file-is-a-kirobot-file.md)): export writes `<name>.kirobot`, with the manifest entry `kirobot.json` and `"format": "kirocrew.kirobot"`. Import still takes the `.crewjam` and `.crewmate` forms through the same checks. A file holding more than one manifest entry is refused (§5.2, "File names").
 - Builds on: [rfc-mate-owned-agent-config.md](rfc-mate-owned-agent-config.md) (draft). Its per-mate file `~/.kiro/mates/agents/<id>.json` is the agent part of the bundle below. That RFC lists "a shared/importable crewmate-definition format" as a non-goal (§4); this RFC is that separate effort.
 - Follows: [TENETS.md](../../TENETS.md) tenet 8, "Everything is an app"; §5.6 says why these two entries sit in core.
 
@@ -137,7 +139,7 @@ A `.crewmate` file is a zip. Its top-level entries are fixed by name. Two folder
 
 Rules on the file:
 
-- Every JSON entry is UTF-8. Every key set is exact: an unknown key refuses the bundle.
+- Every JSON entry is UTF-8; one leading byte-order mark, which Windows editors add, is dropped. Every key set is exact: an unknown key refuses the bundle.
 - `formatVersion` is an integer. A reader accepts only versions it knows. A newer version refuses with "this file needs a newer Kiro Crew". Any added field bumps the version, so a reader never guesses at a field it does not know.
 - `agent.json` holds no `prompt` or `tools` content beyond defaults, because the worker base is source-defined (mate-owned config RFC §5.1).
 - Every MCP `env`, `headers` and `oauth.clientSecret` value in `agent.json` is the placeholder `placeholder_mcp_values` writes (`portability_templates.py`). Keys stay so the card can list what the receiver fills in.
@@ -146,9 +148,11 @@ Rules on the file:
 - Every `crons/<file>.py` entry is named by exactly one `script` cron in `crons.json`, and every `script` cron names an entry in the file. A mismatch refuses the bundle.
 - `<name>` and `<file>` match `^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`: no `..`, no slash, no drive letter.
 - `modelHint` is a hint. The card shows it; a model this host lacks falls back to the host default and the card says so.
-- `dashboardTemplate` is a `builtin:` template id only. A `user:` id names a template folder on the sender's host (`RENDERABLE_SOURCES` in `dashboard_templates/instance.py`), so it would dangle on the receiver's; export drops it and import refuses it. A bundle carries no page HTML, because a page from a sender is unrenderable by rule.
+- `dashboardTemplate` is a `builtin:` template id only. A `user:` id names a template folder on the sender's host (`RENDERABLE_SOURCES` in `dashboard_templates/instance.py`), so it would dangle on the receiver's; export drops it and import refuses it. A bundle carries no page HTML, because a page from a sender is unrenderable by rule. When the receiver ships that `builtin:` page, the import card ends its plan with a dashboard step (`POST /api/members/{slug}/dashboard/template`, card-only, `handlers/member_import_dashboard.py`) that adopts it on the new Bot, and the card's Undo removes that page only while it is still the version the step adopted; a slug that already holds a dashboard keeps it, and the Undo leaves it alone; an id the receiver lacks stays under "Not brought over".
 - Size caps: 8 MiB for the whole file, 512 KiB for the avatar, 64 KiB for each JSON entry, 256 KiB for each skill or script file, 1 MiB for each skill folder, 64 entries. The zip is vetted with `zip_vet.vet_zip_inventory` (`zip_vet.py`) before any entry is read.
 - `formatVersion` stays `1`: no writer of version 1 has shipped, so no file in the wild lacks these entries. Phase 1 widens `crewmate_bundle.py` to read them.
+
+**File names (amendment of 2026-10-31).** Export writes the file as `<name>.crewjam`, its manifest as `crewjam.json` and `"format": "kirocrew.crewjam"`. The reader also takes the form shipped before that date: a `.crewmate` file with a `crewmate.json` manifest and `"format": "kirocrew.crewmate"`. Both forms go through every rule above unchanged, the size caps, path rules, plain-file rule and key checks included. The two manifest names are one part: a file holding both `crewjam.json` and `crewmate.json` is refused. `formatVersion` stays `1`, since the entries and fields are the same. The table and example above show the original names; read `crewjam.json` and `kirocrew.crewjam` for what an export writes. Since 2026-11-04 an export writes `<name>.kirobot`, `kirobot.json` and `"format": "kirocrew.kirobot"`; the reader takes all three forms, and a file holding more than one of the three manifest names is refused.
 
 What a bundle never carries:
 
@@ -183,11 +187,11 @@ Under the list sits one line: "Not included: memory, history, credentials and ap
 
 **What export skips, and says so.** A `script` cron whose file is gone from `~/.kiro/crew/crons/` is left out and listed "not included (script missing)". A skill folder over the §5.2 caps, or holding a file the credential checks below refuse, is left out and listed with the reason.
 
-The press sends the toggles and the edited lessons text to `POST /api/members/{slug}/export`, which runs `_require_owner(request, "crewmate.export")`. Core builds the bundle from the crew record, the mate-owned file, the member rules and goals records, the cron store, the skill folders and the avatar. On the way out it runs `placeholder_mcp_values`, strips every grant field, drops a `user:` dashboard id and never opens an `EXPORT_EXCLUDE` name. Every skill and script file passes the same credential and control-character checks `crewmate.create` runs on text (`_validate_crewmate_create` in `guide_catalog.py`). It answers with the zip bytes and `Content-Disposition: attachment; filename="<name>.crewmate"`; the browser saves the file. Core writes nothing on disk, so the export needs no change card and has nothing to undo.
+The press sends the toggles and the edited lessons text to `POST /api/members/{slug}/export`, which runs `_require_owner(request, "crewmate.export")`. Core builds the bundle from the crew record, the mate-owned file, the member rules and goals records, the cron store, the skill folders and the avatar. On the way out it runs `placeholder_mcp_values`, strips every grant field, drops a `user:` dashboard id and never opens an `EXPORT_EXCLUDE` name. Every skill and script file passes the same credential and control-character checks `crewmate.create` runs on text (`_validate_crewmate_create` in `guide_catalog.py`). It answers with the zip bytes and `Content-Disposition: attachment; filename="<name>.crewjam"` (amendment of 2026-10-31; `.crewmate` before it); the browser saves the file. Core writes nothing on disk, so the export needs no change card and has nothing to undo.
 
 ### 5.4 Import
 
-The crewmate dropdown (`CrewmateSwitcher.tsx`) gains one footer item, **Import from file**, under "New crewmate". It opens the system file picker filtered to `.crewmate`. The browser posts the file to `POST /api/members/import`, which runs `_require_owner(request, "crewmate.import")`, vets the zip, re-runs every check in §5.2 and raises one `crewmate.import` card. A file that fails a check raises no card; the dropdown shows the refusal. The SPA then opens the card in a dialog with the shared card component.
+The crewmate dropdown (`CrewmateSwitcher.tsx`) gains one footer item, **Import from file**, under "New crewmate". It opens the system file picker filtered to `.crewjam` and `.crewmate` (amendment of 2026-10-31). The browser posts the file to `POST /api/members/import`, which runs `_require_owner(request, "crewmate.import")`, vets the zip, re-runs every check in §5.2 and raises one `crewmate.import` card. A file that fails a check raises no card; the dropdown shows the refusal. The SPA then opens the card in a dialog with the shared card component.
 
 The card shows:
 
@@ -313,7 +317,7 @@ Exit criteria:
 
 ## 7. Backward compatibility
 
-Compatible. Every part is added: two owner-only routes, a new card kind and two controls. No existing route, card kind or file format changes, and no App Kit contract changes.
+Compatible. Every part is added: two owner-only routes, a new card kind and two controls. No existing route, card kind or file format changes, and no App Kit contract changes. The 2026-10-31 rename of the export file to `.crewjam` keeps every `.crewmate` file importable (§5.2, "File names"); a Kiro Crew from before that date cannot open a `.crewjam` file.
 
 ## 8. Security considerations
 

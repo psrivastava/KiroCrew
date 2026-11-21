@@ -17,6 +17,10 @@ builds them and an adjustment is a single-file edit.
    by Kiro Crew -- in its process, behind its own deny floor and governance gate
    -- rather than by the backend. The handshake does not announce the surface
    (see ``KAS_CLIENT_CAPABILITIES``), so today the backend asks none of them.
+3. The **structured-question** surface, ``_kiro/userInput`` (see
+   :data:`METHOD_USER_INPUT`): the backend asks it only of a client that
+   announces it. Only the wire names are defined here; nothing announces or
+   answers the surface yet.
 
 The literals below are only what Kiro Crew must match to route a frame or answer
 a request; the backend's own internals are not documented here.
@@ -53,7 +57,7 @@ from kiro_crew.hooks import (
     HOOK_EVENT_STOP,
     HOOK_EVENT_USER_PROMPT_SUBMIT,
     TOOL_DENY,
-    _tool_matches,
+    _hook_tool_matches,
     hook_gate_kwargs,
 )
 from kiro_crew.sel import sel
@@ -78,14 +82,22 @@ KIND_STEERING_CLEARED = "steering_cleared"
 KIND_AGENT_SUBTASK = "agent-subtask"  # hyphenated, not underscored
 # Sent once per prompt, right after KAS stores the user row: names that row's id.
 KIND_USER_MESSAGE_ID_ASSIGNED = "user_message_id_assigned"
+# The engine's own turn boundaries on a session. A turn the client prompted ends
+# on its ``session/prompt`` response; a turn the ENGINE started on its own (a
+# workflow run waking its parent chat) has no request to answer, so these frames
+# are the only start and end it has (parsed by :func:`turn_boundary`).
+KIND_TURN_START = "turn_start"
+KIND_TURN_END = "turn_end"
+# A prompt parked behind another session's turn, waiting for the engine's one
+# active model slot (``AgentExecutionWaitingForActiveSlot``; carries
+# ``activeSessionId``). From 0.66.104 only a spec-generation turn waits there.
+KIND_QUEUED = "queued"
 
 # Summarization maps to Crew's compaction status; steering to mid-turn steer.
 SUMMARIZATION_KINDS = frozenset(
     {KIND_SUMMARIZATION_STARTED, KIND_SUMMARIZATION_COMPLETED, KIND_SUMMARIZATION_FAILED}
 )
-STEERING_KINDS = frozenset(
-    {KIND_STEERING_QUEUED, KIND_STEERING_INJECTED, KIND_STEERING_CLEARED}
-)
+STEERING_KINDS = frozenset({KIND_STEERING_QUEUED, KIND_STEERING_INJECTED, KIND_STEERING_CLEARED})
 
 # ── Payload fields Crew reads ──
 FIELD_KIND = "kind"
@@ -99,6 +111,7 @@ FIELD_STAGES = "stages"
 FIELD_UNIT = "unit"
 FIELD_USAGE = "usage"
 FIELD_USER_MESSAGE_ID = "userMessageId"
+FIELD_STOP_REASON = "stopReason"
 UNIT_CREDIT = "credit"
 # ``initialize``'s ``agentCapabilities._meta.kiro`` flag that announces the
 # ``_kiro/checkpoint/*`` verbs (``METHOD_KAS_CHECKPOINT_REVERT``).
@@ -116,6 +129,27 @@ def kiro_meta(update: dict) -> dict[str, Any] | None:
     meta = update.get(META_KEY)
     kiro = meta.get(KIRO_KEY) if isinstance(meta, dict) else None
     return kiro if isinstance(kiro, dict) else None
+
+
+def turn_boundary(update: object) -> tuple[str, str] | None:
+    """``(kind, stopReason)`` for a ``session_info_update`` turn boundary, else None.
+
+    *kind* is :data:`KIND_TURN_START` or :data:`KIND_TURN_END`; *stopReason* is
+    the end's own reason (``""`` for a start, or for an end that names none).
+    Any other frame -- another discriminant, another ``_meta.kiro`` kind, a
+    malformed blob -- answers None.
+    """
+    if not isinstance(update, dict) or update.get("sessionUpdate") != "session_info_update":
+        return None
+    kiro = kiro_meta(update)
+    kind = kiro.get(FIELD_KIND) if kiro is not None else None
+    if kind == KIND_TURN_START:
+        return KIND_TURN_START, ""
+    if kind == KIND_TURN_END:
+        assert kiro is not None
+        reason = kiro.get(FIELD_STOP_REASON)
+        return KIND_TURN_END, reason.strip() if isinstance(reason, str) else ""
+    return None
 
 
 def turn_credits(kiro: dict) -> float | None:
@@ -151,6 +185,26 @@ def turn_credits(kiro: dict) -> float | None:
 METHOD_HOOKS_LIST = "_kiro/hooks/list"
 METHOD_HOOKS_SESSION_START = "_kiro/hooks/sessionStart"
 METHOD_HOOKS_EXECUTE = "_kiro/hooks/executeHook"
+
+# ── The structured-question surface (``_kiro/userInput``) ──
+#
+# With ``_meta.kiro.userInput: true`` (:data:`CAPABILITY_USER_INPUT`) in the
+# initialize ``clientCapabilities``, the backend asks its ``user_input``
+# tool's question as a server->client REQUEST of this method on the asking
+# session, instead of on the legacy ``session/request_permission`` bridge:
+#
+#   params  {sessionId, toolCallId, question,
+#            options: [{title, description?, recommended?,
+#                       subOptionsLabel?, subOptions?: [{title, description?}]}]}
+#   result  {action: "answered", answer: str} | {action: "dismissed"}
+#
+# An empty ``options`` is a free-form question (the person types the answer);
+# picked sub-options ride the answer as ``"Title [a, b]"``. A dismissal, an
+# error answer or a method-not-found all read as "no answer" to the backend,
+# which moves the asking turn on.
+METHOD_USER_INPUT = "_kiro/userInput"
+#: The ``_meta.kiro`` key that announces the surface.
+CAPABILITY_USER_INPUT = "userInput"
 
 #: JSON-RPC error code for an execute request Kiro Crew REFUSED. A refusal is
 #: answered as an error, never as a result: a result carries an ``exitCode``, and a
@@ -356,10 +410,10 @@ def normalize_script_hook(hook: Any) -> NormalizedHook | None:
         command=command,
         matcher=matcher,
         timeout=timeout,
-        # The literal boolean, not truthiness. The store persists this field
-        # uncoerced -- ``ScriptHook.from_dict`` takes ``data.get("enabled", True)``
-        # as written -- so a hand-edited ``"enabled": "false"`` arrives as that
-        # string, and a truthiness test would read the operator's "off" as "on".
+        # The literal boolean, not truthiness. ``ScriptHook.from_dict`` coerces a
+        # hand-edited value on load (``"false"`` loads off, an unrecognised value
+        # loads on with a warning), so a loaded hook holds a real bool; the
+        # identity test stays as a guard for any hook object built another way.
         # Anything that is not ``True`` is treated as off, which is the direction
         # that cannot list a hook its owner switched off.
         enabled=getattr(hook, "enabled", True) is True,
@@ -422,7 +476,7 @@ def select_hooks(
         if hook.matcher:
             if trigger not in _TOOL_TRIGGERS or not tool_id:
                 continue
-            if not _tool_matches(hook.matcher, tool_id):
+            if not _hook_tool_matches(hook.matcher, tool_id):
                 continue
         if len(out) >= HOOKS_LIST_MAX:
             truncated += 1
@@ -824,7 +878,9 @@ async def hooks_execute(
     2. the id was listed for that session and still resolves to an enabled hook;
     3. the command clears the tool gate (:func:`_gate_hook_command`);
     4. ``capabilities.script_hooks`` permits it on that session's key, for the
-       stored hook's event (``hook_event_governance.event_refusal``).
+       stored hook's event (``hook_event_governance.event_refusal``) and, when
+       the policy names a ``hooks`` list, for the hook itself
+       (``hook_event_governance.hook_refusal``).
 
     The spawn itself is ``run_script_hook`` on the same snapshot the gates judged:
     the same sandbox, environment allowlist, output cap, redaction and timeout a
@@ -849,6 +905,11 @@ async def hooks_execute(
 
             # The policy's ``events`` list, asked for the stored hook's event.
             refusal = await asyncio.to_thread(event_refusal, session_key, hook.event)
+        if refusal is None:
+            from kiro_crew.hook_event_governance import hook_refusal
+
+            # The policy's ``hooks`` list, asked for the stored hook.
+            refusal = await asyncio.to_thread(hook_refusal, session_key, hook)
         if refusal is not None:
             raise HookExecuteRefused(refusal)
         prompt = sanitize_string(_str_param(params, "userPrompt"))

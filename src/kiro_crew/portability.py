@@ -27,11 +27,8 @@ import zlib
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator
 
-# datetime / timezone are the module-level clock binding the export builders read
-# (through ``portability_stream`` as ``_pf.datetime`` / ``_pf.timezone``) and the
-# one a test freezes with ``ManualClock.install(..., datetime=True)``. The sibling
-# module builds the archive timestamps, so this single patch point governs them even
-# though the names are referenced only from there.
+# The clock ``portability_stream`` reads as ``_pf.datetime`` / ``_pf.timezone``, so
+# a test freezing this module's names (``ManualClock.install``) governs archive times.
 from datetime import datetime, timezone  # noqa: F401 - module-level clock binding; see above
 from pathlib import Path, PurePath, PurePosixPath
 from typing import TYPE_CHECKING, Any, cast
@@ -42,6 +39,7 @@ from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.agent_discovery import clear_list_agents_cache, parsed_agent_specs
 from kiro_crew.agent_files import OWNED_KIRO_AGENT_FILES
 from kiro_crew.atomic_write import atomic_write
+from kiro_crew.bounded_read import bounded_read
 from kiro_crew.chat_attachments import ATTACHMENTS_DIR_SUFFIX
 from kiro_crew.config.loader import (
     ConfigReadError,
@@ -49,6 +47,11 @@ from kiro_crew.config.loader import (
     update_config_locked,
 )
 from kiro_crew.config.paths import config_dir, kiro_agents_dir
+from kiro_crew.dashboard.folder_portability import (
+    FolderMerge,
+    import_folders,
+    merge_folders_on_disk,
+)
 from kiro_crew.history import (
     ARCHIVE_DIR_NAME,
     ARCHIVE_SEGMENT_DELIMITER,
@@ -60,6 +63,12 @@ from kiro_crew.history import (
     ConversationLog,
     _safe_key,
     memory_mode_from_header_line,
+)
+from kiro_crew.home_path_rewrite import (
+    _read_path_file,
+    archive_home,
+    rewrite_staged_paths,
+    this_home,
 )
 from kiro_crew.mcp_cron import _log_cron_denial, _vet_shell_command
 from kiro_crew.memory_stores import MEMORY_STORES_DIR_NAME, is_host_local_store_state
@@ -74,6 +83,7 @@ from kiro_crew.portability_archive import (
     MEMORY_EXPORT_MANIFEST_VERSION,
     MEMORY_ONLY_FILES,
     MEMORY_ONLY_TREES,
+    REBUILDABLE_DIRS,
     _chat_stem,
     _entry_is_link,
     _is_link_entry,
@@ -82,8 +92,10 @@ from kiro_crew.portability_archive import (
     _mc_dir,
     _read_first_line_fd,
     _rotation_segment_for_stem,
+    _skipped_on_import,
     _transcript_header_verdict,
     _unsafe_member_name,
+    import_size_problem,
     logger,
     manifest_is_memory_only,
 )
@@ -111,7 +123,7 @@ from kiro_crew.portability_vetting import (
     _top_manifest,
     validate_import_zip,
 )
-from kiro_crew.security import is_sensitive_path
+from kiro_crew.security import is_sensitive_canonical_path, is_sensitive_path
 from kiro_crew.snapshot import (
     _DB_SIDECAR_GLOBS,
     COMPONENTS,
@@ -128,7 +140,9 @@ from kiro_crew.snapshot import (
     _merge_notifications,
     _refuse_corrupt_source_databases,
     _staging_is_pinned,
+    host_local_installable,
 )
+from kiro_crew.staging import IMPORT_STAGING_DIRNAME, staging_dir
 from kiro_crew.user_json import MAX_DOCUMENT_NESTING, exceeds_nesting, strip_utf8_bom
 from kiro_crew.zip_vet import ZipInventoryRejected, vet_zip_inventory
 
@@ -140,7 +154,7 @@ class _SettingsRefused(Exception):
 def _read_archive_text(path: Path) -> str:
     """The archive's *path* as text, read no further than the settings-document cap."""
     with open(path, "rb") as fh:
-        raw = fh.read(_MAX_SETTINGS_DOCUMENT_BYTES + 1)
+        raw = bounded_read(fh, _MAX_SETTINGS_DOCUMENT_BYTES + 1)
     if len(raw) > _MAX_SETTINGS_DOCUMENT_BYTES:
         raise _SettingsRefused(
             f"the archive's {path.name} is larger than {_MAX_SETTINGS_DOCUMENT_BYTES} bytes"
@@ -173,6 +187,98 @@ def _read_archive_object(path: Path) -> dict:
         )
     doc.pop("meta", None)
     return doc
+
+
+def _move_home_paths(snap: Path, summary: dict) -> frozenset[str]:
+    """Move the staged archive's saved folder paths from its home to this one.
+
+    Before either mode copies anything, so both install the moved paths. `project_dir` is
+    only read here, to work out the archive's home; a restore never installs it. Returns the
+    file names of the staged transcripts whose folder could not be moved: such a chat
+    opens in the default workspace, and `_merge_sessions` counts the ones it installs.
+    """
+    old_home, new_home = archive_home(snap), this_home()
+    if old_home is None or new_home is None:
+        return frozenset()
+    rewrite = rewrite_staged_paths(snap, old_home, new_home)
+    if rewrite.moved:
+        summary["home_paths_moved"] = rewrite.moved
+    return rewrite.cleared_chats
+
+
+def _workspace_dir_verdict(staged: Path, mc: Path) -> tuple[Path | None, str | None]:
+    """The folder the archive's workspace_dir may install, or why it may not (pure check)."""
+    if staged.is_symlink() or not staged.is_file():
+        return None, "the saved folder is not a plain file"
+    home = this_home()
+    value = _read_path_file(staged)
+    if home is None:
+        return None, "this install's home is unknown"
+    if not value.startswith("/") or "\0" in value or ".." in PurePosixPath(value).parts:
+        return None, "the saved folder is not a plain absolute path"
+    resolved, home_real = Path(os.path.realpath(value)), Path(os.path.realpath(home))
+    try:
+        str(resolved).encode("utf-8")
+    except UnicodeEncodeError:
+        return None, "the folder name is not valid UTF-8"
+    if resolved == home_real or not resolved.is_relative_to(home_real):
+        return None, "it is not a folder inside this home"
+    if Path(os.path.realpath(mc)).is_relative_to(resolved):
+        return None, "it is the data home or a folder holding it"
+    if is_sensitive_canonical_path(str(resolved)):
+        return None, "it is a protected folder"
+    return resolved, None
+
+
+def _plan_workspace_dir(snap: Path, mc: Path, summary: dict) -> Path | None:
+    """Before a replace swaps anything, decide whether the archive's workspace_dir installs.
+
+    The replace leaves ``workspace_dir`` alone (it is host-local), but the import has
+    already moved the archive's saved folder under this home, so an ordinary folder there
+    is carried over. ``workspace_dir`` roots every session folder, so it must not be the
+    home itself, the data home or a folder holding it, a protected folder, or anything
+    outside this home; then the live copy stays and the summary says so. Decided here so
+    nothing that can refuse runs after the replace has committed.
+    """
+    staged = snap / "workspace_dir"
+    if not os.path.lexists(staged):
+        return None
+    try:
+        resolved, why = _workspace_dir_verdict(staged, mc)
+    except (OSError, ValueError):
+        resolved, why = None, "the saved folder could not be checked"
+    if resolved is not None:
+        # The path that was checked, not the raw value: a link swapped in after the
+        # check is then not followed when the folder is used.
+        return resolved
+    kept = "; this install's copy is kept" if os.path.lexists(mc / "workspace_dir") else ""
+    summary["items"].append(f"workspace_dir (not installed: {why}{kept})")
+    return None
+
+
+def _stage_workspace_dir_verdict(
+    snap: Path, mc: Path, resolved: Path | None, summary: dict
+) -> None:
+    """Make the staged workspace_dir match the import preflight verdict."""
+    staged = snap / "workspace_dir"
+    if platform_compat.is_link_or_junction(staged):
+        platform_compat.unlink_link_or_junction(staged)
+    elif staged.is_dir():
+        shutil.rmtree(str(staged))
+    else:
+        staged.unlink(missing_ok=True)
+    if resolved is None:
+        return
+
+    value = str(resolved)
+    quote = '"' if '"' not in value else "'"
+    if quote in value:
+        kept = "; this install's copy is kept" if os.path.lexists(mc / "workspace_dir") else ""
+        summary["items"].append(
+            f"workspace_dir (not installed: its path contains both quote characters{kept})"
+        )
+        return
+    staged.write_text(f"{quote}{value}{quote}\n", encoding="utf-8")
 
 
 def _skip_setting(summary: dict, label: str, why: str) -> None:
@@ -470,7 +576,14 @@ def _rollback_import_session(
     return left
 
 
-def _merge_sessions(snap: Path, mc: Path, summary: dict, *, allow_unpinned: bool) -> None:
+def _merge_sessions(
+    snap: Path,
+    mc: Path,
+    summary: dict,
+    *,
+    allow_unpinned: bool,
+    cleared: frozenset[str] = frozenset(),
+) -> None:
     """Add the archive's dashboard chats this install does not have yet.
 
     Never overwrites: a transcript whose file name already exists here is left as
@@ -488,7 +601,9 @@ def _merge_sessions(snap: Path, mc: Path, summary: dict, *, allow_unpinned: bool
     use the import driver's declared unpinned policy and still copy, never move.
 
     Records ``sessions_added``, ``sessions_skipped_existing``, ``sessions_withheld``
-    and ``sessions_failed`` in *summary*. Copy failures roll back only this call's
+    and ``sessions_failed`` in *summary*, plus ``sessions_project_cleared``: how many
+    installed transcripts are in *cleared*, the ones whose folder `_move_home_paths`
+    dropped (left out when none). Copy failures roll back only this call's
     files under the stem lock and use the existing items/refused_merges reporting.
     An archive without a ``sessions/`` tree records nothing.
     """
@@ -503,7 +618,7 @@ def _merge_sessions(snap: Path, mc: Path, summary: dict, *, allow_unpinned: bool
     _staging_is_pinned(allow_unpinned=allow_unpinned, what="chat import")
     dest = mc / SESSIONS_DIR_NAME
     history = ConversationLog(base_dir=dest)
-    added = existing = withheld = failed = 0
+    added = existing = withheld = failed = project_cleared = 0
     for name in sorted(entries):
         entry = entries[name]
         stem = _chat_stem(name)
@@ -571,7 +686,11 @@ def _merge_sessions(snap: Path, mc: Path, summary: dict, *, allow_unpinned: bool
                             )
                         continue
                 added += 1
+                if name in cleared:
+                    project_cleared += 1
     summary["sessions_added"] = added
+    if project_cleared:
+        summary["sessions_project_cleared"] = project_cleared
     summary["sessions_skipped_existing"] = existing
     summary["sessions_withheld"] = withheld
     summary["sessions_failed"] = failed
@@ -599,7 +718,7 @@ def _read_session_mtimes(zf: zipfile.ZipFile) -> dict[str, float]:
         return {}
     try:
         with zf.open(manifests[0]) as src:
-            raw = src.read(_MAX_SETTINGS_DOCUMENT_BYTES + 1)
+            raw = bounded_read(src, _MAX_SETTINGS_DOCUMENT_BYTES + 1)
         if len(raw) > _MAX_SETTINGS_DOCUMENT_BYTES:
             return {}
         manifest = json.loads(raw)
@@ -644,6 +763,7 @@ def apply_import_zip(
     channel_settings: ChannelSettings | None = None,
     memory_only: bool = False,
     agent_templates: tuple[str, ...] = (),
+    folder_merge: FolderMerge | None = None,
 ) -> dict:
     """Extract and apply an import zip.
 
@@ -667,6 +787,9 @@ def apply_import_zip(
             only where no template of that name exists, in either mode; every one not
             written is named in ``agent_templates_skipped``. A memory-only import
             installs none.
+        folder_merge: the running gateway's chat-folder store, which adds the
+            archive's folders it lacks so its in-memory copy does not write them
+            away. ``None`` (no gateway in this process) writes ``folders.json``.
 
     Returns summary dict of what was imported. ``ui_prefs_restored`` is True when the
     browser-preference backup was installed, which tells the dashboard to re-read it.
@@ -706,15 +829,9 @@ def apply_import_zip(
     # ancestor-swap resistance, not link resistance.
     staging_pinned = _staging_is_pinned(allow_unpinned=True, what=f"{mode} import")
 
-    # What this field may honestly say depends on the MODE, not only the platform.
-    # Reporting "pinned" for a merge whose core files and skills are still copied by
-    # name with `shutil` is true of the platform, false of the operation, and this
-    # field exists to tell a reader what actually happened.
-    #
-    # replace delegates the whole apply to `_do_replace`, which is pinned throughout. merge
-    # routes only its tree copy through the primitive; its core files (including the
-    # databases, deliberately out of scope) and its skills copy are by name. So merge
-    # on a pinnable platform is MIXED, and saying so is the point.
+    # The field reports the operation, not the platform: replace (`_do_replace`) is
+    # pinned throughout, while merge pins only its tree copy and copies core files
+    # (databases included) and skills by name, so merge on a pinnable platform is mixed.
     if not staging_pinned:
         staging_mode = "unpinned"
     elif mode == "replace":
@@ -734,7 +851,16 @@ def apply_import_zip(
         "staging": staging_mode,
     }
 
-    with tempfile.TemporaryDirectory() as work_str:
+    # Extraction stays on the data home's disk, but outside agent-writable staging.
+    # The sandbox precreates and masks this whole leaf before any agent starts.
+    # The upload spool and snapshot/restore staging keep their existing location.
+    # The hourly maintenance wake reclaims a crash orphan here (staging.sweep_staging).
+    private_staging = mc / IMPORT_STAGING_DIRNAME
+    if platform_compat.is_link_or_junction(private_staging):
+        raise ValueError("import staging directory is not a real directory")
+    private_staging.mkdir(mode=0o700, exist_ok=True)
+    platform_compat.restrict_dir_to_owner(private_staging)
+    with tempfile.TemporaryDirectory(dir=str(private_staging)) as work_str:
         work = Path(work_str)
         platform_compat.restrict_dir_to_owner(work)
 
@@ -745,12 +871,9 @@ def apply_import_zip(
                 raise ValueError(
                     f"Import archive has too many entries ({len(infos)} > {_MAX_IMPORT_MEMBERS})"
                 )
-            total_uncompressed = sum(i.file_size for i in infos)
-            if total_uncompressed > _MAX_IMPORT_UNCOMPRESSED:
-                raise ValueError(
-                    f"Import archive uncompressed size {total_uncompressed} exceeds cap "
-                    f"{_MAX_IMPORT_UNCOMPRESSED} (possible zip bomb)"
-                )
+            size_problem = import_size_problem(infos, os.path.getsize(zip_path))
+            if size_problem is not None:
+                raise ValueError(size_problem)
             session_mtimes = _read_session_mtimes(zf)
             if not memory_only:
                 # The same one manifest the validator read decides the scope; a file
@@ -768,6 +891,8 @@ def apply_import_zip(
                 if _unsafe_member_name(info.filename):
                     continue
                 if _is_link_entry(info):
+                    continue
+                if _skipped_on_import(parts):
                     continue
                 if memory_only and not _is_memory_member(tuple(parts[1:])):
                     continue
@@ -795,8 +920,11 @@ def apply_import_zip(
         if len(snap_dirs) != 1:
             raise ValueError(f"Expected 1 top-level directory in zip, found {len(snap_dirs)}")
         snap = snap_dirs[0]
+        cleared: frozenset[str] = frozenset()
         if memory_only:
             summary["components"] = ["memory"]
+        else:
+            cleared = _move_home_paths(snap, summary)
 
         # Re-vet imported cron commands before ANY path below consumes
         # crons.json (merge, copy, or replace). An import archive is
@@ -829,16 +957,11 @@ def apply_import_zip(
         # installing it would let the archive's author sign as this host's members.
         _strip_host_local_store_state(snap)
 
-        # The memory component's incoming databases are validated before EITHER branch
-        # moves anything, with the restore's own validator: replace installs everything
-        # the archive carries, merge only what the destination lacks, and a named store
-        # the destination lacks is exactly the merge case -- a whole-store copy
-        # would otherwise install a torn `memory_stores/<name>/memory.db` verbatim, and
-        # the member fails at its next open with the archive long gone. Refused here,
-        # nothing has been written; the exception reaches the handler as a refusal.
-        # `crew-teams` rides the same check: replace copies the tree whole through
-        # `_do_replace`, merge copies the document where the destination has none, and
-        # both would otherwise install a document the team store's reader refuses.
+        # Incoming memory databases and the `crew-teams` document are validated with the
+        # restore's own validator before EITHER branch moves anything. Both branches can
+        # install them whole (a named store the destination lacks is copied verbatim), so
+        # a torn `memory_stores/<name>/memory.db` would otherwise fail at its next open.
+        # Refused here, nothing has been written.
         _refuse_corrupt_source_databases(
             snap, ["memory", "crew-teams"], mc_for_merge=None if mode == "replace" else mc
         )
@@ -853,8 +976,13 @@ def apply_import_zip(
                 excluded_file = snap / excluded_name
                 if excluded_file.exists():
                     excluded_file.unlink()
+            # Judged as if staged in the visible ``staging`` leaf, as before this extraction
+            # moved: the private leaf is itself a secret leaf, so its own path would mark
+            # every member sensitive, and the destination path would drop crons.json,
+            # crew-teams and named stores, which Replace restores.
+            neutral = staging_dir() / snap.name
             for fpath in snap.rglob("*"):
-                if fpath.is_file() and is_sensitive_path(str(fpath)):
+                if fpath.is_file() and is_sensitive_path(str(neutral / fpath.relative_to(snap))):
                     fpath.unlink()
             auto_dir = snap / "skills" / "auto"
             # ``is_link_or_junction`` FIRST, not a bare ``is_dir()``: a Windows
@@ -869,18 +997,16 @@ def apply_import_zip(
                 platform_compat.unlink_link_or_junction(auto_dir)
             elif auto_dir.is_dir():
                 shutil.rmtree(str(auto_dir))
-            # A platform that cannot pin a directory by descriptor refuses this
-            # staging pass, and the refusal is allowed to propagate. Catching it and
-            # returning the summary would be worse than the crash: the caller reads a
-            # returned summary as success, so the dashboard would render "Import
-            # complete" over a data home nothing was written to. Propagating reaches the
-            # existing error path, which is the one that tells the user the import did
-            # not happen.
+            # A platform that cannot pin refuses this staging pass, and the refusal
+            # propagates: a returned summary reads as success, so catching it would show
+            # "Import complete" over a data home nothing was written to.
             # Each settings store whose file this swap replaces is held at its writer
             # lock for the whole swap (rollback included): a write from another tab or
             # channel in between would publish its pre-import copy over the restored
             # file. The notification store also re-reads its file before letting go.
             # Taken in one fixed order, ui-prefs then notifications.
+            workspace_dir = _plan_workspace_dir(snap, mc, summary)
+            _stage_workspace_dir_verdict(snap, mc, workspace_dir, summary)
             with contextlib.ExitStack() as swap_guard:
                 if "ui-prefs.json" in vetted_settings:
                     swap_guard.enter_context(ui_prefs.replacing_file())
@@ -890,12 +1016,15 @@ def apply_import_zip(
                         vetted_settings["notification_settings.json"],
                     )
                     swap_guard.enter_context(channel_settings.replacing_file(channels))
-                _do_replace(snap, mc, None, allow_unpinned=not staging_pinned)
+                token = host_local_installable.set(frozenset({"workspace_dir"}))
+                try:
+                    _do_replace(snap, mc, None, allow_unpinned=not staging_pinned)
+                finally:
+                    host_local_installable.reset(token)
             summary["items"].append("full replace")
             if "ui-prefs.json" in vetted_settings:
                 summary["ui_prefs_restored"] = True
         else:
-            # Merge mode
             if (snap / "memory.db").is_file():
                 if not (mc / "memory.db").is_file():
                     # Pinned, not copy2: see `_install_core_file_if_absent`.
@@ -917,21 +1046,21 @@ def apply_import_zip(
                     else:
                         summary["items"].append("memory (skipped: not a regular file)")
                         summary.setdefault("refused_merges", []).append("memory")
-                else:
-                    _merge_memory(snap / "memory.db", mc / "memory.db")
+                elif _merge_memory(snap / "memory.db", mc / "memory.db"):
                     summary["items"].append("memory (merged)")
+                else:
+                    # A refused merge imported no row, so it is named and flagged
+                    # in refused_merges, as a refused crons merge is below.
+                    summary["items"].append("memory (skipped: unreadable or corrupt memory.db)")
+                    summary.setdefault("refused_merges", []).append("memory")
 
             if (snap / "crons.json").is_file():
                 if (mc / "crons.json").is_file():
                     if _merge_crons(snap / "crons.json", mc / "crons.json"):
                         summary["items"].append("crons (merged)")
                     else:
-                        # A refused merge imported zero jobs. Appending
-                        # "crons (merged)" here regardless would render a
-                        # success over a restore that brought no job back.
-                        # The refusal is named in the
-                        # items and flagged machine-readably so the handler can
-                        # log the import as partial rather than a flat ok.
+                        # A refused merge imported zero jobs: name it and flag it in
+                        # refused_merges so the handler logs the import as partial.
                         summary["items"].append("crons (skipped: unreadable or invalid cron store)")
                         summary.setdefault("refused_merges", []).append("crons")
                 elif _install_core_file_if_absent(snap / "crons.json", mc / "crons.json"):
@@ -976,23 +1105,15 @@ def apply_import_zip(
                         )
                         summary["items"].append("notifications (merged)")
                     except NotificationCopyUnsupported as exc:
-                        # Zero records imported: flag it machine-readably so the
-                        # handler logs the import as partial, not a flat ok --
-                        # exactly as the crons refusal above does. A flat ok would
-                        # tell the API caller the import succeeded over records
-                        # left behind, the failure class this whole change removes.
+                        # Zero records imported: flagged like the crons refusal above,
+                        # so the handler logs the import as partial, not a flat ok.
                         summary["items"].append(f"notifications (SKIPPED: {exc})")
                         summary.setdefault("refused_merges", []).append("notifications")
                 else:
-                    # Not `copy2`: it installed records the live file's own reader
-                    # refuses, and that reader loses the whole file to one of them.
-                    # Same abort posture as the merge branch above.
-                    #
-                    # The platform refusal is NOT that abort: it says this platform
-                    # can never do this safely, so it skips one item and lets the
-                    # import proceed. Recorded in the summary as skipped WITH the
-                    # reason -- reporting "copied" for a refusal, or saying nothing,
-                    # would be a silent install.
+                    # Not `copy2`: that would install records the live file's own
+                    # reader refuses, and it loses the whole file to one of them.
+                    # Same abort posture as the merge branch above; the platform
+                    # refusal instead skips this one item, reported with its reason.
                     try:
                         _copy_notifications(
                             snap / "notifications.jsonl", mc / "notifications.jsonl"
@@ -1007,9 +1128,7 @@ def apply_import_zip(
                 if sd.is_dir():
                     dd = mc / dirname
                     dd.mkdir(parents=True, exist_ok=True)
-                    # The permission decided once at entry flows down; otherwise the inner
-                    # gate re-asks and refuses, which is the same platform outage by a
-                    # longer route.
+                    # Pass down the permission decided at entry, or the inner gate refuses.
                     _copy_tree_no_overwrite(sd, dd, allow_unpinned=not staging_pinned)
                     summary["items"].append(f"{dirname} (merged)")
 
@@ -1042,7 +1161,10 @@ def apply_import_zip(
         # Both modes, and add-only in both: Replace restores the components it
         # names, and chats are not one of them, so an archive -- with chats or
         # without -- never deletes or overwrites a chat this install already has.
-        _merge_sessions(snap, mc, summary, allow_unpinned=not staging_pinned)
+        # The chat folders follow the same rule (`dashboard.folder_portability`).
+        if not memory_only:
+            import_folders(snap, summary, folder_merge or merge_folders_on_disk(mc))
+        _merge_sessions(snap, mc, summary, allow_unpinned=not staging_pinned, cleared=cleared)
 
     if agent_templates and not memory_only:
         _install_agent_templates(zip_path, sorted(set(agent_templates)), summary)
@@ -1108,11 +1230,18 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _DASHBOARD_STEM_PREFIX,
         _DRIVE_PREFIX,
         _FILE_ATTRIBUTE_REPARSE_POINT,
+        _IMPORT_DISK_RESERVE,
+        _MAX_IMPORT_COMPRESSION_RATIO,
+        _MAX_IMPORT_UNCOMPRESSED_CEILING,
         _MAX_TRANSCRIPT_HEADER_BYTES,
         _SETTINGS_DOCUMENTS,
+        _SHRINK_HINT,
         _TRANSCRIPT_SUFFIX,
+        _gb,
+        _in_rebuildable_dir,
         _is_excluded,
         _keep_top_level_transcript,
+        _largest_folders,
         _transcript_stem,
     )
     from kiro_crew.portability_export import (  # noqa: F401
@@ -1157,5 +1286,6 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _UNREADABLE_STORE,
         _publish_staged_cron_store,
         _read_staged_cron_store,
+        _read_staged_store_bytes,
         _sanitize_cron_text,
     )

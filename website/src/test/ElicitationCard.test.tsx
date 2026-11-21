@@ -108,8 +108,19 @@ describe('draft helpers', () => {
     expect(draftToContent(f, initialDraft(f))).toEqual({ missing: 'Proto' })
     const shaped = draftToContent(f, Object.assign(initialDraft(f), { ['__proto__']: 'x' }))
     expect(JSON.parse(JSON.stringify(shaped.content))).toEqual({ ['__proto__']: 'x' })
-    expect(answerSummary(f, JSON.parse('{"__proto__": "x"}'))).toBe('Proto: x')
-    expect(answerSummary(f, {})).toBe('')
+    expect(render(<>{answerSummary(f, JSON.parse('{"__proto__": "x"}'))}</>).container.textContent).toBe('Proto: x')
+    expect(answerSummary(f, {})).toBeNull()
+  })
+
+  it('shows a boolean answer as a lucide check or X with a spoken yes or no', () => {
+    const f: ElicitationField[] = [
+      { name: 'a', kind: 'boolean', required: true, title: 'A' },
+      { name: 'b', kind: 'boolean', required: true, title: 'B' },
+    ]
+    const { container } = render(<>{answerSummary(f, { a: true, b: false })}</>)
+    expect(container.textContent).toBe('A:  · B: ')
+    expect(container.querySelector('svg.lucide-check')).toHaveAttribute('aria-label', 'Yes')
+    expect(container.querySelector('svg.lucide-x')).toHaveAttribute('aria-label', 'No')
   })
 
   it('shapes numbers from their text and leaves optional empties out', () => {
@@ -198,6 +209,24 @@ describe('ElicitationCard', () => {
     expect(post.mock.calls[0][1]).toEqual({ request_id: 'rid-1', request_mid: 'mid-1', action: 'decline' })
   })
 
+  it('dismisses with cancel from the visible Close without answering button, not decline, and stamps the row as not answered', async () => {
+    // MCP's third answer: the person put the question away without choosing.
+    // The server reads it apart from Decline's explicit no, so the dismiss
+    // must never be a decline in disguise.
+    const store = configureStore({ reducer: { chat: chatReducer }, middleware: d => d({ serializableCheck: false, immutableCheck: false }) })
+    store.dispatch(setActiveSlot('dashboard:main'))
+    store.dispatch(replaceMessages([row({})]))
+    render(<Provider store={store}><ElicitationCard message={row({})} slot="dashboard:main" /></Provider>)
+    const dismiss = screen.getByRole('button', { name: /^close without answering$/i })
+    // The label is the button's own text, not only an aria-label.
+    expect(dismiss).toHaveTextContent(/^close without answering$/i)
+    expect(dismiss).not.toHaveAttribute('aria-label')
+    fireEvent.click(dismiss)
+    await waitFor(() => expect(post).toHaveBeenCalledTimes(1))
+    expect(post.mock.calls[0][1]).toEqual({ request_id: 'rid-1', request_mid: 'mid-1', action: 'cancel' })
+    await waitFor(() => expect(store.getState().chat.messages[0].meta?.resolved).toBe('cancel'))
+  })
+
   it('shows the gateway reason through ErrorNotice when the answer is refused and keeps the form open', async () => {
     const body = JSON.stringify({ error: "'count' is above its maximum", code: 'invalid_content' })
     post.mockResolvedValueOnce(new Response(body, { status: 400, headers: { 'content-type': 'application/json' } }))
@@ -217,6 +246,7 @@ describe('ElicitationCard', () => {
     expect(screen.getByRole('button', { name: /finished/i })).toBeInTheDocument()
     const resolved = row({ resolved: 'decline' })
     const { container } = render(<ElicitationCard message={resolved} slot="dashboard:main" />)
+    // No Submit, no Decline, and no Close without answering either: nothing is answerable.
     expect(container.querySelectorAll('button')).toHaveLength(0)
     expect(container.textContent).toMatch(/Declined/)
   })

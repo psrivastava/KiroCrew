@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 
-from kiro_crew.config.fields import _meta, _safe_bool
+from kiro_crew.config.fields import _meta, _safe_bool, _safe_int
 from kiro_crew.config.sections_channels import _clamp_pct, _coerce_int_ids, _threshold_pct
 from kiro_crew.config.sections_defaults import SectionReader
 from kiro_crew.config.sections_slack import ACTIVATION_ALWAYS, ACTIVATION_MENTION, ACTIVATION_OFF
@@ -88,7 +88,9 @@ def _parse_telegram_accounts(raw: object) -> dict[str, "TelegramAccountConfig"]:
             allowed_user_ids=_coerce_int_ids(account.get("allowed_user_ids")),
             allow_forum=account.read("allow_forum", _safe_bool),
             allowed_forum_chat_ids=_coerce_int_ids(account.get("allowed_forum_chat_ids")),
-            soft_threshold_pct=account.read("soft_threshold_pct", _threshold_pct),
+            soft_threshold_pct=account.read(
+                "soft_threshold_pct", _threshold_pct, unclamped=_safe_int
+            ),
         )
     return out
 
@@ -266,6 +268,15 @@ class TelegramConfig:
             "folder name, created when these settings are saved and marked with "
             "the channel's brand mark. A configured folder that no longer exists "
             "leaves conversations unfiled until the next save recreates it.",
+            tags=["telegram"],
+        ),
+    )
+    max_text_inject_kb: int = field(
+        default=50,
+        metadata=_meta(
+            "Attachment Text Limit (KiB)",
+            "How much of an attached text file or document reaches the model, in "
+            "KiB of characters (at least 1); the rest is cut with a truncation marker.",
             tags=["telegram"],
         ),
     )

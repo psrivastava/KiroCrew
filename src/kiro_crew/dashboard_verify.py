@@ -153,10 +153,18 @@ from kiro_crew import (
     github_runner,
     platform_compat,
 )
-from kiro_crew.browser_cli.launcher import _SANDBOX_MARKERS
 from kiro_crew.constants import DEFAULT_SPAWN_MIN_MEMORY_GB
 
 logger = logging.getLogger(__name__)
+
+#: Chromium's own stderr lines when it cannot set up its process sandbox (no
+#: unprivileged user namespaces). Matched against the verify browser's log to
+#: name the cause instead of quoting a stack.
+_SANDBOX_MARKERS = (
+    "No usable sandbox",
+    "sandbox initialization failed",
+    "Failed to initialize sandbox.",
+)
 
 __all__ = [
     "DATA_RECORD",
@@ -771,14 +779,15 @@ def _defined_by(name: str, url: str) -> bool:
     Read from the URL alone, because nothing was fetched: ``Chart`` for ``.../chart.js@4``,
     ``d3`` for ``.../d3/7.8.5/d3.min.js``, ``ReactDOM`` for ``.../react-dom``. A name the
     URL does not suggest is the page's own, so a typo on a page that loads a library is
-    still reported.
+    still reported. ``js`` is filler on its own but joins a neighbouring library word, so
+    ``jsyaml`` for ``.../js-yaml`` and ``videojs`` for ``.../video.js@8``.
     """
-    words = [
-        word
-        for word in re.sub(r"[^a-z0-9]+", " ", urlsplit(url).path.lower()).split()
-        if word not in _URL_FILLER
-    ]
+    every = re.sub(r"[^a-z0-9]+", " ", urlsplit(url).path.lower()).split()
+    words = [word for word in every if word not in _URL_FILLER]
     words += [a + b for a, b in zip(words, words[1:])]
+    words += [
+        a + b for a, b in zip(every, every[1:]) if "js" in (a, b) and not {a, b} <= _URL_FILLER
+    ]
     return any(
         word == wanted or (len(wanted) >= 4 and word.startswith(wanted))
         for wanted in _LIBRARY_ALIASES.get(name) or (name.lower(),)
@@ -860,7 +869,9 @@ class _Collector:
         if isinstance(description, str) and description:
             message = description.split("\n", 1)[0]
         elif "value" in exception:
-            message = f"{text} {exception['value']}"
+            value = exception["value"]
+            shown = value if isinstance(value, str) else json.dumps(value, default=str)
+            message = f"{text} {shown}"
         else:
             message = text
         line, column, url = _first_frame(details.get("stackTrace"))
@@ -961,6 +972,23 @@ def _stop(proc: subprocess.Popen[bytes]) -> None:
         proc.wait(timeout=_REAP_SECONDS)
     except subprocess.TimeoutExpired:
         logger.warning("the verification browser did not exit after SIGKILL")
+
+
+def _remove_profile(profile: str, end: float) -> None:
+    """Delete the throwaway profile, going over it again until *end* while it is still there.
+
+    A helper the browser starts in a session of its own, such as its crash handler, is
+    missed by the group kill, and an entry it writes while the tree is being removed leaves
+    the directory behind.
+    """
+    while True:
+        shutil.rmtree(profile, ignore_errors=True)
+        if not os.path.lexists(profile):
+            return
+        if time.monotonic() >= end:
+            logger.warning("the page check could not remove its browser profile %s", profile)
+            return
+        time.sleep(0.02)
 
 
 def _exited(proc: subprocess.Popen[bytes], seconds: float) -> bool:
@@ -1179,13 +1207,15 @@ def _drive(
         starting = run is None or not run.started
         raise _BrowserGone(reason or str(exc), failed_to_start=bool(reason) and starting) from None
     finally:
+        # The kill and the profile's removal share the one reap limit REPLY_SECONDS counts.
+        reaped_by = time.monotonic() + _REAP_SECONDS
         if proc is not None:
             _stop(proc)
         if pipe is not None:
             pipe.close()
         for fd in list(owned):
             release(fd)
-        shutil.rmtree(profile, ignore_errors=True)
+        _remove_profile(profile, reaped_by)
 
 
 # --------------------------------------------------------------------------- #
@@ -1440,7 +1470,7 @@ def _run_in_slot(
         copy = _copy_of_record(read, model, page_html, real_record)
     except _ReadFailed:
         return _skipped(
-            "this crewmate's current data could not be read, so the page was not run", started
+            "this Bot's current data could not be read, so the page was not run", started
         )
     except dashboard_synth.SynthesisRefused as exc:
         return _skipped(f"the record could not be copied for the check ({exc})", started)

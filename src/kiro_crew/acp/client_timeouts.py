@@ -43,6 +43,13 @@ _MAX_CONSECUTIVE_EMPTY = 5
 
 # Timeouts for session initialization steps
 _INIT_TIMEOUT = 240.0  # 4 min — MCP servers can be slow to initialize
+# Scope admission's share of the ``initialize`` window, by the runtime's rule
+# (``runtime_spawn_launch._SCOPE_ADMISSION_RESERVE``): a scoped spawn has no agent
+# until the user systemd manager has moved its pid into the scope, and that wait
+# comes out of the same window. Admission may take the window less the reserve,
+# and ``initialize`` keeps at least the reserve after a slow admission.
+_SCOPE_ADMISSION_RESERVE = 30.0
+_SCOPE_ADMISSION_TIMEOUT = _INIT_TIMEOUT - _SCOPE_ADMISSION_RESERVE
 # set_mode/set_model: fire-and-forget.  kiro-cli accepts these commands
 # but usually never sends a JSON-RPC response — MCP servers load
 # asynchronously.  Any late responses land in _buffer and are harmlessly
@@ -116,12 +123,22 @@ def resolve_prompt_timeout() -> float:
     """
     turn_limit = current_turn_limit_secs() or 0.0
     try:
+        from kiro_crew.config import load_memo
         from kiro_crew.config.loader import KiroCrewConfig
         from kiro_crew.constants import SUBAGENT_TIMEOUT_SECS
 
-        agent = KiroCrewConfig.load().agent
-        subagent = float(agent.subagent_timeout_secs) or float(SUBAGENT_TIMEOUT_SECS)
-        configured = max(float(agent.chat_turn_timeout_secs), subagent, turn_limit)
+        def _read(cfg: KiroCrewConfig) -> tuple[float, float]:
+            agent = cfg.agent
+            return float(agent.chat_turn_timeout_secs), float(agent.subagent_timeout_secs)
+
+        # Read at every prompt dispatch, on the event loop too: the config rebuild
+        # is skipped while the config files are unchanged (``config.load_memo``).
+        # The turn's own limit above is live, never part of the memo.
+        turn_ceiling, subagent_setting = load_memo.memoized(
+            "acp.prompt_timeout_inputs", KiroCrewConfig.load, _read
+        )
+        subagent = subagent_setting or float(SUBAGENT_TIMEOUT_SECS)
+        configured = max(turn_ceiling, subagent, turn_limit)
     except Exception:
         logger.debug("turn-ceiling config unavailable; transport keeps default", exc_info=True)
         return prompt_timeout_for_ceiling(turn_limit)
@@ -156,7 +173,7 @@ async def _effective_prompt_timeout_async(timeout: float | None) -> float:
     → ``KiroCrewConfig.load()``: stat, read, validate), so resolving it inline
     in an ``async def`` would block the event loop for every session sharing
     it. Offload to a thread, matching this module's convention for filesystem
-    work (see ``_resolve_kiro_bin_async``).
+    work (see ``_resolve_kiro_bin_for_spawn``).
     """
     if timeout is not None:
         return float(timeout)
@@ -165,6 +182,11 @@ async def _effective_prompt_timeout_async(timeout: float | None) -> float:
 
 _READ_TIMEOUT = 20.0
 _OPENCODE_PERMISSION_REFINEMENT_TIMEOUT = 2.0
+# How long a command-less MiMo Code shell request waits for the running update that
+# carries its command. Every 0.1.15 capture has the two frames adjacent
+# (``test/fixtures/acp_frames/mimocode``), so this only bounds a stalled harness; a
+# request still unpaired at the bound reaches the dispatcher without a command.
+_MIMOCODE_PERMISSION_REFINEMENT_TIMEOUT = 2.0
 # Steers sent as a second ``session/prompt`` (``ACP_BACKENDS_STEER_CONCURRENT_PROMPT``).
 # A steer the running loop read is answered at the same idle as the turn, so the
 # turn's clean end waits only this long for its answer.
@@ -200,7 +222,16 @@ _STALE_TURN_TIMEOUT = 90.0
 # either stream tool_call_update progress frames or ping the session-keepalive
 # endpoint (both reset the clock).  This window — not the ~90s stale-turn
 # cutoff — is what governs an open tool call's silence.
-_TOOL_STALL_TIMEOUT = 600.0
+#
+# It must sit strictly ABOVE the longest wait a harness's own built-in tool may
+# legally spend silent, or a call the model was allowed to make is reaped as a
+# stall: Copilot CLI's `bash` (`initial_wait`) and `read_bash` (`delay`) accept up
+# to 600s and emit no frame meanwhile, as does Claude Code's Bash `timeout`. A
+# window equal to that maximum killed the agent on a legal 600s `read_bash`.
+_LONGEST_NATIVE_TOOL_WAIT = 600.0
+# Room past that wait for the tool to return and its result frame to arrive.
+_TOOL_STALL_MARGIN = 120.0
+_TOOL_STALL_TIMEOUT = _LONGEST_NATIVE_TOOL_WAIT + _TOOL_STALL_MARGIN
 
 
 # After a compaction `failed` status, kiro-cli can leave the turn it was
@@ -216,6 +247,16 @@ _TOOL_STALL_TIMEOUT = 600.0
 # writing stderr must still be reaped.
 _COMPACTION_FAILED_TURN_BUDGET = 60.0
 _CANCEL_GRACE_SECS = 10.0  # grace window for cooperative cancel ack
+# How long a stop waits, after it closes the child's stdin, for the child to
+# exit on its own before the forced kill. EOF on stdin is how an ACP client
+# ends a session, and an agent tidies up on it: kiro-cli removes its session
+# lock (``~/.kiro/sessions/cli/<id>.lock``) or lease, which a SIGKILL leaves
+# behind for good. Measured on kiro-cli 3.2.1: the lock is gone 0.21-0.37 s
+# after EOF and the lease 0.57 s after, while the process itself needs 0.3 s,
+# or 3.2-3.4 s when no turn has finished yet. So this covers the tidy-up
+# several times over and is not sized to outlast the slow exit: a child still
+# running at the deadline is killed.
+_EOF_EXIT_GRACE_SECS = 2.0
 # Absolute safety cap for _wait_for_response's activity-based deadline. The
 # per-call deadline resets on every received frame (so a long session/load
 # replay that streams the whole transcript as notifications is not killed),

@@ -28,6 +28,7 @@ from meetings_helpers import (  # noqa: F401 — fixtures are used by name
     reset_module_state_fixture,
     root_fixture,
 )
+from redaction_structured_cases import github_classic
 
 from kiro_crew.apps.builtins.meetings.backend import constants as k
 from kiro_crew.apps.builtins.meetings.backend import store
@@ -55,9 +56,7 @@ def _queue(root: Path, *, language: str = "ja", runner=None) -> translate.Transl
     )
 
 
-# ---------------------------------------------------------------------------
 # Prompt
-# ---------------------------------------------------------------------------
 
 
 class TestPrompt:
@@ -100,6 +99,16 @@ class TestCleanTranslation:
             ("```text\nBonjour\n```", "Bonjour"),
             # A model that ignores "one line" is commentating, not translating.
             ("Bonjour\nThis is a translation of hello.", "Bonjour"),
+            # A leading label is scaffolding, on the same line or its own.
+            ("Translation: Hola a todos", "Hola a todos"),
+            ("translation:Hola", "Hola"),
+            ("TRANSLATION :  Hola", "Hola"),
+            ("Translation:\nHola a todos", "Hola a todos"),
+            ("```\nTranslation: Hola\n```", "Hola"),
+            ("Translation:\n```\nHola\n```", "Hola"),
+            # Only a leading label: the word inside a translation stays.
+            ("La translation: ok", "La translation: ok"),
+            ("Translation", "Translation"),
             ("", ""),
             ("\n\n", ""),
         ],
@@ -108,9 +117,7 @@ class TestCleanTranslation:
         assert translate.clean_translation(raw) == expected
 
 
-# ---------------------------------------------------------------------------
 # Queue
-# ---------------------------------------------------------------------------
 
 
 class TestEnabled:
@@ -252,15 +259,17 @@ class TestDrain:
 
     @pytest.mark.asyncio
     async def test_model_output_is_redacted(self, root: Path):
+        key = github_classic(seed=1)
+
         async def runner(_prompt: str) -> str:
-            return "token AKIAIOSFODNN7EXAMPLE here"
+            return f"token {key} here"
 
         queue = _queue(root, runner=runner)
         queue.enqueue("A real sentence here.")
         await queue.drain()
 
         text = store.read_translations("m1", root)["lines"][0]["text"]
-        assert "AKIAIOSFODNN7EXAMPLE" not in text
+        assert key not in text
 
     @pytest.mark.asyncio
     async def test_clear_drops_pending_work(self, root: Path):
@@ -272,9 +281,7 @@ class TestDrain:
         await asyncio.sleep(0)
 
 
-# ---------------------------------------------------------------------------
 # Store
-# ---------------------------------------------------------------------------
 
 
 class TestStore:
@@ -334,9 +341,7 @@ class TestStore:
             store.translations_path("../escape", root)
 
 
-# ---------------------------------------------------------------------------
 # Config + route
-# ---------------------------------------------------------------------------
 
 
 class TestConfig:
@@ -383,7 +388,7 @@ class TestConfig:
     @pytest.mark.asyncio
     async def test_put_preserves_the_language_it_was_not_asked_to_change(self, app, root: Path):
         # `handle_put_config` is a narrow allow-list REBUILD, so a field the frontend
-        # forgets to resend is silently reset. This is the regression guard for that.
+        # forgets to resend is silently reset.
         async with client_for(app) as client:
             await client.put(
                 f"{k.API_BASE}/config", json={"config": {"translation_language": "de"}}

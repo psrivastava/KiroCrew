@@ -25,6 +25,8 @@
 // (window.open instead of location.href) lives in ComputerUsePanel.tsx.
 "use strict";
 
+const { HOSTNAME_RE } = require("./validation");
+
 // Non-web URLs handed to the OS. Deliberately an EXACT-MATCH allowlist of whole
 // URLs, not a scheme allowlist: the string comes from the renderer and reaches
 // shell.openExternal, which launches an external application.
@@ -62,6 +64,61 @@ const EXTERNAL_URLS = Object.freeze([
   "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
 ]);
 
+// Editor deep links that open a file, locally or over SSH, after the user
+// confirms. Any other `vscode:` or `kiro:` URL (an extension URI handler) stays
+// blocked. Matched on the raw string, for the same reason as EXTERNAL_URLS.
+const EDITOR_LINK_RE =
+  /^(vscode|vscode-insiders|kiro):\/\/(?:file(\/[A-Za-z]:)?|vscode-remote\/ssh-remote\+([^/]+))(\/[A-Za-z0-9._~@+%/-]*)(?::\d{1,7}){0,2}$/;
+
+/**
+ * The editor and machine an editor link opens a file on, or null when `url` is
+ * not an editor link that names a file path.
+ *
+ * Accepts `vscode://file/<path>` and
+ * `vscode://vscode-remote/ssh-remote+<host>/<path>`, each with an optional
+ * `:line[:col]`, and the same for `vscode-insiders://` and `kiro://` (Kiro is a
+ * VS Code build and reads the same authorities). A local file may start
+ * with a Windows drive letter (`vscode://file/C:/<path>`). The host must be a DNS
+ * name or SSH alias, and the decoded path must have no `..` segment. A local
+ * path that starts with `//` and no drive letter names a share on another
+ * machine (`vscode://file//<host>/<share>/<path>`), so it comes back as `share`.
+ *
+ * @param {string} url the raw requested target
+ * @returns {{scheme: string, host: string|null, share: string|null}|null} host is
+ *   null for a local file; share is the decoded path of a share link, else null
+ */
+function editorLinkTarget(url) {
+  if (typeof url !== "string") return null;
+  const match = EDITOR_LINK_RE.exec(url);
+  if (!match) return null;
+  const [, scheme, drive, host, rawPath] = match;
+  if (host !== undefined && !HOSTNAME_RE.test(host)) return null;
+  let path;
+  try {
+    path = decodeURIComponent(rawPath);
+  } catch {
+    return null;
+  }
+  if (path.split("/").includes("..") || /[\u0000-\u001f\\]/.test(path)) return null;
+  const share = drive === undefined && host === undefined && path.startsWith("//");
+  return {
+    scheme,
+    host: host === undefined ? null : host.toLowerCase(),
+    share: share ? path : null,
+  };
+}
+
+function isEditorLink(url) {
+  return editorLinkTarget(url) !== null;
+}
+
+// A share link is remembered by its own path, so a choice made for local files,
+// an SSH host or another share never opens it without asking.
+function editorTargetKey(url) {
+  const target = editorLinkTarget(url);
+  return target === null ? null : `${target.scheme} ${target.share || target.host || ""}`;
+}
+
 // Web schemes the dashboard itself may navigate to.
 const WEB_SCHEMES = Object.freeze(["http:", "https:"]);
 
@@ -80,6 +137,7 @@ const ORIGIN_INHERITING_SCHEMES = Object.freeze(["blob:"]);
  * Returns one of:
  *  - "allow"    — same-origin: let the WebContents handle it in-app.
  *  - "external" — hand to the OS / default browser.
+ *  - "confirm"  — an editor link: hand to the OS only if the user confirms.
  *  - "block"    — deny, and do nothing (unknown or unsafe scheme).
  *
  * SAME-ORIGIN IS CHECKED FIRST, deliberately. The handler this replaced tested
@@ -94,7 +152,7 @@ const ORIGIN_INHERITING_SCHEMES = Object.freeze(["blob:"]);
  *
  * @param {string} url the requested target
  * @param {string} appOrigin the dashboard's own origin (e.g. http://127.0.0.1:6777)
- * @returns {"allow"|"external"|"block"}
+ * @returns {"allow"|"external"|"confirm"|"block"}
  */
 function classifyNavigation(url, appOrigin) {
   let target;
@@ -128,7 +186,8 @@ function classifyNavigation(url, appOrigin) {
   }
   // Non-web: exact whole-URL match only. Compared against the RAW string, so the
   // value validated here is byte-identical to the one forwarded to the OS.
-  return EXTERNAL_URLS.includes(url) ? "external" : "block";
+  if (EXTERNAL_URLS.includes(url)) return "external";
+  return isEditorLink(url) ? "confirm" : "block";
 }
 
 /**
@@ -176,6 +235,13 @@ function openExternalSafely(openExternal, url, log) {
  * @param {object} deps
  * @param {(url: string) => Promise<void>|void} deps.openExternal shell.openExternal (REQUIRED)
  * @param {() => string} deps.getAppOrigin resolves the dashboard origin (REQUIRED)
+ * @param {(url: string) => Promise<{open: boolean, remember?: boolean}>} [deps.confirmOpen]
+ *   asks the user before a "confirm" verdict is handed to the OS; without it
+ *   those are denied. `remember` skips the prompt for later links to the same
+ *   editor and machine (for a share link, the same path).
+ * @param {Set<string>} [deps.rememberedEditorTargets] the editor and machine (or
+ *   share path) keys the user chose not to be asked about again; share one
+ *   across windows
  * @param {(msg: string) => void} [deps.log] diagnostic sink
  * @returns {(details: {url: string}) => {action: "allow"|"deny"}}
  */
@@ -187,6 +253,8 @@ function createWindowOpenHandler(deps) {
     throw new Error("getAppOrigin is required");
   }
   const log = deps.log || (() => {});
+  const remembered = deps.rememberedEditorTargets || new Set();
+  let prompting = false;
 
   // The WHOLE body is guarded, not just the classification: a throwing `log`
   // sink (a closed stdout / EPIPE) or a hostile `url` getter would otherwise
@@ -198,6 +266,26 @@ function createWindowOpenHandler(deps) {
       if (verdict === "allow") return { action: "allow" };
       if (verdict === "external") {
         openExternalSafely(deps.openExternal, url, log);
+      } else if (verdict === "confirm" && remembered.has(editorTargetKey(url))) {
+        openExternalSafely(deps.openExternal, url, log);
+      } else if (verdict === "confirm" && typeof deps.confirmOpen === "function" && !prompting) {
+        // One prompt at a time, so a page that calls window.open in a loop
+        // cannot stack dialogs.
+        prompting = true;
+        const key = editorTargetKey(url);
+        Promise.resolve()
+          .then(() => deps.confirmOpen(url))
+          .then((answer) => {
+            if (!answer || answer.open !== true) return;
+            if (answer.remember === true) remembered.add(key);
+            openExternalSafely(deps.openExternal, url, log);
+          })
+          .catch(() => {
+            /* a failed prompt opens nothing */
+          })
+          .finally(() => {
+            prompting = false;
+          });
       } else {
         log(`denied window.open for unsupported target: ${String(url).slice(0, 60)}`);
       }
@@ -271,5 +359,6 @@ module.exports = {
   createNavigationGuard,
   createRedirectGuard,
   createWindowOpenHandler,
+  isEditorLink,
   openExternalSafely,
 };

@@ -1,0 +1,1530 @@
+"""``browser_harness.ops``: every op against a fake supervisor and a fake page.
+
+The fake records each ``call(helper, **kwargs)`` and answers the walker's
+methods from a scripted page, so a test proves WHICH helper an op reaches for
+and what it refuses, with no browser, no daemon and no real clock: ``sleep``
+advances an injected clock. Pinned here:
+
+* the ``js`` helper is only ever given the walker source plus one method call;
+* ``type`` refuses a password field by ref AND by whatever holds focus;
+* ``tabs`` lists and switches only the targets the relay says the agent owns;
+* every op returns ``user_in_control`` at once while the person holds the browser;
+* each op's argument validation, and the wait loops on an injected clock.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from kiro_crew import browser_snapshots
+from kiro_crew.browser_harness import ops
+from kiro_crew.mcp_tools import browser as browser_tool
+
+_METHOD_RE = re.compile(r"\.(\w+)\((.*)\)$", re.DOTALL)
+
+
+class FakeBrowser:
+    """A scripted supervisor + page. ``page`` maps walker method -> answer or callable."""
+
+    def __init__(self, tmp_path: Path) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.page: dict[str, Any] = {
+            "askedValues": 0,
+            "passwordBoxes": 0,
+            "secretValues": 0,
+            "unreadableFrames": 0,
+            "framesSeen": 0,
+            "objectsSeen": 0,
+        }
+        self.helpers: dict[str, Any] = {}
+        self.steps: list[str] = []
+        self.held = False
+        self.targets: list[str] = ["T-agent"]
+        self.clock = 1000.0
+        self.tmp = tmp_path
+
+    async def call(self, helper: str, **kwargs: Any) -> Any:
+        if helper == "closed_secret_count":
+            return 0
+        if helper == "frame_owner_count":
+            return 0
+        if helper == "current_tab" and helper not in self.helpers:
+            return {"url": "https://example.com/"}
+        self.calls.append((helper, kwargs))
+        if helper in ("js", "js_isolated"):
+            expression = kwargs["expression"]
+            assert expression.startswith(ops.WALKER_SOURCE), "js must carry the walker"
+            m = _METHOD_RE.search(expression[len(ops.WALKER_SOURCE) :])
+            assert m, expression[-80:]
+            method, raw = m.group(1), m.group(2)
+            args = json.loads(f"[{raw}]") if raw else []
+            answer = self.page.get(method)
+            return answer(*args) if callable(answer) else answer
+        answer = self.helpers.get(helper)
+        return answer(**kwargs) if callable(answer) else answer
+
+    async def sleep(self, seconds: float) -> None:
+        self.clock += seconds
+
+    def now(self) -> float:
+        return self.clock
+
+    def ctx(self) -> ops.OpContext:
+        return ops.OpContext(
+            helper=self.call,
+            step=self.steps.append,
+            in_control=lambda: self.held,
+            agent_targets=lambda: list(self.targets),
+            screenshot_dir=self.tmp / "shots",
+            sleep=self.sleep,
+            now=self.now,
+        )
+
+    def helper_names(self) -> list[str]:
+        return [h for h, _ in self.calls]
+
+    def page_methods(self) -> list[str]:
+        out = []
+        for h, kw in self.calls:
+            if h in ("js", "js_isolated"):
+                m = _METHOD_RE.search(kw["expression"][len(ops.WALKER_SOURCE) :])
+                out.append(m.group(1) if m else "?")
+        return out
+
+
+@pytest.fixture
+def fake(tmp_path: Path) -> FakeBrowser:
+    return FakeBrowser(tmp_path)
+
+
+def run(coro: Any) -> Any:
+    return asyncio.run(coro)
+
+
+# --- the walker file -----------------------------------------------------------
+
+
+def test_walker_source_is_one_iife_the_ops_call_methods_on() -> None:
+    assert ops.WALKER_PATH.exists()
+    assert ops.WALKER_SOURCE.startswith("(() => {")
+    assert ops.WALKER_SOURCE.endswith("})()")
+    for method in (
+        "snapshot",
+        "resolve",
+        "focus",
+        "activeField",
+        "paste",
+        "selectOption",
+        "textPresent",
+        "stamp",
+        "state",
+        "back",
+        "consoleMessages",
+    ):
+        assert f"{method}: function" in ops.WALKER_SOURCE, method
+
+
+def test_every_page_side_call_goes_through_the_walker(fake: FakeBrowser) -> None:
+    fake.page["snapshot"] = {"url": "u", "title": "t", "nodes": []}
+    run(ops.run_op("snapshot", {}, fake.ctx()))
+    (expr,) = [kw["expression"] for h, kw in fake.calls if h == "js_isolated"]
+    assert expr == ops.WALKER_SOURCE + ".snapshot()"
+    # Only the console hook and the navigation stamp are read in the page's own world.
+    (page_expr,) = [kw["expression"] for h, kw in fake.calls if h == "js"]
+    assert page_expr == ops.WALKER_SOURCE + ".consoleMessages(0)"
+
+
+# --- dispatch ------------------------------------------------------------------
+
+
+def test_unknown_op_is_refused_before_anything_runs(fake: FakeBrowser) -> None:
+    out = run(ops.run_op("evaluate", {}, fake.ctx()))
+    assert out["ok"] is False and out["code"] == "bad_op"
+    assert fake.calls == []
+
+
+@pytest.mark.parametrize("op", ops.OPS)
+def test_every_op_returns_user_in_control_at_once_while_held(fake: FakeBrowser, op: str) -> None:
+    fake.held = True
+    out = run(ops.run_op(op, {"url": "https://x", "ref": "e1", "text": "a"}, fake.ctx()))
+    assert out == {
+        "ok": False,
+        "code": "user_in_control",
+        "error": "the user has taken over the browser; wait for them to hand it back",
+    }
+    assert fake.calls == [] and fake.steps == []
+
+
+def test_in_control_may_be_awaitable(fake: FakeBrowser) -> None:
+    async def _held() -> bool:
+        return True
+
+    ctx = fake.ctx()
+    ctx.in_control = _held
+    assert run(ops.run_op("snapshot", {}, ctx))["code"] == "user_in_control"
+
+
+def test_a_failing_step_hook_never_fails_the_op(fake: FakeBrowser) -> None:
+    def _boom(_label: str) -> None:
+        raise RuntimeError("card gone")
+
+    ctx = fake.ctx()
+    ctx.step = _boom
+    fake.page["snapshot"] = {"url": "u", "title": "t", "nodes": []}
+    assert run(ops.run_op("snapshot", {}, ctx))["ok"] is True
+
+
+# --- navigate / back -----------------------------------------------------------
+
+
+def _committing_page(fake: FakeBrowser, href: str, polls_until_new: int = 2) -> None:
+    state = {"token": "", "n": 0}
+
+    def stamp(token: str) -> bool:
+        state["token"] = token
+        return True
+
+    def page_state() -> dict[str, Any]:
+        state["n"] += 1
+        new = state["n"] >= polls_until_new
+        return {
+            "readyState": "complete" if new else "loading",
+            "stale": "" if new else state["token"],
+            "href": href if new else "https://old.example/",
+            "title": "New" if new else "Old",
+        }
+
+    fake.page.update(stamp=stamp, state=page_state, consoleMessages=[])
+
+
+def test_navigate_stamps_goes_and_waits_for_the_new_document(fake: FakeBrowser) -> None:
+    _committing_page(fake, "https://example.com/")
+    fake.helpers["goto"] = {"frameId": "F", "loaderId": "L"}
+    out = run(ops.run_op("navigate", {"url": "https://example.com/"}, fake.ctx()))
+    assert out == {"ok": True, "url": "https://example.com/", "title": "New"}
+    # stamp, then the starting href, then goto.
+    assert fake.helper_names()[:3] == ["js", "js", "goto"]
+    assert fake.calls[2] == ("goto", {"url": "https://example.com/"})
+    assert fake.page_methods()[0] == "stamp"
+    assert "state" in fake.page_methods()
+    assert fake.page_methods()[-1] == "consoleMessages"  # the hook is armed on the new page
+    assert fake.steps == ["Open https://example.com/"]
+
+
+def test_navigate_refuses_a_non_web_url_without_touching_the_browser(fake: FakeBrowser) -> None:
+    for url in ("file:///etc/passwd", "javascript:1", "", 7, None):
+        out = run(ops.run_op("navigate", {"url": url}, fake.ctx()))
+        assert out["ok"] is False and out["code"] == "bad_url", url
+    assert fake.calls == []
+
+
+def test_navigate_surfaces_the_browsers_error_text(fake: FakeBrowser) -> None:
+    fake.page.update(stamp=True)
+    fake.helpers["goto"] = {"errorText": "net::ERR_NAME_NOT_RESOLVED"}
+    out = run(ops.run_op("navigate", {"url": "https://nope.invalid/"}, fake.ctx()))
+    assert out == {"ok": False, "code": "nav_error", "error": "net::ERR_NAME_NOT_RESOLVED"}
+
+
+def test_navigate_times_out_on_the_injected_clock_when_the_old_document_stays(
+    fake: FakeBrowser,
+) -> None:
+    fake.page.update(
+        stamp=lambda tok: True,
+        state=lambda: {
+            "readyState": "complete",
+            "stale": "same",
+            "href": "https://old/",
+            "title": "",
+        },
+    )
+
+    # The stamp the op wrote is what ``state`` must echo for "still old".
+    def stamp(tok: str) -> bool:
+        fake.page["state"] = lambda: {
+            "readyState": "complete",
+            "stale": tok,
+            "href": "https://old/",
+            "title": "",
+        }
+        return True
+
+    fake.page["stamp"] = stamp
+    fake.helpers["goto"] = {}
+    start = fake.clock
+    out = run(ops.run_op("navigate", {"url": "https://new/"}, fake.ctx()))
+    assert out["ok"] is False and out["code"] == "nav_timeout"
+    assert "still old doc" in out["error"]
+    assert fake.clock - start >= ops.NAV_SETTLE_S - ops.NAV_POLL_S  # injected sleep only
+
+
+def test_same_document_navigation_commits_on_href_match(fake: FakeBrowser) -> None:
+    def stamp(tok: str) -> bool:
+        fake.page["state"] = lambda: {
+            "readyState": "complete",
+            "stale": tok,  # same document: the stamp survives
+            "href": "https://x/#a",
+            "title": "X",
+        }
+        return True
+
+    fake.page.update(stamp=stamp, consoleMessages=[])
+    fake.helpers["goto"] = {}
+    out = run(ops.run_op("navigate", {"url": "https://x/#a"}, fake.ctx()))
+    assert out["ok"] is True and out["url"] == "https://x/#a"
+
+
+def test_back_uses_history_and_waits_for_commit(fake: FakeBrowser) -> None:
+    _committing_page(fake, "https://prev.example/")
+    fake.page["back"] = {"ok": True}
+    out = run(ops.run_op("back", {}, fake.ctx()))
+    assert out["ok"] is True and out["url"] == "https://prev.example/"
+    assert fake.page_methods()[:3] == ["stamp", "state", "back"]
+    assert fake.helper_names()[:3] == ["js", "js", "js_isolated"]
+
+
+@pytest.mark.parametrize(
+    "before, after", [("https://x/#b", "https://x/#a"), ("https://x/app/2", "https://x/app/1")]
+)
+def test_back_within_the_same_document_commits_when_the_href_moves(
+    fake: FakeBrowser, before: str, after: str
+) -> None:
+    """A fragment or pushState step back keeps the document (and its stamp): the
+    href moving off where it started is the commit, not a ten-second timeout."""
+    where = {"href": before}
+    stamped = {"tok": ""}
+
+    def stamp(tok: str) -> bool:
+        stamped["tok"] = tok
+        return True
+
+    def back() -> dict[str, Any]:
+        where["href"] = after
+        return {"ok": True}
+
+    fake.page.update(
+        stamp=stamp,
+        back=back,
+        state=lambda: {
+            "readyState": "complete",
+            "stale": stamped["tok"],
+            "href": where["href"],
+            "title": "X",
+        },
+    )
+    start = fake.clock
+    out = run(ops.run_op("back", {}, fake.ctx()))
+    assert out == {"ok": True, "url": after, "title": "X"}
+    assert fake.clock - start < ops.NAV_SETTLE_S / 2
+
+
+def test_back_with_no_history_is_refused(fake: FakeBrowser) -> None:
+    fake.page.update(stamp=True, back={"ok": False, "code": "no_history"})
+    assert run(ops.run_op("back", {}, fake.ctx()))["code"] == "no_history"
+
+
+# --- snapshot ------------------------------------------------------------------
+
+
+def test_snapshot_formats_the_outline_with_refs_and_states(fake: FakeBrowser) -> None:
+    fake.page["snapshot"] = {
+        "url": "https://x/",
+        "title": "X",
+        "nodes": [
+            {"depth": 0, "role": "heading", "name": "Sign in"},
+            {"depth": 1, "role": "textbox", "name": "Email", "ref": "e1", "state": {}},
+            {"depth": 1, "role": "textbox", "name": "", "ref": "e2", "state": {"password": True}},
+            {
+                "depth": 1,
+                "role": "checkbox",
+                "name": "Remember",
+                "ref": "e3",
+                "state": {"checked": True},
+            },
+            {"depth": 1, "role": "button", "name": "Go", "ref": "e4", "state": {"disabled": True}},
+            {
+                "depth": 0,
+                "role": "button",
+                "name": "More",
+                "ref": "e5",
+                "state": {"expanded": False},
+            },
+        ],
+    }
+    out = run(ops.run_op("snapshot", {}, fake.ctx()))
+    assert out["ok"] is True
+    assert out["snapshot"].splitlines() == [
+        '- heading "Sign in"',
+        '  - textbox "Email" [ref=e1]',
+        '  - textbox "" [ref=e2] [password]',
+        '  - checkbox "Remember" [ref=e3] [checked]',
+        '  - button "Go" [ref=e4] [disabled]',
+        '- button "More" [ref=e5] [collapsed]',
+    ]
+    assert fake.steps == ["Read the page"]
+
+
+def test_snapshot_with_no_nodes_is_an_error_and_partial_is_reported(fake: FakeBrowser) -> None:
+    fake.page["snapshot"] = {"url": "u", "title": "t"}
+    assert run(ops.run_op("snapshot", {}, fake.ctx()))["code"] == "snapshot_error"
+    fake.page["snapshot"] = {"url": "u", "title": "t", "nodes": [], "error": "boom"}
+    assert run(ops.run_op("snapshot", {}, fake.ctx()))["partial"] == "boom"
+
+
+# --- click / hover / drag / scroll --------------------------------------------
+
+
+def test_click_by_ref_resolves_then_clicks_the_centre(fake: FakeBrowser) -> None:
+    fake.page["resolve"] = {"ok": True, "x": 10.5, "y": 20, "tag": "button"}
+    out = run(ops.run_op("click", {"ref": "e1"}, fake.ctx()))
+    assert out["ok"] is True
+    assert fake.calls[-1] == ("click", {"x": 10.5, "y": 20.0, "button": "left", "clicks": 1})
+    assert fake.steps == ["Click e1"]
+
+
+def test_click_by_ref_waits_for_the_layout_to_settle_after_scrolling(fake: FakeBrowser) -> None:
+    # The page collapses a header after the scroll: the first read is 60 px low.
+    reads = iter([422, 362, 362])
+    scrolls: list[bool] = []
+
+    def resolve(ref: str, scroll: bool = True) -> dict[str, Any]:
+        scrolls.append(scroll)
+        return {"ok": True, "x": 100, "y": next(reads), "tag": "a"}
+
+    fake.page["resolve"] = resolve
+    out = run(ops.run_op("click", {"ref": "e1"}, fake.ctx()))
+    assert out["ok"] is True
+    assert fake.calls[-1] == ("click", {"x": 100.0, "y": 362.0, "button": "left", "clicks": 1})
+    # Only the first read scrolls: a re-scroll would re-centre and hide any later shift.
+    assert scrolls == [True, False, False]
+
+
+def test_click_by_ref_reads_past_an_empty_frame_and_stops_after_the_last_try(
+    fake: FakeBrowser,
+) -> None:
+    ys = iter([10, None, *range(20, 20 + 10 * ops.RESOLVE_SETTLE_TRIES, 10)])
+
+    def resolve(ref: str, scroll: bool = True) -> dict[str, Any]:
+        y = next(ys)
+        return {"ok": False, "code": "ref_stale"} if y is None else {"ok": True, "x": 1, "y": y}
+
+    fake.page["resolve"] = resolve
+    out = run(ops.run_op("click", {"ref": "e1"}, fake.ctx()))
+    assert out["ok"] is True
+    assert fake.page_methods().count("resolve") == 1 + ops.RESOLVE_SETTLE_TRIES
+    assert fake.calls[-1][1]["y"] == 10.0 + 10 * (ops.RESOLVE_SETTLE_TRIES - 1)
+
+
+def test_click_by_ref_needs_two_good_reads_in_a_row_after_an_empty_one(fake: FakeBrowser) -> None:
+    ys = iter([10, None, 10, 10])
+
+    def resolve(ref: str, scroll: bool = True) -> dict[str, Any]:
+        y = next(ys)
+        return {"ok": False, "code": "ref_stale"} if y is None else {"ok": True, "x": 1, "y": y}
+
+    fake.page["resolve"] = resolve
+    assert run(ops.run_op("click", {"ref": "e1"}, fake.ctx()))["ok"] is True
+    assert fake.page_methods().count("resolve") == 4
+
+
+def test_click_by_ref_refuses_a_ref_the_page_dropped_after_scrolling(fake: FakeBrowser) -> None:
+    fake.page["resolve"] = lambda ref, scroll=True: (
+        {"ok": True, "x": 1, "y": 2} if scroll else {"ok": False, "code": "ref_stale"}
+    )
+    out = run(ops.run_op("click", {"ref": "e1"}, fake.ctx()))
+    assert out["code"] == "ref_stale"
+    assert "click" not in fake.helper_names()
+
+
+def test_click_by_coordinates_double_and_right(fake: FakeBrowser) -> None:
+    out = run(ops.run_op("click", {"x": 5, "y": 6, "clicks": 2, "button": "right"}, fake.ctx()))
+    assert out["ok"] is True
+    assert fake.calls == [("click", {"x": 5.0, "y": 6.0, "button": "right", "clicks": 2})]
+    assert (
+        run(ops.run_op("click", {"x": 5, "y": 6, "doubleClick": True}, fake.ctx()))["clicks"] == 2
+    )
+
+
+def test_click_validation(fake: FakeBrowser) -> None:
+    assert run(ops.run_op("click", {}, fake.ctx()))["code"] == "bad_target"
+    assert run(ops.run_op("click", {"x": -1, "y": 2}, fake.ctx()))["code"] == "bad_target"
+    assert run(ops.run_op("click", {"ref": "button"}, fake.ctx()))["code"] == "bad_ref"
+    assert (
+        run(ops.run_op("click", {"x": 1, "y": 1, "button": "x"}, fake.ctx()))["code"]
+        == "bad_button"
+    )
+    assert (
+        run(ops.run_op("click", {"x": 1, "y": 1, "clicks": 3}, fake.ctx()))["code"] == "bad_clicks"
+    )
+    fake.page["resolve"] = {"ok": False, "code": "ref_stale"}
+    out = run(ops.run_op("click", {"ref": "e9"}, fake.ctx()))
+    assert out["code"] == "ref_stale" and "re-snapshot" in out["error"]
+    assert "click" not in fake.helper_names()
+
+
+def test_hover_moves_the_mouse(fake: FakeBrowser) -> None:
+    fake.page["resolve"] = {"ok": True, "x": 1, "y": 2}
+    assert run(ops.run_op("hover", {"ref": "e1"}, fake.ctx()))["ok"] is True
+    assert fake.calls[-1] == ("mouse_move", {"x": 1.0, "y": 2.0})
+
+
+def test_drag_resolves_both_ends(fake: FakeBrowser) -> None:
+    fake.page["resolve"] = lambda ref, scroll=True: {
+        "ok": True,
+        "x": 1 if ref == "e1" else 9,
+        "y": 2,
+    }
+    out = run(ops.run_op("drag", {"ref": "e1", "to_ref": "e2"}, fake.ctx()))
+    assert out == {"ok": True, "from": [1.0, 2.0], "to": [9.0, 2.0]}
+    assert fake.calls[-1] == ("drag", {"x": 1.0, "y": 2.0, "to_x": 9.0, "to_y": 2.0})
+    assert run(ops.run_op("drag", {"x": 1, "y": 1}, fake.ctx()))["code"] == "bad_target"
+
+
+def test_scroll_defaults_to_the_viewport_centre_and_a_page_down(fake: FakeBrowser) -> None:
+    fake.helpers["page_info"] = {"w": 800, "h": 600}
+    out = run(ops.run_op("scroll", {}, fake.ctx()))
+    assert out["ok"] is True
+    assert fake.calls[-1] == ("scroll", {"x": 400.0, "y": 300.0, "dy": 300.0, "dx": 0.0})
+    fake.page["resolve"] = {"ok": True, "x": 7, "y": 8}
+    run(ops.run_op("scroll", {"ref": "e1", "dy": -50}, fake.ctx()))
+    assert fake.calls[-1] == ("scroll", {"x": 7.0, "y": 8.0, "dy": -50.0, "dx": 0.0})
+
+
+# --- type / press_key ----------------------------------------------------------
+
+
+def test_type_by_ref_focuses_then_inserts_and_submits(fake: FakeBrowser) -> None:
+    fake.page["focus"] = {"ok": True, "focused": True, "activeTag": "input"}
+    fake.page["activeField"] = {"focused": True, "password": False, "tag": "input"}
+    out = run(ops.run_op("type", {"ref": "e1", "text": "hello", "submit": True}, fake.ctx()))
+    assert out == {"ok": True, "ref": "e1", "chars": 5, "submitted": True}
+    assert fake.calls[-2:] == [
+        ("type_text", {"text": "hello"}),
+        ("press_key", {"key": "Enter", "modifiers": 0}),
+    ]
+
+
+def test_type_refuses_a_password_field_by_ref(fake: FakeBrowser) -> None:
+    fake.page["focus"] = {"ok": False, "code": "password_field"}
+    out = run(ops.run_op("type", {"ref": "e2", "text": "hunter2"}, fake.ctx()))
+    assert out["code"] == "password_field"
+    assert "take over" in out["error"]
+    assert "type_text" not in fake.helper_names()
+    assert "hunter2" not in json.dumps(fake.calls)
+
+
+def test_type_refuses_when_focus_sits_in_a_password_field(fake: FakeBrowser) -> None:
+    fake.page["activeField"] = {"focused": True, "password": True, "tag": "input"}
+    out = run(ops.run_op("type", {"text": "hunter2"}, fake.ctx()))
+    assert out["code"] == "password_field"
+    assert "type_text" not in fake.helper_names()
+
+
+def test_type_refuses_when_focus_did_not_land_or_nothing_is_focused(fake: FakeBrowser) -> None:
+    fake.page["focus"] = {"ok": True, "focused": False, "disabled": True, "activeTag": "body"}
+    out = run(ops.run_op("type", {"ref": "e1", "text": "x"}, fake.ctx()))
+    assert out["code"] == "not_focusable" and "(disabled)" in out["error"]
+    fake.page["activeField"] = {"focused": False, "password": False, "tag": ""}
+    assert run(ops.run_op("type", {"text": "x"}, fake.ctx()))["code"] == "no_focus"
+    assert run(ops.run_op("type", {"ref": "e1"}, fake.ctx()))["code"] == "bad_text"
+    assert run(ops.run_op("type", {"ref": "nope", "text": "x"}, fake.ctx()))["code"] == "bad_ref"
+    assert "type_text" not in fake.helper_names()
+
+
+def _inputs(fake: FakeBrowser) -> list[tuple[str, dict[str, Any]]]:
+    return [(h, kw) for h, kw in fake.calls if h in ("type_text", "press_key")]
+
+
+def test_type_steps_run_text_and_keys_in_order_and_stop_at_the_first_refusal(
+    fake: FakeBrowser,
+) -> None:
+    steps = [{"text": "Users"}, {"key": "Tab"}, {"text": "2,500"}]
+    fake.page["activeField"] = {"focused": True, "password": False, "tag": "input"}
+    out = run(ops.run_op("type", {"steps": steps}, fake.ctx()))
+    assert out == {"ok": True, "ref": None, "steps": 3, "chars": 10}
+    assert _inputs(fake) == [
+        ("type_text", {"text": "Users"}),
+        ("press_key", {"key": "Tab", "modifiers": 0}),
+        ("type_text", {"text": "2,500"}),
+    ]
+
+    # The Tab lands on a password field: the text step aimed at it is refused.
+    fake.calls.clear()
+    fake.page["activeField"] = lambda: {
+        "focused": True,
+        "password": any(h == "press_key" for h, _ in fake.calls),
+        "tag": "input",
+    }
+    out = run(ops.run_op("type", {"steps": steps}, fake.ctx()))
+    assert out["code"] == "password_field" and out["step"] == 2
+    assert out["error"].startswith("step 2 (counting from 0; the steps before it ran): ")
+    assert _inputs(fake) == [
+        ("type_text", {"text": "Users"}),
+        ("press_key", {"key": "Tab", "modifiers": 0}),
+    ]
+    assert "2,500" not in json.dumps(fake.calls)
+
+
+def test_type_steps_are_all_checked_before_anything_runs(fake: FakeBrowser) -> None:
+    fake.page["activeField"] = {"focused": True, "password": False, "tag": "input"}
+    out = run(ops.run_op("type", {"steps": [{"text": "a"}, {"oops": 1}]}, fake.ctx()))
+    assert out["code"] == "bad_steps" and out["step"] == 1
+    assert out["error"].startswith("step 1 (counting from 0): ")
+    for bad in (
+        {"text": "x", "steps": [{"text": "a"}]},
+        {"steps": [{"text": "a"}, {"key": "tab"}]},
+        {"submit": True, "steps": [{"text": "a"}]},
+        {"steps": []},
+        {"steps": [{"key": "Tab"}] * (ops.STEPS_CAP + 1)},
+        {"steps": [{"text": 1}]},
+        {"steps": [{"text": "a", "key": "Tab"}]},
+    ):
+        assert run(ops.run_op("type", bad, fake.ctx()))["code"] == "bad_steps", bad
+    over = [{"text": "x" * ops.TEXT_CAP}, {"text": "y"}]
+    assert run(ops.run_op("type", {"steps": over}, fake.ctx()))["code"] == "bad_text"
+    out = run(ops.run_op("type", {"steps": [{"text": "a"}, {"key": "Bogus"}]}, fake.ctx()))
+    assert out["code"] == "bad_steps" and out["step"] == 1 and "Bogus" in out["error"]
+    assert _inputs(fake) == []
+    steps = {"submit": False, "steps": [{"text": "a"}]}
+    assert run(ops.run_op("type", steps, fake.ctx()))["ok"] is True
+
+
+def test_type_steps_stop_when_a_key_step_lands_on_a_refused_page(fake: FakeBrowser) -> None:
+    from kiro_crew.browser_harness.url_gate import url_allowed
+
+    tab = {"url": "https://example.com/"}
+    fake.helpers["current_tab"] = lambda: dict(tab)
+    fake.helpers["press_key"] = lambda **_kw: tab.update(url="http://169.254.169.254/latest")
+    ctx = _gated_ctx(fake, lambda url: url_allowed(url, frozenset(), 6776))
+    out = run(ops.run_op("type", {"steps": [{"key": "Enter"}, {"text": "x"}]}, ctx))
+    assert out["code"] == "redirect_refused" and out["step"] == 1
+    assert "type_text" not in fake.helper_names()
+
+
+def test_type_steps_stopped_by_an_open_dialog_name_the_step(fake: FakeBrowser) -> None:
+    from kiro_crew.browser_harness.supervisor import HelperError
+
+    def type_text(**_kw: Any) -> None:
+        # The Enter opened a confirm: the page answers nothing until it is answered.
+        if "press_key" in fake.helper_names():
+            raise HelperError("Input.insertText timed out after 5s waiting for the daemon")
+
+    fake.page["activeField"] = {"focused": True, "password": False, "tag": "input"}
+    fake.helpers["type_text"] = type_text
+    fake.helpers["page_info"] = lambda: {
+        "dialog": {"type": "confirm", "message": "Leave?", "defaultPrompt": ""}
+    }
+    steps = [{"text": "q"}, {"key": "Enter"}, {"text": "more"}]
+    out = run(ops.run_op("type", {"steps": steps}, fake.ctx()))
+    assert out["code"] == "dialog_open" and out["step"] == 2
+    assert out["error"].startswith("step 2 (counting from 0; the steps before it ran): ")
+    assert "confirm" in out["error"] and "Leave?" in out["error"]
+
+
+_TABLE = "<table><tr><td>a</td><td>b</td></tr></table>"
+
+
+@pytest.mark.parametrize("handled", [True, False])
+def test_paste_hands_html_and_text_to_the_page_and_types_only_what_it_left(
+    fake: FakeBrowser, handled: bool
+) -> None:
+    """The page's editor gets both formats on one paste event; a page that did not
+    take it (nothing cancelled the event) gets the plain text typed, as ``type`` would."""
+    seen: list[list[Any]] = []
+    fake.page["focus"] = {"ok": True, "focused": True, "activeTag": "div"}
+    fake.page["activeField"] = {"focused": True, "password": False, "tag": "div"}
+    fake.page["paste"] = lambda *a: seen.append(list(a)) or {"ok": True, "handled": handled}
+    out = run(ops.run_op("paste", {"ref": "e1", "html": _TABLE, "text": "a\tb"}, fake.ctx()))
+    assert out == {"ok": True, "ref": "e1", "chars": 3, "handled": handled}
+    assert seen == [["e1", _TABLE, "a\tb"]]
+    typed = [kw for h, kw in fake.calls if h == "type_text"]
+    assert typed == ([] if handled else [{"text": "a\tb"}])
+    assert fake.steps[-1] == "Paste into e1"
+
+
+@pytest.mark.parametrize(
+    ("moved", "code"), [({"password": True}, "password_field"), ({"asked": True}, "asked_field")]
+)
+def test_paste_types_nothing_where_the_page_handler_moved_focus(
+    fake: FakeBrowser, moved: dict[str, Any], code: str
+) -> None:
+    field = {"focused": True, "password": False, "tag": "div"}
+    fake.page["activeField"] = lambda: dict(field)
+    fake.page["paste"] = lambda *_a: field.update(moved) or {"ok": True, "handled": False}
+    out = run(ops.run_op("paste", {"html": _TABLE, "text": "a\tb"}, fake.ctx()))
+    assert out["ok"] is False and out["code"] == code
+    assert "type_text" not in fake.helper_names()
+
+
+def test_paste_types_its_fallback_only_into_the_ref_it_was_given(fake: FakeBrowser) -> None:
+    """A page handler that moved focus off ``ref`` gets no text: the ref is focused
+    again before typing, and one that will not keep focus is refused."""
+    answers = iter(
+        [{"ok": True, "focused": True}, {"ok": True, "focused": False, "activeTag": "input"}]
+    )
+    fake.page["focus"] = lambda *_a: next(answers)
+    fake.page["activeField"] = {"focused": True, "password": False, "tag": "div"}
+    fake.page["paste"] = {"ok": True, "handled": False}
+    out = run(ops.run_op("paste", {"ref": "e1", "html": _TABLE, "text": "a\tb"}, fake.ctx()))
+    assert out["ok"] is False and out["code"] == "not_focusable"
+    assert fake.page_methods().count("focus") == 2
+    assert "type_text" not in fake.helper_names()
+
+
+@pytest.mark.parametrize(
+    ("page", "args", "code"),
+    [
+        ({"focus": {"ok": False, "code": "password_field"}}, {"ref": "e2"}, "password_field"),
+        ({"focus": {"ok": False, "code": "asked_field"}}, {"ref": "e2"}, "asked_field"),
+        ({"activeField": {"focused": True, "password": True}}, {}, "password_field"),
+        ({"activeField": {"focused": True, "asked": True}}, {}, "asked_field"),
+        ({"activeField": {"focused": True, "unreadable": True}}, {}, "focus_in_frame"),
+        ({"activeField": {"focused": False}}, {}, "no_focus"),
+        ({"paste": {"ok": False, "code": "focus_in_frame"}}, {}, "focus_in_frame"),
+        ({}, {"text": 5}, "bad_text"),
+        ({}, {"html": ["<b>x</b>"]}, "bad_html"),
+        ({}, {"html": "x" * (ops.TEXT_CAP + 1)}, "bad_html"),
+    ],
+)
+def test_paste_is_refused_where_type_is(
+    fake: FakeBrowser, page: dict[str, Any], args: dict[str, Any], code: str
+) -> None:
+    fake.page.update({"activeField": {"focused": True, "password": False, "tag": "div"}})
+    fake.page.update(page)
+    args = {"text": "hunter2", "html": "<b>hunter2</b>", **args}
+    out = run(ops.run_op("paste", args, fake.ctx()))
+    assert out["ok"] is False and out["code"] == code
+    assert "type_text" not in fake.helper_names() and fake.steps == []
+    if "paste" not in page:
+        assert "paste" not in fake.page_methods(), "nothing reaches the page"
+
+
+def test_press_key_named_single_and_modifiers(fake: FakeBrowser) -> None:
+    assert run(ops.run_op("press_key", {"key": "Enter"}, fake.ctx()))["ok"] is True
+    assert fake.calls[-1] == ("press_key", {"key": "Enter", "modifiers": 0})
+    run(ops.run_op("press_key", {"key": "a", "modifiers": ["Control", "Shift"]}, fake.ctx()))
+    assert fake.calls[-1] == ("press_key", {"key": "a", "modifiers": 10})
+    run(ops.run_op("press_key", {"key": "Space"}, fake.ctx()))
+    assert fake.calls[-1] == ("press_key", {"key": " ", "modifiers": 0})
+    assert run(ops.run_op("press_key", {"key": "Bogus"}, fake.ctx()))["code"] == "bad_key"
+    assert run(ops.run_op("press_key", {}, fake.ctx()))["code"] == "bad_key"
+
+
+# --- select_option / wait_for / console ---------------------------------------
+
+
+def test_select_option(fake: FakeBrowser) -> None:
+    fake.page["selectOption"] = lambda ref, values: {"ok": True, "selected": values}
+    out = run(ops.run_op("select_option", {"ref": "e1", "values": ["b", 2]}, fake.ctx()))
+    assert out == {"ok": True, "ref": "e1", "selected": ["b", "2"]}
+    out = run(ops.run_op("select_option", {"ref": "e1", "value": "a"}, fake.ctx()))
+    assert out["selected"] == ["a"]
+    assert run(ops.run_op("select_option", {"ref": "e1"}, fake.ctx()))["code"] == "bad_values"
+    assert (
+        run(ops.run_op("select_option", {"ref": "x", "value": "a"}, fake.ctx()))["code"]
+        == "bad_ref"
+    )
+    fake.page["selectOption"] = {"ok": False, "code": "not_select"}
+    assert (
+        run(ops.run_op("select_option", {"ref": "e1", "value": "a"}, fake.ctx()))["code"]
+        == "not_select"
+    )
+
+
+def test_wait_for_time_sleeps_on_the_injected_clock_and_caps(fake: FakeBrowser) -> None:
+    start = fake.clock
+    assert run(ops.run_op("wait_for", {"time": 2}, fake.ctx())) == {"ok": True, "waited": 2.0}
+    assert fake.clock - start == 2.0
+    assert run(ops.run_op("wait_for", {"time": 500}, fake.ctx()))["waited"] == ops.WAIT_MAX_S
+
+
+def test_wait_for_text_polls_until_present_and_times_out(fake: FakeBrowser) -> None:
+    seen = {"n": 0}
+
+    def present(text: str) -> bool:
+        seen["n"] += 1
+        return seen["n"] >= 3
+
+    fake.page["textPresent"] = present
+    out = run(ops.run_op("wait_for", {"text": "Done"}, fake.ctx()))
+    assert out == {"ok": True, "matched": "present", "text": "Done"}
+    fake.page["textPresent"] = True
+    start = fake.clock
+    out = run(ops.run_op("wait_for", {"textGone": "Loading", "timeout": 1}, fake.ctx()))
+    assert out["code"] == "wait_timeout" and fake.clock - start >= 1.0
+    assert run(ops.run_op("wait_for", {}, fake.ctx()))["code"] == "bad_wait"
+
+
+def test_wait_for_load_uses_the_helper(fake: FakeBrowser) -> None:
+    fake.helpers["wait_for_load"] = True
+    assert run(ops.run_op("wait_for", {"load": True}, fake.ctx())) == {"ok": True, "loaded": True}
+    assert fake.calls[-1] == ("wait_for_load", {"timeout": ops.WAIT_DEFAULT_S})
+    fake.helpers["wait_for_load"] = False
+    assert (
+        run(ops.run_op("wait_for", {"load": True, "timeout": 2}, fake.ctx()))["code"]
+        == "wait_timeout"
+    )
+
+
+def test_console_reads_the_pages_buffer_with_a_bounded_limit(fake: FakeBrowser) -> None:
+    fake.page["consoleMessages"] = lambda limit: [{"level": "log", "text": str(limit)}]
+    assert run(ops.run_op("console", {"limit": 5}, fake.ctx()))["messages"][0]["text"] == "5"
+    assert run(ops.run_op("console", {"limit": 10**9}, fake.ctx()))["messages"][0]["text"] == str(
+        ops.CONSOLE_CAP
+    )
+    assert run(ops.run_op("console", {"limit": "x"}, fake.ctx()))["messages"][0]["text"] == str(
+        ops.CONSOLE_CAP
+    )
+
+
+# --- screenshot ---------------------------------------------------------------
+
+
+def test_screenshot_writes_under_the_screenshot_dir_and_returns_the_path(
+    fake: FakeBrowser,
+) -> None:
+    def shoot(path: str) -> str:
+        Path(path).write_bytes(b"\x89PNG")
+        return path
+
+    fake.helpers["screenshot"] = shoot
+    out = run(ops.run_op("screenshot", {}, fake.ctx()))
+    assert out["ok"] is True
+    path = Path(out["path"])
+    assert path.is_absolute() and path.parent == fake.tmp / "shots" and path.suffix == ".png"
+    assert path.read_bytes() == b"\x89PNG"
+
+
+def test_screenshot_with_no_file_is_an_error(fake: FakeBrowser) -> None:
+    fake.helpers["screenshot"] = None
+    assert run(ops.run_op("screenshot", {}, fake.ctx()))["code"] == "screenshot_error"
+
+
+def test_screenshot_dir_is_a_fixed_leaf_of_the_home(tmp_path: Path) -> None:
+    assert ops.screenshot_dir(tmp_path) == tmp_path / "browser-snapshots"
+
+
+def test_a_screenshot_prunes_old_shots_from_its_directory(fake: FakeBrowser) -> None:
+    shots = fake.tmp / "shots"
+    shots.mkdir(parents=True)
+    stale = shots / "shot-old.png"
+    stale.write_bytes(b"x")
+    os.utime(stale, (0, 0))  # 1970: past every age bound
+
+    def shoot(path: str) -> str:
+        Path(path).write_bytes(b"\x89PNG")
+        return path
+
+    fake.helpers["screenshot"] = shoot
+    assert run(ops.run_op("screenshot", {}, fake.ctx()))["ok"] is True
+    assert not stale.exists()
+
+
+def test_prune_keeps_a_day_and_two_hundred_shots_and_never_a_fresh_one(tmp_path: Path) -> None:
+    now = 10_000_000.0
+    hour = now - 3600
+    for i in range(205):
+        p = tmp_path / f"shot-h{i:03d}.png"
+        p.write_bytes(b"x")
+        os.utime(p, (hour - i, hour - i))
+    fresh = [tmp_path / f"shot-f{i}.png" for i in range(3)]
+    for p in fresh:
+        p.write_bytes(b"x")
+        os.utime(p, (now - 10, now - 10))
+    other = tmp_path / "notes.txt"
+    other.write_bytes(b"x")
+    os.utime(other, (0, 0))
+
+    browser_snapshots.prune(tmp_path, now)
+
+    left = sorted(p.name for p in tmp_path.glob("shot-*.png"))
+    assert all(p.exists() for p in fresh)  # inside the grace window, whatever the count
+    assert len(left) == browser_snapshots.MAX_FILES  # the fresh three count toward it
+    assert "shot-h196.png" in left and "shot-h197.png" not in left  # oldest go first
+    assert other.exists()  # only the op's own shots are pruned
+
+
+# --- tabs ---------------------------------------------------------------------
+
+
+def test_tabs_list_shows_only_the_agents_targets(fake: FakeBrowser) -> None:
+    fake.helpers["list_tabs"] = [
+        {"targetId": "T-agent", "url": "https://a/", "title": "A"},
+        {"targetId": "T-user", "url": "https://bank/", "title": "Bank"},
+    ]
+    out = run(ops.run_op("tabs", {}, fake.ctx()))
+    assert out == {
+        "ok": True,
+        "tabs": [{"target_id": "T-agent", "url": "https://a/", "title": "A"}],
+    }
+
+
+def test_tabs_switch_refuses_a_tab_the_agent_did_not_open(fake: FakeBrowser) -> None:
+    out = run(ops.run_op("tabs", {"action": "switch", "target_id": "T-user"}, fake.ctx()))
+    assert out["code"] == "not_agent_tab"
+    assert "switch_tab" not in fake.helper_names()
+    out = run(ops.run_op("tabs", {"action": "switch", "target_id": "T-agent"}, fake.ctx()))
+    assert out == {"ok": True, "target_id": "T-agent"}
+    assert fake.calls[-1] == ("switch_tab", {"target": "T-agent"})
+
+
+def test_tabs_new_opens_a_web_url_or_blank(fake: FakeBrowser) -> None:
+    fake.helpers["new_tab"] = "T-new"
+    out = run(ops.run_op("tabs", {"action": "new", "url": "https://x/"}, fake.ctx()))
+    assert out == {"ok": True, "target_id": "T-new"}
+    assert run(ops.run_op("tabs", {"action": "new"}, fake.ctx()))["ok"] is True
+    assert fake.calls[-1] == ("new_tab", {"url": "about:blank"})
+    assert (
+        run(ops.run_op("tabs", {"action": "new", "url": "file:///x"}, fake.ctx()))["code"]
+        == "bad_url"
+    )
+    assert run(ops.run_op("tabs", {"action": "close"}, fake.ctx()))["code"] == "bad_action"
+
+
+# --- availability -------------------------------------------------------------
+
+
+def test_browsing_available_fails_closed_without_the_install_plane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys
+    import types
+
+    monkeypatch.setitem(sys.modules, "kiro_crew.browser_harness.install", None)
+    assert ops.browsing_available(tmp_path) is False
+    fake_install = types.ModuleType("kiro_crew.browser_harness.install")
+    fake_install.install_state = lambda home: types.SimpleNamespace(installed=True)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "kiro_crew.browser_harness.install", fake_install)
+    assert ops.browsing_available(tmp_path) is True
+
+
+def test_press_key_refuses_a_printable_key_into_a_password_field(fake: FakeBrowser) -> None:
+    """A password cannot be spelled one key at a time: the same refusal as ``type``."""
+    fake.page["activeField"] = {"focused": True, "password": True, "tag": "input"}
+    for key in ("p", " ", "Space", "1"):
+        out = run(ops.run_op("press_key", {"key": key}, fake.ctx()))
+        assert out["code"] == "password_field", key
+    assert "press_key" not in fake.helper_names()
+    assert "p" not in [c for c in fake.calls if c and c[0] == "press_key"]
+
+
+def test_press_key_still_lets_the_agent_leave_a_password_field(fake: FakeBrowser) -> None:
+    """Named keys and Ctrl/Meta chords insert no text, so Tab/Escape/Ctrl+A stay allowed."""
+    fake.page["activeField"] = {"focused": True, "password": True, "tag": "input"}
+    for args in (
+        {"key": "Tab"},
+        {"key": "Escape"},
+        {"key": "Enter"},
+        {"key": "a", "modifiers": ["control"]},
+        {"key": "a", "modifiers": 4},
+        {"key": "Tab", "modifiers": ["shift"]},
+        {"key": "ArrowUp", "modifiers": ["alt"]},
+    ):
+        out = run(ops.run_op("press_key", args, fake.ctx()))
+        assert out["ok"] is True, args
+    assert fake.helper_names().count("press_key") == 7
+
+
+def test_press_key_asks_the_page_only_for_printable_keys(fake: FakeBrowser) -> None:
+    fake.page["activeField"] = {"focused": True, "password": False, "tag": "input"}
+    run(ops.run_op("press_key", {"key": "x"}, fake.ctx()))
+    assert any("activeField" in str(c) for c in fake.calls)
+    fake.calls.clear()
+    run(ops.run_op("press_key", {"key": "ArrowDown"}, fake.ctx()))
+    assert not any("activeField" in str(c) for c in fake.calls)
+
+
+def test_a_field_the_person_filled_takes_no_key_and_no_copy_chord(fake: FakeBrowser) -> None:
+    """A quick-ask field: no character, and no select-all / copy / cut chord either, so
+    its value cannot be carried into a field the agent reads. Tab still leaves it."""
+    fake.page["activeField"] = {"focused": True, "password": False, "asked": True, "tag": "input"}
+    for args in (
+        {"key": "x"},
+        {"key": "a", "modifiers": ["control"]},
+        {"key": "c", "modifiers": ["control"]},
+        {"key": "c", "modifiers": ["meta"]},
+        {"key": "x", "modifiers": ["meta"]},
+        {"key": "Home", "modifiers": ["shift"]},
+        {"key": "Delete", "modifiers": ["shift"]},
+        {"key": "ArrowLeft", "modifiers": ["shift"]},
+    ):
+        out = run(ops.run_op("press_key", args, fake.ctx()))
+        assert out["code"] == "asked_field", args
+    assert "press_key" not in fake.helper_names()
+    assert run(ops.run_op("press_key", {"key": "Tab"}, fake.ctx()))["ok"] is True
+    out = run(ops.run_op("type", {"text": "x"}, fake.ctx()))
+    assert out["code"] == "asked_field"
+
+
+def test_type_by_ref_into_a_field_the_person_filled_is_refused(fake: FakeBrowser) -> None:
+    fake.page["focus"] = {"ok": False, "code": "asked_field"}
+    out = run(ops.run_op("type", {"ref": "e3", "text": "x"}, fake.ctx()))
+    assert out["code"] == "asked_field"
+    assert "type_text" not in fake.helper_names()
+
+
+def _gated_ctx(fake: FakeBrowser, gate: Any) -> ops.OpContext:
+    ctx = fake.ctx()
+    ctx.url_allowed = gate
+    return ctx
+
+
+def test_navigate_judges_the_url_the_page_landed_on_not_only_the_one_asked_for(
+    fake: FakeBrowser,
+) -> None:
+    """The shim's gate is one hop deep; the gateway re-applies it to the COMMITTED URL,
+    so a public page that 302s to loopback or link-local is refused and left."""
+    _committing_page(fake, "http://127.0.0.1:5173/admin")
+    fake.helpers["goto"] = {"frameId": "F", "loaderId": "L"}
+    seen: list[str] = []
+
+    def gate(url: str) -> bool:
+        seen.append(url)
+        return not url.startswith("http://127.0.0.1")
+
+    out = run(ops.run_op("navigate", {"url": "https://public.example/r"}, _gated_ctx(fake, gate)))
+    assert out["ok"] is False and out["code"] == "redirect_refused"
+    assert "127.0.0.1:5173" in out["error"] and "about:blank" in out["error"]
+    assert seen == ["http://127.0.0.1:5173/admin"]
+    assert fake.calls[-1] == ("goto", {"url": "about:blank"}), "the landed page is left"
+    assert "consoleMessages" not in fake.page_methods(), "nothing more is read off that page"
+    # The same gate lets a public landing through untouched.
+    fake.calls.clear()
+    _committing_page(fake, "https://public.example/home")
+    out = run(ops.run_op("navigate", {"url": "https://public.example/r"}, _gated_ctx(fake, gate)))
+    assert out["ok"] is True and out["url"] == "https://public.example/home"
+    assert ("goto", {"url": "about:blank"}) not in fake.calls
+
+
+def test_back_judges_where_history_landed_too(fake: FakeBrowser) -> None:
+    _committing_page(fake, "http://169.254.169.254/latest")
+    fake.page["back"] = {"ok": True}
+    gate = lambda url: not url.startswith("http://169.254.")  # noqa: E731
+    out = run(ops.run_op("back", {}, _gated_ctx(fake, gate)))
+    assert out["ok"] is False and out["code"] == "redirect_refused"
+
+
+def test_the_default_context_admits_every_landing_and_the_route_wires_the_real_gate() -> None:
+    """``OpContext.url_allowed`` defaults open (tests, no gateway); the route binds the
+    shared predicate so the gateway and the shim judge by ONE rule."""
+    from kiro_crew.browser_harness import url_gate
+    from kiro_crew.dashboard.handlers import browser_ops as route
+    from kiro_crew.mcp_tools import browser as shim
+
+    async def _noop(*_a: Any, **_k: Any) -> None:
+        return None
+
+    assert ops.OpContext(helper=_noop).url_allowed("http://127.0.0.1:1/") is True
+    assert shim._navigate_target_is_public("http://127.0.0.1:5173/") is False
+    assert shim._navigate_target_is_public("https://example.com/") is True
+    assert route.committed_url_allowed("https://example.com/") is True
+    assert route.committed_url_allowed("http://169.254.169.254/latest") is False
+    assert route.committed_url_allowed("http://localhost:5173/") is False, "unlisted loopback"
+    listed = frozenset({"localhost:5173", "localhost:6776"})
+    assert url_gate.target_is_allowed_local("http://localhost:5173/", listed, 6776)
+    assert not url_gate.target_is_allowed_local("http://localhost:5173/", listed, None)
+    assert not url_gate.target_is_allowed_local("http://localhost:6776/", listed, 6776)
+
+
+@pytest.mark.parametrize("op", [op for op in ops.OPS if op not in {"navigate", "tabs", "ask"}])
+def test_current_private_page_is_refused_before_reads_actions_or_decisions(fake, op) -> None:
+    from kiro_crew.browser_harness.url_gate import url_allowed
+
+    fake.helpers["current_tab"] = {"url": "http://127.0.0.1:5173/admin"}
+    ctx = _gated_ctx(fake, lambda url: url_allowed(url, frozenset(), 6776))
+
+    class Decisions:
+        async def run(self, *_args):
+            pytest.fail("a decision must not read a refused page")
+
+    ctx.decisions = Decisions()
+    out = run(ops.run_op(op, {"x": 1, "y": 2, "text": "x"}, ctx))
+    assert out["code"] == "redirect_refused"
+    assert fake.calls == [("current_tab", {}), ("goto", {"url": "about:blank"})]
+
+
+def test_link_to_private_page_is_refused_before_the_card_follows(fake) -> None:
+    from kiro_crew.browser_harness.url_gate import url_allowed
+
+    tab = {"url": "https://example.com/"}
+    fake.helpers["current_tab"] = lambda: dict(tab)
+    fake.helpers["click"] = lambda **_kw: tab.update(url="http://169.254.169.254/latest")
+    ctx = _gated_ctx(fake, lambda url: url_allowed(url, frozenset(), 6776))
+    out = run(ops.run_op("click", {"x": 1, "y": 2}, ctx))
+    assert out["code"] == "redirect_refused"
+    assert fake.calls[-1] == ("goto", {"url": "about:blank"})
+
+
+def test_a_tab_with_no_document_yet_is_left_to_load(fake) -> None:
+    """A popup reports url "" until its first page commits: sending it to about:blank
+    would cancel the navigation its opener started."""
+    from kiro_crew.browser_harness.url_gate import url_allowed
+
+    fake.helpers["current_tab"] = {"url": ""}
+    ctx = _gated_ctx(fake, lambda url: url_allowed(url, frozenset(), 6776))
+    out = run(ops.run_op("click", {"x": 1, "y": 2}, ctx))
+    assert out["ok"] is True, out
+    assert ("goto", {"url": "about:blank"}) not in fake.calls
+
+
+@pytest.mark.parametrize("tab", ["not-a-dict", {}, {"url": None}])
+def test_a_malformed_current_tab_is_still_refused(fake, tab) -> None:
+    """Only an exact "" url is left to load: the gate stays closed on anything else."""
+    from kiro_crew.browser_harness.url_gate import url_allowed
+
+    fake.helpers["current_tab"] = tab
+    ctx = _gated_ctx(fake, lambda url: url_allowed(url, frozenset(), 6776))
+    out = run(ops.run_op("click", {"x": 1, "y": 2}, ctx))
+    assert out["code"] == "redirect_refused"
+    assert fake.calls[-1] == ("goto", {"url": "about:blank"})
+
+
+# --- screenshot options: whole page, one element, a region, a size cap ---------
+
+
+def _shoot_into(fake: FakeBrowser, helper: str) -> None:
+    def shoot(path: str, **_kw: Any) -> str:
+        Path(path).write_bytes(b"\x89PNG")
+        return path
+
+    fake.helpers[helper] = shoot
+
+
+def _calls(fake: FakeBrowser, helper: str) -> list[dict[str, Any]]:
+    return [kw for h, kw in fake.calls if h == helper]
+
+
+def test_a_screenshot_without_arguments_asks_the_helper_for_the_path_only(
+    fake: FakeBrowser,
+) -> None:
+    _shoot_into(fake, "screenshot")
+    assert run(ops.run_op("screenshot", {}, fake.ctx()))["ok"] is True
+    (kw,) = _calls(fake, "screenshot")
+    assert set(kw) == {"path"}
+    assert _calls(fake, "screenshot_clip") == []
+
+
+def test_a_full_page_screenshot_with_a_size_cap_passes_both_to_the_helper(
+    fake: FakeBrowser,
+) -> None:
+    _shoot_into(fake, "screenshot")
+    out = run(ops.run_op("screenshot", {"full": True, "max_dim": 900.0}, fake.ctx()))
+    assert out["ok"] is True
+    (kw,) = _calls(fake, "screenshot")
+    assert kw["full"] is True and kw["max_dim"] == 900 and isinstance(kw["max_dim"], int)
+
+
+def test_a_screenshot_by_ref_photographs_the_element_box_at_its_own_size(
+    fake: FakeBrowser,
+) -> None:
+    fake.page["resolve"] = {"ok": True, "x": 150.0, "y": 240.0, "w": 200.0, "h": 80.0, "tag": "div"}
+    _shoot_into(fake, "screenshot_clip")
+    out = run(ops.run_op("screenshot", {"ref": "e7"}, fake.ctx()))
+    assert out["ok"] is True and Path(out["path"]).read_bytes() == b"\x89PNG"
+    (kw,) = _calls(fake, "screenshot_clip")
+    assert (kw["x"], kw["y"], kw["width"], kw["height"]) == (50.0, 200.0, 200.0, 80.0)
+    assert kw["magnify"] == 1.0 and kw["max_dim"] == ops.SHOT_MAX_DIM
+    assert _calls(fake, "screenshot") == []
+
+
+def test_a_screenshot_by_ref_honours_the_size_cap(fake: FakeBrowser) -> None:
+    fake.page["resolve"] = {"ok": True, "x": 10.0, "y": 10.0, "w": 20.0, "h": 20.0, "tag": "p"}
+    _shoot_into(fake, "screenshot_clip")
+    assert run(ops.run_op("screenshot", {"ref": "e1", "max_dim": 300}, fake.ctx()))["ok"]
+    assert _calls(fake, "screenshot_clip")[0]["max_dim"] == 300
+
+
+def test_a_screenshot_of_a_region_magnifies_it_to_the_zoom_size(fake: FakeBrowser) -> None:
+    _shoot_into(fake, "screenshot_clip")
+    region = [5, 6, 60, 20]
+    assert run(ops.run_op("screenshot", {"region": region}, fake.ctx()))["ok"] is True
+    (kw,) = _calls(fake, "screenshot_clip")
+    assert (kw["x"], kw["y"], kw["width"], kw["height"]) == (5, 6, 60, 20)
+    assert kw["magnify"] == ops.SHOT_ZOOM_MAGNIFY and kw["max_dim"] == ops.SHOT_ZOOM_DIM
+    assert fake.page_methods().count("resolve") == 0
+
+
+def test_a_region_screenshot_through_the_browser_tool_reaches_the_capture(
+    fake: FakeBrowser, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ``region`` the tool advertises passes its argument gate, which admits
+    only scalars and lists of them, and arrives here as the box it names."""
+    _shoot_into(fake, "screenshot_clip")
+    monkeypatch.setattr(browser_tool.mcp_core, "_vet_browse_governance", lambda s: None)
+    monkeypatch.setattr(browser_tool.mcp_core, "_resolve_session_key", lambda: "")
+    sent: list[dict[str, Any]] = []
+
+    def post(_key: str, op: str, args: dict, _header: str, _timeout: float) -> tuple[int, dict]:
+        # As /api/browser/op answers: a result wrapped when it is ok, a refusal as it is.
+        sent.append(args)
+        result = run(ops.run_op(op, args, fake.ctx()))
+        return 200, ({"ok": True, "result": result} if result.get("ok") else result)
+
+    monkeypatch.setattr(browser_tool, "_post_command", post)
+    out = browser_tool.browser("browser", {"op": "screenshot", "args": {"region": [5, 6, 60, 20]}})
+    assert out.startswith("Browser screenshot saved: "), out
+    assert sent == [{"region": [5, 6, 60, 20]}]
+    (kw,) = _calls(fake, "screenshot_clip")
+    assert (kw["x"], kw["y"], kw["width"], kw["height"]) == (5, 6, 60, 20)
+
+
+@pytest.mark.parametrize(
+    ("args", "named"),
+    [
+        ({"full": "yes"}, "`full` ignored"),
+        ({"max_dim": 10}, "`max_dim` ignored"),
+        ({"max_dim": 99999}, "`max_dim` ignored"),
+        ({"max_dim": "big"}, "`max_dim` ignored"),
+        ({"ref": "banana"}, "`ref` ignored"),
+        ({"region": "left"}, "`region` ignored"),
+        ({"region": [1, 1, 0, 5]}, "`region` ignored"),
+        ({"region": [-1, 1, 5, 5]}, "`region` ignored"),
+        ({"region": [1, 1, 5]}, "`region` ignored"),
+        ({"region": [1, 1, 5, "5"]}, "`region` ignored"),
+        ({"region": {"x": 1, "y": 1, "width": 5, "height": 5}}, "`region` ignored"),
+        ({"full": True, "ref": "e1"}, "`full`, `ref` ignored: give only one"),
+        ({"ref": "e1", "region": [1, 1, 5, 5]}, "`ref`, `region` ignored: give only one"),
+    ],
+)
+def test_a_bad_or_conflicting_option_takes_the_visible_page_and_warns(
+    fake: FakeBrowser, args: dict[str, Any], named: str
+) -> None:
+    """Every call main answers still succeeds: the option is left out, not refused."""
+    _shoot_into(fake, "screenshot")
+    out = run(ops.run_op("screenshot", args, fake.ctx()))
+    assert out["ok"] is True and Path(out["path"]).read_bytes() == b"\x89PNG"
+    assert named in out["warning"]
+    (kw,) = _calls(fake, "screenshot")
+    assert set(kw) == {"path"}
+    assert _calls(fake, "screenshot_clip") == []
+
+
+def test_a_bad_option_leaves_the_valid_ones_in_place(fake: FakeBrowser) -> None:
+    _shoot_into(fake, "screenshot")
+    out = run(ops.run_op("screenshot", {"full": "yes", "max_dim": 900}, fake.ctx()))
+    assert out["ok"] is True and "`full` ignored" in out["warning"]
+    (kw,) = _calls(fake, "screenshot")
+    assert set(kw) == {"path", "max_dim"} and kw["max_dim"] == 900
+
+
+def test_a_screenshot_with_valid_options_carries_no_warning(fake: FakeBrowser) -> None:
+    _shoot_into(fake, "screenshot")
+    out = run(ops.run_op("screenshot", {"full": True, "max_dim": 900}, fake.ctx()))
+    assert out["ok"] is True and "warning" not in out
+
+
+@pytest.mark.parametrize("args", [{"ref": "e1"}, {"region": [0, 0, 10, 10]}])
+def test_a_page_refused_just_before_a_box_capture_is_not_captured(
+    fake: FakeBrowser, args: dict[str, Any]
+) -> None:
+    """The URL check every page helper gets right before it runs covers the box capture
+    too, as it covers today's screenshot: a tab that reaches a refused page after the
+    guards and before the capture is never photographed."""
+    from kiro_crew.browser_harness.url_gate import url_allowed
+
+    tab = {"url": "https://example.com/"}
+    fake.helpers["current_tab"] = lambda: dict(tab)
+    fake.page["resolve"] = {"ok": True, "x": 5.0, "y": 5.0, "w": 10.0, "h": 10.0, "tag": "div"}
+    _shoot_into(fake, "screenshot_clip")
+    ctx = _gated_ctx(fake, lambda url: url_allowed(url, frozenset(), 6776))
+
+    def step(_label: str) -> None:
+        tab["url"] = "http://127.0.0.1:5173/admin"
+
+    ctx.step = step
+    out = run(ops.run_op("screenshot", args, ctx))
+    assert out["ok"] is False and out["code"] == "redirect_refused"
+    assert _calls(fake, "screenshot_clip") == []
+
+
+def test_a_screenshot_by_ref_of_a_gone_element_takes_the_visible_page_and_warns(
+    fake: FakeBrowser,
+) -> None:
+    fake.page["resolve"] = {"ok": False, "code": "ref_stale"}
+    _shoot_into(fake, "screenshot")
+    out = run(ops.run_op("screenshot", {"ref": "e3"}, fake.ctx()))
+    assert out["ok"] is True and "`ref` e3 ignored" in out["warning"]
+    assert _calls(fake, "screenshot_clip") == []
+    assert [set(kw) for kw in _calls(fake, "screenshot")] == [{"path"}]
+
+
+def test_a_screenshot_by_ref_of_an_element_with_no_size_takes_the_visible_page_and_warns(
+    fake: FakeBrowser,
+) -> None:
+    fake.page["resolve"] = {"ok": True, "x": 1.0, "y": 1.0, "tag": "div"}
+    _shoot_into(fake, "screenshot")
+    out = run(ops.run_op("screenshot", {"ref": "e3"}, fake.ctx()))
+    assert out["ok"] is True and "has no size" in out["warning"]
+    assert _calls(fake, "screenshot_clip") == []
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        {"full": True},
+        {"ref": "e1"},
+        {"region": [0, 0, 10, 10]},
+    ],
+)
+def test_every_screenshot_form_keeps_the_secret_field_guard(
+    fake: FakeBrowser, args: dict[str, Any]
+) -> None:
+    fake.page["secretValues"] = 1
+    fake.page["resolve"] = {"ok": True, "x": 5.0, "y": 5.0, "w": 10.0, "h": 10.0, "tag": "div"}
+    out = run(ops.run_op("screenshot", args, fake.ctx()))
+    assert out["code"] == "secret_value_on_page"
+    assert _calls(fake, "screenshot") == [] and _calls(fake, "screenshot_clip") == []
+
+
+def test_a_clip_image_is_discarded_when_the_page_turns_unsafe_during_capture(
+    fake: FakeBrowser,
+) -> None:
+    fake.page["resolve"] = {"ok": True, "x": 5.0, "y": 5.0, "w": 10.0, "h": 10.0, "tag": "div"}
+    seen = {"n": 0}
+
+    def secret_values() -> int:
+        seen["n"] += 1
+        return 0 if seen["n"] == 1 else 1
+
+    fake.page["secretValues"] = secret_values
+
+    def shoot(path: str, **_kw: Any) -> str:
+        Path(path).write_bytes(b"\x89PNG")
+        return path
+
+    fake.helpers["screenshot_clip"] = shoot
+    out = run(ops.run_op("screenshot", {"ref": "e1"}, fake.ctx()))
+    assert out["code"] == "secret_value_on_page"
+    assert not list((fake.tmp / "shots").glob("*.png"))
+
+
+def test_the_walker_resolve_answers_the_element_size_for_screenshot_by_ref() -> None:
+    start = ops.WALKER_SOURCE.index("resolve: function")
+    body = ops.WALKER_SOURCE[start : ops.WALKER_SOURCE.index("focus: function", start)]
+    assert "w: r.width" in body and "h: r.height" in body
+
+
+# --- JavaScript dialogs: report one, answer it ---------------------------------
+
+
+def _pending(
+    fake: FakeBrowser, kind: str = "alert", message: str = "Saved!", default: str = ""
+) -> list[dict[str, Any]]:
+    """Script ``dialog`` as the worker answers it with one dialog open; returns its calls."""
+    calls: list[dict[str, Any]] = []
+
+    def answer(**kw: Any) -> dict[str, Any]:
+        calls.append(kw)
+        shown = {"type": kind, "message": message, "defaultPrompt": default, "url": "https://x/"}
+        if kw.get("action"):
+            return {"dialog": shown, "answered": kw["action"]}
+        return {"dialog": shown}
+
+    fake.helpers["dialog"] = answer
+    return calls
+
+
+def test_dialog_with_nothing_open_says_so_and_changes_nothing(fake: FakeBrowser) -> None:
+    fake.helpers["dialog"] = lambda **_kw: {"dialog": None}
+    out = run(ops.run_op("dialog", {}, fake.ctx()))
+    assert out == {"ok": True, "dialog": None}
+    assert _calls(fake, "dialog") == [{}]
+
+
+def test_dialog_without_an_action_reports_the_open_dialog_and_leaves_it_open(
+    fake: FakeBrowser,
+) -> None:
+    calls = _pending(fake, "prompt", "Your name?", default="Ada")
+    out = run(ops.run_op("dialog", {}, fake.ctx()))
+    assert out == {
+        "ok": True,
+        "dialog": {"type": "prompt", "message": "Your name?", "default": "Ada"},
+    }
+    assert calls == [{}]
+
+
+@pytest.mark.parametrize(("action", "answered"), [("accept", "accepted"), ("dismiss", "dismissed")])
+def test_dialog_accepts_or_dismisses_the_open_dialog(
+    fake: FakeBrowser, action: str, answered: str
+) -> None:
+    calls = _pending(fake, "confirm", "Delete it?")
+    out = run(ops.run_op("dialog", {"action": action}, fake.ctx()))
+    assert out == {
+        "ok": True,
+        "dialog": {"type": "confirm", "message": "Delete it?"},
+        "answered": answered,
+    }
+    assert calls == [{"action": action}]
+
+
+def test_dialog_accept_sends_the_answer_to_a_prompt(fake: FakeBrowser) -> None:
+    calls = _pending(fake, "prompt", "Your name?")
+    out = run(ops.run_op("dialog", {"action": "accept", "text": "Ada"}, fake.ctx()))
+    assert out["answered"] == "accepted" and "warning" not in out
+    assert calls == [{"action": "accept", "text": "Ada"}]
+    assert "Ada" not in json.dumps(out)
+
+
+@pytest.mark.parametrize(
+    ("args", "named", "sent"),
+    [
+        ({"action": "maybe"}, "`action` ignored", {}),
+        ({"action": 7}, "`action` ignored", {}),
+        ({"action": ["accept"]}, "`action` ignored", {}),
+        ({"action": {"accept": True}}, "`action` ignored", {}),
+        ({"text": "Ada"}, "`text` ignored: it is only used with action accept", {}),
+        (
+            {"action": "dismiss", "text": "Ada"},
+            "`text` ignored: it is only used with action accept",
+            {"action": "dismiss"},
+        ),
+        ({"action": "accept", "text": 5}, "`text` ignored", {"action": "accept"}),
+        (
+            {"action": "accept", "text": "x" * (ops.TEXT_CAP + 1)},
+            "`text` ignored",
+            {"action": "accept"},
+        ),
+    ],
+)
+def test_a_bad_or_conflicting_dialog_argument_is_dropped_with_a_warning(
+    fake: FakeBrowser, args: dict[str, Any], named: str, sent: dict[str, Any]
+) -> None:
+    """The dialog op never refuses an argument: what is left out is named in the
+    ``warning`` and the rest of the call runs as it would without it."""
+    calls = _pending(fake, "prompt", "Your name?")
+    out = run(ops.run_op("dialog", args, fake.ctx()))
+    assert out["ok"] is True and named in out["warning"]
+    assert calls == [sent]
+
+
+def test_dialog_text_for_a_dialog_that_is_not_a_prompt_is_noted_and_the_answer_stands(
+    fake: FakeBrowser,
+) -> None:
+    _pending(fake, "confirm", "Sure?")
+    out = run(ops.run_op("dialog", {"action": "accept", "text": "Ada"}, fake.ctx()))
+    assert out["ok"] is True and out["answered"] == "accepted"
+    assert "`text` ignored: the dialog is not a prompt" in out["warning"]
+
+
+def test_dialog_message_is_capped_and_the_page_address_is_not_passed_on(
+    fake: FakeBrowser,
+) -> None:
+    _pending(fake, "alert", "m" * (ops.DIALOG_MESSAGE_CAP + 50))
+    out = run(ops.run_op("dialog", {}, fake.ctx()))
+    assert len(out["dialog"]["message"]) == ops.DIALOG_MESSAGE_CAP
+    assert "url" not in out["dialog"]
+
+
+def test_dialog_reports_itself_on_the_live_card(fake: FakeBrowser) -> None:
+    _pending(fake)
+    run(ops.run_op("dialog", {"action": "accept"}, fake.ctx()))
+    assert fake.steps == ["Accept a dialog"]
+
+
+def _blocked_click(fake: FakeBrowser) -> None:
+    """A click whose helper timed out, as Harness's does while a dialog holds the page."""
+    from kiro_crew.browser_harness.supervisor import HelperError
+
+    def blocked(**_kw: Any) -> Any:
+        raise HelperError("Input.dispatchMouseEvent timed out after 5s waiting for the daemon")
+
+    fake.helpers["click"] = blocked
+
+
+def test_an_op_the_page_blocked_with_an_open_dialog_says_to_answer_it(
+    fake: FakeBrowser,
+) -> None:
+    _blocked_click(fake)
+    fake.helpers["page_info"] = lambda: {
+        "dialog": {"type": "alert", "message": "Saved!", "defaultPrompt": ""}
+    }
+    out = run(ops.run_op("click", {"x": 5, "y": 6}, fake.ctx()))
+    assert out["ok"] is False and out["code"] == "dialog_open"
+    assert "alert" in out["error"] and "Saved!" in out["error"]
+    assert "`dialog`" in out["error"] and "accept" in out["error"] and "dismiss" in out["error"]
+
+
+def test_an_op_the_page_blocked_with_no_dialog_open_fails_as_it_did(fake: FakeBrowser) -> None:
+    """Main's outcome is kept: with no dialog, the helper's own error reaches the route."""
+    from kiro_crew.browser_harness.supervisor import HelperError
+
+    _blocked_click(fake)
+    fake.helpers["page_info"] = lambda: {"url": "https://example.com/", "w": 800, "h": 600}
+    with pytest.raises(HelperError, match="timed out"):
+        run(ops.run_op("click", {"x": 5, "y": 6}, fake.ctx()))
+
+
+def test_an_unreadable_page_while_checking_for_a_dialog_keeps_the_original_error(
+    fake: FakeBrowser,
+) -> None:
+    from kiro_crew.browser_harness.supervisor import HelperError
+
+    _blocked_click(fake)
+
+    def gone() -> Any:
+        raise HelperError("daemon gone")
+
+    fake.helpers["page_info"] = gone
+    with pytest.raises(HelperError, match="timed out"):
+        run(ops.run_op("click", {"x": 5, "y": 6}, fake.ctx()))
+
+
+def test_a_failed_dialog_answer_is_not_rewritten_as_dialog_open(fake: FakeBrowser) -> None:
+    from kiro_crew.browser_harness.supervisor import HelperError
+
+    def refused(**_kw: Any) -> Any:
+        raise HelperError("No dialog is showing")
+
+    fake.helpers["dialog"] = refused
+    fake.helpers["page_info"] = lambda: {"dialog": {"type": "alert", "message": "x"}}
+    with pytest.raises(HelperError, match="No dialog"):
+        run(ops.run_op("dialog", {"action": "accept"}, fake.ctx()))
+
+
+def test_an_error_that_is_not_the_helpers_is_kept_even_with_a_dialog_open(
+    fake: FakeBrowser,
+) -> None:
+    """Only a helper's failure can mean the page is held; any other error is main's."""
+
+    def broken(**_kw: Any) -> Any:
+        raise ValueError("bad reply")
+
+    fake.helpers["click"] = broken
+    fake.helpers["page_info"] = lambda: {"dialog": {"type": "alert", "message": "x"}}
+    with pytest.raises(ValueError, match="bad reply"):
+        run(ops.run_op("click", {"x": 5, "y": 6}, fake.ctx()))
+
+
+def test_the_browser_tool_reports_and_answers_a_dialog(
+    fake: FakeBrowser, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = _pending(fake, "confirm", "Leave this page?")
+    monkeypatch.setattr(browser_tool.mcp_core, "_vet_browse_governance", lambda s: None)
+    monkeypatch.setattr(browser_tool.mcp_core, "_resolve_session_key", lambda: "")
+
+    def post(_key: str, op: str, args: dict, _header: str, _timeout: float) -> tuple[int, dict]:
+        result = run(ops.run_op(op, args, fake.ctx()))
+        return 200, ({"ok": True, "result": result} if result.get("ok") else result)
+
+    monkeypatch.setattr(browser_tool, "_post_command", post)
+    seen = browser_tool.browser("browser", {"op": "dialog", "args": {}})
+    assert seen.startswith("Browser dialog: ") and "Leave this page?" in seen
+    done = browser_tool.browser("browser", {"op": "dialog", "args": {"action": "dismiss"}})
+    assert '"answered": "dismissed"' in done
+    assert calls == [{}, {"action": "dismiss"}]
+    assert "dialog" in browser_tool.BROWSER_OPS
+
+
+def test_the_tool_text_names_the_dialog_op_and_its_arguments() -> None:
+    from kiro_crew.mcp_tools.catalog import browser as catalog
+
+    (schema,) = catalog.schemas()
+    text = schema["description"]
+    assert "dialog {action?: accept|dismiss, text?}" in text
+    assert "dialog" in schema["inputSchema"]["properties"]["op"]["enum"]

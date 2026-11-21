@@ -27,7 +27,12 @@ from typing import Any
 
 from aiohttp import web
 
-from kiro_crew.acp_backends import ACP_BACKEND_GOOSE, ACP_BACKENDS_SIDE_READONLY
+from kiro_crew import name_grant, redaction_seams
+from kiro_crew.acp_backends import (
+    ACP_BACKEND_GOOSE,
+    ACP_BACKEND_STRANDS,
+    ACP_BACKENDS_SIDE_READONLY,
+)
 from kiro_crew.agent_discovery import warm_project_agent_names
 from kiro_crew.agent_sdk.backend_identity import is_claude_backend_name
 from kiro_crew.agent_sdk.drivers.acp import (
@@ -35,8 +40,8 @@ from kiro_crew.agent_sdk.drivers.acp import (
     goose_side_home_supported,
 )
 from kiro_crew.agent_sdk.host_auth import signed_out_message
-from kiro_crew.config.loader import KiroCrewConfig, resolve_agent_bindings
-from kiro_crew.dashboard.chat_utils import slot_history_key
+from kiro_crew.config.loader import KiroCrewConfig, rescan_before_refusal, resolve_agent_bindings
+from kiro_crew.dashboard.chat_utils import blocked_links_for_workspace, slot_history_key
 from kiro_crew.dashboard.handlers._shared import read_bounded_json
 from kiro_crew.dashboard.request_priority import owner_start_priority
 from kiro_crew.dashboard.side_readonly_spec import ReadOnlySpecError, publish_readonly_spec
@@ -140,6 +145,18 @@ THREAD_BOUNDARY_PROMPT_LISTING = (
     "main chat."
 )
 
+#: The read-only boundary for a thread session whose one tool reads a file's text
+#: by its absolute path (Strands, whose side session proves only its own ``read``).
+THREAD_BOUNDARY_PROMPT_FILE_READS = (
+    "This thread is read-only: lookups work here, but changes don't. Reading a "
+    "file by its absolute path runs without asking, so use it when a reply needs "
+    "it. There is no shell, search or web tool here. Writing or editing files, "
+    "running commands, fetching pages, and MCP tools are refused here, even when "
+    "the user asks for them. Never claim that a tool is unconfigured or suggest "
+    "enabling it. If the user wants a change made, tell them to ask in the main "
+    "chat."
+)
+
 THREAD_BOUNDARY_PROMPT_NO_TOOLS = (
     "This thread is context-only: tools are unavailable here, even when the "
     "user asks for them, so reply from the chat and your own knowledge. Never "
@@ -159,10 +176,10 @@ _NO_TEXT_FALLBACK_NO_TOOLS = (
 #: One sentence per failure. A retry line only where a retry can succeed.
 _FAILED_FALLBACK = "The reply didn't go through. Try again."
 _UNREADABLE_FALLBACK = "This chat's threads can't be read right now, so the reply was not kept."
-_NO_SPEC_FALLBACK = "This mate can't reply in threads right now. Ask in the main chat."
+_NO_SPEC_FALLBACK = "This Bot can't reply in threads right now. Ask in the main chat."
 _CREWMATE_GONE_FALLBACK = (
-    "This mate is no longer available, so the reply was not answered. "
-    "Restore the mate or choose another one."
+    "This Bot is no longer available, so the reply was not answered. "
+    "Restore the Bot or choose another one."
 )
 _FULL_FALLBACK = "This thread is full. Ask in the main chat instead."
 _SIDECAR_FULL_FALLBACK = (
@@ -231,6 +248,7 @@ def _new_reply(role: str, content: str, reply_id: str | None = None) -> dict[str
 _in_flight: set[str] = set()
 
 
+@redaction_seams.in_seam(redaction_seams.CHAT)
 def _redacted_reply(reply: dict[str, Any]) -> dict[str, Any]:
     """The reply-schema fields of *reply* -- and only those -- with the prose
     re-redacted at the output boundary, as ``chat_pins._redacted_pin`` does: a
@@ -317,6 +335,7 @@ def _find_parent(
     return None, []
 
 
+@redaction_seams.in_seam(redaction_seams.CHAT)
 def _parent_payload(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "mid": _row_mid(row),
@@ -324,6 +343,16 @@ def _parent_payload(row: dict[str, Any]) -> dict[str, Any]:
         "content": redact(str(row.get("content", "") or "")),
         "ts": row.get("ts", ""),
     }
+
+
+def _with_link_blocks(shown: dict[str, Any], workspace: str | None) -> dict[str, Any]:
+    """*shown* (a parent or a reply as the thread read sends it) with the
+    blocked-link records of its text when the crewmate wrote it, as a main chat
+    row carries them, so the panel draws a flagged link as a Blocked link card."""
+    if shown.get("role") != ROLE_ASSISTANT:
+        return shown
+    records = blocked_links_for_workspace(shown.get("content"), workspace)
+    return {**shown, "link_blocks": records} if records else shown
 
 
 # ── Envelope ──────────────────────────────────────────────────────────────────
@@ -351,6 +380,7 @@ def build_thread_message(
     tools_available: bool,
     shell_available: bool = True,
     file_reads_available: bool = True,
+    searches_available: bool = True,
 ) -> str:
     """The whole envelope, every time: a thread turn always cold-starts its
     session, so nothing carries over between replies."""
@@ -388,6 +418,8 @@ def build_thread_message(
     else:
         if shell_available:
             parts.append(THREAD_BOUNDARY_PROMPT)
+        elif file_reads_available and not searches_available:
+            parts.append(THREAD_BOUNDARY_PROMPT_FILE_READS)
         elif file_reads_available:
             parts.append(THREAD_BOUNDARY_PROMPT_NO_SHELL)
         else:
@@ -444,7 +476,7 @@ def _resolve_slot(
     if slot.mode != DM_SLOT_MODE:
         return None, web.json_response(
             {
-                "error": "Threads live on a mate's chat.",
+                "error": "Threads live on a Bot's chat.",
                 "code": "not_crewmate_chat",
             },
             status=409,
@@ -525,10 +557,13 @@ async def api_chat_thread_detail(request: web.Request) -> web.Response:
     if refused is not None:
         return refused
     assert threads is not None
+    workspace = slot.workspace if isinstance(slot.workspace, str) else None
     return web.json_response(
         {
-            "parent": _parent_payload(parent),
-            "replies": [_redacted_reply(r) for r in threads.get(mid, [])],
+            "parent": _with_link_blocks(_parent_payload(parent), workspace),
+            "replies": [
+                _with_link_blocks(_redacted_reply(r), workspace) for r in threads.get(mid, [])
+            ],
             "in_flight": f"{slot.key}:{mid}" in _in_flight,
         }
     )
@@ -661,7 +696,7 @@ async def api_chat_thread_reply(request: web.Request) -> web.Response:
     if flight_key in _in_flight:
         return web.json_response(
             {
-                "error": f"{slot.agent or 'Your mate'} is still replying. Wait for that reply.",
+                "error": f"{slot.agent or 'Your Bot'} is still replying. Wait for that reply.",
                 "code": "thread_turn_in_flight",
             },
             status=409,
@@ -871,6 +906,7 @@ def _is_auth_required(exc: BaseException) -> bool:
     return type(exc).__name__ == "AcpAuthRequired"
 
 
+@redaction_seams.in_seam(redaction_seams.CHAT)
 async def _run_thread_turn(
     state: DashboardState,
     slot: _ChatSlot,
@@ -1006,6 +1042,16 @@ async def _thread_turn_body(
             # gateway task for the busy timeout. The main chat's resolvers pass
             # the same flag; only the kiro agent name is needed here.
             bindings = resolve_agent_bindings(cfg, slot_agent, project, validate_memory_files=False)
+            if (
+                slot_agent
+                and not slot._app
+                and not bindings.requested_resolved
+                and await rescan_before_refusal()
+            ):
+                # The snapshot may lack a spec written after it warmed.
+                bindings = resolve_agent_bindings(
+                    cfg, slot_agent, project, validate_memory_files=False
+                )
             if slot_agent and not slot._app and not bindings.requested_resolved:
                 # The crewmate this slot belongs to does not resolve (deleted
                 # or renamed while its chat stayed open). The resolver falls
@@ -1013,7 +1059,7 @@ async def _thread_turn_body(
                 # a stranger's words under the crewmate's name, with no marker.
                 # The main chat refuses this state; so does the thread.
                 logger.warning(
-                    "Thread turn: crewmate %r no longer resolves for slot=%s; not replying",
+                    "Thread turn: Bot %r no longer resolves for slot=%s; not replying",
                     slot_agent,
                     slot.key,
                 )
@@ -1028,17 +1074,18 @@ async def _thread_turn_body(
             )
         tools_available = backend is not None and backend in ACP_BACKENDS_SIDE_READONLY
         # The same confinement per harness as a Side Chat turn
-        # (dashboard/handlers/side.py): claude and goose through the session
-        # shape their client starts for ``side_read_only``, kiro-cli through the
-        # derived spec.
+        # (dashboard/handlers/side.py): claude, goose and Strands through the
+        # session shape their client starts for ``side_read_only``, kiro-cli
+        # through the derived spec.
         claude_thread = tools_available and is_claude_backend_name(backend)
         if claude_thread and not await asyncio.to_thread(claude_adapter_honours_session_options):
             tools_available = claude_thread = False
         if backend == ACP_BACKEND_GOOSE and not goose_side_home_supported():
             tools_available = False
         goose_thread = tools_available and backend == ACP_BACKEND_GOOSE
+        strands_thread = tools_available and backend == ACP_BACKEND_STRANDS
         session_kwargs: dict[str, Any] = {}
-        if claude_thread or goose_thread:
+        if claude_thread or goose_thread or strands_thread:
             agent: str | None = kiro_agent or slot_agent
             approval_policy = ToolApprovalPolicy.READ_ONLY
             session_kwargs["side_read_only"] = True
@@ -1050,6 +1097,10 @@ async def _thread_turn_body(
         else:
             agent = kiro_agent or slot_agent
             approval_policy = ToolApprovalPolicy.REJECT_ALL
+        if slot.is_restricted:
+            # Memory withheld as in the incognito or temporary parent (on claude,
+            # Claude Code's auto-memory off), as on a Side Chat.
+            session_kwargs["include_memory"] = False
 
         # A thread turn never reuses a session: the one it acquires is destroyed
         # in the finally below, so every reply cold-starts under the agent, the
@@ -1065,14 +1116,23 @@ async def _thread_turn_body(
         )
         acquired_key = session_key
         threads = await asyncio.to_thread(log.read_threads, history_key)
+        # A shell read runs only when its program name can be vouched for. While
+        # the environment refuses every name (a PowerShell profile, an inherited
+        # BASH_ENV, an ambiguous PATH) each one is declined and a thread has no
+        # card to fall back to, so the boundary names no shell. The check stats
+        # files, so it runs off the loop.
+        shell_available = not (claude_thread or goose_thread or strands_thread)
+        if tools_available and shell_available:
+            shell_available = await asyncio.to_thread(name_grant.environment_refusal) is None
         message = build_thread_message(
             parent,
             context_before,
             threads.get(mid, []),
             text,
             tools_available=tools_available,
-            shell_available=not (claude_thread or goose_thread),
+            shell_available=shell_available,
             file_reads_available=not goose_thread,
+            searches_available=not strands_thread,
         )
         try:
             response_text = redact(

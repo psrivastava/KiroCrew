@@ -1,6 +1,6 @@
 ---
 name: theme-pack-authoring
-description: Build, validate, and install Kiro Crew theme packs -- pack anatomy, the 60-variable palette, role-tagged fonts, the overrides.css allowlist (what installs vs what actually renders), and the install-verify cycle. Use when the user wants to create or edit a theme pack.
+description: Build, validate, and install Kiro Crew theme packs -- pack anatomy, the 61-variable palette, role-tagged fonts, the overrides.css allowlist (what installs vs what actually renders), and the install-verify cycle. Use when the user wants to create or edit a theme pack.
 triggers: theme pack, custom theme, theme.json, variables.json, overrides.css, install theme, theme font, dashboard theme, build a theme
 ---
 
@@ -16,7 +16,7 @@ real debugging time.
 ```
 my-theme/
 ├── theme.json          # manifest: slug, name, emoji, level, formatVersion, fonts[]
-├── variables.json      # dark + light palettes (60 allowlisted CSS vars)
+├── variables.json      # dark + light palettes (61 allowlisted CSS vars)
 ├── readme.md           # optional; attribution and notes
 ├── styles/
 │   ├── overrides.css   # optional; scoped structural CSS (see allowlist below)
@@ -38,6 +38,7 @@ a level-0 pack shipping a font is refused.
   "level": 1,
   "formatVersion": 1,
   "loaderIcons": ["star", "sparkles", "moon", "cloud"],
+  "codeTheme": { "dark": "one-dark-pro", "light": "one-light" },
   "fonts": [
     { "family": "My Sans", "file": "my-sans-400.woff2", "weight": 400, "role": "sans" },
     { "family": "My Sans", "file": "my-sans-500.woff2", "weight": 500, "role": "sans" },
@@ -57,6 +58,13 @@ in `loader/` (Level 1): one renders alone, 2–8 are cycled, and they win over
 (WebP/APNG/GIF, or SVG with its own animation) plays as authored, except under
 reduced motion: there Kiro Crew shows each image's first frame, held still, so
 make the first frame read as the loader at rest.
+
+`codeTheme` is optional and read only on a Level 1 or 2 pack (a Level-0 pack's
+is ignored, not refused). It names the Shiki scheme
+that code blocks and diffs use in dark and light mode; a name must be one the
+dashboard bundles (Shiki's bundled schemes such as `one-dark-pro`, `dracula`,
+`github-light`), since a pack cannot ship a scheme file. A mode left out, or a
+name it does not bundle, keeps the stock `pierre-dark` / `pierre-light` scheme.
 
 ## Fonts — the role system (the ONLY supported route)
 
@@ -85,7 +93,7 @@ make the first frame read as the loader at rest.
 
 ## variables.json — the palette
 
-Two blocks, `dark` and `light`, each holding up to **60 allowlisted variables**.
+Two blocks, `dark` and `light`, each holding up to **61 allowlisted variables**.
 Required minimum per block: `--bg`, `--text`, `--accent`. Unknown keys are
 REJECTED (install fails), so do not invent variables; the allowlist is
 `_THEME_CSS_VARS` in `kiro_crew/dashboard/theme_validate.py`.
@@ -106,11 +114,16 @@ REJECTED (install fails), so do not invent variables; the allowlist is
   `--term-cursor` and `--term-selection`; each falls back to `--bg`, `--text`,
   `--accent` and `--accent-subtle` respectively, so a pack that omits them keeps
   today's terminal colors.
+- `--glass-band-plain` is optional: it colours the lit top/bottom band and its
+  specular gradient on the Liquid Glass panes (composer dock, search fields, top
+  bar capsules) when Translucent panels is on. Omit it to keep the white (light)
+  / smoked (dark) band; set a value lighter than the pane, because one darker
+  than the pane turns the light into a shadow.
 
 ### Omitted tokens are derived from your palette
 
 You only have to declare the three required vars, so most packs omit most of the
-60. Those omissions are **derived from your own `--bg` / `--text` / `--accent`**
+61. Those omissions are **derived from your own `--bg` / `--text` / `--accent`**
 by `buildCustomThemeCss` (`website/src/hooks/themeCss.ts`) — they are not
 inherited from a built-in theme:
 
@@ -145,7 +158,8 @@ that deliberately ships a dark `light` block gets the dark sets in both.
 
 The remaining allowlisted tokens are not derived and do fall back to the
 stylesheet default: `--accent-hover` / `--accent-subtle` / `--accent-glow` /
-`--ring`, whose direction is polarity-dependent, and the two `--term-*` hues.
+`--ring`, whose direction is polarity-dependent, the two `--term-*` hues, and
+`--glass-band-plain`.
 Declare those yourself if they matter to you.
 
 ## overrides.css — what installs is NOT what renders
@@ -186,7 +200,7 @@ not against the count of 6.
 Beyond `theme.json`, `variables.json`, `readme.md`, `styles/` and `LICENSE.txt`,
 the classifier also recognizes `branding/logo.{svg,png}`,
 `branding/favicon.{ico,png,svg}`, `branding/wordmark.{svg,png}`,
-`branding/welcome.{svg,png,webp,gif}` and
+`branding/welcome.{svg,png,webp,gif}`, `branding/splash.{svg,png}` and
 `branding/preview.{png,webp}` and `loader/*.{png,webp,gif,svg}` (max 8) at
 level 1, and `persona.md`, `overlays/*.html`,
 `topbar/{dark,light}.html`, `audio/manifest.json` and `audio/*.{mp3,ogg,wav}` at

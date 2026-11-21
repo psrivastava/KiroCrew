@@ -327,11 +327,14 @@ def test_a_source_grown_after_fstat_aborts_at_the_first_excess_byte(
             )
         return st
 
-    monkeypatch.setattr(os, "fstat", lying_fstat)
-    copied = pinned_fs.copy_file_pinned(
-        str(src), str(dst), max_bytes=16, on_skip=lambda r, p: reasons.append((r, p))
-    )
-    monkeypatch.undo()
+    with monkeypatch.context() as mp:
+        mp.setattr(os, "fstat", lying_fstat)
+        copied = pinned_fs.copy_file_pinned(
+            str(src),
+            str(dst),
+            max_bytes=16,
+            on_skip=lambda r, p: reasons.append((r, p)),
+        )
 
     assert copied is False
     assert reasons and reasons[0][0] == pinned_fs.SKIP_TOO_LARGE
@@ -622,7 +625,8 @@ def test_the_manifest_records_what_was_omitted(tmp_path: Path) -> None:
         assert "archive/workspace/alias.json" not in tar.getnames()
 
     omitted = {e["path"]: e["reason"] for e in manifest["skipped"]}
-    assert omitted == {os.path.join("workspace", "alias.json"): pinned_fs.SKIP_NOT_REGULAR}
+    # Forward slashes on every host, so a bundle made on Windows reads the same on POSIX.
+    assert omitted == {"workspace/alias.json": pinned_fs.SKIP_NOT_REGULAR}
 
 
 # ── The opt-in has to be reachable from the shipped command ──────────────────
@@ -687,8 +691,7 @@ def test_the_import_path_records_unpinned_staging_instead_of_removing_the_featur
     payload = tmp_path / "import.zip"
     with zipfile.ZipFile(payload, "w") as zf:
         # One top-level directory is the format's requirement -- a flat zip is rejected
-        # before staging is reached, which made an earlier version of this test fail for a
-        # reason that had nothing to do with what it was asserting.
+        # before staging is reached, so the test would fail for an unrelated reason.
         zf.writestr("kirocrew-export/crons.json", "[]\n")
         zf.writestr("kirocrew-export/workspace/note.md", "hi\n")
 

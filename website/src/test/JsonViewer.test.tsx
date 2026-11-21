@@ -3,6 +3,7 @@ import { fireEvent, render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { JsonViewer } from '../components/FileRenderers'
 import { i18nT } from '../i18n/t'
+import { fmtNumber } from '../i18n/format'
 
 describe('JsonViewer', () => {
   it('renders ASCII JSON without showing the error banner', () => {
@@ -93,7 +94,7 @@ describe('JsonViewer', () => {
 })
 
 describe('JsonViewer long string leaves', () => {
-  const showAll = (count: number) => i18nT('components.fileRenderers.json_string_show_all', { count })
+  const showAll = (count: number) => i18nT('components.fileRenderers.json_string_show_all', { count, n: fmtNumber(count) })
   const showLess = () => i18nT('components.fileRenderers.json_string_show_less')
   const preview = (value: string) => JSON.stringify(value.slice(0, 200)) + '…'
   // The element the toggle names in aria-controls: the string value itself.
@@ -168,5 +169,22 @@ describe('JsonViewer long string leaves', () => {
     fireEvent.click(toggle)
     expect(valueOf(toggle)).toBe(JSON.stringify(value))
     expect(valueOf(toggle)).toContain('\\"stop\\" at C:\\\\temp\\\\x. TAIL"')
+  })
+})
+
+describe('JsonViewer tree toggles', () => {
+  it('say whether their node is open and keep the arrow out of the name', () => {
+    // Depth 2 starts collapsed, so this object has one closed toggle to drive.
+    render(<JsonViewer content={'{"a": {"b": {"c": 1}}}'} />)
+    const closed = screen.getAllByRole('button').filter(b => b.getAttribute('aria-expanded') === 'false')
+    expect(closed).toHaveLength(1)
+    const toggle = closed[0]
+
+    expect(toggle.textContent).not.toMatch(/[▼▶]/)
+    for (const svg of toggle.querySelectorAll('svg')) expect(svg).toHaveAttribute('aria-hidden', 'true')
+
+    fireEvent.click(toggle)
+    expect(toggle).toHaveAttribute('aria-expanded', 'true')
+    expect(screen.getByText('1')).toBeInTheDocument()
   })
 })

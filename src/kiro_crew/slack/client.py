@@ -20,6 +20,7 @@ from slack_sdk.http_retry.response import HttpResponse
 from slack_sdk.http_retry.state import RetryState
 from slack_sdk.web.async_client import AsyncWebClient
 
+from kiro_crew.http_proxy import resolve_proxy
 from kiro_crew.slack.agent_sessions.fence import note_message, turn_muted
 from kiro_crew.slack.channel_policy import require_channel
 from kiro_crew.slack.team_ids import use_channel_team_store
@@ -32,6 +33,10 @@ logger = logging.getLogger(__name__)
 # conversations.list pagination limits
 _CONVERSATIONS_LIST_MAX_PAGES = 20  # 20 pages × 1000 = 20k channels max
 _CONVERSATIONS_LIST_PAGE_SIZE = 1000
+
+# fetch_history pagination limits: 20 pages × 200 = 4k messages max
+_HISTORY_MAX_PAGES = 20
+_HISTORY_PAGE_SIZE = 200
 
 # A Slack file fetch is the one outbound request that carries the bot token in
 # an ``Authorization`` header, and its URL is not ours: it is whatever
@@ -79,6 +84,52 @@ def blocks_request_remote_media(blocks: Any) -> bool:
                 return True
             if obj.get("type") in _BLOCK_REMOTE_MEDIA_TYPES:
                 return True
+            pending.extend(obj.values())
+        elif isinstance(obj, list):
+            pending.extend(obj)
+    return False
+
+
+#: Action ids only the gateway's own code-channel messages carry (the wrap-up's
+#: Archive button, the hand-off notice's Turn-on button). An agent may not post or
+#: edit in a button that wears one: its handler would act on the owner's click as
+#: consent to a message the agent wrote.
+RESERVED_ACTION_PREFIX = "kc_code_channel_"
+#: Error code for that refusal, shared by both agent block paths.
+BLOCKS_RESERVED_ACTION_ERROR = "blocks_reserved_action"
+
+
+def _id_text(value: str) -> str:
+    """*value* as an id reads once ANSI escapes and control/format characters go,
+    in Unicode compatibility form (NFKC: fullwidth letters as their ASCII ones).
+
+    The agent block paths sanitize after this check (ANSI stripped from keys and
+    values), so a key the check saw as ``"action_id\\x1b[0m"`` can be published as
+    ``"action_id"``. Matching on this normal form keeps the raw check and the
+    published tree in agreement.
+    """
+    import unicodedata
+
+    from kiro_crew.messaging.display_safety import strip_ansi
+
+    text = unicodedata.normalize("NFKC", strip_ansi(value))
+    return "".join(c for c in text if unicodedata.category(c) not in ("Cc", "Cf")).strip().lower()
+
+
+def blocks_use_reserved_action(blocks: Any) -> bool:
+    """Whether a Block Kit tree carries an action id reserved for the gateway."""
+    pending: list[Any] = [blocks]
+    while pending:
+        obj = pending.pop()
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if (
+                    isinstance(key, str)
+                    and _id_text(key) in ("action_id", "block_id")
+                    and isinstance(value, str)
+                    and _id_text(value).startswith(RESERVED_ACTION_PREFIX)
+                ):
+                    return True
             pending.extend(obj.values())
         elif isinstance(obj, list):
             pending.extend(obj)
@@ -153,6 +204,10 @@ class SlackClientOps(ABC):
         """List pinned messages in a channel as [{ts, text}, ...]."""
         return []
 
+    async def get_permalink(self, channel: str, ts: str) -> str:
+        """A message's permalink (``chat.getPermalink``), or ``""`` when unavailable."""
+        return ""
+
     @abstractmethod
     async def upload_file(
         self,
@@ -161,8 +216,14 @@ class SlackClientOps(ABC):
         file: str,
         filename: str,
         title: str,
+        initial_comment: str | None = None,
     ) -> None:
-        """Upload a file to a Slack thread."""
+        """Upload a file to a Slack thread.
+
+        *initial_comment* is an optional message posted with the file as its
+        Slack ``initial_comment``; ``None`` (the default) carries no comment, so
+        callers that have none (voice replies, the outbox copy) are unchanged.
+        """
 
     @abstractmethod
     async def open_dm(self, user_id: str) -> str:
@@ -214,8 +275,17 @@ class SlackClientOps(ABC):
         """Append text to a streaming message. Returns True on success."""
         return False
 
-    async def stop_stream(self, channel: str, ts: str, final_text: str | None = None) -> bool:
-        """Stop a streaming message. Returns True on success."""
+    async def stop_stream(
+        self,
+        channel: str,
+        ts: str,
+        final_text: str | None = None,
+        blocks: list[dict] | None = None,
+    ) -> bool:
+        """Stop a streaming message. Returns True on success.
+
+        ``blocks`` render at the bottom of the finalized message.
+        """
         return False
 
     async def append_task(
@@ -309,6 +379,12 @@ class SlackClientOps(ABC):
         *oldest* / *latest* bound the range by ts, both exclusive.
         """
         return []
+
+    async def fetch_history(
+        self, channel: str, limit: int, *, thread_ts: str | None = None, oldest: str | None = None
+    ) -> list[dict]:
+        """The newest *limit* messages no bot posted, newest first; errors raise."""
+        raise NotImplementedError
 
     async def conversations_list(self) -> list[dict]:
         """List channels the bot can see. Each dict has at least ``id`` and ``name``.
@@ -427,7 +503,7 @@ class RealSlackClient(SlackClientOps):
             use_channel_team_store(cache)
         cache[channel] = team_id
 
-    async def ensure_channel_team(self, channel: str) -> None:
+    async def ensure_channel_team(self, channel: str, *, retry: bool = False) -> None:
         """Resolve a channel's HOME workspace into the routing cache.
 
         Inbound handlers call this once per message. conversations_info
@@ -442,7 +518,9 @@ class RealSlackClient(SlackClientOps):
         the cache, which leaves outbound calls without team_id — the same
         routing Slack does for a cache miss — and lands in
         ``_channel_team_unresolvable`` so the failure costs one lookup per
-        process rather than one per message.
+        process rather than one per message. *retry* looks it up again anyway,
+        for a caller that gates access on the answer and must not deny for
+        the rest of the run on one transient failure.
         """
         if not channel:
             return
@@ -453,7 +531,7 @@ class RealSlackClient(SlackClientOps):
         if unresolvable is None:
             unresolvable = set()
             self._channel_team_unresolvable = unresolvable
-        if channel in unresolvable:
+        if channel in unresolvable and not retry:
             return
         try:
             resp = await self._web.conversations_info(channel=channel)
@@ -472,6 +550,7 @@ class RealSlackClient(SlackClientOps):
             home = ""
         if home:
             self.record_channel_team(channel, home)
+            unresolvable.discard(channel)
         else:
             unresolvable.add(channel)
 
@@ -633,6 +712,12 @@ class RealSlackClient(SlackClientOps):
                 pins.append({"ts": ts, "text": msg.get("text", "")})
         return pins
 
+    async def get_permalink(self, channel: str, ts: str) -> str:
+        kwargs: dict[str, Any] = {"channel": channel, "message_ts": ts}
+        self._inject_team(channel, kwargs)
+        resp = await self._web.chat_getPermalink(**kwargs)
+        return str(resp.get("permalink") or "")
+
     async def views_publish(self, user_id: str, view: dict) -> None:
         await self._web.views_publish(user_id=user_id, view=view)
 
@@ -643,16 +728,23 @@ class RealSlackClient(SlackClientOps):
         file: str,
         filename: str,
         title: str,
+        initial_comment: str | None = None,
     ) -> None:
         require_channel(channel)
         if turn_muted(channel, thread_ts):
             return
+        # initial_comment defaults to None, which files_upload_v2 treats as "no
+        # comment" -- the same call the comment-less callers (voice replies)
+        # rely on. Explicit kwargs, not a dict spread, because the SDK's kwargs
+        # are heterogeneously typed (list/bool/str), which mypy cannot check
+        # through a single dict[str, str].
         await self._web.files_upload_v2(
             channel=channel,
             thread_ts=thread_ts,
             file=file,
             filename=filename,
             title=title,
+            initial_comment=initial_comment,
         )
 
     async def open_dm(self, user_id: str) -> str:
@@ -775,9 +867,13 @@ class RealSlackClient(SlackClientOps):
             require_channel(channel)
             body: dict[str, Any] = {
                 "channel": channel,
-                "thread_ts": thread_ts,
                 "task_display_mode": "plan",
             }
+            # A Slack Code channel streams TOP-LEVEL (the whole channel is one
+            # session), which Slack spells by omitting thread_ts: an empty string
+            # is rejected. Every threaded caller passes a real ts, unchanged.
+            if thread_ts:
+                body["thread_ts"] = thread_ts
             # Workspace routing for org-wide installs.  Prefer the cached
             # home team for this channel — that's the workspace the channel
             # lives in, which is what ``body["team_id"]`` must route to.
@@ -882,12 +978,21 @@ class RealSlackClient(SlackClientOps):
             logger.debug("chat.appendStream task_update failed", exc_info=True)
             return False
 
-    async def stop_stream(self, channel: str, ts: str, final_text: str | None = None) -> bool:
+    async def stop_stream(
+        self,
+        channel: str,
+        ts: str,
+        final_text: str | None = None,
+        blocks: list[dict] | None = None,
+    ) -> bool:
         """Stop a streaming message via chat.stopStream.
 
         We intentionally do NOT call chat.update after stopping — the streamed
         content already has rich formatting (syntax-highlighted code blocks, etc.)
         that chat.update would downgrade to plain mrkdwn.
+
+        ``blocks`` (e.g. the timing footer) render at the bottom of the finalized
+        message. False means Slack did not take them either.
         """
         if turn_muted(channel, ts=ts):
             return False
@@ -895,6 +1000,8 @@ class RealSlackClient(SlackClientOps):
             # Each chunk is new content; see update_message.
             require_channel(channel)
             body: dict[str, Any] = {"channel": channel, "ts": ts}
+            if blocks:
+                body["blocks"] = blocks
             self._inject_team(channel, body)
             await self._web.api_call("chat.stopStream", json=body)
             return True
@@ -1165,6 +1272,48 @@ class RealSlackClient(SlackClientOps):
             logger.debug("fetch_thread_replies failed for %s/%s", channel, thread_ts, exc_info=True)
         return []
 
+    async def fetch_history(
+        self, channel: str, limit: int, *, thread_ts: str | None = None, oldest: str | None = None
+    ) -> list[dict]:
+        """The newest *limit* messages no bot posted, newest first.
+
+        Reads one thread when *thread_ts* is set, else the channel timeline;
+        only messages after *oldest* count. Bot posts are dropped before *limit*
+        applies, so a run of them cannot hide a reply. Unlike
+        ``fetch_thread_replies`` every error raises: a caller waiting for a reply
+        must not read one as "none".
+        """
+        kwargs: dict[str, Any] = {"channel": channel, "limit": _HISTORY_PAGE_SIZE}
+        if thread_ts:
+            kwargs["ts"] = thread_ts
+        if oldest:
+            kwargs["oldest"] = oldest
+        self._inject_team(channel, kwargs)
+        read = self._web.conversations_replies if thread_ts else self._web.conversations_history
+
+        def wanted(m: dict) -> bool:
+            # conversations.replies returns the thread's parent whatever oldest says.
+            newer = not oldest or float(m.get("ts") or 0) > float(oldest)
+            return newer and not (m.get("bot_id") or m.get("subtype") == "bot_message")
+
+        found: dict[str, dict] = {}  # by ts: a repeated parent is kept once
+        for _ in range(_HISTORY_MAX_PAGES):
+            resp = await read(**kwargs)
+            page: list[dict] = resp.get("messages", [])
+            found.update((str(m.get("ts")), m) for m in page if wanted(m))
+            kwargs["cursor"] = (resp.get("response_metadata") or {}).get("next_cursor")
+            # The timeline is newest-first, so it stops once it has enough; a
+            # thread is oldest-first, so its newest replies are on the last page.
+            if not kwargs["cursor"] or (not thread_ts and len(found) >= limit):
+                break
+        else:
+            raise RuntimeError(
+                f"{thread_ts or channel} has more than {_HISTORY_MAX_PAGES} pages to read; "
+                "pass a later oldest"
+            )
+        newest = sorted(found.values(), key=lambda m: float(m.get("ts") or 0), reverse=True)
+        return newest[:limit]
+
     async def conversations_list(self) -> list[dict]:
         """Fetch all public + private channels the bot is a member of.
 
@@ -1232,7 +1381,9 @@ class RealSlackClient(SlackClientOps):
         headers = {"Authorization": f"Bearer {self._web.token}"}
         timeout = aiohttp.ClientTimeout(total=_FILE_DOWNLOAD_TIMEOUT_SECS)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, headers=headers, allow_redirects=False) as resp:
+            async with session.get(
+                url, headers=headers, allow_redirects=False, proxy=resolve_proxy(url)
+            ) as resp:
                 if 300 <= resp.status < 400:
                     raise ValueError("refusing redirected Slack file URL")
                 resp.raise_for_status()

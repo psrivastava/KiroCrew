@@ -6,6 +6,9 @@ the native turn (``handler_runtime/turn.py``) -- handed the record's NAME to
 ``get_or_create`` as the kiro-cli mode and no ``cwd``, so the session asked for
 a mode that does not exist and ran in a per-session scratch directory. The cron
 path collapses the name the same way (``cron_fire._resolve_cron_agent``).
+
+The context builder takes the record's TEMPLATE on both call sites, linked
+dashboard sessions included (``channel_crew.context_template``).
 """
 
 from __future__ import annotations
@@ -19,15 +22,24 @@ from slack_transport_dispatch_helpers import (
     FakeSessions,
     RecordingSlackClient,
     ScriptedProvider,
+    _CapturingCtxBuilder,
     make_event,
 )
 
-from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK, STOP_REASON_END_TURN
+from kiro_crew.acp.types import (
+    EVENT_COMPLETE,
+    EVENT_PERMISSION_REQUEST,
+    EVENT_TEXT_CHUNK,
+    STOP_REASON_END_TURN,
+)
+from kiro_crew.agent_sdk.backends import ACP_BACKEND_KAS
+from kiro_crew.agent_sdk.capabilities import capabilities_for
 from kiro_crew.config import live, loader
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.config.sections import KiroCrewAgentConfig, WorkspaceConfig
 from kiro_crew.messaging.link import canonical_key
-from kiro_crew.slack import transport_dispatch
+from kiro_crew.providers.base import LLMEvent
+from kiro_crew.slack import channel_crew, transport_dispatch
 from kiro_crew.slack.channel_crew import ChannelCrew, resolve_channel_crew
 
 
@@ -69,6 +81,25 @@ class TestResolveChannelCrew:
         assert resolve_channel_crew("web-frontend") is None
 
 
+class TestContextTemplate:
+    """The context builder's ``agent`` is a template, never a Crew record's name."""
+
+    def test_record_name_collapses_to_its_template(self, crew_cfg):
+        assert channel_crew.context_template("web-frontend") == "kirocrew"
+
+    def test_resolved_binding_is_reused(self, crew_cfg):
+        crew = ChannelCrew(kiro_agent="kirocrew-lite", crew_agent="web-frontend", cwd="/x")
+        assert channel_crew.context_template("web-frontend", crew) == "kirocrew-lite"
+
+    def test_binding_for_another_name_is_not_applied(self, crew_cfg):
+        crew = ChannelCrew(kiro_agent="kirocrew-lite", crew_agent="web-frontend", cwd="/x")
+        assert channel_crew.context_template("kirocrew-research", crew) == "kirocrew-research"
+
+    def test_plain_mode_and_empty_pass_through(self, crew_cfg):
+        assert channel_crew.context_template("kirocrew-lite") == "kirocrew-lite"
+        assert channel_crew.context_template(None) is None
+
+
 class _KwargsSessions(FakeSessions):
     """Records every keyword ``get_or_create`` is called with for the turn."""
 
@@ -86,7 +117,7 @@ class _KwargsSessions(FakeSessions):
         )
 
 
-def _run_transport(monkeypatch, *, agent_override, thread_agent=None):
+def _run_transport(monkeypatch, *, agent_override, thread_agent=None, context_builder=None):
     monkeypatch.setattr(transport_dispatch, "_get_default_agent", lambda: "")
     monkeypatch.setattr(
         transport_dispatch, "_hydrate_thread_overrides", AsyncMock(return_value=None)
@@ -112,7 +143,7 @@ def _run_transport(monkeypatch, *, agent_override, thread_agent=None):
             thread_ts=None,
             msg_ts=_MSG_TS,
             user_id="U_OWNER",
-            context_builder=None,
+            context_builder=context_builder,
             conversation_log=None,
             agent_override=agent_override,
         )
@@ -164,9 +195,45 @@ class TestTransportHonorsChannelCrew:
         assert "cwd" not in kw
 
 
+class TestTransportContextTemplate:
+    """``build_message`` receives the template the turn runs, not the record's name.
+
+    A dashboard-linked session that carries a private crewmate builds that
+    member's essentials from ``agent``; a record name there names no template
+    file and aborts every turn with ``Essential template '<record>': not found``.
+    """
+
+    def _agent_seen(self, monkeypatch, **kw):
+        ctx = _CapturingCtxBuilder()
+        _run_transport(monkeypatch, context_builder=ctx, **kw)
+        return ctx.captured["agent"]
+
+    def test_dashboard_linked_session_gets_the_record_template(self, monkeypatch, crew_cfg):
+        monkeypatch.setattr(transport_dispatch, "is_slack_born", lambda key: False)
+        assert self._agent_seen(monkeypatch, agent_override="web-frontend") == "kirocrew"
+
+    def test_crew_bound_channel_gets_the_record_template(self, monkeypatch, crew_cfg):
+        assert self._agent_seen(monkeypatch, agent_override="web-frontend") == "kirocrew"
+
+    def test_plain_mode_channel_is_unchanged(self, monkeypatch, crew_cfg):
+        assert self._agent_seen(monkeypatch, agent_override="ops-agent") == "ops-agent"
+
+    def test_thread_override_is_unchanged(self, monkeypatch, crew_cfg):
+        seen = self._agent_seen(
+            monkeypatch, agent_override="web-frontend", thread_agent="kirocrew-research"
+        )
+        assert seen == "kirocrew-research"
+
+
 async def _empty_stream(*a, **kw):
     return
     yield  # makes this an async generator
+
+
+async def _one_permission_request(*a, **kw):
+    yield LLMEvent(
+        kind=EVENT_PERMISSION_REQUEST, title="Say hi", tool_kind="execute", request_id="r1"
+    )
 
 
 def _native_mocks():
@@ -215,13 +282,17 @@ def _native_agent_cache():
 
 @pytest.mark.usefixtures("_native_agent_cache")
 class TestNativeTurnHonorsChannelCrew:
-    async def _run(self, channel_agent, thread_agent=None):
+    async def _run(self, channel_agent, thread_agent=None, stream=_empty_stream, backend=None):
         from kiro_crew.slack import handler
         from kiro_crew.slack.handler import handle_message
 
         if thread_agent is not None:
             handler._thread_agents[canonical_key(_MSG_TS)] = thread_agent
         slack, sessions, ctx = _native_mocks()
+        client = sessions.get_or_create.return_value[0]
+        client.stream = stream
+        if backend is not None:
+            client.capabilities = capabilities_for(backend)
         with patch("kiro_crew.slack.handler.publish_turn_identity"):
             await handle_message(
                 slack=slack,
@@ -245,8 +316,35 @@ class TestNativeTurnHonorsChannelCrew:
         assert kw["agent"] == "kirocrew"
         assert kw["crew_agent"] == "web-frontend"
         assert kw["cwd"] == str(tree)
-        # The context builder still sees the record's name, as before.
-        assert ctx.build_message.call_args.kwargs.get("agent") == "web-frontend"
+        # The context builder takes the record's template, not its name.
+        assert ctx.build_message.call_args.kwargs.get("agent") == "kirocrew"
+
+    @pytest.mark.asyncio
+    async def test_crew_bound_channel_gates_on_the_spec_of_the_agent_the_record_runs(
+        self, crew_cfg, monkeypatch
+    ):
+        """A record's name has no agent spec: the permission step reads its template's."""
+        from kiro_crew.agent_sdk.spec_hooks import TurnSpecHooks
+        from kiro_crew.slack import handler
+
+        asked: list[str] = []
+
+        async def spec_turn(_client, agent_name):
+            asked.append(agent_name)
+            return TurnSpecHooks([], None, False, False)
+
+        monkeypatch.setattr(handler, "spec_turn", spec_turn)
+        await self._run("web-frontend", stream=_one_permission_request, backend=ACP_BACKEND_KAS)
+        assert asked == ["kirocrew"]
+
+    @pytest.mark.asyncio
+    async def test_dashboard_linked_session_gives_the_builder_the_template(self, crew_cfg):
+        # A linked session is not Slack-born, so the session keeps its own
+        # allocation, but its context is still built for the record's template.
+        with patch("kiro_crew.slack.handler.is_slack_born", lambda key: False):
+            kw, ctx = await self._run("web-frontend")
+        assert kw["agent"] == "web-frontend"
+        assert ctx.build_message.call_args.kwargs.get("agent") == "kirocrew"
 
     @pytest.mark.asyncio
     async def test_binding_restored_from_the_transcript_still_runs_the_record(self, crew_cfg):

@@ -31,6 +31,7 @@ from kiro_crew.dashboard import change_cards as cards
 from kiro_crew.dashboard.change_cards import CardStore
 from kiro_crew.dashboard.handlers import change_cards as routes
 from kiro_crew.dashboard.handlers.undo_identity_guard import REQ_CARD_UNDO_CREWMATE_EXPECT
+from kiro_crew.testing.synthetic_credentials import github_classic
 
 world = change_cards_helpers.world
 
@@ -48,7 +49,7 @@ BUNDLE = {
     "goals": {"longTerm": "Ship clean releases", "keyResults": [{"text": "zero rollbacks"}]},
     "crons": [{"name": "weekly", "message": "Check in", "cron_expr": "0 9 * * 1"}],
 }
-_FAKE_TOKEN = "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"
+_FAKE_TOKEN = github_classic(seed=402)
 _SCRIPT_CRON = {"name": "s", "cron_expr": "0 9 * * 1", "script": "a.py:run"}
 
 
@@ -186,8 +187,11 @@ def test_import_shares_the_create_state_read_and_partial_line():
     line = catalog.result_summary("crewmate.import", params, "partial", "t", failed_step=1)
     assert (
         line
-        == "Created mate “Q” without its goal or anything after it. Undo removes the mate and what was saved"
+        == "Created Bot “Q” without its goal or anything after it. Undo removes the Bot and what was saved"
     )
+    shown = {"name": "Q", "goal": "g", "dashboard_template": "builtin:standup"}
+    line = catalog.result_summary("crewmate.import", shown, "partial", "t", failed_step=2)
+    assert line.startswith("Created Bot “Q” without its dashboard or anything after it")
 
 
 def test_propose_writes_only_a_card_under_the_app_key_and_the_press_creates(
@@ -218,6 +222,7 @@ def test_propose_writes_only_a_card_under_the_app_key_and_the_press_creates(
         app = change_cards_helpers._app(world, store)
         app.router.add_post("/api/agents", create)
         app.router.add_delete("/api/agents/{name}", delete)
+        app.router.add_delete("/api/agents/b64/{name_b64}", delete)
         async with TestClient(TestServer(app)) as c:
             sdk = CrewmateSDK("share", app)
             bundle = {**_with("goals", {}), "crons": []}
@@ -240,5 +245,12 @@ def test_propose_writes_only_a_card_under_the_app_key_and_the_press_creates(
     assert rec["slot_key"] == routes.APP_SLOT_PREFIX + "share" and rec["session_key"] == ""
     # The bundle's name is taken, so the card proposes the first free one.
     assert rec["params"]["name"] == "Release Captain 2"
-    assert seen == ([], {"status": "pending"}, 403, 200, "/api/agents/Release%20Captain%202", 200)
+    assert seen == (
+        [],
+        {"status": "pending"},
+        403,
+        200,
+        "/api/agents/b64/UmVsZWFzZSBDYXB0YWluIDI",
+        200,
+    )
     assert modes == ["normal"] and guarded == ["m1"] and rec["status"] == "undone"

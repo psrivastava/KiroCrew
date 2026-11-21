@@ -10,6 +10,8 @@ import ShortcutsModal, {
   PanelToggleRows,
   GlobalHotkeyRow,
 } from './ShortcutsModal'
+import { loadChatConfig, saveChatConfig } from '../pages/chat/ChatSettings'
+import { shortcutLabel } from '../hooks/useKeyboardShortcuts'
 
 function renderWithQuery(ui: React.ReactElement) {
   const client = new QueryClient({
@@ -174,6 +176,30 @@ describe('ShortcutsModal & subcomponents', () => {
     // Search by chord with '+' separator
     fireEvent.change(searchInput, { target: { value: 'alt+k' } })
     expect(screen.queryAllByText(/keyboard shortcuts/i).length).toBeGreaterThan(0)
+  })
+
+  it('lists Tab and Shift+Tab for indenting a list line, found by searching the key (#14848)', () => {
+    renderWithQuery(<ShortcutsModal onClose={vi.fn()} />)
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'tab' } })
+    const caps = (label: string) => screen.getByText(label).parentElement?.querySelector('[data-testid="shortcut-combo"]')?.textContent
+    expect(caps('Indent list line')).toBe('Tab')
+    expect(caps('Outdent list line')).toBe('Shift+Tab')
+  })
+
+  it('leaves the Tab rows out while Style Markdown While Typing is on, where Tab does not indent', () => {
+    saveChatConfig({ ...loadChatConfig(), inlineMarkdown: true })
+    const ids = groupShortcuts('actions', true).map(s => s.id)
+    expect(ids).toContain('edit-last-message')
+    expect(ids).not.toContain('list-indent')
+    expect(ids).not.toContain('list-outdent')
+  })
+
+  it('lists Esc under the Stop button\'s name, and leaves it out while a second Escape is required (#23462)', () => {
+    const stopRow = () => groupShortcuts('actions', true).find(s => s.id === 'stop-turn')
+    expect(stopRow()).toMatchObject({ key: 'Escape', group: 'actions' })
+    expect(shortcutLabel(stopRow()!)).toBe('Stop generation')
+    saveChatConfig({ ...loadChatConfig(), doubleEscapeToStop: true })
+    expect(stopRow()).toBeUndefined()
   })
 
   it('handles Escape key: clears search input first, then closes modal', () => {

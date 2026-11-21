@@ -1,12 +1,16 @@
 /** The sidebar's shared row and folder chrome: the open-in-tab gesture, the
- *  disclosure chevron, the pinned-section divider, the folder body geometry and
+ *  open chat row's side-panel re-click and its tooltip, the disclosure chevron, the pinned-section divider, the folder body geometry and
  *  text-control classes that the session row, the folder blocks and the lanes all
- *  draw with, and the date-segment label the flat lane and the Older Sessions pane
- *  head their groups with. */
+ *  draw with, the date-segment label the flat lane and the Older Sessions pane
+ *  head their groups with, and the folder name's tooltip. */
 import { ChevronRight } from 'lucide-react'
 import { IS_MAC } from '../../hooks/useKeyboardShortcuts'
 import { i18nT } from '../../i18n/t'
-import { fmtDateFields } from '../../i18n/format'
+import { loadPanelToggleOverrides, resolvePanelToggleBinding } from '../../lib/panelToggleShortcuts'
+import { formatChordKeys } from '../../lib/quickSearchShortcut'
+import { fmtDateFields, fmtDateTime } from '../../i18n/format'
+import { folderHasCreatedStamp, type FolderSortMode } from '../../utils/folderTree'
+import type { ChatFolder } from '../../types'
 
 /** Is this click the "open as a tab" modifier gesture? One predicate for every
  *  surface that offers it (session rows, the New button, the folder create
@@ -16,6 +20,17 @@ import { fmtDateFields } from '../../i18n/format'
  *  excluded because both carry other meanings in the sidebar (range/reorder). */
 export function isOpenInTabModifierClick(e: React.MouseEvent): boolean {
   return (IS_MAC ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey) && !e.shiftKey && !e.altKey
+}
+
+// The open chat row's side-panel re-click: lib owns the timer, the row calls it.
+export { reclickDoubleClick, reclickTogglesPanel } from '../../lib/reclickPanelToggle'
+
+/** The open chat row's tooltip: what a click does, with the live shortcut. */
+export function reclickPanelTitle(): string {
+  const chord = resolvePanelToggleBinding('side-panel', loadPanelToggleOverrides())
+  return chord
+    ? i18nT('pages.chatSidebar.reclick_toggles_side_panel_shortcut', { shortcut: formatChordKeys(chord).join(IS_MAC ? '' : '+') })
+    : i18nT('pages.chatSidebar.reclick_toggles_side_panel')
 }
 
 /** Tab mode for a click on a CREATE control (the header New button, a folder
@@ -156,4 +171,20 @@ export function dateSegment(ts: number | string | undefined): string {
   if (d >= daysAgo30) return i18nT('pages.chatSidebar.last_30_days')
   if (d.getFullYear() === now.getFullYear()) return fmtDateFields(d, { month: 'long' })
   return fmtDateFields(d, { year: 'numeric', month: 'long' })
+}
+
+/** A folder name's tooltip, for the tree row and the board column row alike. In
+ *  Created order it leads with the key that order sorts by -- the creation time, or
+ *  that the folder has none and so sits in the Custom order after the dated ones --
+ *  so the order can be traced on the row once the menu is closed. The rename hint,
+ *  where the row offers rename, follows on its own line. */
+export function folderNameTitle(folder: ChatFolder, mode: FolderSortMode, renamable: boolean): string | undefined {
+  const lines: string[] = []
+  if (mode === 'created') {
+    lines.push(folderHasCreatedStamp(folder)
+      ? i18nT('pages.chatSidebar.folder_created_on', { date: fmtDateTime(folder.created_at) })
+      : i18nT('pages.chatSidebar.folder_created_unrecorded'))
+  }
+  if (renamable) lines.push(i18nT('pages.chatSidebar.double_click_to_rename'))
+  return lines.length > 0 ? lines.join('\n') : undefined
 }

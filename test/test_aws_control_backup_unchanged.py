@@ -1,31 +1,22 @@
 """AWS Control backup -- the unchanged-check that stops a nightly re-uploading a copy.
 
-Three layers, because each answers a question the others cannot:
-
-* ``TestTreeFingerprint`` pins the MECHANISM on hand-built archives. This is where
-  the "archives differ, decision does not" property lives, and where each
-  normalization (the bundle's timestamped root, the manifest's ``created_at``) is
-  shown to ignore exactly what it claims to and nothing more -- every exclusion gets
-  a case where the value it drops is the ONLY difference, and a second case proving a
-  neighbouring value still counts.
-* ``TestRealBundleAssumption`` pins an ASSUMPTION about a module this one does not
-  own. The skip rests on ``created_at`` being the only field ``snapshot_build.py`` rewrites
-  on a rebuild; that is measured rather than assumed, and this builds two real
-  bundles so the day a second volatile field appears CI goes red instead of the skip
-  quietly never firing again.
-* ``TestUnchangedBaseline`` and the two run-path classes pin the DECISION, in both
-  directions. A guard that only ever refuses is indistinguishable from a feature that
-  never runs, so every skip test has a sibling proving the same setup uploads when
-  something really moved.
+* ``TestTreeFingerprint`` pins the mechanism: each normalization ignores exactly
+  the value it claims to, and a neighbouring value still counts.
+* ``TestRealBundleAssumption`` builds two real bundles, so a second volatile field in
+  ``snapshot_build.py`` turns CI red instead of silently disabling the skip.
+* ``TestUnchangedBaseline`` and the run-path classes pin the decision both ways:
+  every skip test has a sibling that uploads when something moved.
 """
 
 from __future__ import annotations
 
 import contextlib
 import io
+import itertools
 import json
+import os
 import tarfile
-import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 from unittest import mock
@@ -38,8 +29,14 @@ from kiro_crew.apps.builtins.aws_control.backend import backup
 ACCOUNT = "111122223333"
 
 
-def _pack(path: Path, entries: dict[str, bytes], *, dirs: tuple[str, ...] = ()) -> Path:
-    """Write a ``tar.gz`` holding exactly *entries* (and any empty *dirs*)."""
+def _pack(
+    path: Path, entries: dict[str, bytes], *, dirs: tuple[str, ...] = (), mtime: float = 0.0
+) -> Path:
+    """Write a ``tar.gz`` holding exactly *entries* (and any empty *dirs*).
+
+    A non-zero *mtime* stamps every member with it, so two packs of one tree can
+    carry different member mtimes without waiting out a real second.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     staging = path.parent / f"{path.name}.stage"
     staging.mkdir()
@@ -49,6 +46,9 @@ def _pack(path: Path, entries: dict[str, bytes], *, dirs: tuple[str, ...] = ()) 
         member = staging / name
         member.parent.mkdir(parents=True, exist_ok=True)
         member.write_bytes(body)
+    if mtime:
+        for member in [*staging.rglob("*"), staging]:
+            os.utime(member, (mtime, mtime))
     with tarfile.open(path, "w:gz") as tar:
         for child in sorted(staging.iterdir()):
             tar.add(str(child), arcname=child.name)
@@ -70,9 +70,7 @@ def _pack_member(path: Path, *, body: bytes, mode: int, name: str = "a.txt") -> 
     return path
 
 
-# ---------------------------------------------------------------------------
 # The mechanism
-# ---------------------------------------------------------------------------
 
 
 class TestTreeFingerprint:
@@ -84,9 +82,9 @@ class TestTreeFingerprint:
         # could never fire. Both halves are asserted here -- the differing bytes are
         # what make the matching fingerprint mean something.
         body = {"a.txt": b"hello", "nested/b.txt": b"world"}
-        first = _pack(tmp_path / "one.tar.gz", body)
-        time.sleep(1.1)  # tar mtimes are second-granular; force them apart
-        second = _pack(tmp_path / "two.tar.gz", body)
+        # tar mtimes are second-granular, so the two packs carry stamps far apart.
+        first = _pack(tmp_path / "one.tar.gz", body, mtime=1_700_000_000)
+        second = _pack(tmp_path / "two.tar.gz", body, mtime=1_700_000_100)
 
         assert first.read_bytes() != second.read_bytes()
         assert backup._tree_fingerprint(first, volatile_root=False) == backup._tree_fingerprint(
@@ -296,9 +294,7 @@ class TestTreeFingerprint:
         assert backup._tree_fingerprint(tmp_path / "absent.tar.gz", volatile_root=True) == ""
 
 
-# ---------------------------------------------------------------------------
 # The assumption about snapshot_build.py, pinned rather than trusted
-# ---------------------------------------------------------------------------
 
 
 def _manifest_field(archive: Path, field: str) -> Any:
@@ -315,18 +311,9 @@ def _manifest_field(archive: Path, field: str) -> Any:
 def _build_real_bundle(out: Path) -> Path:
     """Build one real snapshot bundle into *out* and return the archive it wrote.
 
-    The staging mode is the platform's, not a preference. ``snapshot_build.py`` refuses to
-    stage the data home where the platform cannot open a directory relative to a
-    descriptor, because a by-name walk is exactly the mechanism an ancestor swapped
-    mid-walk redirects; the documented way to proceed there is to ask for that walk
-    explicitly, and the manifest records that it was asked for. So the flag is added
-    where production requires it and nowhere else, which leaves the pinned walk under
-    test on a platform that has one.
-
-    Both sides of every comparison are built through here, so the staging mode is
-    identical on either side. That matters because ``staging`` is a manifest field the
-    fingerprint KEEPS: were one side pinned and the other not, the two would differ on
-    the mode rather than on the tree.
+    The by-name walk flag is added only where the platform cannot pin, as production
+    requires. Both sides of every comparison come through here because the fingerprint
+    keeps the manifest's ``staging`` field.
     """
     out.mkdir(parents=True, exist_ok=True)
     argv = [str(out), "--keep", "1"]
@@ -336,6 +323,27 @@ def _build_real_bundle(out: Path) -> Path:
     return sorted(out.glob("kirocrew-snapshot-*.tar.gz"))[-1]
 
 
+@pytest.fixture
+def one_second_per_build(monkeypatch):
+    """Each ``datetime.now`` the snapshot engine reads lands one second later.
+
+    The bundle name and the manifest's ``created_at`` are second-granular, and the
+    real case is two builds in different seconds. Stepping the engine's own clock
+    gives that gap without waiting it out.
+    """
+    from kiro_crew import snapshot as snapshot_mod
+
+    ticks = itertools.count()
+
+    class _OneSecondPerCall(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=next(ticks))
+
+    monkeypatch.setattr(snapshot_mod, "datetime", _OneSecondPerCall)
+
+
+@pytest.mark.usefixtures("one_second_per_build")
 class TestRealBundleAssumption:
     def test_two_real_bundles_of_one_unchanged_tree_share_a_fingerprint(
         self, tmp_path, monkeypatch
@@ -356,8 +364,8 @@ class TestRealBundleAssumption:
 
         first = build(tmp_path / "one")
         # The bundle name and its root directory are second-granular, so the two
-        # builds have to land in different seconds for this to be the real case.
-        time.sleep(1.1)
+        # builds land in different seconds (one_second_per_build) for this to be
+        # the real case.
         second = build(tmp_path / "two")
 
         assert first.read_bytes() != second.read_bytes()
@@ -384,7 +392,6 @@ class TestRealBundleAssumption:
 
         first = build(tmp_path / "one")
         (home / "workspace" / "note.md").write_text("changed\n", encoding="utf-8")
-        time.sleep(1.1)
         second = build(tmp_path / "two")
 
         assert backup._tree_fingerprint(first, volatile_root=True) != backup._tree_fingerprint(
@@ -407,7 +414,6 @@ class TestRealBundleAssumption:
         monkeypatch.setenv("KIROCREW_HOME", str(home))
 
         first = _build_real_bundle(tmp_path / "one")
-        time.sleep(1.1)
         second = _build_real_bundle(tmp_path / "two")
 
         # The precondition, asserted rather than assumed: a simulation that failed to
@@ -424,16 +430,13 @@ class TestRealBundleAssumption:
         )
 
         (home / "workspace" / "note.md").write_text("changed\n", encoding="utf-8")
-        time.sleep(1.1)
         third = _build_real_bundle(tmp_path / "three")
         assert backup._tree_fingerprint(first, volatile_root=True) != backup._tree_fingerprint(
             third, volatile_root=True
         )
 
 
-# ---------------------------------------------------------------------------
 # The decision -- every branch that must upload
-# ---------------------------------------------------------------------------
 
 
 class TestUnchangedBaseline:
@@ -701,9 +704,7 @@ class TestUnchangedBaseline:
             )
 
 
-# ---------------------------------------------------------------------------
 # The locked skip record
-# ---------------------------------------------------------------------------
 
 
 class TestRecordSkipCompareAndSet:
@@ -887,9 +888,7 @@ class TestRecordSkipCompareAndSet:
         assert skipped is None, "an empty process is not proof the slot is still the baseline's"
 
 
-# ---------------------------------------------------------------------------
 # The run paths, both directions
-# ---------------------------------------------------------------------------
 
 
 def _fake_snapshot(body: bytes):
@@ -1178,19 +1177,14 @@ class TestRunSessionsBackupSkip:
         assert len(archive_pushes) == 1
 
 
-# ---------------------------------------------------------------------------
 # Composition with retention -- the two halves have to move together
-# ---------------------------------------------------------------------------
 
 
 class _Drive:
     """A fake versioned drive that GROWS when an upload lands.
 
-    The growth is the point. Retention's protection of the newest archive is only
-    testable if the key the run just uploaded is actually in the listing retention
-    reads, which is what it is in production. A fake that never added the new key
-    would leave the candidate set free of it and the test would pass without the
-    guarantee existing.
+    Without the new key in the listing, retention's protection of the newest archive
+    would pass untested.
     """
 
     def __init__(self, rows: list[dict[str, Any]]) -> None:
@@ -1259,14 +1253,10 @@ INSTALL = "c" * 32
 
 
 class TestRetentionComposition:
-    """Retention retires copies; the unchanged-check skips sending one. Together they
-    must not leave the run record pointing at an object that is gone.
+    """Retention and the unchanged-check never leave the run record on a gone object.
 
-    The composition matters in one direction specifically: the next skip proves its
-    baseline by HEADing the key the last run RECORDED, and retention is the thing in
-    this module that deletes keys. So the question is whether retention can ever
-    delete the recorded key, and whether a run of skips can walk the keep window
-    down to it.
+    The next skip HEADs the recorded key, so retention must never delete it, even
+    after a run of skips.
     """
 
     @pytest.fixture(autouse=True)
@@ -1308,11 +1298,8 @@ class TestRetentionComposition:
     def _seed_uploads(self, n: int) -> list[dict[str, Any]]:
         """``n`` real uploads, each with different content so none of them skips.
 
-        Deliberately not hand-written listing rows. Retention only retires an archive
-        whose recorded version id is still the key's CURRENT version
-        (``_current_version_is_ours``), so a fabricated row this install never recorded
-        uploading is not a candidate at all -- a sweep over seeded rows deletes nothing
-        and every assertion below would pass while proving nothing.
+        Not hand-written rows: ``_current_version_is_ours`` makes an unrecorded row no
+        candidate, so the assertions would prove nothing.
         """
         records = []
         for i in range(n):
@@ -1468,9 +1455,7 @@ class TestRetentionComposition:
         )
 
 
-# ---------------------------------------------------------------------------
 # The docstring stops describing a state the module has left
-# ---------------------------------------------------------------------------
 
 
 class TestModuleDocstringIsCurrent:

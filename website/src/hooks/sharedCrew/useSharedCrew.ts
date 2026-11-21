@@ -1,0 +1,144 @@
+/**
+ * React Query reads for Shared Crew. Each except the mode answers `null` when
+ * the gateway does not serve the route, so a consumer renders "not available"
+ * rather than an error. Live updates arrive as socket frames (./sharedCrewSocket) into these
+ * same cache entries.
+ */
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useEffect } from 'react'
+import { api } from '../../api/client'
+import { noteSendRevision } from '../../api/sendRace'
+import type { SendState } from '../../api/sharedCrew'
+import { effectiveMode, showsTeamAttribution } from '../../api/sharedCrewMode'
+import { ALL_UNAVAILABLE, capabilityUsable, sharedAccessConfigured, sharedCrewPreviewOn, someoneJoined } from '../../api/sharedCrewUi'
+import { timedPoll } from '../../lib/pollRule'
+import { latestSendState, PEOPLE_POLL_ID, sharedCrewKeys } from './sharedCrewSocket'
+
+/** The Crew's capabilities; all unavailable until the gateway says otherwise. */
+export function useSharedCrewCapabilities({ fetchOnMount = true }: { fetchOnMount?: boolean } = {}) {
+  const query = useQuery({
+    queryKey: sharedCrewKeys.capabilities,
+    queryFn: () => api.sharedCrewCapabilities(),
+    staleTime: 60_000,
+    retry: false,
+    refetchOnMount: fetchOnMount,
+    retryOnMount: fetchOnMount,
+  })
+  return { ...query, capabilities: query.data ?? ALL_UNAVAILABLE }
+}
+
+/** Who this tab is, as the server derived it; `null` when it reports no one. */
+export function useSharedCrewViewer(enabled = true) {
+  return useQuery({ queryKey: sharedCrewKeys.viewer, queryFn: () => api.sharedCrewViewer(), enabled, staleTime: 60_000, retry: false })
+}
+
+/** This Crew's People/setup mode. A missing or failing route is a query error,
+ *  which every consumer renders as an error, never as a personal Crew. */
+export function useSharedCrewMode(enabled = true, { fetchOnMount = true }: { fetchOnMount?: boolean } = {}) {
+  return useQuery({
+    queryKey: sharedCrewKeys.mode,
+    queryFn: () => api.sharedCrewMode(),
+    enabled,
+    staleTime: 60_000,
+    retry: false,
+    refetchOnMount: fetchOnMount,
+    retryOnMount: fetchOnMount,
+  })
+}
+
+export function useSharedCrewPeople(enabled = true, { fetchOnMount = true }: { fetchOnMount?: boolean } = {}) {
+  return useQuery({ queryKey: sharedCrewKeys.people, queryFn: () => timedPoll(PEOPLE_POLL_ID, () => api.sharedCrewPeople()), enabled, retry: false, refetchOnMount: fetchOnMount, retryOnMount: fetchOnMount })
+}
+
+/** Whether this tab is NOT the Crew owner, from `/api/auth/me`'s `owner_ok`, read
+ *  whatever the Shared Crew preview is (a relay teammate is admitted with it off
+ *  too). `notOwner` is `false` until the gateway says so, so the owner's view
+ *  never waits on it; a failed read is returned as `error`, not discarded.
+ *  `owner` is the fail-closed reading for a surface that writes owner-only
+ *  state: true only once the gateway said this tab clears the owner gate.
+ *  `failed` is a read that failed with no answer yet: a refetch that fails after
+ *  one answered keeps that answer (react-query holds `data`), so it is not. */
+export function useViewerIsNotOwner() {
+  const query = useQuery({ queryKey: [...sharedCrewKeys.viewer, 'owner-ok'], queryFn: () => api.viewerOwnerOk(), staleTime: 60_000, retry: false })
+  return { notOwner: query.data === false, owner: query.data === true, failed: query.data === undefined && !!query.error, error: query.error, retry: query.refetch }
+}
+
+/** Whether this Crew shows who did what (bylines, decision attribution,
+ *  presence), decided the way the session list decides it: only with the
+ *  Shared Crew preview on and someone besides the owner joined
+ *  (`showsTeamAttribution`). The read failures are SessionCollabStrip's to
+ *  show, once per chat. */
+export function useTeamAttribution(): boolean {
+  const { capabilities } = useSharedCrewCapabilities()
+  const previewOn = sharedCrewPreviewOn(capabilities)
+  const attributes = previewOn && capabilityUsable(capabilities.attribution)
+  const modeQuery = useSharedCrewMode(attributes)
+  const people = useSharedCrewPeople(attributes)
+  const rows = people.data?.people
+  const mode = modeQuery.data === undefined ? null : effectiveMode(modeQuery.data, {
+    teamPath: sharedAccessConfigured(capabilities),
+    othersSeen: (rows ?? []).some(row => !row.is_viewer),
+  })
+  return showsTeamAttribution({ previewOn, attributes, mode, joined: someoneJoined(rows) })
+}
+
+export function useSharedCrewCapacity(enabled = true) {
+  return useQuery({ queryKey: sharedCrewKeys.capacity, queryFn: () => api.sharedCrewCapacity(), enabled, retry: false })
+}
+
+export function useSessionWork(sessionKey: string | null | undefined, enabled = true) {
+  return useQuery({
+    queryKey: sharedCrewKeys.work(sessionKey ?? ''),
+    queryFn: () => api.sharedCrewWork(sessionKey ?? ''),
+    enabled: enabled && !!sessionKey,
+    retry: false,
+  })
+}
+
+export function useSessionPresence(sessionKey: string | null | undefined, enabled = true) {
+  return useQuery({
+    queryKey: sharedCrewKeys.presence(sessionKey ?? ''),
+    queryFn: () => api.sharedCrewPresence(sessionKey ?? ''),
+    enabled: enabled && !!sessionKey,
+    retry: false,
+  })
+}
+
+/** `enabled = false` reads the cache without fetching, for a card's label and settled line: the chat's `SessionCollabStrip` owns the read and its failure notice. */
+export function useSessionDecisions(sessionKey: string | null | undefined, enabled = true) {
+  return useQuery({
+    queryKey: sharedCrewKeys.decisions(sessionKey ?? ''),
+    queryFn: () => api.sharedCrewDecisions(sessionKey ?? ''),
+    enabled: enabled && !!sessionKey,
+    retry: false,
+  })
+}
+
+/** The session's send revision, read on open and after every reconnect (the
+ *  socket's open invalidates `shared-crew`), then kept current by frames. The
+ *  revision it reads is what this tab's next send is based on. */
+export function useSessionSendState(sessionKey: string | null | undefined, enabled = true) {
+  const client = useQueryClient()
+  const query = useQuery({
+    queryKey: sharedCrewKeys.sendState(sessionKey ?? ''),
+    queryFn: () => api.sharedCrewSendState(sessionKey ?? ''),
+    structuralSharing: latestSendState,
+    enabled: enabled && !!sessionKey,
+    retry: false,
+  })
+  useEffect(() => {
+    if (sessionKey) noteSendRevision(sessionKey, client.getQueryData<SendState | null>(sharedCrewKeys.sendState(sessionKey))?.revision)
+  }, [client, sessionKey, query.data])
+  return query
+}
+
+/** Who holds the session's composer typing lease, read on open and after every
+ *  reconnect, then kept current by `shared_crew.typing_lease` frames. */
+export function useSessionTypingLease(sessionKey: string | null | undefined, enabled = true) {
+  return useQuery({
+    queryKey: sharedCrewKeys.typingLease(sessionKey ?? ''),
+    queryFn: () => api.sharedCrewTypingLease(sessionKey ?? ''),
+    enabled: enabled && !!sessionKey,
+    retry: false,
+  })
+}

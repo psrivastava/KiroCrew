@@ -1,5 +1,8 @@
 """The Slack App Home tab: ``_publish_home_tab`` builds and publishes its Block Kit view.
 
+``_home_tab_builtin_enabled`` reads ``slack.home_tab_builtin``: off, an open publishes
+nothing, so a Home view the owner published with the same bot stays.
+
 The view carries a status header, the MCP servers and skills (listed through
 ``_get_skills_loader``, a listing-only loader created on first use), the cron jobs, the
 recent sessions (collected off the event loop, one collection at a time through
@@ -19,8 +22,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from kiro_crew import __version__
-from kiro_crew.config.loader import KiroCrewConfig
-from kiro_crew.cron import format_schedule
+from kiro_crew.cron import format_schedule, job_zone_name
 from kiro_crew.dashboard.handlers import get_update_info
 from kiro_crew.mcp_discovery import list_servers
 from kiro_crew.platform import current_context
@@ -29,7 +31,12 @@ from kiro_crew.sel import sel
 from kiro_crew.skills import SkillsLoader
 from kiro_crew.slack.blocks import command_hint_block
 from kiro_crew.slack.events_slash import SLASH_REGISTRY
-from kiro_crew.slack.handler import is_allowed_user, is_owner, is_yolo_mode, slack_cfg
+from kiro_crew.slack.handler import (
+    is_allowed_user,
+    is_owner,
+    is_yolo_mode,
+    slack_cfg,
+)
 from kiro_crew.slack.sessions_view import (
     _HOME_TAB_SESSIONS_PER_KIND,
     _SESSION_KIND_DASHBOARD,
@@ -81,6 +88,11 @@ def _home_tab_collect_gate() -> asyncio.Semaphore:
     if _home_tab_collect_sem is None:
         _home_tab_collect_sem = asyncio.Semaphore(_HOME_TAB_COLLECT_CONCURRENCY)
     return _home_tab_collect_sem
+
+
+def _home_tab_builtin_enabled(orch: GatewayOrchestrator) -> bool:
+    """Whether an open publishes the built-in page, read from the live config each time."""
+    return slack_cfg(orch).slack.home_tab_builtin
 
 
 # ---------------------------------------------------------------------------
@@ -175,24 +187,14 @@ async def _publish_home_tab(orch: GatewayOrchestrator, user_id: str) -> None:
         if orch.cron_svc is not None:
             jobs = orch.cron_svc.list_jobs(include_disabled=True)
             if jobs:
-                try:
-                    _tz = KiroCrewConfig.load().timezone
-                except Exception:
-                    _tz = ""
-                if not _tz and orch.slack is not None:
-                    try:
-                        profile = await orch.slack.get_user_profile(user_id)
-                        _tz = profile.get("timezone", "")
-                    except Exception:
-                        _tz = ""
                 lines = []
                 for j in jobs[:15]:
                     status = "✅" if j.enabled else "⏸️"
-                    # Each job carries its own timezone; honour it first and
-                    # fall back to the configured/viewer zone only when the job
-                    # has none, matching the scheduler and the other cron
-                    # display surfaces.
-                    sched = format_schedule(j.schedule, tz_name=getattr(j, "timezone", "") or _tz)
+                    # The zone the scheduler fires the job in: its own, else the
+                    # configured one, else the host's (format_schedule resolves
+                    # it). Never the viewer's Slack zone, which would show a
+                    # different instant than the one the job runs at.
+                    sched = format_schedule(j.schedule, tz_name=job_zone_name(j))
                     raw = f"{status} *{j.name}* — `{sched}`"
                     lines.append(redact_credentials(redact_exfiltration_urls(raw)[0])[0])
                 if len(jobs) > 15:

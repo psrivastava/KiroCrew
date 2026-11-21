@@ -101,7 +101,7 @@ def test_dedup_text_swaps_the_placeholder_and_keeps_the_annotations() -> None:
     from kiro_crew.slack.gateway import _dedup_text
 
     tally = _tally(READ, READ)
-    prefix = "⚠️ Model 'x' unavailable; ran with default.\n\n"
+    prefix = "Warning: Model 'x' unavailable; ran with default.\n\n"
     delivered = prefix + tally.empty_reply_placeholder()
 
     key = _dedup_text(delivered, tally, empty_reply=True)
@@ -150,6 +150,7 @@ def _make_gateway():
     gw._owner_id = "U000"
     gw.subagent_mgr = None
     gw._cron_injecting = {}
+    gw._cron_runs_holding = set()
     gw._no_crons = False
     gw.sessions.get_or_create = AsyncMock(return_value=(MagicMock(), True, False))
     gw.sessions.release = MagicMock()
@@ -269,7 +270,7 @@ def test_a_refusal_beside_an_empty_reply_is_a_new_result() -> None:
 
     assert gw.slack.post_blocks.await_count == 2
     assert job.consecutive_dupes == 0
-    assert job.last_result is not None and job.last_result.startswith("⛔")
+    assert job.last_result is not None and job.last_result.startswith("Blocked: ")
     assert job.last_result.endswith(WORK_ONE)
 
 

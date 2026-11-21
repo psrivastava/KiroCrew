@@ -12,7 +12,8 @@ turn is never cut. The work ledger is keyed on the session, not the agent, so th
 conductor reads the same items. Each switch writes one audit line
 (``crew_mode.migrate``). With no file yet (the first start with this code) the
 current name is recorded and nothing moves: the existing roots stay on the conductor
-they run, and are Crew Mode there.
+they run, and are Crew Mode there. A file that exists but cannot be read records
+nothing and moves nothing; the pass logs one warning and reads it again on every retry.
 
 The same start pass converts existing conductor sessions on load: a live root that
 runs a conductor but carries no Crew Mode stamp gets one (and its metadata line), and
@@ -26,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -80,14 +82,39 @@ def _state_path() -> Any:
     return data_home() / STATE_FILENAME
 
 
+class AppliedUnreadable(Exception):
+    """The state file exists but names no conductor this pass can read."""
+
+
+#: Set once the unreadable state file has been logged, so the retry loop's pass every
+#: :data:`RETRY_SECS` does not repeat the warning; a readable file clears it.
+_unreadable_logged = False
+
+
 def read_applied() -> str | None:
-    """The conductor last applied, or ``None`` when nothing was ever recorded. BLOCKING."""
+    """The conductor last applied, or ``None`` when no state file exists. BLOCKING.
+
+    Only a missing file is a first start. A file that cannot be read, does not parse,
+    or names no conductor raises :class:`AppliedUnreadable`: its recorded name is
+    unknown, not absent, and recording the current name over it would mark every
+    root as moved. One leading UTF-8 byte-order mark is read as part of the encoding.
+    """
+    from kiro_crew.user_json import loads_user_json
+
+    path = _state_path()
     try:
-        raw = json.loads(_state_path().read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
+        raw = loads_user_json(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        # A symlink whose target is gone is an entry that exists, not a first start.
+        if not os.path.lexists(path):
+            return None
+        raise AppliedUnreadable(f"{path}: {exc}") from exc
+    except (OSError, ValueError) as exc:
+        raise AppliedUnreadable(f"{path}: {exc}") from exc
     value = raw.get("applied") if isinstance(raw, dict) else None
-    return value if isinstance(value, str) and value else None
+    if not isinstance(value, str) or not value:
+        raise AppliedUnreadable(f"{path}: no conductor name under 'applied'")
+    return value
 
 
 def write_applied(agent: str) -> None:
@@ -143,6 +170,7 @@ def _usable(target: str) -> str:
     """
     from kiro_crew.config import KiroCrewConfig
     from kiro_crew.config.loader_agents import resolve_agent_bindings
+    from kiro_crew.config.loader_snapshots import refresh_materialized_agents
     from kiro_crew.validation_parts.input_bounds import is_registered_agent_name
 
     if not is_registered_agent_name(target):
@@ -157,6 +185,12 @@ def _usable(target: str) -> str:
         bindings = resolve_agent_bindings(
             cfg, target, None, validate_memory_files=False, selection_kind="template"
         )
+        if not bindings.requested_resolved:
+            # The snapshot may lack a template whose file is on disk.
+            refresh_materialized_agents()
+            bindings = resolve_agent_bindings(
+                cfg, target, None, validate_memory_files=False, selection_kind="template"
+            )
     except Exception:
         return "agent_unresolved"
     return "" if bindings.requested_resolved else "agent_not_found"
@@ -253,8 +287,8 @@ async def migrate(
             names = ", ".join(f"{k} ({c})" for k, c in sorted(newly_failed.items()))
             _notify(
                 state,
-                "A Crew Mode chat did not move",
-                f"These chats stay on their conductor instead of {target}: {names}. "
+                "A conductor mode chat did not move",
+                f"These chats stay on their own agent instead of {target}: {names}. "
                 "Kiro Crew tries again after the next config change or restart.",
             )
         if (
@@ -321,8 +355,24 @@ async def reconcile(state: Any, *, retry_failed: bool = True) -> dict[str, list[
         return None
     from kiro_crew import crew_mode
 
+    global _unreadable_logged
+
     configured = crew_mode.configured_crew_mode_agent()
-    applied = await asyncio.to_thread(read_applied)
+    try:
+        applied = await asyncio.to_thread(read_applied)
+    except AppliedUnreadable as exc:
+        # Nothing is recorded and nothing moves: the retry loop and the next start
+        # read the file again, and a readable file lets the pass run.
+        if not _unreadable_logged:
+            _unreadable_logged = True
+            logger.warning(
+                "crew mode: %s is unreadable; Crew Mode chats stay where they are "
+                "until it can be read (%s)",
+                STATE_FILENAME,
+                exc,
+            )
+        return None
+    _unreadable_logged = False
     if configured != applied:
         why = await asyncio.to_thread(_usable, configured)
         if why:
@@ -390,6 +440,7 @@ def _closed_roots(log: Any) -> list[str]:
         try:
             meta = log.get_metadata(key)
         except Exception:
+            # A row whose metadata cannot be read is left out; one bad row must not stop the rest.
             continue
         if isinstance(meta, dict) and crew_mode.saved_row_is_root(meta):
             found.append(history_slot_key(key))
@@ -472,7 +523,17 @@ async def _await_restore(state: Any, *, limit: float = RESTORE_WAIT_SECS) -> Non
 
 async def run(state: Any, *, start_delay: float = 2.0) -> None:
     """The dashboard's background task, started once its restore has rebuilt the slot
-    set: the start pass, then retry busy roots. A headless gateway never starts it."""
+    set: the start pass, then retry busy roots. A headless gateway never starts it.
+
+    It first reads the conductor mode pause file off-loop, so the sidebar and the sends
+    that consult it find it in memory.
+    """
+    from kiro_crew import crew_pause
+
+    try:
+        await asyncio.to_thread(crew_pause.load)
+    except Exception:
+        logger.warning("crew pause preload failed", exc_info=True)
     await asyncio.sleep(start_delay)
     await _await_restore(state)
     try:

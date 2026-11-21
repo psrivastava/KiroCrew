@@ -72,8 +72,9 @@ from typing import Any, Dict, List, Optional, Tuple
 # The ledger's real bounds, mirrored from kiro_crew/session_ledger_layout.py
 # (_MAX_TEXT, _MAX_ARTIFACTS) and kiro_crew/session_ledger.py (the key clamp in
 # record()). Do NOT tune these here:
-# test_conductor_ledger_entry.py asserts they equal the ledger's own constants,
-# so a ledger-side change fails that test instead of silently drifting.
+# test_conductor_ledger_entry.py asserts the text and artifact bounds equal the
+# ledger's own constants (the key bound against the literal 128), so a ledger-side
+# change to those two fails that test instead of silently drifting.
 # The ledger CLAMPS rather than rejects (a long value is truncated, a full map
 # ages out its oldest entries), which is exactly why validation must happen on
 # this side, before the write.
@@ -83,16 +84,13 @@ MAX_KEY_CHARS = 128
 MAX_ENTRIES = 32
 
 #: The full status vocabulary. ``encode`` REJECTS anything else: a synonym like
-#: "passed" or "done" would decode as non-terminal, so rotation would treat the
-#: finished item as active forever and the map would fill to an unresolvable
-#: cap_exceeded_all_active. Failing at authoring time is the cheap failure.
+#: "done" would decode as non-terminal, and the map would fill to an
+#: unresolvable cap_exceeded_all_active.
 #:
-#: Retry semantics are part of the contract: a cycle-level acceptance failure
-#: is NOT terminal — the skill's stop condition allows three failures — so on a
-#: failed check the entry stays "running" with ``fails`` incremented, and
-#: "fail" is written only when the item is finally given up (retries exhausted
-#: or the item abandoned). Collapsing on the first failed check would destroy
-#: the acceptance spec, session key and cursor that the retry needs.
+#: A failed acceptance check is NOT terminal (the stop condition allows three):
+#: the entry stays "running" with ``fails`` incremented, and "fail" is written
+#: only when the item is given up. Collapsing earlier would destroy the
+#: acceptance spec, session key and cursor the retry needs.
 ALLOWED_STATUSES = frozenset({"running", "waiting", "pass", "fail"})
 
 #: Statuses that mean the item is FINISHED (see the retry semantics above).
@@ -274,21 +272,16 @@ def _collapse(entry: Dict[str, Any]) -> Tuple[str, bool]:
 def mode_rotate(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Collapse/drop terminal entries; the result must be written back WHOLE.
 
-    Two trigger points, and the second is load-bearing: on a terminal verdict,
-    and BEFORE any dispatch write that would push the map past the cap — run
-    on the COMBINED current-plus-new map, because rotate trims down TO the cap
-    (never below), so a map already at the cap plus a new entry would
-    otherwise be capped by the ledger itself, whose age-out is blind to status
-    and evicts the oldest entry even when it is an active item's only
-    surviving state. A cap_exceeded_all_active error at dispatch time means
-    there is no capacity: do not dispatch.
+    Run on a terminal verdict, and BEFORE any dispatch write that would push
+    the map past the cap, on the COMBINED current-plus-new map: rotate trims
+    down TO the cap, so otherwise the ledger's status-blind age-out evicts the
+    oldest entry, even an active item's only state. A cap_exceeded_all_active
+    error at dispatch time means no capacity: do not dispatch.
 
-    The ledger MERGES artifacts rather than replacing them: a key omitted from
-    a ``session_ledger_record`` call is never removed, and every key present is
-    re-inserted as newest. So writing back only the changed entries would move
-    the collapsed TERMINAL entries to the newest positions and leave the
-    untouched ACTIVE entries oldest — inverting the age-out order rotation
-    exists to protect, and making ``dropped`` a no-op. Always write the entire
+    The ledger MERGES artifacts: an omitted key is never removed and every
+    present key is re-inserted as newest. Writing back only changed entries
+    would make terminal entries newest and active ones oldest, inverting the
+    age-out order and making ``dropped`` a no-op. Always write the entire
     returned ``artifacts`` map in one call.
     """
     artifacts = payload.get("artifacts")

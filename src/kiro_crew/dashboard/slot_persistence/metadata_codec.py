@@ -47,6 +47,7 @@ binders still read a few fields of the line by hand.
 from __future__ import annotations
 
 import logging
+import operator
 import re
 import uuid
 from collections.abc import Callable, Mapping
@@ -55,17 +56,20 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 from kiro_crew.dashboard.chat_utils import (
     effective_session_key,
+    slot_history_key,
     slot_transcript_key,
 )
 from kiro_crew.dashboard.slot_buffers import (
-    committed_filtered_note_ids,
-    drop_committed_restored_notes,
+    MAX_FORK_PARENT_KEY_CHARS,
+    bounded_transcript_created_at,
+    restore_deferred_note_hold,
     sanitize_restored_deferred_notes,
 )
 from kiro_crew.dashboard.slot_queue_repository import (
     queue_persist_signature,
     sanitize_restored_queue,
 )
+from kiro_crew.history import transcript_stem, transcript_stems
 from kiro_crew.memory_stores import named_store_or_empty
 from kiro_crew.messaging.link import is_channel_session_key
 from kiro_crew.validation import ARTIFACT_SLUG_RE, normalize_theme_consent_sha
@@ -154,6 +158,9 @@ class Resume:
     disk_meta_observed: bool = True
     app: str = ""
     history_key: str = ""
+    #: Whether a non-plain mode the line carries is kept, decided off the loop by the
+    #: caller (``apps.hidden_sessions.resume_keeps_mode``); otherwise it resumes plain.
+    keeps_mode: bool = True
 
 
 Purpose = Restore | Resume
@@ -191,6 +198,7 @@ class SaveFolds:
     last_consolidated: object = 0
     closed: bool = False
     closed_at: object = None
+    closed_id: str = ""
     dismissed_source_links: list[str] | None = None
     deferred_notes: list[dict] = field(default_factory=list)
     queued_prompts: list[dict] = field(default_factory=list)
@@ -215,6 +223,8 @@ class SaveFolds:
     # clears the session's limit): ``None`` here means "nothing staged, read the
     # live slot", ``(value,)`` means "write *value*".
     turn_timeout_secs: tuple[int | None] | None = None
+    # Staged ``autocompact_pct`` for the threshold endpoint, the same shape.
+    autocompact_pct: tuple[float | None] | None = None
 
 
 @dataclass
@@ -251,6 +261,9 @@ class Field:
     merge: Writer | None = None
     read: Callable[[_Read], None] | None = None
     why: str = ""
+
+
+_PICKED = operator.attrgetter("_project_picked")
 
 
 def _titled(slot: Any) -> bool:
@@ -376,7 +389,8 @@ def _read_agent(r: _Read) -> None:
         agent = r.purpose.agent
         if agent is None:
             # The session the conversation runs on names the committed choice.
-            session = r.meta.get("linked_session_key") or slot_transcript_key(r.purpose.name)
+            history_key = slot_transcript_key(r.purpose.name)
+            session = own_linked_session_key(r.meta, history_key) or history_key
             agent = cp._restored_agent_name(str(session), r.meta)
         r.slot.agent = agent
     elif r.meta.get("agent"):
@@ -390,7 +404,7 @@ def _read_model(r: _Read) -> None:
     # tools, so a value read back from this file would let a prompt-injected
     # agent grant itself routing the owner never selected. The flag lives in
     # memory only: a restart leaves the slot on its persisted model -- the
-    # documented refusal -- and the owner re-picks "Auto (Jev)" to route again.
+    # documented refusal -- and the owner re-picks "Auto (decision model)" to route again.
     from kiro_crew.dashboard import chat_persistence as cp  # circular import: facade imports owners
 
     purpose = r.purpose
@@ -421,15 +435,28 @@ def _read_model(r: _Read) -> None:
 
 def _read_autocompact_pct(r: _Read) -> None:
     from kiro_crew.dashboard import chat_persistence as cp  # circular import: facade imports owners
+    from kiro_crew.dashboard.transcript_binding import seed_autocompact_from_disk
 
-    if r.meta.get("autocompact_pct") is not None:
-        r.slot.autocompact_pct = cp._validate_autocompact_pct(r.meta["autocompact_pct"])
+    seed_autocompact_from_disk(
+        r.state, r.slot, cp._validate_autocompact_pct(r.meta.get("autocompact_pct"))
+    )
+
+
+def _staged_autocompact(slot: Any, folds: SaveFolds) -> float | None:
+    """The threshold a save writes: the endpoint's staged value, else the slot's."""
+    if folds.autocompact_pct is not None:
+        return folds.autocompact_pct[0]
+    value: float | None = slot.autocompact_pct
+    return value
 
 
 def _read_turn_timeout_secs(r: _Read) -> None:
     from kiro_crew.dashboard import chat_persistence as cp  # circular import: facade imports owners
+    from kiro_crew.dashboard.transcript_binding import seed_turn_timeout_from_disk
 
-    r.slot.turn_timeout_secs = cp._validate_turn_timeout_secs(r.meta.get("turn_timeout_secs"))
+    seed_turn_timeout_from_disk(
+        r.state, r.slot, cp._validate_turn_timeout_secs(r.meta.get("turn_timeout_secs"))
+    )
 
 
 def _staged_turn_timeout(slot: Any, folds: SaveFolds) -> int | None:
@@ -460,6 +487,8 @@ def _read_mode(r: _Read) -> None:
 
         if mode == members_mod.DM_SLOT_MODE:
             return
+        if mode and not r.purpose.keeps_mode:
+            return
     if mode:
         r.slot.mode = mode
 
@@ -482,6 +511,19 @@ def _read_agent_kind(r: _Read) -> None:
         r.slot.agent_kind = r.meta["agent_kind"]
 
 
+def _read_backend(r: _Read) -> None:
+    # The harness the session was created on. Restored as stored and published
+    # to the selection's in-memory pick table, so the first turn after a restart
+    # allocates on it. A value governance has since denied still reads back: the
+    # selection gate degrades it with the reason in the log.
+    value = r.meta.get("backend")
+    if isinstance(value, str) and value and len(value) <= 64:
+        from kiro_crew import members as members_mod  # members imports artifacts: see cp
+
+        r.slot.backend = value
+        members_mod.note_session_backend_pick(r.slot.key, value)
+
+
 def _read_crew_mode_agent(r: _Read) -> None:
     # The conductor the chat runs in Crew Mode: it marks the chat as Crew Mode until
     # the migration moves it onto ``agent.crew_mode_agent`` (``crew_mode.runs_crew_mode``).
@@ -501,9 +543,9 @@ def _read_app_agent_owner(r: _Read) -> None:
 
 
 def _read_project(r: _Read) -> None:
-    from kiro_crew.dashboard.transcript_binding import seed_project_from_disk
+    from kiro_crew.dashboard.transcript_binding import seed_project_line
 
-    seed_project_from_disk(r.state, r.slot, r.meta.get("project") or "")
+    seed_project_line(r.state, r.slot, r.meta)
 
 
 def _read_executor(r: _Read) -> None:
@@ -535,17 +577,52 @@ def _read_turn_in_flight(r: _Read) -> None:
         r.applied.turn_prompt = cp._local_turn_prompt(r.meta)
 
 
+#: The creator a cron's chat routes stamp on a slot they open (``cron:<job id>``, from
+#: ``handlers._shared_route_guards.cron_slot_creator``). It names no session.
+_CRON_CREATOR_PREFIX = "cron:"
+
+
 def _read_created_by(r: _Read) -> None:
-    # Creator attribution restored so the member ownership boundary in
-    # session-control authorization survives a restart. ``created_by_sid`` is
-    # never restored, and ``_lineage_minted`` stays False: a value read back
-    # from this file must not become gateway-authored crew-log lineage.
-    if r.meta.get("created_by"):
-        r.slot._created_by = str(r.meta["created_by"])
+    # Creator attribution, so the member ownership boundary in session-control
+    # authorization survives a restart. A sandboxed shell can write this line, so
+    # ``created_by`` is only a claim. A claim naming a session is kept when the crew
+    # log's creation records, which no sandboxed process can write, name the same
+    # creator, and is otherwise ``UNVERIFIED_CREATOR`` (fenced, matching no caller),
+    # the rule a revive applies. A cron's stamp names no session, so the crew log
+    # holds no edge to check it against, and it is kept as written.
+    # ``created_by_sid`` is never restored, and ``_lineage_minted`` stays False.
+    claimed = r.meta.get("created_by")
+    if claimed:
+        # circular import: session control imports the chat persistence facade.
+        from kiro_crew.dashboard.session_control_parts.session_revive import (
+            UNVERIFIED_CREATOR,
+            _creation_parent,
+        )
+
+        claimed = str(claimed)
+        verified = (
+            claimed.startswith(_CRON_CREATOR_PREFIX) or _creation_parent(r.slot.key) == claimed
+        )
+        r.slot._created_by = claimed if verified else UNVERIFIED_CREATOR
         # A mode a person set on this session lived in memory and did not survive,
         # so the session follows its creator's next mode change again. A raise
         # still needs the crew log's creation record (``approval_inheritance``).
         r.slot._posture_inherited = True
+
+
+def _creator_line(slot: Any) -> str:
+    # ``UNVERIFIED_CREATOR`` is a verdict on the line's claim, not a claim: the line
+    # keeps the claim it was read with, so one start that could not confirm it (the
+    # crew log off, a failed fold) does not erase it, and the next restore judges it
+    # again. With no claim to keep, the verdict is written.
+    creator = str(getattr(slot, "_created_by", "") or "")
+    if creator:
+        # circular import: session control imports the chat persistence facade.
+        from kiro_crew.dashboard.session_control_parts.session_revive import UNVERIFIED_CREATOR
+
+        if creator == UNVERIFIED_CREATOR:
+            return str(getattr(slot, "_saved_created_by", "") or "") or creator
+    return creator
 
 
 def _read_attribution(r: _Read) -> None:
@@ -561,6 +638,20 @@ def _attribution_value(slot: Any, folds: SaveFolds) -> object:
     from kiro_crew.shared_crew import attribution as shared_crew_attribution
 
     value = shared_crew_attribution.metadata_value(slot)
+    return OMIT if value is None else value
+
+
+def _read_participants(r: _Read) -> None:
+    # Shared Crew participants, display only. Function-local like attribution's.
+    from kiro_crew.shared_crew import participants as shared_crew_participants
+
+    shared_crew_participants.restore_from_metadata(r.slot, r.meta)
+
+
+def _participants_value(slot: Any, folds: SaveFolds) -> object:
+    from kiro_crew.shared_crew import participants as shared_crew_participants
+
+    value = shared_crew_participants.metadata_value(slot)
     return OMIT if value is None else value
 
 
@@ -623,7 +714,8 @@ def _read_color_index(r: _Read) -> None:
 def _read_color_hex(r: _Read) -> None:
     color_hex = r.meta.get("color_hex")
     if isinstance(color_hex, str) and COLOR_HEX_RE.match(color_hex):
-        r.slot.color_hex = color_hex.lower()
+        # The pattern's ``$`` admits one trailing newline; keep the colour only.
+        r.slot.color_hex = color_hex[:7].lower()
 
 
 def _read_color_theme(r: _Read) -> None:
@@ -641,16 +733,18 @@ def _read_tags(r: _Read) -> None:
     raw = r.meta.get("tags")
     if not isinstance(raw, list):
         return
+    # Imported here: an owner of the chat_persistence facade imports at module
+    # scope only what the facade itself imports.
+    from kiro_crew.dashboard.tag_vocabulary_read import known_tag_ids, prune_tag_ids
+
     slot = r.slot
-    slot.tags = [str(t) for t in raw if isinstance(t, str) and t]
     # Prune ids missing from the vocabulary: tag deletion commits the vocab
     # write first (crash-atomic), so a crash mid-delete can leave dangling ids on
-    # the line. FAIL-OPEN only when the vocabulary is UNKNOWN (tags.json parse or
-    # I/O failure): pruning then would wipe EVERY assignment and the next save
-    # persists the loss. A legitimately-empty vocabulary IS authoritative.
-    if getattr(r.state, "_tags_authoritative", True):
-        known = {t.get("id") for t in r.state._tags}
-        slot.tags = [t for t in slot.tags if t in known]
+    # the line. The one vocabulary reader decides the rule for every prune site:
+    # FAIL-OPEN only when the vocabulary is UNKNOWN (tags.json parse or I/O
+    # failure), since pruning then would wipe EVERY assignment and the next save
+    # persists the loss; a legitimately-empty vocabulary IS authoritative.
+    slot.tags = prune_tag_ids(raw, known_tag_ids(r.state))
     # "tags changed => revision changed" wherever tags are replaced. A resume
     # rotates through the tag module's helper, which also mints a revision for a
     # duck-typed slot without the method; the startup reads call the method only.
@@ -678,6 +772,38 @@ def _read_human_seen(r: _Read) -> None:
         r.slot._human_seen = True
 
 
+#: The characters of the mark ``_telemetry_notice_is_new`` and
+#: ``_project_hook_files_notice_is_new`` write: 16 of these. Any other value is not
+#: a mark.
+_HEX = frozenset("0123456789abcdef")
+
+
+def _notice_mark(r: _Read, key: str) -> str | None:
+    mark = r.meta.get(key)
+    if isinstance(mark, str) and len(mark) == 16 and set(mark) <= _HEX:
+        return mark
+    return None
+
+
+def _read_telemetry_notice_shown(r: _Read) -> None:
+    if mark := _notice_mark(r, "telemetry_notice_shown"):
+        r.slot._telemetry_notice_shown = mark
+
+
+def _read_project_hook_files_notice_shown(r: _Read) -> None:
+    if mark := _notice_mark(r, "project_hook_files_notice_shown"):
+        r.slot._project_hook_files_notice_shown = mark
+
+
+def _read_session_notice_marks(r: _Read) -> None:
+    from kiro_crew.dashboard.session_notice_marks import SESSION_NOTICE_MARKS
+
+    marks = r.meta.get("session_notice_marks")
+    if isinstance(marks, list):
+        kept = [m for m in marks if isinstance(m, str) and len(m) == 16 and set(m) <= _HEX]
+        r.slot._session_notice_marks = kept[-SESSION_NOTICE_MARKS:]
+
+
 def _read_deferred_notes(r: _Read) -> None:
     # Sanitized and bounded by the DURABLE CEILING; entries whose delivered row
     # is already committed are dropped by ``settle``, against the loaded rows.
@@ -695,7 +821,10 @@ def _read_queued_prompts(r: _Read) -> None:
     queue = sanitize_restored_queue(r.meta.get("queued_prompts"))
     if queue:
         slot._queue[:] = queue
-        logger.info("Restored %d queued prompt(s) for slot %s", len(queue), r.purpose.name)
+        # ``Resume`` carries no ``name`` (it publishes under the slot's own key);
+        # the startup purposes do. Use the slot key for the log either way.
+        name = slot.key if isinstance(r.purpose, Resume) else r.purpose.name
+        logger.info("Restored %d queued prompt(s) for slot %s", len(queue), name)
     # Stamped whatever was restored, so the first flush re-persists only a queue
     # that actually changed.
     slot._queue_persisted_sig = queue_persist_signature(slot.durable_queue_entries())
@@ -711,11 +840,62 @@ def _read_memory_mode(r: _Read) -> None:
         r.state._restricted_keys.add(restricted)
     elif isinstance(r.purpose, Resume):
         r.state._restricted_keys.discard(restricted)
+    link = r.slot.linked_session_key if isinstance(r.purpose, Resume) else ""
+    admitted = getattr(getattr(r.state, "context_builder", None), "_session_memory_modes", None)
+    if mode != "persistent" and link.startswith("taskrunner:") and isinstance(admitted, dict):
+        # No ``dashboard:`` mark names the review session ``slot_args`` bound the tab
+        # to, so its mode is admitted for that key, as the runner admits its own.
+        # Function-local: the chat_persistence facade's import closure stays unchanged.
+        from kiro_crew.messaging.privacy_mode import strictest
+
+        admitted[link] = strictest((mode, admitted.get(link, mode))) or mode
+
+
+def _restore_fork_lineage(slot: _ChatSlot, meta: dict) -> None:
+    """Restore a bounded fork parent key and its transcript identity.
+
+    ``forked_from_created_at`` is that transcript's ``created_at``: a merge back
+    checks a chat on the parent's key against it.
+    """
+    forked_from = meta.get("forked_from")
+    if not isinstance(forked_from, str) or not forked_from:
+        if "forked_from" in meta:
+            logger.warning("Discarding invalid persisted forked_from: %r", forked_from)
+        return
+    if len(forked_from) > MAX_FORK_PARENT_KEY_CHARS:
+        logger.warning(
+            "Discarding invalid persisted forked_from of %d characters", len(forked_from)
+        )
+        return
+    slot.forked_from = forked_from
+    slot.forked_from_created_at = bounded_transcript_created_at(meta.get("forked_from_created_at"))
 
 
 def _read_forked_from(r: _Read) -> None:
-    if r.meta.get("forked_from") is not None:
-        r.slot.forked_from = r.meta["forked_from"]
+    _restore_fork_lineage(r.slot, r.meta)
+
+
+def _refuse_foreign_link(history_key: str, link: str) -> None:
+    logger.warning(
+        "Leaving %s unbound: its persisted linked_session_key %r names another transcript",
+        history_key,
+        link,
+    )
+    from kiro_crew.dashboard import chat_persistence as cp  # circular import: facade imports owners
+
+    try:
+        cp.sel().log_governance_decision(
+            session_key=history_key,
+            tool_name="chat:adopt_persisted_binding",
+            scope="chat.linked_session_key",
+            item=link,
+            outcome="denied",
+            rule="own_linked_session_key",
+            layer="hydration",
+            reason="the persisted binding names another transcript",
+        )
+    except Exception:
+        logger.debug("persisted-binding refusal audit failed", exc_info=True)
 
 
 def _read_linked_session_key(r: _Read) -> None:
@@ -723,8 +903,14 @@ def _read_linked_session_key(r: _Read) -> None:
     # slot would answer from a dashboard-only session and the channel thread
     # would stop seeing its replies.
     slot, meta, purpose = r.slot, r.meta, r.purpose
-    if meta.get("linked_session_key"):
-        slot.linked_session_key = str(meta["linked_session_key"])
+    history_key = (
+        purpose.history_key if isinstance(purpose, Recent) else slot_transcript_key(purpose.name)
+    )
+    link = own_linked_session_key(meta, history_key)
+    if meta.get("linked_session_key") and not link:
+        _refuse_foreign_link(history_key, str(meta["linked_session_key"]))
+    if link:
+        slot.linked_session_key = link
     elif isinstance(purpose, Recent):
         if is_channel_session_key(purpose.history_key) and r.state.sessions:
             # Resolved from the session map, never derived from the filename:
@@ -833,8 +1019,8 @@ FIELDS: tuple[Field, ...] = (
         "autocompact_pct",
         _ALL,
         attr="autocompact_pct",
-        line=_always(lambda s: s.autocompact_pct),
-        merge=_always(lambda s: s.autocompact_pct),
+        line=_staged_autocompact,
+        merge=_staged_autocompact,
         read=_read_autocompact_pct,
     ),
     Field(
@@ -878,15 +1064,12 @@ FIELDS: tuple[Field, ...] = (
     # rebound to the default store stops consolidating into the silo it left.
     Field(
         "memory_store",
-        _STARTUP,
+        _ALL,
         attr="memory_store",
         line=lambda s, f: _named_store(s, f) or OMIT,
         merge=_named_store,
         read=_read_memory_store,
-        why=(
-            "RESUME does not restore it, so the next full save after a History "
-            "resume clears it (#17025). A restricted line names no store"
-        ),
+        why="a restricted line names no store (its absence is the owner claim a restart reads)",
     ),
     Field(
         "agent_kind",
@@ -895,6 +1078,17 @@ FIELDS: tuple[Field, ...] = (
         line=_truthy(lambda s: s.agent_kind),
         merge=_always(lambda s: s.agent_kind),
         read=_read_agent_kind,
+    ),
+    Field(
+        "backend",
+        _ALL,
+        attr="backend",
+        line=_truthy(lambda s: s.backend),
+        # Truthy in the merge too, and not slot-owned (``SLOT_OWNED_META_KEYS``):
+        # the pick is set once, at creation, and never cleared, so a carried-forward
+        # copy is always current and a line without one stays byte-identical to main's.
+        merge=_truthy(lambda s: s.backend),
+        read=_read_backend,
     ),
     Field(
         "crew_mode_agent",
@@ -920,6 +1114,8 @@ FIELDS: tuple[Field, ...] = (
         merge=_always(lambda s: s.project),
         read=_read_project,
     ),
+    # Restored by ``_read_project``: a pick only ever comes back beside its directory.
+    Field("project_picked", _ALL, "_project_picked", _flag(_PICKED), _always(_PICKED)),
     # Written while a local turn is between admission and teardown and omitted
     # otherwise -- slot ownership makes the omission the durable clear; the merge,
     # which cannot delete a key, writes the cleared ``0`` / ``None``.
@@ -994,12 +1190,15 @@ FIELDS: tuple[Field, ...] = (
         "created_by",
         _STARTUP,
         attr="_created_by",
-        line=_truthy(lambda s: getattr(s, "_created_by", "")),
-        merge=_truthy(lambda s: getattr(s, "_created_by", "")),
+        line=_truthy(_creator_line),
+        merge=_truthy(_creator_line),
         read=_read_created_by,
         why=(
-            "RESUME does not restore it (#17025); a session-control revive restores "
-            "it after the build when lineage corroborates"
+            "RESUME does not restore it from the line: it is agent-editable and the "
+            "ownership fence reads it, so a session-control revive restores it after "
+            "the build only when gateway lineage corroborates the claim. RESTORE and "
+            "RECENT keep it only when the crew log's creation records do, and an "
+            "unconfirmed claim is written back as read"
         ),
     ),
     # Shared Crew session creator. Write-once: the slot holds the first value
@@ -1011,6 +1210,16 @@ FIELDS: tuple[Field, ...] = (
         line=_attribution_value,
         merge=_attribution_value,
         read=_read_attribution,
+    ),
+    # Shared Crew participants: who has written here, for the session and Bot
+    # rows' initials (``shared_crew.participants``). Read after ``attribution``,
+    # which names the creator the list keeps first. Display only.
+    Field(
+        "participants",
+        _ALL,
+        line=_participants_value,
+        merge=_participants_value,
+        read=_read_participants,
     ),
     Field(
         "folder_id",
@@ -1040,9 +1249,10 @@ FIELDS: tuple[Field, ...] = (
         merge=_truthy(lambda s: s._app),
         read=_read_app,
         why=(
-            "RESUME takes the app from the request, not the line, so a dashboard "
-            "user's resume of an app session clears it on the next full save "
-            "(#17025); a hooked revive restores the line's after the build"
+            "RESUME takes the app from the request, not the line: the resume core "
+            "owns that scope decision (a person's History resume of an app session "
+            "must not re-tag the tab app-owned), and a hooked revive restores the "
+            "line's after the build"
         ),
     ),
     # Round-trips with ``app``: an untagged restore falls back to the fail-closed
@@ -1054,23 +1264,21 @@ FIELDS: tuple[Field, ...] = (
         attr="_origin",
         line=_truthy(lambda s: s._origin),
         merge=_truthy(lambda s: s._origin),
-        why=(
-            "applied at construction (``slot_args``), as ``str(...)``: a null origin "
-            'reads as the string "None" (#17026)'
-        ),
+        why="applied at construction (``slot_args``); a null origin reads as no origin",
     ),
     # The artifact companion binding: a bound session restored after a gateway
     # restart comes back as the artifact's active bound session.
     Field(
         "artifact",
-        _STARTUP,
+        _ALL,
         attr="_artifact",
         line=_truthy(lambda s: s._artifact),
         merge=_or_cleared(lambda s: s._artifact, ""),
         read=_read_artifact,
         why=(
-            "RESUME does not restore it, so the next full save after a History "
-            "resume clears it (#17025)"
+            "RESUME restores the artifact binding (``docs/.../artifacts.md`` says a "
+            "resume re-establishes it); a transfer import carries no artifact key "
+            "and so lands unbound"
         ),
     ),
     Field(
@@ -1123,12 +1331,12 @@ FIELDS: tuple[Field, ...] = (
     ),
     Field(
         "color_theme",
-        frozenset({RECENT, RESUME}),
+        _ALL,
         attr="color_theme",
         line=_truthy(lambda s: s.color_theme),
         merge=_or_cleared(lambda s: s.color_theme, ""),
         read=_read_color_theme,
-        why="RESTORE does not restore it, so the next full save of an open tab clears it (#17025)",
+        why="RESUME also reads the theme-consent pair beside the theme",
     ),
     Field(
         "theme_consent",
@@ -1172,7 +1380,37 @@ FIELDS: tuple[Field, ...] = (
         line=_flag(lambda s: getattr(s, "_human_seen", False)),
         merge=_flag(lambda s: getattr(s, "_human_seen", False)),
         read=_read_human_seen,
-        why="RESUME does not restore it (#17025); the key is unowned, so it survives on disk",
+        why="RESUME does not restore it; the key is unowned, so a save never clears it",
+    ),
+    # The last KAS telemetry notice the chat showed, as a mark of its text. Written
+    # when set and never cleared, like the once-flags above: without it a restart
+    # shows the same notice again on the chat's next session start.
+    Field(
+        "telemetry_notice_shown",
+        _ALL,
+        attr="_telemetry_notice_shown",
+        line=_truthy(lambda s: s._telemetry_notice_shown),
+        merge=_truthy(lambda s: s._telemetry_notice_shown),
+        read=_read_telemetry_notice_shown,
+    ),
+    # The project hook-files notice the chat showed, as a mark of its folder and
+    # file names; kept the same way, so a restart does not show it again.
+    Field(
+        "project_hook_files_notice_shown",
+        _ALL,
+        attr="_project_hook_files_notice_shown",
+        line=_truthy(lambda s: s._project_hook_files_notice_shown),
+        merge=_truthy(lambda s: s._project_hook_files_notice_shown),
+        read=_read_project_hook_files_notice_shown,
+    ),
+    # The session-start spec notices the chat showed, as marks; kept the same way.
+    Field(
+        "session_notice_marks",
+        _ALL,
+        attr="_session_notice_marks",
+        line=_truthy(lambda s: s._session_notice_marks),
+        merge=_truthy(lambda s: s._session_notice_marks),
+        read=_read_session_notice_marks,
     ),
     Field(
         "last_user_at",
@@ -1182,24 +1420,21 @@ FIELDS: tuple[Field, ...] = (
     ),
     Field(
         "deferred_notes",
-        _STARTUP,
+        _ALL,
         attr="_deferred_notes",
         line=lambda s, f: f.deferred_notes or OMIT,
         merge=lambda s, f: f.deferred_notes,
         read=_read_deferred_notes,
-        why="RESUME does not replay the held notes (#17025); a later save keeps them on disk",
+        why="settled after the loaded window so committed merge-card context is restored once",
     ),
     Field(
         "queued_prompts",
-        _STARTUP,
+        _ALL,
         attr="_queue",
         line=lambda s, f: f.queued_prompts or OMIT,
         merge=lambda s, f: f.queued_prompts,
         read=_read_queued_prompts,
-        why=(
-            "RESUME does not hand them back, so the next full save after a History "
-            "resume clears them (#17025)"
-        ),
+        why="RESUME hands the queued prompts back too; a transfer import carries none",
     ),
     Field(
         "memory_mode",
@@ -1218,6 +1453,14 @@ FIELDS: tuple[Field, ...] = (
         merge=lambda s, f: s.forked_from if s.forked_from is not None else OMIT,
         read=_read_forked_from,
     ),
+    Field(
+        "forked_from_created_at",
+        _ALL,
+        attr="forked_from_created_at",
+        line=_truthy(lambda s: s.forked_from_created_at if s.forked_from is not None else ""),
+        merge=_truthy(lambda s: s.forked_from_created_at if s.forked_from is not None else ""),
+        why="validated and restored with forked_from by its leading row",
+    ),
     # Nothing re-creates a channel slot's binding on restart (no injection
     # re-fires), so without it the slot comes back unbound, as a dashboard-only
     # copy of the thread.
@@ -1228,7 +1471,13 @@ FIELDS: tuple[Field, ...] = (
         line=_truthy(lambda s: s.linked_session_key),
         merge=_truthy(lambda s: s.linked_session_key),
         read=_read_linked_session_key,
-        why="RESUME does not restore it (a hooked revive restores it after the build)",
+        why=(
+            "RESUME binds a cron or task-runner transcript's own key at construction "
+            "(``slot_args``) and restores the rest in the resume core from the "
+            "fresher post-await snapshot, beside the crew-log-class record a bare "
+            "table read cannot make (a hooked revive and a channel History resume "
+            "both land there)"
+        ),
     ),
     # Durable provenance: a name is not evidence, so this flag is what tells a
     # later boot the tab was adopted from a channel conversation.
@@ -1251,9 +1500,14 @@ FIELDS: tuple[Field, ...] = (
         merge=_truthy(lambda s: getattr(s, "_tab_id", None)),
         read=_read_tab_id,
         why=(
-            "RESUME keeps the constructor's fresh id, which the next save writes over "
-            "the persisted one and so severs the fork chain (#17025). The full save "
-            "also carries the disk's id forward"
+            "RESUME keeps the constructor's fresh per-object id. ``tab_id`` is the "
+            "per-writer ownership mark ``_line_is_this_slots`` reads, and a resume "
+            "can run while the original slot is still live (close a running tab, "
+            "resume the same transcript): two live slots sharing one id would let "
+            "the old slot's rows-only save rebuild the resumed slot's line from "
+            "stale state. The startup reads adopt the id safely because no "
+            "concurrent same-transcript slot exists at boot. The full save carries "
+            "the disk's id forward"
         ),
     ),
     Field(
@@ -1270,6 +1524,17 @@ FIELDS: tuple[Field, ...] = (
         frozenset(),
         line=lambda s, f: f.closed_at if f.closed else OMIT,
         merge=lambda s, f: f.closed_at if f.closed else OMIT,
+    ),
+    # The identity of the close that wrote this line's ``closed``: a nonce the
+    # save mints beside ``closed_at`` (``metadata_line.close_identity``), which
+    # the owed-dismissal marker also writes for its own stamp. A clear keyed on
+    # it removes exactly the stamp its writer put there: two closes stamped on
+    # the same clock tick carry the same ``closed_at`` and different ids.
+    Field(
+        "closed_id",
+        frozenset(),
+        line=lambda s, f: f.closed_id if f.closed and f.closed_id else OMIT,
+        merge=lambda s, f: f.closed_id if f.closed and f.closed_id else OMIT,
     ),
     Field(
         "rotation_generation",
@@ -1288,6 +1553,7 @@ LINE_ORDER: tuple[str, ...] = (
     "last_consolidated",
     "closed",
     "closed_at",
+    "closed_id",
     "memory_mode",
     "title",
     "title_origin",
@@ -1303,9 +1569,11 @@ LINE_ORDER: tuple[str, ...] = (
     "workspace",
     "memory_store",
     "agent_kind",
+    "backend",
     "crew_mode_agent",
     "app_agent_owner",
     "project",
+    "project_picked",
     "executor",
     "instance_id",
     "remote_slot",
@@ -1317,6 +1585,7 @@ LINE_ORDER: tuple[str, ...] = (
     "origin",
     "created_by",
     "attribution",
+    "participants",
     "artifact",
     "pinned",
     "mutes_opened",
@@ -1327,10 +1596,14 @@ LINE_ORDER: tuple[str, ...] = (
     "tags",
     "auto_tagged",
     "human_seen",
+    "telemetry_notice_shown",
+    "project_hook_files_notice_shown",
+    "session_notice_marks",
     "last_user_at",
     "deferred_notes",
     "queued_prompts",
     "forked_from",
+    "forked_from_created_at",
     "linked_session_key",
     "channel_origin",
     "tab_id",
@@ -1364,16 +1637,20 @@ MERGE_ORDER: tuple[str, ...] = (
     "workspace",
     "memory_store",
     "agent_kind",
+    "backend",
     "crew_mode_agent",
     "app_agent_owner",
     "project",
+    "project_picked",
     "app",
     "origin",
     "created_by",
     "attribution",
+    "participants",
     "linked_session_key",
     "channel_origin",
     "forked_from",
+    "forked_from_created_at",
     "turn_in_flight_generation",
     "turn_in_flight_prompt",
     "executor",
@@ -1382,9 +1659,13 @@ MERGE_ORDER: tuple[str, ...] = (
     "tab_id",
     "auto_tagged",
     "human_seen",
+    "telemetry_notice_shown",
+    "project_hook_files_notice_shown",
+    "session_notice_marks",
     "channel_folder_filed",
     "closed",
     "closed_at",
+    "closed_id",
     "dismissed_source_links",
     "deferred_notes",
 )
@@ -1413,6 +1694,29 @@ def encode(slot: _ChatSlot, *, folds: SaveFolds, merge: bool = False) -> dict:
     return out
 
 
+def own_linked_session_key(meta: Mapping[str, Any], history_key: str) -> str:
+    """The line's ``linked_session_key`` when it names *history_key*'s own file, else ``""``.
+
+    Every save writes a linked slot's line into its link's own transcript
+    (``slot_history_key``), so a genuine link always names the file it is read
+    from. The line is agent-writable, and a link naming any other file would
+    route the slot's turns to a conversation the tab does not show.
+    """
+    link = str(meta.get("linked_session_key") or "")
+    return link if link and transcript_stem(history_key) in transcript_stems(link) else ""
+
+
+def _own_link(meta: Mapping[str, Any], history_key: str, prefix: str | tuple[str, ...]) -> str:
+    """The line's *prefix* link when it names *history_key*'s own file, else ``""``."""
+    link = own_linked_session_key(meta, history_key)
+    return link if link.startswith(prefix) else ""
+
+
+def own_cron_link(meta: Mapping[str, Any], history_key: str) -> str:
+    """The line's ``cron:`` link when it names *history_key*'s own file, else ``""``."""
+    return _own_link(meta, history_key, "cron:")
+
+
 def slot_args(meta: dict[str, Any], purpose: Purpose) -> dict[str, Any]:
     """The ``get_or_create_slot`` keywords *purpose* takes from *meta*.
 
@@ -1431,14 +1735,19 @@ def slot_args(meta: dict[str, Any], purpose: Purpose) -> dict[str, Any]:
         # Resuming a channel transcript adopts that conversation, so the tab is
         # channel-origin even when the session map cannot name its session.
         args["channel_origin"] = is_channel_session_key(purpose.history_key)
+        # Unbound, the slot of a cron transcript, or of a task-runner review
+        # transcript the dashboard user reopens, saves to a second ``dashboard:`` file.
+        kinds = ("cron:",) if purpose.app else ("cron:", "taskrunner:")
+        if link := _own_link(meta, purpose.history_key, kinds):
+            args["linked_session_key"] = link
     else:
         args["app"] = meta.get("app", "")
         if purpose.purpose == RESTORE:
             # PERSISTED provenance only: a name is not evidence.
             args["channel_origin"] = bool(meta.get("channel_origin")) or bool(
-                meta.get("linked_session_key")
+                own_linked_session_key(meta, slot_transcript_key(purpose.name))
             )
-    args["origin"] = str(meta.get("origin", ""))
+    args["origin"] = str(meta.get("origin") or "")
     return args
 
 
@@ -1452,6 +1761,7 @@ class AppliedMeta:
     line lacked, for the reader to persist after its transcript read.
     """
 
+    state: Any
     slot: Any
     purpose: Any
     meta: dict[str, Any] = field(default_factory=dict)
@@ -1471,11 +1781,17 @@ class AppliedMeta:
         in that order. Returns whether a local-turn marker was present.
         """
         slot = self.slot
-        if self.purpose.purpose in _STARTUP and self.restored_notes and persisted is not None:
-            pending = slot._deferred_notes
-            slot._deferred_notes = drop_committed_restored_notes(persisted, pending)
-            slot._dropped_note_ids.update(
-                committed_filtered_note_ids(pending, slot._deferred_notes)
+        if self.restored_notes and persisted is not None:
+            transcript_key = (
+                self.purpose.history_key
+                if isinstance(self.purpose, (Recent, Resume))
+                else slot_transcript_key(self.purpose.name)
+            )
+            # The LIVE hold, never the line: a sidebar row's loader clears
+            # ``meta`` before its window loads, so by the time this runs the
+            # line's entries exist only in ``slot._deferred_notes``.
+            restore_deferred_note_hold(
+                slot, slot._deferred_notes, persisted, transcript_key, state=self.state
             )
         from kiro_crew.dashboard import chat_persistence as cp  # circular import
 
@@ -1500,7 +1816,7 @@ def apply(
     loop-affine like the slot it writes. Raises whatever a value check raises; the
     reader's own rollback owns the slot it created.
     """
-    applied = AppliedMeta(slot=slot, purpose=purpose, meta=meta)
+    applied = AppliedMeta(state=state, slot=slot, purpose=purpose, meta=meta)
     read = _Read(state=state, slot=slot, meta=meta, purpose=purpose, applied=applied)
     for row in FIELDS:
         if row.read is not None and purpose.purpose in row.purposes:
@@ -1512,9 +1828,20 @@ def apply(
     # The line's creator, for display on every purpose. Not ``_created_by``, whose
     # purposes stay as the ``created_by`` row declares: the line is agent-editable,
     # so this copy only places a Crew Mode worker under its root in the person's
-    # lists (``slot._saved_created_by``) and is never read as ownership.
+    # lists (``slot._saved_created_by``) and is the claim ``_creator_line`` keeps; it
+    # is never read as ownership.
     saved_creator = meta.get("created_by")
     slot._saved_created_by = saved_creator if isinstance(saved_creator, str) else ""
+    # Record the transcript key the identity was observed under, now that the
+    # full field loop has settled ``linked_session_key`` (the fields run in
+    # FIELDS order, so ``created_at`` is read before the link is restored —
+    # resolving the key inside ``_read_created_at`` would see the unset link).
+    # The delete witnesses compare this against the current write target; a
+    # mismatch means the slot's routing has drifted to a different file, so the
+    # observed ``created_at`` must not be read as a delete-recreate.
+    # Read through getattr: a reader may hand a partial slot that never observed a line.
+    if getattr(slot, "_disk_meta_created_at", "") or getattr(slot, "_disk_meta_observed", False):
+        slot._disk_meta_key = slot_history_key(slot)
     # The SessionManager's override map is process-local, so a hydrated slot
     # pushes its persisted value back or the session compacts at the global one.
     if slot.autocompact_pct is not None and state.sessions:

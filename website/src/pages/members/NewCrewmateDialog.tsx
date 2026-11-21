@@ -27,7 +27,10 @@
  * one free-text field the record already carries for a human-readable
  * account of the crew, and the line the crewmate's first greeting is seeded
  * from (see MembersPage). Memory is provisioned by the server on create
- * (a private store per crewmate, never a choice here). The look follows the
+ * (a private store per crewmate). The one choice is in Advanced settings and
+ * only when there is something to offer: start from the memory a deleted
+ * crewmate left behind, which the server binds to this crewmate as it is
+ * (nothing is copied). The look follows the
  * name until the user picks an icon and colour in the avatar editor (icon
  * tier only); a pick is pinned on the record and survives a renamed draft,
  * and anything richer (a picture, a pack) is edited on the detail page
@@ -62,6 +65,8 @@ import CrewAvatar, { type CrewAvatarOverride } from '../../components/CrewAvatar
 import { lookSeed, defaultLookFor } from '../../lib/avatarPoses'
 import CrewAvatarBuilder from '../../components/CrewAvatarBuilder'
 import ErrorNotice from '../../components/ErrorNotice'
+import { DataHomeOwnerHelp, dataHomeOwnerMessage } from '../../components/DataHomeOwnerNotice'
+import SimpleSelect from '../../components/SimpleSelect'
 import { InstantTip, useInstantTip } from '../../components/InstantTip'
 import { Btn, Input } from '../../components/ui'
 import { api } from '../../api/client'
@@ -70,7 +75,7 @@ import { useSidePanelLeaveGuard } from '../../components/SidePanelLayout'
 // From the side-effect-free module, not `api/client`: test doubles of the
 // client mock only `api`, and an `instanceof` against an undefined import
 // throws instead of falling through to the generic message.
-import { ApiError } from '../../api/apiError'
+import { ApiError, isPermissionRefusal } from '../../api/apiError'
 import { parseErrorCode } from '../../utils/errorReport'
 import { useAvailableModelsQuery } from '../../hooks/useAvailableModels'
 import { useGuideRequestHeaders, useGuideSaveLifecycle } from '../../guide/GuideContext'
@@ -128,21 +133,24 @@ const ADVANCED_FOLD = {
 const ADVANCED_CUT = { duration: 0 } as const
 
 /**
- * The Advanced settings toggle: a quiet centred text button under Create,
+ * The Advanced settings toggle: a quiet centred text button under the name,
  * the chevron before the label. The fields it unfolds open directly below
  * it, so the chevron turns from pointing down to pointing up while they are
  * open. Under reduced motion the chevron turns without animating.
  */
-function AdvancedSettingsToggle({ open, onToggle, label }: {
+function AdvancedSettingsToggle({ open, onToggle, label, disabled }: {
   open: boolean
   onToggle: () => void
   label: string
+  /** Locked while the create is out, like the fields it unfolds. */
+  disabled?: boolean
 }) {
   const reduceMotion = useReducedMotion()
   return (
     <Btn
       type="button"
       onClick={onToggle}
+      disabled={disabled}
       aria-expanded={open}
       aria-controls={ADVANCED_ID}
       className={SUBTLE_TEXT_BUTTON}
@@ -224,8 +232,8 @@ function LookTile({ seed, avatar, onEdit, label, disabled }: {
 }
 
 /**
- * The form's DOM id. Every control, both Create buttons included, lives
- * inside the form, so each Create is a submit button by nesting, and a form
+ * The form's DOM id. Every control, the one Create included, lives
+ * inside the form, so Create is a submit button by nesting, and a form
  * with a submit button is what gives Enter in the Name field its implicit
  * submission (with two text fields and no submit button, Enter does nothing).
  */
@@ -239,6 +247,34 @@ export const CACHE_WARM_BOUND_MS = 2500
  *  unreadable — the same `null` an errored read yields — so the dialog says
  *  "unconfirmed" and unlocks instead of sitting on "Creating…". */
 export const RECONCILE_BOUND_MS = 2500
+
+/** Create refusals whose cause is this computer's storage: the Bot's memory
+ *  database or its own folder could not be made (`POST /api/agents`, 409). */
+const CREATE_STORAGE_CODES = new Set([
+  'member_memory_unavailable',
+  'workspace_dir_uncreatable',
+  'workspace_dir_not_a_directory',
+])
+/** The create refusal for a data home another account owns (409). */
+const DATA_HOME_NOT_OWNED = 'data_home_not_owned'
+
+/** A string field of a JSON refusal body, or `''`. */
+function errorBodyField(body: string, field: string): string {
+  try {
+    const value = (JSON.parse(body) as Record<string, unknown>)?.[field]
+    return typeof value === 'string' ? value : ''
+  } catch {
+    return ''
+  }
+}
+/** Longest server reason shown after a create failure, in characters. */
+const CREATE_REASON_MAX = 200
+
+/** The server's reason as one short line, or `''` when it gave none. */
+function createFailureReason(reason: string | undefined): string {
+  const line = (reason ?? '').replace(/\s+/g, ' ').trim()
+  return line.length > CREATE_REASON_MAX ? `${line.slice(0, CREATE_REASON_MAX - 1)}…` : line
+}
 
 /** What the page needs to open the new crewmate's chat and seed its greeting. */
 export interface CreatedCrewmate {
@@ -262,6 +298,8 @@ interface CreateBody {
   model?: string
   avatar?: CrewAvatarOverride
   first_greeting?: true
+  /** A kept memory store to start from instead of a fresh one. */
+  adopt_memory_store?: string
 }
 
 /** A proposed name and goal an opening starts from. */
@@ -321,6 +359,9 @@ export default function NewCrewmateDialog({
   const [model, setModel] = useState(INHERIT_MODEL)
   const [triggers, setTriggers] = useState('')
   const [sessionColor, setSessionColor] = useState('')
+  // '' = a fresh, empty memory; a store name = the kept memory of a deleted
+  // crewmate, which this one starts from (`adopt_memory_store`).
+  const [memory, setMemory] = useState('')
   // The nested New workspace dialog: whether it is open, and the GENERATION
   // of that opening. `WorkspaceForm`'s create is an awaited POST whose
   // continuation calls `onCreated` when the answer lands — after Radix has
@@ -333,8 +374,9 @@ export default function NewCrewmateDialog({
   // it; and every close path — nested Cancel / X / Escape / backdrop, the
   // parent's reset-on-open, the parent closing, unmount — bumps the live
   // counter synchronously. A completion whose generation is no longer the
-  // live one is dropped whole: no cache write, no pending pick, no draft
-  // change. A completion from the still-open generation behaves as before.
+  // live one makes no cache write, no pending pick, no draft change and no
+  // fetch; it only marks the list stale, since the workspace exists either
+  // way. A completion from the still-open generation behaves as before.
   const [wsModal, setWsModal] = useState<{ open: boolean; gen: number }>({ open: false, gen: 0 })
   const wsModalOpen = wsModal.open
   const wsGen = useRef(0)
@@ -362,6 +404,9 @@ export default function NewCrewmateDialog({
   // marked on the Name field, since the field is what the answer is about.
   const [nameRefused, setNameRefused] = useState(false)
   const [error, setError] = useState('')
+  // The docs link the server sent with `data_home_not_owned`, shown under the
+  // notice with the likely cause. Every other failure clears it (see `fail`).
+  const [dataHomeHelpUrl, setDataHomeHelpUrl] = useState('')
   // The one failure that is NOT "nothing was created": the request got no
   // answer and the roster could not be read to reconcile it. It is rendered
   // through the same notice as every other failure, but under its own lead
@@ -378,7 +423,7 @@ export default function NewCrewmateDialog({
     const draftGoal = initialDraft?.goal ?? ''
     setLook(null); setLookOpen(false)
     setName(draftName); setJob(draftGoal); setAdvanced(startExpanded || draftGoal.trim() !== '')
-    setWorkspace(OWN_WORKSPACE); setModel(INHERIT_MODEL); setTriggers(''); setSessionColor('')
+    setWorkspace(OWN_WORKSPACE); setModel(INHERIT_MODEL); setTriggers(''); setSessionColor(''); setMemory('')
     setHint(''); setError(''); setNameRefused(false); setUnconfirmed(false); setPendingWorkspace(null)
     // The nested workspace form too: a draft left in it belongs to the
     // dismissed open, and `atStake` must not count it against the next one.
@@ -418,7 +463,19 @@ export default function NewCrewmateDialog({
     enabled: open,
   })
   const { data: availableModels, error: modelsError } = useAvailableModelsQuery({ enabled: open })
-  const optionsError = workspacesError ?? modelsError
+  // Kept memory a deleted crewmate left behind. Re-read on every open, like the
+  // catalog. The field only shows when there is something to offer; a failed
+  // read is said in the same notice as the other lists, so it never passes for
+  // "nothing kept". The default (a fresh memory) is unaffected. The list is the
+  // owner's: a non-owner's refusal means nothing is kept for them, not a failure.
+  const { data: keptMemory, refetch: refetchKeptMemory, error: keptMemoryError } = useQuery({
+    queryKey: ['memory-ownerless-stores'],
+    queryFn: () => api.memoryOwnerlessStores(),
+    enabled: open,
+    staleTime: 0,
+  })
+  const keptStores = Array.isArray(keptMemory?.stores) ? keptMemory.stores : []
+  const optionsError = workspacesError ?? modelsError ?? (isPermissionRefusal(keptMemoryError) ? null : keptMemoryError)
 
   // The look shown and stored when the user has not picked one: a name-seeded
   // icon (pose + colour both follow the name). Never null, so the create flow
@@ -452,7 +509,7 @@ export default function NewCrewmateDialog({
   // not the user's work.
   const dirty = Boolean(
     name !== (initialDraft?.name ?? '') || job !== (initialDraft?.goal ?? '')
-    || workspace !== OWN_WORKSPACE || model !== INHERIT_MODEL || triggers || sessionColor
+    || workspace !== OWN_WORKSPACE || model !== INHERIT_MODEL || triggers || sessionColor || memory
     || look !== null || lookOpen,
   )
 
@@ -509,9 +566,17 @@ export default function NewCrewmateDialog({
   // Every failed create is said on the card AND reported up, so a card the
   // user left while it was busy cannot swallow the failure out of sight.
   const fail = useCallback((message: string) => {
+    setDataHomeHelpUrl('')
     setError(message)
     onFailedRef.current?.(message)
   }, [])
+  // A refusal the dialog has no plain-words copy for still says the server's
+  // short reason after the product's sentence, so a create that keeps failing
+  // carries something a person can report.
+  const failWithReason = useCallback((message: string, reason: string | undefined) => {
+    const short = createFailureReason(reason)
+    fail(short ? `${message} ${t('pages.membersPage.create_failed_details', { reason: short })}` : message)
+  }, [fail, t])
   const createMut = useMutation({
     mutationFn: async (body: CreateBody) => {
       // A guided create (the human pressed Start on a crewmate's guide and is now
@@ -527,8 +592,8 @@ export default function NewCrewmateDialog({
     },
     onSuccess: async ({ r, credited }, body) => {
       // A 2xx whose body still carries `error` is a refusal in the server's
-      // words; like every other failure it is said in the product's.
-      if (r?.error) { if (guided) guideSave.refused(); fail(t('pages.membersPage.create_failed')); return }
+      // words; it is said in the product's, with the server's short reason.
+      if (r?.error) { if (guided) guideSave.refused(); failWithReason(t('pages.membersPage.create_failed'), r.error); return }
       // Saved, but without the guide's headers (the guide had not reached its
       // Create step): the guide is closed honestly rather than left asking for
       // the press the user already made.
@@ -619,11 +684,43 @@ export default function NewCrewmateDialog({
           setNameRefused(true)
           return
         }
-        // Verbatim server text is reserved for the codes the dialog knows
-        // (above); every other answer — a 5xx, a refused body — is said in the
-        // product's words with its next step, never as the server's raw
-        // sentence. The server answered, so nothing was created.
-        fail(t('pages.membersPage.create_failed'))
+        // A name an agent template already holds: the name is what to change.
+        if (e.status === 409 && code === 'template_name_in_use') {
+          fail(t('pages.membersPage.create_name_reserved'))
+          setNameRefused(true)
+          return
+        }
+        // The kept memory picked here could not be used (another crewmate took
+        // it meanwhile, or it no longer matches its record): nothing was
+        // created, the pick goes back to an empty memory where the user can see
+        // it, and the list is re-read so the stale row goes. A pick is always
+        // sent as picked, so a stale one is refused by the server rather than
+        // quietly becoming a fresh memory.
+        if (e.status === 409 && code === 'adopt_memory_unavailable' && body.adopt_memory_store) {
+          setMemory('')
+          void refetchKeptMemory()
+          fail(t('pages.membersPage.create_memory_unavailable'))
+          return
+        }
+        // Every other answer is said in the product's words with its next
+        // step, followed by the server's short reason. The server answered,
+        // so nothing was created.
+        // Files another account owns: which folder and owner, the likely cause
+        // and the docs link, since no retry from here can get past it.
+        if (code === DATA_HOME_NOT_OWNED) {
+          fail(dataHomeOwnerMessage(errorBodyField(e.body, 'home'), errorBodyField(e.body, 'owner')))
+          setDataHomeHelpUrl(errorBodyField(e.body, 'help_url'))
+          return
+        }
+        if (code === 'invalid_model') {
+          failWithReason(t('pages.membersPage.create_failed_model'), e.message)
+          return
+        }
+        if (code && CREATE_STORAGE_CODES.has(code)) {
+          failWithReason(t('pages.membersPage.create_failed_storage'), e.message)
+          return
+        }
+        failWithReason(t('pages.membersPage.create_failed'), e.message)
         return
       }
       // No server answer at all (a dropped connection, a parse error): the
@@ -674,6 +771,8 @@ export default function NewCrewmateDialog({
         fail(t('pages.membersPage.create_unconfirmed', { name: body.name }))
         return
       }
+      // No server answered, so there is no server reason to add; the
+      // browser's exception text ("Failed to fetch") tells a person nothing.
       fail(t('pages.membersPage.create_failed'))
     },
   })
@@ -756,6 +855,7 @@ export default function NewCrewmateDialog({
       ...(model !== INHERIT_MODEL ? { model } : {}),
       avatar: effectiveLook,
       ...(firstGreeting ? { first_greeting: true as const } : {}),
+      ...(memory ? { adopt_memory_store: memory } : {}),
     })
   }
 
@@ -766,19 +866,23 @@ export default function NewCrewmateDialog({
       data-testid="crewmate-create-form"
       onSubmit={(e) => { e.preventDefault(); if (!busy) submit() }}
     >
-      {/* One lock for the whole form while the POST is in flight: a
-          disabled fieldset disables every control under it -- the look
-          tile, both Create buttons and the editor's own fields, which take
-          no `disabled` prop of their own -- so an edit cannot land after
-          the body was sent and vanish when success closes the dialog. */}
+      {/* The whole-panel lock while the nested New workspace dialog is open:
+          focus is in that layer, not here, so disabling every control under
+          this fieldset is safe (the panel is already `inert` then, see the
+          Modal's `interactionDisabled`). The POST-in-flight lock is NOT here:
+          a `disabled` fieldset natively disables the control the reader just
+          pressed and blurs it to <body>. While busy the look tile and the
+          editor's own fields -- which take no `disabled` prop -- are held by
+          the nested fieldset below, and Name and Create, the two controls a
+          create can start from, are held focusable with `aria-disabled`. */}
       <fieldset
-        disabled={busy || wsModalOpen}
+        disabled={wsModalOpen}
         aria-busy={busy || undefined}
         className="contents min-w-0 m-0 p-0 border-0"
         data-testid="crewmate-create-fieldset"
       >
-      {/* One column, top to bottom: the look, the name, Create,
-          the secondary line, then the Advanced fields. Spacing is each
+      {/* One column, top to bottom: the look, the name, the secondary
+          line, then the Advanced fields; Create follows in the footer. Spacing is each
           element's own margin, so the space above the unfolding region is
           its own padding and moves with it. */}
       <div className="flex flex-col">
@@ -805,13 +909,20 @@ export default function NewCrewmateDialog({
             value={name}
             onChange={(e) => { setName(e.target.value); setHint(''); setError(''); setNameRefused(false); setUnconfirmed(false) }}
             aria-invalid={hint || nameRefused ? true : undefined}
-            aria-describedby={hint ? 'crewmate-create-name-hint' : undefined}
+            aria-describedby={hint ? 'crewmate-create-name-hint' : nameRefused && error ? 'crewmate-create-error' : undefined}
             placeholder={t('pages.membersPage.create_name_placeholder')}
             // The variant carries an attribute selector, so it outranks the
             // base `border-border` whatever order the stylesheet emits them in.
             className="aria-invalid:border-danger"
             autoFocus
-            disabled={busy}
+            // While the POST is out the field is held, not disabled: a native
+            // `disabled` on the control a reader pressed Enter in blurs it to
+            // <body>, outside the dialog, so they lose their place until the
+            // create answers. `readOnly` refuses every edit while keeping the
+            // field focusable, and `aria-disabled` announces it unavailable.
+            // The `wsModalOpen` inert lock stays with the fieldset below.
+            readOnly={busy}
+            aria-disabled={busy || undefined}
           />
         </div>
         {/* A refusal, not a field hint: it reads in the error tone and the
@@ -825,8 +936,8 @@ export default function NewCrewmateDialog({
         {/* No hand-off on either notice: both sit over this unsaved form --
             the name, job and every Advanced pick live only in local state --
             and the hand-off navigates to the chat, unmounting the dialog
-            and the draft with it. Both sit right above Create, the press
-            they answer. */}
+            and the draft with it. Both sit under the name, above the
+            Advanced settings toggle. */}
         {/* A load that did not happen is a failure (errors-use-error-notice):
             the shared notice, inline, naming WHICH list fell back so the
             user knows what they are not being offered. The create still
@@ -837,7 +948,9 @@ export default function NewCrewmateDialog({
               message={t('pages.membersPage.create_options_failed', {
                 list: workspacesError
                     ? t('pages.kiroCrewAgentsPage.workspace_2')
-                    : t('pages.kiroCrewAgentsPage.model'),
+                    : modelsError
+                      ? t('pages.kiroCrewAgentsPage.model')
+                      : t('pages.membersPage.create_memory'),
               })}
               variant="inline"
               testId="crewmate-create-options-error"
@@ -860,34 +973,31 @@ export default function NewCrewmateDialog({
               // a span's default display, so the wrap it buys changes nothing
               // on screen; it only gives the sentence its own element.
               messageClassName={unconfirmed ? 'inline' : undefined}
+              id="crewmate-create-error"
               testId={unconfirmed ? 'crewmate-create-unconfirmed' : 'crewmate-create-error'}
             />
+            {dataHomeHelpUrl && (
+              <div data-testid="crewmate-create-data-home-help">
+                <DataHomeOwnerHelp helpUrl={dataHomeHelpUrl} />
+              </div>
+            )}
           </div>
         )}
-        {/* The primary action, right after the name: full width and 44px
-            tall on a phone. It is the form's first submit button, so Enter
-            in the Name field submits through it. */}
-        <Btn primary type="submit" disabled={busy || wsModalOpen} className="mt-5 min-h-11 w-full justify-center sm:min-h-9" data-testid="crewmate-create-submit" data-guide-anchor={guided ? GUIDE_ANCHORS.crewmateCreate : undefined}>
-          {busy ? t('pages.membersPage.create_submitting') : t('pages.membersPage.create_submit')}
-        </Btn>
-        {/* The secondary line, centred under Create: the Advanced settings
+        {/* The secondary line, centred under the name: the Advanced settings
             toggle alone. The way out is the modal's header X. */}
-        <div className="mt-2 flex items-center justify-center" data-testid="crewmate-create-secondary">
+        <div className="mt-3 flex items-center justify-center" data-testid="crewmate-create-secondary">
           <AdvancedSettingsToggle
             open={advanced}
             onToggle={() => setAdvanced((v) => !v)}
             label={t('pages.membersPage.create_advanced_settings')}
+            disabled={busy}
           />
         </div>
         {/* The fields grow out of the card directly under the toggle
             instead of appearing whole, so the reader sees where they came
             from (sequenced as `ADVANCED_OPEN` / `ADVANCED_FOLD` describe).
             Cut, not animated, under reduced motion. Folding unmounts the
-            fields, never their values: those live in this dialog's state.
-            The region ends with a second Create, so a user who scrolled
-            down through the fields does not scroll back up to finish. It
-            is a plain submit button of the same form: each press is one
-            submit event through the one `onSubmit`, with the same lock. */}
+            fields, never their values: those live in this dialog's state. */}
         <AnimatePresence initial={false}>
           {advanced && (
             <motion.div
@@ -898,7 +1008,17 @@ export default function NewCrewmateDialog({
               exit={reduceMotion ? { ...ADVANCED_FOLD, transition: ADVANCED_CUT } : ADVANCED_FOLD}
               data-testid="crewmate-create-advanced"
             >
-              <div className="flex flex-col gap-5 pt-5">
+              {/* Each Advanced field is locked individually while the create
+                  is out, because a create can start from more than Name and
+                  Create: Enter in any text field here (Job, Triggers, the hex
+                  colour) implicitly submits the form, so a native `disabled`
+                  on one of them would blur it to <body>. The text fields are
+                  held focusable with `readOnly` + `aria-disabled`; the
+                  non-text controls (the workspace and model selects, the
+                  colour swatches and picker) cannot submit, so they keep a
+                  native lock. A single disabled fieldset here would re-disable
+                  the text fields, so there is none. */}
+              <div className="flex flex-col gap-4 pt-4">
                 <Field
                   label={`${t('pages.membersPage.create_job')} · ${t('pages.membersPage.create_optional')}`}
                   hint={t('pages.membersPage.create_job_hint')}
@@ -908,7 +1028,8 @@ export default function NewCrewmateDialog({
                     onChange={(e) => setJob(e.target.value)}
                     aria-label={t('pages.membersPage.create_job')}
                     placeholder={t('pages.membersPage.create_job_placeholder')}
-                    disabled={busy}
+                    readOnly={busy}
+                    aria-disabled={busy || undefined}
                   />
                 </Field>
                 <WorkspaceField
@@ -919,22 +1040,60 @@ export default function NewCrewmateDialog({
                   value={workspace}
                   onChange={setWorkspace}
                   onNewWorkspace={openWsModal}
+                  disabled={busy}
                 />
                 <ModelField
                   options={modelOptions}
                   value={model}
                   onChange={setModel}
                   hint={t('pages.kiroCrewAgentsPage.model_inherited_from_default')}
+                  disabled={busy}
                 />
-                <TriggersField value={triggers} onChange={setTriggers} subject="member" />
-                <SessionColorField value={sessionColor} onChange={setSessionColor} subject="member" />
-                <Btn primary type="submit" disabled={busy || wsModalOpen} className="min-h-11 w-full justify-center sm:min-h-9" data-testid="crewmate-create-submit-end">
-                  {busy ? t('pages.membersPage.create_submitting') : t('pages.membersPage.create_submit')}
-                </Btn>
+                <TriggersField value={triggers} onChange={setTriggers} subject="member" busy={busy} />
+                <SessionColorField value={sessionColor} onChange={setSessionColor} subject="member" busy={busy} />
+                {keptStores.length > 0 && (
+                  <Field label={t('pages.membersPage.create_memory')} hint={t('pages.membersPage.create_memory_hint')}>
+                    <SimpleSelect
+                      options={['', ...keptStores.map((s) => s.name)]}
+                      optionLabels={[
+                        t('pages.membersPage.create_memory_fresh'),
+                        ...keptStores.map((s) => t('pages.membersPage.create_memory_kept', { name: s.former_owner || s.name })),
+                      ]}
+                      value={memory}
+                      onChange={setMemory}
+                      disabled={busy}
+                      aria-label={t('pages.membersPage.create_memory')}
+                    />
+                  </Field>
+                )}
               </div>
             </motion.div>
           )}
         </AnimatePresence>
+      </div>
+      {/* The one primary action, in a footer that sticks to the bottom of
+          the modal's scrolling body: however far the Advanced fields run,
+          Create stays in view without a second copy of it. The band reaches
+          over the body's padding (`-mx-5 -mb-4`, and `-bottom-4` because a
+          sticky box stops at the scroller's padding edge) so the fields
+          scroll under it, never past it. It stays inside the form, so it is the form's
+          submit button (Enter in the Name field submits through it) and the
+          fieldset's lock covers it. 44px tall on a phone. */}
+      <div className="sticky -bottom-4 z-10 -mx-5 -mb-4 mt-4 border-t border-border bg-card px-5 py-3" data-testid="crewmate-create-footer">
+        {/* While the POST is out Create is HELD, not `disabled`: a native
+            `disabled` on the button a reader just pressed blurs it to <body>,
+            outside the dialog. `aria-disabled` announces it unavailable and
+            `aria-busy` that a request is running, while the button stays
+            focusable; the form's `onSubmit` guard (`if (!busy)`) is what
+            refuses a second submit. The `aria-disabled:` classes mirror the
+            `disabled:` look so the held button is pixel-for-pixel the same.
+            `wsModalOpen` keeps its native lock: the panel is inert then and
+            focus is in the nested dialog, so nothing here is focused. An
+            empty name holds it the same way: pressing it still says why
+            (`create_name_required`) instead of doing nothing. */}
+        <Btn primary type="submit" disabled={wsModalOpen} aria-disabled={busy || !name.trim() || undefined} aria-busy={busy || undefined} className="min-h-11 w-full justify-center sm:min-h-9 aria-disabled:bg-bg-hover aria-disabled:text-muted aria-disabled:border-transparent aria-disabled:shadow-none aria-disabled:opacity-60 aria-disabled:cursor-not-allowed aria-disabled:hover:bg-bg-hover aria-disabled:hover:shadow-none aria-disabled:active:scale-100" data-testid="crewmate-create-submit" data-guide-anchor={guided ? GUIDE_ANCHORS.crewmateCreate : undefined}>
+          {busy ? t('pages.membersPage.create_submitting') : t('pages.membersPage.create_submit')}
+        </Btn>
       </div>
       </fieldset>
     </form>
@@ -981,9 +1140,14 @@ export default function NewCrewmateDialog({
         // of the opening it was rendered for: `WorkspaceForm` keeps the
         // handler from the render its submit started in, so a form that was
         // closed — or a parent that was reset or closed — before the POST
-        // answered arrives here with a retired generation and is dropped.
+        // answered arrives here with a retired generation and is dropped,
+        // save for marking the list stale: with `staleTime: Infinity` nothing
+        // else would re-read it when the dialog next opens.
         onCreated={(newName) => {
-          if (wsModal.gen !== wsGen.current) return
+          if (wsModal.gen !== wsGen.current) {
+            void queryClient.invalidateQueries({ queryKey: ['workspaces'], refetchType: 'none' })
+            return
+          }
           closeWsModal()
           queryClient.setQueryData(['workspaces'], (prev: { workspaces?: { name: string }[] } | undefined) => {
             const list = prev?.workspaces ?? [{ name: 'default' }]

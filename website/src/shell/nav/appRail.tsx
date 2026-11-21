@@ -10,6 +10,7 @@ import { APP_NAV_ORDER_KEY, buildReorderBaseline, mergeVisibleReorder, readAppNa
 import { useNavPinned } from '../../lib/navPinned'
 import { haptic } from '../../lib/haptic'
 import { surfacePreviewEnabled } from '../../surfaces/registry'
+import { surfaceSwitchedOn } from '../../surfaces/surfaceData'
 import { safeSetItem } from '../../utils/safeStorage'
 import { i18nT } from '../../i18n/t'
 import { NAV_ITEMS } from './navItems'
@@ -19,12 +20,34 @@ import { useNavTip } from './navTip'
 export interface AppNavRow { path: string; id: string; label: string; group: string; icon: React.ReactElement; appName?: string }
 
 /**
+ * The Apps group in its natural order, before any order the user saved: the
+ * group's own surfaces first, then the installed apps as `GET /api/apps` lists
+ * them (by name), with each surface that was a built-in app (`formerApp`) put
+ * back where that app's row stood among them.
+ */
+export function naturalAppGroupOrder<T extends { id: string; appName?: string; formerApp?: string }>(
+  surfaces: readonly T[], appRows: readonly T[],
+): T[] {
+  const merged = [...appRows]
+  for (const s of surfaces) {
+    if (!s.formerApp) continue
+    const at = merged.findIndex(row => !!row.appName && row.appName > s.formerApp!)
+    merged.splice(at < 0 ? merged.length : at, 0, s)
+  }
+  return [...surfaces.filter(s => !s.formerApp), ...merged]
+}
+
+/**
  * The rail's advertised destinations and the Apps group's order: which surfaces
  * the rail may show (preview flags, pinned sub-items), the Apps group merged with
  * the installed apps in the user's saved order minus the rows they unpinned, and
  * the drag-reorder that writes that order back.
  */
-export function useAppRailOrder(appNavItems: AppNavRow[]) {
+export function useAppRailOrder(
+  appNavItems: AppNavRow[],
+  /** The shared `['kirocrewConfig']` read a surface's `configSwitch` is judged by. */
+  kirocrewConfig?: unknown,
+) {
   const [appNavOrder, setAppNavOrder] = useState<string[]>(() => { try { return JSON.parse(localStorage.getItem(APP_NAV_ORDER_KEY) || '[]') } catch { return [] } })
   // Which app rows the user UNPINNED from the sidebar via the Library
   // launchpad grid (`mc-app-nav-hidden`, owned by `lib/appNavHidden.ts`).
@@ -49,7 +72,8 @@ export function useAppRailOrder(appNavItems: AppNavRow[]) {
   // for the same reason — a `pinnable` sub-item filtered in only one branch
   // would appear on the rail in the other without the user pinning it.
   const advertisedNavItems = useMemo(
-    () => NAV_ITEMS.filter(n => surfacePreviewEnabled(n) && (!n.pinnable || pinnedNavIds.has(n.id))),
+    () => NAV_ITEMS.filter(n => surfacePreviewEnabled(n) && surfaceSwitchedOn(n, kirocrewConfig)
+      && (!n.pinnable || pinnedNavIds.has(n.id))),
     // The revision is an invalidation token: what `surfacePreviewEnabled` reads
     // lives in localStorage, not in React state, so nothing else here can
     // express the dep. The directive stays on ONE line directly above the deps
@@ -57,7 +81,7 @@ export function useAppRailOrder(appNavItems: AppNavRow[]) {
     // rationale wrapped after it aims the directive at its own continuation and
     // suppresses nothing.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [previewFlagRevision, pinnedNavIds],
+    [previewFlagRevision, pinnedNavIds, kirocrewConfig],
   )
   // Apps nav reorder is dnd-kit sortable (mirrors QueueStack): rows reflow to
   // open a gap as you drag, and a DragOverlay renders the floating ghost.
@@ -84,7 +108,8 @@ export function useAppRailOrder(appNavItems: AppNavRow[]) {
     // `mc-app-nav-order` is empty or has never listed it (its slot is then
     // implicit in this natural order, and persisting only the visible ids
     // would erase it).
-    const all = [...advertisedNavItems.filter(n => n.group === 'Apps'), ...appNavItems]
+    const all: AppNavRow[] = naturalAppGroupOrder<AppNavRow & { formerApp?: string }>(
+      advertisedNavItems.filter(n => n.group === 'Apps'), appNavItems)
     const orderMap = new Map(appNavOrder.map((id, i) => [id, i]))
     const sortedAll = appNavOrder.length === 0
       ? all
@@ -200,8 +225,11 @@ export function SortableAppNavRow({ id, children }: { id: string; children: Reac
 /** The "N more" / "Show less" Apps-overflow toggle. Mirrors NavItem: a text row
  *  when expanded, an icon-only button with a portaled hover label when the
  *  sidebar is collapsed, so the collapse-to-more behavior works in both modes. */
-export function NavToggle({ collapsed, expanded, hiddenCount, onClick }: {
+export function NavToggle({ collapsed, expanded, hiddenCount, onClick, genericTitles = false }: {
   collapsed: boolean; expanded: boolean; hiddenCount: number; onClick: () => void
+  /** For a list that is not apps (the dock's Mates group): the fuller title
+   *  falls back to the visible label instead of naming apps. */
+  genericTitles?: boolean
 }) {
   const { tip, tipOn, rowRef, showTip, hideTip, dismissTip, pointerProps: tipPointerProps } = useNavTip<HTMLButtonElement>(collapsed)
   // `hiddenCount === 0 && !expanded` happens when the only overflow item is the
@@ -210,10 +238,12 @@ export function NavToggle({ collapsed, expanded, hiddenCount, onClick }: {
   const showsCollapse = expanded || hiddenCount === 0
   const Icon = showsCollapse ? ChevronUp : MoreHorizontal
   const labelText = showsCollapse ? i18nT('app.show_less') : i18nT('app.n_more', { count: hiddenCount })
-  const titleText = showsCollapse ? i18nT('app.show_fewer_apps') : i18nT('app.show_more_apps', { count: hiddenCount })
+  const titleText = genericTitles
+    ? labelText
+    : showsCollapse ? i18nT('app.show_fewer_apps') : i18nT('app.show_more_apps', { count: hiddenCount })
   return (
     <button ref={rowRef}
-      className="group/nav relative flex items-center rounded-md cursor-pointer text-sm font-medium whitespace-nowrap gap-2.5 py-2 pl-3 pr-3 transition-colors duration-200 text-muted hover:text-text hover:bg-bg-hover/60 bg-transparent border-none w-full"
+      className={`group/nav relative flex items-center rounded-md cursor-pointer text-sm font-medium whitespace-nowrap gap-2.5 py-2 pl-2.5 pr-2.5 transition-colors duration-200 text-muted hover:text-text hover:bg-bg-hover/60 bg-transparent border-none w-full`}
       // Dismiss the hover label on activation, without the fade-out. Unlike a
       // NavItem (which stays put when clicked, so the pointer is still
       // legitimately over it), activating this toggle re-flows the Apps list and
@@ -238,7 +268,7 @@ export function NavToggle({ collapsed, expanded, hiddenCount, onClick }: {
       onFocus={showTip}
       onBlur={hideTip}
     >
-      <span className="w-4 h-4 flex items-center justify-center shrink-0 opacity-70"><Icon size={16} /></span>
+      <span className="w-5 h-5 flex items-center justify-center shrink-0 opacity-70"><Icon size={20} /></span>
       {/* Same reason as the nav-item label in `navRow.tsx`'s `NavItem`: clipped by `whitespace-nowrap
           overflow-hidden`, so the full string lives on `aria-label` (not `title` — see the
           getByTitle collision note on the NavItem span). */}
@@ -249,10 +279,10 @@ export function NavToggle({ collapsed, expanded, hiddenCount, onClick }: {
       )}
       {collapsed && tip && <OverlayPortal>
         <div
-          className={`fixed flex items-center gap-2.5 pl-3 pr-3 rounded-md bg-card border border-border shadow-lg text-text text-sm font-medium z-[9999] pointer-events-none whitespace-nowrap transition-opacity duration-150 ${tipOn ? 'opacity-100' : 'opacity-0'}`}
+          className={`fixed flex items-center gap-2.5 pl-2.5 pr-3 rounded-md bg-card border border-border shadow-lg text-text text-sm font-medium z-[9999] pointer-events-none whitespace-nowrap transition-opacity duration-150 ${tipOn ? 'opacity-100' : 'opacity-0'}`}
           style={{ top: tip.top, left: tip.left, height: tip.height }}
         >
-          <span className="w-4 h-4 flex items-center justify-center shrink-0"><Icon size={16} /></span>
+          <span className="w-5 h-5 flex items-center justify-center shrink-0"><Icon size={20} /></span>
           {labelText}
         </div>
       </OverlayPortal>}

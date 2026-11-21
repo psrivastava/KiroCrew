@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from redaction_structured_cases import github_classic
 
 from kiro_crew import crew_teams as teams
 from kiro_crew import members as members_mod
@@ -922,6 +923,7 @@ class TestBackupCoverage:
         import zipfile
 
         from kiro_crew import portability
+        from kiro_crew import snapshot as snap
 
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w") as zf:
@@ -934,7 +936,7 @@ class TestBackupCoverage:
         zip_path = tmp_path / "import.zip"
         zip_path.write_bytes(buf.getvalue())
         with patch.object(portability, "_mc_dir", return_value=home):
-            with pytest.raises(Exception) as exc:
+            with pytest.raises(snap.SourceComponentUnsound) as exc:
                 portability.apply_import_zip(zip_path, mode="replace")
         assert "crew-teams" in str(exc.value)
         assert not teams.teams_path().exists()
@@ -1002,7 +1004,9 @@ class TestTeamsRoutes:
         failing the display-name rule) is ``unknown_member`` on every write."""
         from kiro_crew.config.loader import KiroCrewConfig
 
-        eggbot, hidden = "dr. eggbot", "AKIAIOSFODNN7EXAMPLE"
+        # A GitHub token with a valid checksum is credential-shaped to the
+        # redactor; an AWS key ID stays visible as an identifier.
+        eggbot, hidden = "dr. eggbot", github_classic(seed=161)
         cfg = KiroCrewConfig()
         cfg.agents = {
             name: KiroCrewAgentConfig(kiro_agent="kirocrew") for name in (eggbot, hidden, RADAR)

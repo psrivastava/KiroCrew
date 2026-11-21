@@ -11,9 +11,9 @@ The context-assembly integration lives in test_decisions_integration.py.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import threading
-import time
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -24,6 +24,7 @@ from kiro_crew import decisions as core
 from kiro_crew.decisions.points import MAX_KEY_CHARS, as_text
 from kiro_crew.decisions.points import skills_select as sel
 from kiro_crew.decisions.types import Answer
+from kiro_crew.testing.clock import ManualClock
 from kiro_crew.testing.wait import wait_until
 
 
@@ -484,6 +485,49 @@ def test_a_raising_transport_keeps_the_baseline(bg_loop, enabled, monkeypatch):
     assert sel.selected_skills(loader, "review this", None, session_key="s", loop=bg_loop) is None
 
 
+def _record_select_waits(monkeypatch, started, budget=None):
+    """Record every timeout ``selected_skills`` hands the wait on its oracle future.
+
+    The point's start deadline reads a ``ManualClock`` installed on
+    ``skills_select``, which moves only by the recorded wait, so a loop that runs
+    the coroutine late on a loaded host still finds it inside its deadline. Only
+    the future of the ``select_skills`` coroutine is instrumented; every other
+    submission passes through. Before the wait proceeds, *started* must hold
+    (bounded by ``wait_until``'s lost-run fallback), so the abandoned call has
+    begun on the loop. A wait above *budget* (the fixture's 0.5s floor by
+    default), or one with no timeout, is recorded and answered as an expiry at
+    once, so that regression fails by name on the recorded value instead of
+    being sat out.
+    """
+    limit = sel.MIN_WAIT_SECS if budget is None else budget
+    clock = ManualClock()
+    clock.install(monkeypatch, sel)
+    waits: list[float | None] = []
+    real_submit = asyncio.run_coroutine_threadsafe
+
+    def submit(coro, loop):
+        future = real_submit(coro, loop)
+        if getattr(getattr(coro, "cr_code", None), "co_name", "") != "select_skills":
+            return future
+        real_result = future.result
+
+        def result(timeout=None):
+            waits.append(timeout)
+            wait_until(started, describe=lambda: "the oracle call never started on the loop")
+            if timeout is None or timeout > limit + 1e-6:
+                raise concurrent.futures.TimeoutError
+            try:
+                return real_result(timeout)
+            finally:
+                clock.advance(timeout)
+
+        future.result = result
+        return future
+
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", submit)
+    return waits
+
+
 def test_an_expired_budget_cancels_the_call_and_keeps_the_baseline(bg_loop, enabled, monkeypatch):
     """The bounded wait discards late answers and propagates cancellation."""
     observed: dict[str, bool] = {}
@@ -498,12 +542,12 @@ def test_an_expired_budget_cancels_the_call_and_keeps_the_baseline(bg_loop, enab
         return _answers("review")  # pragma: no cover - the sleep is cancelled
 
     monkeypatch.setattr(core, "decide", _slow)
+    waits = _record_select_waits(monkeypatch, lambda: observed.get("started"))
     loader = _loader(("review", {"triggers": "code review"}))
-    started = time.monotonic()
     picked = sel.selected_skills(loader, "review this", None, session_key="s", loop=bg_loop)
-    waited = time.monotonic() - started
     assert picked is None
-    assert waited < 10, "the caller must not wait past its own budget"
+    # The fixture's budget is the 0.5s floor, and the caller waits for it exactly once.
+    assert waits == [sel.MIN_WAIT_SECS], f"the caller waited {waits}, not its own budget once"
     wait_until(lambda: observed.get("cancelled"), describe=lambda: observed)
     assert observed == {"started": True, "cancelled": True}, "no detached call may survive"
 
@@ -596,9 +640,7 @@ def test_an_unreadable_provider_budget_falls_back_to_the_floor(monkeypatch):
     assert sel._wait_budget() == sel.MIN_WAIT_SECS
 
 
-# ---------------------------------------------------------------------------
 # Prior turns: what the budget buys, and what it refuses to carry
-# ---------------------------------------------------------------------------
 
 
 def _menu(count, *, description="d" * 8):
@@ -816,7 +858,8 @@ def test_the_history_source_is_not_called_for_an_unsampled_turn(bg_loop, monkeyp
 # the repo's own secret scanners, correctly, since neither they nor Semgrep can
 # tell a test vector from a real leak.
 _AWS_KEY = _cred.AWS_KEY_ID_PREFIXES.split("|")[0] + "A2B3C4D5E6F7G8H9"
-_EXFIL_URL = "https://collector.example.invalid/x?sess" + "ion=" + "b" * 40
+# ``x`` and not a hex letter: a 40-run of hex is a git object name and is kept.
+_EXFIL_URL = "https://collector.example.invalid/x?sess" + "ion=" + "x" * 40
 
 
 def _state_with_prior_turn(text):
@@ -850,16 +893,14 @@ def test_a_clean_prior_turn_is_sent():
     assert gate.scrub_reason(_state_with_prior_turn("we were talking about invoices"), []) is None
 
 
-# ---------------------------------------------------------------------------
 # One question, whatever the menu size
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_the_whole_menu_is_one_question(monkeypatch):
     """The menu has a ceiling of its own, so there is nothing for a split to do.
 
-    ``MAX_CANDIDATES`` x (``MAX_KEY_CHARS`` + ``MAX_DESCRIPTION_CHARS``) is 32,000
+    ``MAX_CANDIDATES`` x (``MAX_KEY_CHARS`` + ``MAX_DESCRIPTION_CHARS``) is 31,680
     characters; a request cannot grow past it however large the skill tree is.
     """
     spy = AsyncMock(return_value=_answers("s0"))
@@ -871,10 +912,24 @@ async def test_the_whole_menu_is_one_question(monkeypatch):
     assert spy.await_count == 1, "one menu, one question, one answer to reconcile"
 
 
+@pytest.mark.asyncio
+async def test_the_largest_menu_is_a_choice_laya_accepts(monkeypatch):
+    """Laya's server refuses a Choice of more than 100 options, so the fullest menu
+    plus "none" must stay at 100 or every turn on a large skill tree is a provider
+    error there."""
+    spy = AsyncMock(return_value=_answers("s0"))
+    monkeypatch.setattr(core, "decide", spy)
+    await sel.select_skills(
+        "review this", _menu(sel.MAX_CANDIDATES * 3), session_key="s", history_budget_chars=0
+    )
+    (question,) = spy.await_args.args[2]
+    assert len(question.options) == 100
+
+
 def test_the_menu_ceiling_is_a_bound_in_its_own_right():
     """The number that makes a per-request budget unnecessary, pinned as arithmetic."""
     ceiling = sel.MAX_CANDIDATES * (MAX_KEY_CHARS + sel.MAX_DESCRIPTION_CHARS)
-    assert ceiling == 32_000
+    assert ceiling == 31_680
     rows = sel.screen_candidates(
         [
             {"key": "k" * MAX_KEY_CHARS, "description": "d" * sel.MAX_DESCRIPTION_CHARS}
@@ -892,9 +947,7 @@ def test_the_split_menu_vocabulary_is_gone():
     assert not hasattr(core, "state_budget_chars")
 
 
-# ---------------------------------------------------------------------------
 # Both arms: what word overlap would have injected, beside what Jev picked
-# ---------------------------------------------------------------------------
 
 
 def test_the_baseline_arm_is_the_matchers_own_result(tmp_path):
@@ -1049,9 +1102,7 @@ def test_a_refused_turn_writes_no_outcome_row(bg_loop, enabled, log_home, monkey
     assert [row for row in _rows_in(log_home) if "baseline" in row] == []
 
 
-# ---------------------------------------------------------------------------
 # The outcome publish hook, which this module only ever reads
-# ---------------------------------------------------------------------------
 
 
 def test_the_outcome_is_published_when_the_module_is_importable(monkeypatch):
@@ -1070,12 +1121,9 @@ def test_the_outcome_is_published_when_the_module_is_importable(monkeypatch):
 def test_a_build_without_the_outcomes_module_publishes_nothing(monkeypatch):
     """A ``None`` entry in ``sys.modules`` is what an unimportable module raises as.
 
-    Patching ``builtins.__import__`` would NOT simulate this: ``import_module``
-    resolves through ``sys.modules`` and the import machinery, not through that
-    hook, so such a test passes only while the module happens not to exist and
-    goes vacuous the moment it does. The ``pytest.raises`` below is the guard
-    against that: the mechanism has to still produce an ``ImportError`` for the
-    assertion under it to mean anything.
+    Patching ``builtins.__import__`` would not simulate this, since ``import_module``
+    bypasses that hook. The ``pytest.raises`` below proves the setup still raises
+    ``ImportError``.
     """
     import importlib
     import sys

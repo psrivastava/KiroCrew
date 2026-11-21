@@ -1,12 +1,12 @@
 ---
 title: Mate-owned agent config — a copied custom agent in its own folder
-status: accepted
+status: implemented
 author: gjjnn
 created: 2026-10-16
-last-audited: 2026-10-20
-audited-at: 8892889b91
+last-audited: 2026-11-19
+audited-at: fc89562d69
 doc-pr:
-implementation-prs: [21463, 22037]
+implementation-prs: [21463, 22037, 23010]
 tracking-issues: []
 supersedes: []
 superseded-by: []
@@ -14,9 +14,10 @@ superseded-by: []
 
 # RFC: Mate-owned agent config — a copied custom agent in its own folder
 
-- Status: accepted — the product owner's decision of 2026-10-20 (rayrayxu),
-  not a description of what the code does today; the implementation is in
-  #21463 and #22037, both open. "Exists today" claims cite symbols verified
+- Status: implemented — the product owner's decision of 2026-10-20 (rayrayxu),
+  shipped in #23010 (merged 2026-10-23: `mate_config.py`,
+  `mate_config_migration.py`, `~/.kiro/mates/agents/`); #21463 and #22037
+  closed unmerged. "Exists today" claims cite symbols verified
   against the working tree at `8892889b91`; re-verify at implementation time.
 - Author: gjjnn
 - Related: [rfc-crewmates-launch.md](rfc-crewmates-launch.md) (the product
@@ -311,6 +312,10 @@ design can start reading, say, `model` or `permissions` without a format
 migration. The worker's own base system prompt and its tools come from Crew's
 source code; the file's `tools` staying default is what makes the tool base
 non-editable while the additions are editable.
+(2026-11-05: the file's explicit `@server` / `@server/tool` entries also select
+tools on a non-managed server the base declares but does not select, so a Bot
+can switch those tools on; the base's own selection and Crew's managed servers
+stay as the base sets them. See `docs/system-specs/modules/crew-mode.md`.)
 
 **How `prompt` is applied** (2026-10-17). The worker's source prompt comes
 first and whole. The file's `prompt` is appended after it as a clearly labelled

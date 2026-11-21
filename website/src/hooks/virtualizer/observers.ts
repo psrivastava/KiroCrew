@@ -12,7 +12,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject, type RefObject } from 'react'
 import { attachUserScrollIntent } from '../../utils/searchScroll'
-import { computeAtBottom, isSelfScroll } from './FollowController'
+import { computeAtBottom, isSelfScroll, scrollerCollapsed } from './FollowController'
 import { noteUserScrollActivity } from '../../lib/scrollQuiet'
 import { devWatchScroller } from '../../dev/scrollInspector'
 import type { FollowState, Pinning } from './followPolicy'
@@ -103,8 +103,15 @@ export function useScrollerElement(
   // would silently never attach (frozen isAtBottom, no follow, no window
   // recompute during scroll). `syncScrollerEl` below keeps this in step.
   const [scrollerEl, setScrollerEl] = useState<HTMLDivElement | null>(null)
+  // The last element handed to setScrollerEl. syncScrollerEl runs after every
+  // host commit, so it compares here and schedules nothing when the element is
+  // unchanged: an updater that returns `prev` still makes React re-run the host
+  // body to find that out whenever the host has other work pending.
+  const scrollerElSentRef = useRef<HTMLDivElement | null>(null)
   const syncScrollerEl = useCallback(() => {
-    setScrollerEl((prev) => (prev === scrollerRef.current ? prev : scrollerRef.current))
+    if (scrollerElSentRef.current === scrollerRef.current) return
+    scrollerElSentRef.current = scrollerRef.current
+    setScrollerEl(scrollerRef.current)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -240,9 +247,11 @@ export function useResizeObserver(ctx: {
   compensation: Pick<ShiftCompensation, 'compensateAboveFold'>
   sync: Pick<GeometrySync, 'deferForRailSettle' | 'scheduleResizeSync' | 'cancelRailSettle'>
   pinning: Pick<Pinning, 'followResizeBatch'>
+  reading: Pick<ReadingPositionEntry, 'replaceCollapsedEntry'>
   ops: Pick<WindowOperations, 'recomputeWindow'>
 }): void {
   const { scrollerRef, scrollerEl, elIndexRef, trailingRef, resizeObserverRef } = ctx
+  const { replaceCollapsedEntry } = ctx.reading
   const { measureResizeEntries, shiftRowTops } = ctx.measurement
   const { compensateAboveFold } = ctx.compensation
   const { deferForRailSettle, scheduleResizeSync, cancelRailSettle } = ctx.sync
@@ -258,9 +267,17 @@ export function useResizeObserver(ctx: {
     if (typeof ResizeObserver === 'undefined') return
     let scheduled = false
     let rafId = 0
+    // Whether the scroller had no height at the last fire (see below).
+    let boxCollapsed = scrollerRef.current !== null && scrollerCollapsed(scrollerRef.current)
     const ro = new ResizeObserver((entries) => {
       const el = scrollerRef.current
       if (!el) return
+      // The box got a height after being laid out at zero (a Remote Crew pane
+      // shown after warming display:none): an entry placed against the
+      // collapsed box is re-run now (see replaceCollapsedEntry).
+      const regrown = boxCollapsed && !scrollerCollapsed(el)
+      boxCollapsed = scrollerCollapsed(el)
+      if (regrown) replaceCollapsedEntry()
 
       // Record every measurement and classify the fire, then act on it in this
       // order: hold a released reader against a reprice above them; let the
@@ -320,7 +337,7 @@ export function useResizeObserver(ctx: {
     }
   }, [
     scrollerRef, measureResizeEntries, shiftRowTops, compensateAboveFold, deferForRailSettle, followResizeBatch,
-    scheduleResizeSync, cancelRailSettle, recomputeWindow, elIndexRef, trailingRef, resizeObserverRef,
+    scheduleResizeSync, cancelRailSettle, recomputeWindow, elIndexRef, trailingRef, resizeObserverRef, replaceCollapsedEntry,
   ])
 
   // Late-mounting scroller: the RO effect above observes `scrollerRef.current`

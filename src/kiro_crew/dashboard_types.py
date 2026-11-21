@@ -54,7 +54,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Final, Mapping
 
-from kiro_crew.crew_log.entry_types import CUSTOM_FOLD_NAME, DASHBOARD_FOLD_NAME
+from kiro_crew.crew_log.entry_types import CUSTOM_FOLD_NAME, DASHBOARD_FOLD_NAME, OBJECTS_FOLD_NAME
 from kiro_crew.crew_log.projection import (
     _FOLDS,
     _SLOT_FOLD_ROW_BYTES,
@@ -104,8 +104,9 @@ _PROBE_SLOT: Final[str] = "catalog-probe"
 #: ``null`` at these paths, and ``null`` carries no type.
 #:
 #: Read off each fold's own ``render``, which is why each entry names the line it came
-#: from. A stale entry cannot sit here unnoticed: ``test_every_declared_nullable_leaf_is
-#: _a_real_path`` fails on a path the probe does not reach, and the companion test fails
+#: from. A stale entry cannot sit here unnoticed:
+#: ``test_every_declared_nullable_leaf_is_a_path_the_fold_renders_null`` fails on a
+#: path the probe does not reach, and the companion test fails
 #: on a null leaf with no entry -- so the two directions are both pinned and neither a
 #: removed field nor an added one passes quietly.
 #: Crew's five running sums, in characters, as the usage fold's context part names them.
@@ -254,8 +255,8 @@ _NULLABLE: Final[dict[str, dict[str, Any]]] = {
 #: refusing those would refuse a working dashboard, and accepting them silently would
 #: let a typo through. Saying which it is leaves the choice with the validator.
 #:
-#: ``test_every_opaque_node_is_a_real_object`` pins each path, and
-#: ``test_no_empty_properties_passes_as_a_known_shape`` fails on an object the probe
+#: ``test_every_opaque_declaration_is_a_real_path`` pins each path, and
+#: ``test_no_object_passes_as_having_no_keys`` fails on an object the probe
 #: rendered empty that is declared neither here nor in :data:`_NULLABLE`, so a map added
 #: to a fold cannot land as "has no keys".
 _OPAQUE: Final[dict[str, str]] = {
@@ -269,6 +270,7 @@ _OPAQUE: Final[dict[str, str]] = {
     "panel.data": "a key the publishing crew chose",
     "panel.owners": "an owning crew key",
     "otel_usage.turns": "an actor value",
+    "otel_usage.resumed_turns": "an actor value",
     # Built from the fold's own registry constant rather than spelled out, because a
     # key naming a fold under a name the registry does not carry is not an error here:
     # ``_node`` looks this table up with a plain ``in``, misses, and falls through to
@@ -279,6 +281,8 @@ _OPAQUE: Final[dict[str, str]] = {
     # The same, for the records a script cron appends: each key is the record type
     # the script named, and a page binds ``custom.latest.<type>.data.<key>``.
     f"{CUSTOM_FOLD_NAME}.latest": "a custom record type a script cron named",
+    # Each key is a subject's URL, and each value is keyed by the producer that read it.
+    f"{OBJECTS_FOLD_NAME}.latest": "a subject URL, then a producer name",
 }
 
 
@@ -305,6 +309,7 @@ def _row_keys() -> dict[str, dict[str, Any]]:
             "title",
             "state",
             "status",
+            "awaits_person",
             "summary",
             "verdict",
             "pr",
@@ -345,7 +350,7 @@ def _row_keys() -> dict[str, dict[str, Any]]:
         "goal.milestones": {
             "row_keys": list(_MILESTONE_TEXT_KEYS),
             "names_the_row": "text",
-            "row_note": "target/current are text; current is the crewmate's own latest reading; latest snapshot, not history",
+            "row_note": "target/current are text; current is the Bot's own latest reading; latest snapshot, not history",
         },
         "waiting.items": {
             "row_keys": [*_WAITING_TEXT_KEYS, "options", "options_omitted"],
@@ -353,12 +358,34 @@ def _row_keys() -> dict[str, dict[str, Any]]:
             "row_note": "options is a list of strings; asked_at is the recorded time string",
         },
         "custom.latest": {
-            "row_keys": ["data", "at", "seq", "writer", "member", "crew_key"],
+            "row_keys": [
+                "data",
+                "at",
+                "seq",
+                "writer",
+                "member",
+                "crew_key",
+                "max_age_s",
+                "stale_after",
+                "failed_at",
+                "last_error",
+            ],
             "names_the_row": "writer",
             "row_note": (
                 "one row per record type, the latest record only; data is the object the "
                 "script sent (bind custom.latest.<type>.data.<key>), at is its ISO time, "
-                "writer is cron:<job id> stamped by the gateway"
+                "writer is cron:<job id> stamped by the gateway; stale_after (ISO, only when "
+                "the script declared max_age_s) is when the record stops being current; "
+                "failed_at and last_error appear when the writer's run failed after writing it"
+            ),
+        },
+        "custom.failures": {
+            "row_keys": ["writer", "at", "error"],
+            "names_the_row": "writer",
+            "row_note": (
+                "each bound cron's latest failed run, newest first, stamped by the gateway; "
+                "a writer listed here with no row in latest has never landed a record; "
+                "failures_omitted counts writers evicted past the cap"
             ),
         },
         "workstreams.series": series,

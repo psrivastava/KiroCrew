@@ -10,15 +10,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
+from redaction_structured_cases import github_classic
 
 from kiro_crew.dashboard.handlers import api_taskrunner_export_yaml, api_taskrunner_status
 from kiro_crew.dashboard.handlers_project import (
     _redact,
     _run_to_project,
-    api_activities_list,
-    api_comment_add,
-    api_comment_delete,
-    api_comments_list,
     api_project_create,
     api_project_delete,
     api_project_get,
@@ -97,15 +94,16 @@ class TestRedactAndConvert:
         The old spelling ``_redact(desc[:4000])`` sliced first, so a key cut at
         the boundary lost its tail, stopped matching the credential regex, and
         the raw prefix escaped into the dashboard payload.
-        The fabricated AKIA-shaped literal is inlined rather than bound to a
+        The fabricated token is inlined rather than bound to a
         ``secret``-named variable, which would trip CodeQL's name-based
         sensitive-source heuristic on this real call path.
         """
         run = _make_run()
-        # cut lands 8 chars into the fabricated 20-char key
-        run.description = "x" * 3992 + "AKIAIOSFODNN7EXAMPLE" + " trailing"
+        # cut lands 8 chars into the fabricated 40-char token; a blank before it,
+        # since a token glued to a letter is no token by its format
+        run.description = "x" * 3991 + " " + github_classic(seed=1) + " trailing"
         result = _run_to_project(run)
-        assert "AKIA" not in result["description"]
+        assert github_classic(seed=1)[:8] not in result["description"]
         assert len(result["description"]) <= 4000
 
     def test_run_to_project_plain_description_truncation_unchanged(self):
@@ -254,6 +252,90 @@ class TestProjectHandlers:
             await api_project_update(req)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "body", ["xnamex", ["name"], 7, None], ids=["string", "list", "number", "null"]
+    )
+    async def test_update_rejects_non_object_body_with_coded_400(self, body):
+        """A JSON body that is not an object is a client error, not a 500."""
+        run = _make_run("r1")
+        runner = MagicMock()
+        runner._apersist_runs = AsyncMock()
+        runner._runs = {"r1": run}
+        req = _make_request(
+            _make_app(runner=runner), method="PUT", match_info={"id": "r1"}, json_body=body
+        )
+        if body is None:
+            req.json = AsyncMock(return_value=None)
+        resp = await api_project_update(req)
+        assert resp.status == 400
+        assert json.loads(resp.body) == {
+            "error": "body must be a JSON object",
+            "code": "body_not_object",
+        }
+        assert run.name == "Test Run"
+        runner._apersist_runs.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "name", [42, None, ["a"], {"a": 1}], ids=["int", "null", "list", "dict"]
+    )
+    async def test_update_rejects_non_string_name_with_coded_400(self, name):
+        run = _make_run("r1")
+        runner = MagicMock()
+        runner._apersist_runs = AsyncMock()
+        runner._runs = {"r1": run}
+        req = _make_request(
+            _make_app(runner=runner),
+            method="PUT",
+            match_info={"id": "r1"},
+            json_body={"name": name},
+        )
+        resp = await api_project_update(req)
+        assert resp.status == 400
+        assert json.loads(resp.body) == {"error": "name must be a string", "code": "invalid_name"}
+        assert run.name == "Test Run"
+        runner._apersist_runs.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("sent", "stored"),
+        [("  New  ", "New"), ("n" * 5000, "n" * 5000)],
+        ids=["padded", "long"],
+    )
+    async def test_update_trims_name_and_keeps_long_names(self, sent, stored):
+        run = _make_run("r1")
+        runner = MagicMock()
+        runner._apersist_runs = AsyncMock()
+        runner._runs = {"r1": run}
+        req = _make_request(
+            _make_app(runner=runner),
+            method="PUT",
+            match_info={"id": "r1"},
+            json_body={"name": sent},
+        )
+        resp = await api_project_update(req)
+        assert resp.status == 200
+        assert run.name == stored
+        runner._apersist_runs.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "body", [{}, {"name": ""}, {"name": "   "}], ids=["no-name", "empty", "blank"]
+    )
+    async def test_update_without_a_usable_name_changes_nothing(self, body):
+        run = _make_run("r1")
+        runner = MagicMock()
+        runner._apersist_runs = AsyncMock()
+        runner._runs = {"r1": run}
+        req = _make_request(
+            _make_app(runner=runner), method="PUT", match_info={"id": "r1"}, json_body=body
+        )
+        resp = await api_project_update(req)
+        assert resp.status == 200
+        assert run.name == "Test Run"
+        runner._apersist_runs.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_delete_success(self):
         runner = MagicMock()
         runner.delete_run = AsyncMock(return_value=True)
@@ -269,13 +351,27 @@ class TestProjectHandlers:
         with pytest.raises(web.HTTPNotFound):
             await api_project_delete(req)
 
-    @pytest.mark.asyncio
-    async def test_stub_endpoints(self):
-        req = _make_request(_make_app())
-        assert json.loads((await api_activities_list(req)).body) == []
-        assert (await api_comment_add(req)).status == 201
-        assert json.loads((await api_comments_list(req)).body) == []
-        assert json.loads((await api_comment_delete(req)).body) == {"ok": True}
+    def test_the_stub_activity_and_comment_routes_are_not_mounted(self):
+        """`/api/activities` and `/api/comments` were placeholders: POST answered
+        201 while saving nothing, and no client called them. They stay unmounted
+        so a request gets the normal 404 instead of a fake success."""
+        from kiro_crew.dashboard.routes import connections
+
+        app = web.Application()
+        connections.register(app)
+        mounted = {
+            (route.method, route.resource.canonical)
+            for route in app.router.routes()
+            if route.resource is not None
+        }
+        for method, path in (
+            ("GET", "/api/activities"),
+            ("GET", "/api/comments"),
+            ("POST", "/api/comments"),
+            ("DELETE", "/api/comments/{id}"),
+        ):
+            assert (method, path) not in mounted
+        assert ("GET", "/api/projects/{id}") in mounted, "fixture mounted nothing"
 
 
 # ── TaskRunner.delete_run ──
@@ -378,7 +474,10 @@ class TestProjectRunAlias:
     async def test_project_run_normalizes(self):
         runner = MagicMock()
         runner.status.return_value = {"running": False, "runs": []}
-        await _handle_run_command("project run status", runner, MagicMock(), "C123", "ts123")
+        reply = await _handle_run_command(
+            "project run status", runner, MagicMock(), "C123", "ts123"
+        )
+        assert reply == "No task running."
         runner.status.assert_called_once()
 
     @pytest.mark.asyncio
@@ -495,7 +594,7 @@ class TestTaskRunnerStatusMcpFilter:
             source="dashboard",
         )
         run.lessons_learned = [
-            "Use token AKIAIOSFODNN7EXAMPLE for the build",
+            f"Use token {github_classic(seed=1)} for the build",
             "A second, clean lesson with no secrets",
         ]
         runner._runs = {"dash1": run}
@@ -509,7 +608,7 @@ class TestTaskRunnerStatusMcpFilter:
         data = json.loads(resp.body)
         lessons = data["runs"][0]["lessons_learned"]
         joined = " ".join(lessons)
-        assert "AKIAIOSFODNN7EXAMPLE" not in joined  # secret scrubbed
+        assert github_classic(seed=1) not in joined  # secret scrubbed
         assert "[REDACTED" in lessons[0]  # redaction marker present
         assert lessons[1] == "A second, clean lesson with no secrets"  # clean text intact, list shape preserved
 

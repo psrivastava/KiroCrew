@@ -3,7 +3,7 @@
 **Local page, not a mirror.** Part of the [crew log reference](README.md), which is
 marked as a named exception in [the Reference index](../README.md).
 
-Fifty types. Read [envelope.md](envelope.md) first for the fields every entry
+Fifty-three types. Read [envelope.md](envelope.md) first for the fields every entry
 carries; this page covers only each type's `data`.
 
 Session entries are written with `src` `gateway` or `acp` and nothing else. They
@@ -14,7 +14,7 @@ failed-turn closer writes `turn/completed` with `gateway` too. Each type's secti
 names its writers.
 
 Every subsection below follows one template: summary, kind and `src`, when written,
-pairing, fields, invariants, example, reader hint, since.
+pairing, fields, invariants, example, reader hint.
 
 ## Summary
 
@@ -48,6 +48,7 @@ The **Emitter** column says whether this build writes the type. Every row below 
 | [`tool/completed`](#toolcompleted) | A tool call's terminal frame. | live | `acp`, `gateway` | closer, by `call_id` |
 | [`approval/requested`](#approvalrequested) | A tool call is waiting on a human. | live | `gateway` | opener of `approval/decided` |
 | [`approval/decided`](#approvaldecided) | How an approval resolved. | live | `gateway` | closer, by `approval_id` |
+| [`approval/bridged`](#approvalbridged) | An action on an approval, taken from a chat app through the notification bridge. | live | `gateway` | none; beside the approval, by `approval_id` |
 | [`model/selected`](#modelselected) | A model swap, and why. | live | `gateway` | — |
 | [`compaction/applied`](#compactionapplied) | A compaction, as context-usage percentages. | live | `gateway` | — |
 | [`plan/updated`](#planupdated) | The session's task list, as just restated. | live | `acp` | — |
@@ -63,12 +64,14 @@ The **Emitter** column says whether this build writes the type. Every row below 
 | [`work/recorded`](#workrecorded) | One work-board mutation: who acted, on which item, and the fields it set. | live | `gateway` | — |
 | [`work/charged`](#workcharged) | One bound worker's charge, relayed by the gateway into the board's own log. | live | `gateway` | — |
 | [`panel/published`](#panelpublished) | One publish of a crew's own webview: the data, and the template that renders it. | live | `gateway` | — |
-| [`dashboard/instance_changed`](#dashboardinstance_changed) | One mate dashboard-instance change: adopted, edited or rolled back. | live | `gateway` | — |
+| [`dashboard/instance_changed`](#dashboardinstance_changed) | One Bot dashboard-instance change: adopted, edited or rolled back. | live | `gateway` | — |
 | [`dashboard/agentic_value`](#dashboardagentic_value) | One agent-written dynamic dashboard value. | live | `gateway` | — |
 | [`dashboard/agentic_refused`](#dashboardagentic_refused) | A refused agentic dashboard write (the mistake book's input), or a correction. | live | `gateway` | — |
-| [`dashboard/goal_recorded`](#dashboardgoal_recorded) | A crewmate's goal record after a change: goals and milestones. | live | `gateway` | — |
-| [`dashboard/waiting_changed`](#dashboardwaiting_changed) | What a crewmate waits on the person for, after it changed. | live | `gateway` | — |
-| [`dashboard/custom_value`](#dashboardcustom_value) | One record a script cron or an installed app appended for a crewmate, stamped with who wrote it. | live | `gateway` | — |
+| [`dashboard/goal_recorded`](#dashboardgoal_recorded) | A Bot's goal record after a change: goals and milestones. | live | `gateway` | — |
+| [`dashboard/waiting_changed`](#dashboardwaiting_changed) | What a Bot waits on the person for, after it changed. | live | `gateway` | — |
+| [`dashboard/custom_value`](#dashboardcustom_value) | One record a script cron or an installed app appended for a Bot, stamped with who wrote it. | live | `gateway` | — |
+| [`dashboard/custom_failed`](#dashboardcustom_failed) | A run of a script cron bound to this Bot ended in error, stamped by the gateway. | live | `gateway` | — |
+| [`dashboard/stale_wake`](#dashboardstale_wake) | The gateway started a turn in this Bot's thread because fields on its page went out of date. | live | `gateway` | — |
 | [`card/proposed`](#cardproposed) | The agent proposed a change card, at this point in the conversation. | live | `gateway` | opener of `card/finished` |
 | [`card/finished`](#cardfinished) | A change card reached a finished status. | live | `gateway` | closer, by `card_id`; may repeat |
 | [`guide/offered`](#guideoffered) | The agent offered a guide, at this point in the conversation. | live | `gateway` | opener of `guide/finished` |
@@ -108,6 +111,7 @@ entry's write is the point the interrupted-turn repair runs.
 | `parent` | object | when `session_create` made this session | The creating session, recorded on the child. | |
 | `parent.slot` | string | required inside `parent` | The creating session's slot key. | |
 | `parent.sid` | string | optional | The creator's ACP session id frozen at mint time; absent when no live handle was available or the retained id was unusable. | |
+| `depth` | int | optional | How many creators stand above this session in the session tree, as the writer could establish it when the log was opened: `0` for a session nobody created (a person's own tab, a fork, a channel conversation), a child's creator's depth plus one. Absent means not established, never zero. A write-time reading: a later `session/adopted` or `session/released` does not change it. | |
 
 **Invariants** — At most one per create and one per re-attach. The session's
 *starting* model rides here rather than in a `model/selected` entry, which records
@@ -136,11 +140,10 @@ applies"; that is what
 [reading-from-an-agent.md](reading-from-an-agent.md) means by a closed target
 staying decidable.
 
-`model_requested` is written from #12017 onward. An entry older than that carries
-no such field whatever the gateway chose, so even the qualified reading of an
-absent field holds only for entries written since. A fold spanning the upgrade must
-read an absent field on an older entry as *unknown*, which is the same misreading
-#12017 exists to remove.
+An entry written before `model_requested` existed carries no such field whatever
+the gateway chose, so even the qualified reading of an absent field holds only for
+entries that can carry it. A fold spanning such older entries reads an absent field
+there as *unknown*.
 
 `previous` never names this same session: a re-attach is the same crew log, and a
 self-edge would make a chain walker revisit the crew log it started from.
@@ -209,8 +212,6 @@ log, reads `previous` off the `status` projection, folds that crew log, and
 repeats. A `null` answer is "no edge to follow", never "there was no earlier crew
 log": retention deletes whole segments off the front, and the edge rides on the
 creating entry.
-
-**Since** — #10091.
 
 ### `session/class`
 
@@ -284,8 +285,6 @@ may land after it.
 **Reader hint** — Do not stop folding here, and do not treat a later entry as
 corruption. Read to the end of the last segment.
 
-**Since** — #10091.
-
 ### `session/unrestored`
 
 This session's tab was listed as open at startup and did not come back.
@@ -314,8 +313,6 @@ something against the set.
 
 **Reader hint** — Read it as "this tab was not shown", never as "this session ended".
 `kept` against `listed` tells a lost working set from one unreadable transcript.
-
-**Since** — #18262.
 
 ### `session/adopted`
 
@@ -352,8 +349,6 @@ states who holds it now.
 `session/adopted` and `session/released`; do not merge them. No fold reads
 `previous_parent`; it is there for a person reading who held the session and when.
 
-**Since** — #12962.
-
 ### `session/released`
 
 This session's parent let it go, so it stands on its own again.
@@ -380,8 +375,6 @@ retraction: it means that entry did not repeat a creator.
 
 **Reader hint** — After this entry the session is a root in the tree until a later
 `session/adopted` says otherwise.
-
-**Since** — #12962.
 
 ### `session/spawned`
 
@@ -414,8 +407,6 @@ entry a gateway restart in between lost the edge.
 own `session/opened` entries names a `parent`. A `session/adopted` or
 `session/released` on the child's log still wins over it.
 
-**Since** — #18341.
-
 ### `turn/started`
 
 A turn was authorized and is about to run.
@@ -431,7 +422,7 @@ stop-before-dispatch gates. A `turn/started` therefore always means the turn ran
 | Field | Type | Required | Meaning | Enum |
 |---|---|---|---|---|
 | `turn` | int | required | Message-boundary ordinal identifying the turn. | |
-| `actor` | string | required | Who caused the turn. An unrecognized value is folded to `other`. | `user`, `app`, `crew`, `cron`, `autonudge`, `subagent`, `gateway`, `other` |
+| `actor` | string | required | Who caused the turn. An unrecognized value is folded to `other`. | `user`, `app`, `crew`, `cron`, `autonudge`, `subagent`, `agent`, `resource`, `gateway`, `other` |
 | `depth` | int | required | Prompt depth. | |
 | `message_seq` | int | optional | `seq` of the causing message entry. Omitted when 0 or unknown. | |
 | `attempt` | int | optional | Which try at this ordinal. Omitted at 1; present and greater than 1 on a rerun of the same ordinal. | |
@@ -445,8 +436,6 @@ stop-before-dispatch gates. A `turn/started` therefore always means the turn ran
 
 **Reader hint** — Key a turn on `(turn, attempt)` rather than `turn` alone, taking
 a missing `attempt` as 1.
-
-**Since** — #10091.
 
 ### `turn/refused`
 
@@ -463,7 +452,7 @@ attracts a repair closer.
 | Field | Type | Required | Meaning | Enum |
 |---|---|---|---|---|
 | `turn` | int | required | Turn ordinal. | |
-| `actor` | string | required | Who caused the turn. Same folding as `turn/started`. | `user`, `app`, `crew`, `cron`, `autonudge`, `subagent`, `gateway`, `other` |
+| `actor` | string | required | Who caused the turn. Same folding as `turn/started`. | `user`, `app`, `crew`, `cron`, `autonudge`, `subagent`, `agent`, `resource`, `gateway`, `other` |
 | `reason` | string | required | Which gate refused. The writer records the caller's value without constraining it. | `not_authorized`, `gateway_closing`, `stopped_before_dispatch`, `replay_superseded_before_dispatch`, `blocked`, `too_large` |
 | `depth` | int | required | Prompt depth. | |
 
@@ -475,8 +464,6 @@ attracts a repair closer.
 
 **Reader hint** — Count refusals separately from turns. Folding them together
 makes a session look busier than it was.
-
-**Since** — #10091.
 
 ### `turn/completed`
 
@@ -529,8 +516,6 @@ that reported it beside it (`usage` serves `turns.credits_reported` and
 `turns.tokens_reported`). Older logs carry `tokens` as four zeros on a closer whose
 provider reported nothing; read that block as absent, as the fold does.
 
-**Since** — #10091.
-
 ### `write/dropped`
 
 One durable account of writer losses, before later entries resume.
@@ -559,8 +544,6 @@ the point it gives up.
 **Reader hint** — This is the one entry that says the record is incomplete. A
 reader reporting on a session should surface it rather than fold it away, and
 should not try to infer *which* facts are missing.
-
-**Since** — #10091.
 
 ## Message, request and step
 
@@ -600,8 +583,6 @@ or split.
 **Reader hint** — Handle both body forms. Reconstruct an overflow body by reading
 the `chunks` seqs in order and concatenating their `delta` values.
 
-**Since** — #10091.
-
 ### `message/sent`
 
 A finished assistant message — one model call's worth of text.
@@ -632,8 +613,6 @@ rides on [`turn/completed`](#turncompleted).
 
 **Reader hint** — Several of these per turn is normal — one per model call. Do not
 treat the first as the turn's answer.
-
-**Since** — #10091.
 
 ### `message/chunk`
 
@@ -666,8 +645,6 @@ citing entry.
 list; a reader that does not understand the type may skip them, which is what
 `ignorable` promises.
 
-**Since** — #10091.
-
 ### `message/queued`
 
 A message arrived while a turn was already running.
@@ -694,8 +671,6 @@ drains.
 
 **Reader hint** — `queued_seq` names a queue slot and must not be resolved as a
 crew log `seq` or fed to a `ref`.
-
-**Since** — #10091.
 
 ### `request/configured`
 
@@ -726,8 +701,6 @@ list is written: with tool search on, the gateway does not receive one.
 
 **Reader hint** — The absence of this entry on a turn means the configuration
 matches the last one recorded, not that it is unknown. Carry the value forward.
-
-**Since** — #10091.
 
 ### `context/composed`
 
@@ -769,8 +742,6 @@ from.
 figures are on [`turn/completed`](#turncompleted). An entry with no `step` is the
 turn's opening composition; attribute it to the turn's first model call.
 
-**Since** — #10091.
-
 ### `context/measured`
 
 What the agent engine measured of a turn: its last model request by category, in
@@ -790,18 +761,16 @@ row.
 |---|---|---|---|---|
 | `turn` | int | required | Turn ordinal. | |
 | `turn_id` | string | optional | The engine's turn id. The same id twice is the same measurement. | |
-| `breakdown` | object | optional | `schema`, `categories` (category name to characters, every category the engine sent), `model_calls`, `total_chars`, `compacted` and `history` (`user`, `assistant`, `thinking`, `compaction_summary`). It describes the turn's LAST model request, not the turn as a whole. `history.user` covers the user text of every turn still in the engine's context. | |
+| `breakdown` | object | optional | `schema`, `categories` (category name to characters, every category the engine sent), `model_calls`, `total_chars`, `compacted` and `history` (`user`, `assistant`, `thinking`, `compaction_summary`); when the engine sent them, also `percent` (category name to its share of the total, in tenths of a percent), `counts` (entries in the agents, skills and powers lists, by category name), `parts` (`category.part` to characters, splitting a category), `window` (`size_tokens`, the model's input window, and `usage_milli`, the backend's usage of it in thousandths of a percent) and `media` (`images`, `image_bytes`, `documents`, `document_bytes`, counted outside `total_chars`). It describes the turn's LAST model request, not the turn as a whole. `history.user` covers the user text of every turn still in the engine's context. | |
 | `ttft` | object | optional | `total_ms` (turn start to first displayed output), and when the engine captured model timing `setup_ms` and `model_ms`. | |
 
-**Invariants** — Every figure in `breakdown` is in characters and describes the turn's last model request. `history.user` covers the user text of every turn still in the engine's context, which is why the `usage` fold keeps Kiro Crew's share as a running sum rather than reading this turn's composition alone.
+**Invariants** — Every figure in `breakdown` describes the turn's last model request, and every figure outside `percent`, `counts`, `window` and `media` is in characters. `history.user` covers the user text of every turn still in the engine's context, which is why the `usage` fold keeps Kiro Crew's share as a running sum rather than reading this turn's composition alone.
 
 ```json
 {"type":"context/measured","seq":14,"time":1789000004100,"src":"gateway","data":{"turn":3,"turn_id":"e-01","breakdown":{"schema":1,"categories":{"history":4000,"toolSpecs":2865},"model_calls":1,"total_chars":6865,"history":{"user":3990,"assistant":5,"thinking":5,"compaction_summary":0}},"ttft":{"total_ms":2870,"setup_ms":59,"model_ms":1534}}}
 ```
 
 **Reader hint** — An absent entry means the engine measured nothing for the turn, never a measurement of zero.
-
-**Since** — #23648.
 
 ### `step/started`
 
@@ -834,8 +803,6 @@ those calls into one step.
 not an exact count: consecutive tool-only calls may share one step. Use `call_index`
 on the tool entries to order every tool call regardless of how the steps fell.
 
-**Since** — #10091.
-
 ### `step/completed`
 
 Closes one model call and records how long it took.
@@ -862,8 +829,6 @@ closer, so a step may be left open by a crash.
 
 **Reader hint** — An open `step/started` with a `turn/completed` after it means the
 turn ended mid-step. That is expected, not damage.
-
-**Since** — #10091.
 
 ## Tool and approval
 
@@ -899,8 +864,6 @@ calls be compared for equality without recording what was passed.
 
 **Reader hint** — `call_id` may be empty, so it is not a safe dictionary key on its
 own. Fall back to `(turn, call_index)`.
-
-**Since** — #10091.
 
 ### `tool/completed`
 
@@ -944,8 +907,6 @@ unmatched completion is a real close rather than a dropped one.
 **Reader hint** — Do not count `unknown` as a failure. Distinguish it from
 `is_error: true`, which is a real reported error.
 
-**Since** — #10091.
-
 ### `approval/requested`
 
 A tool call is waiting on a human.
@@ -978,8 +939,6 @@ so two children's prompts never share an id.
 **Reader hint** — An unmatched request means the process died while a human was
 still deciding.
 
-**Since** — type #10091; written by #11185.
-
 ### `approval/decided`
 
 How an approval resolved.
@@ -1010,7 +969,41 @@ not read it as an unattributed decision.
 **Reader hint** — To count what a person actually approved, filter to entries with
 no `by`.
 
-**Since** — type #10091; written by #11185.
+### `approval/bridged`
+
+An action on an approval, taken from a chat app through the notification bridge.
+
+**Kind and `src`** — `session`; `src` is `gateway`.
+
+**When written** — Once for every action a chat app takes on a bridged approval,
+admitted or refused, by `notifications/bridge_action_audit.audit_action`. Its
+callers are Slack's approval buttons (`slack/interactions_approvals.py`) and the
+chat-reply path of the reply transports (`notifications/bridge_reply.py`).
+
+**Pairing** — None. It sits beside the approval's own entries, matched by
+`approval_id`, and never replaces `approval/decided`: an admitted action resolves
+the decision, and the waiter writes `approval/decided` as it does for any surface.
+
+| Field | Type | Required | Meaning | Enum |
+|---|---|---|---|---|
+| `turn` | int | optional | The turn that asked; absent when unknown. | |
+| `approval_id` | string | required | The same id as the request. | |
+| `transport` | string | required | The chat transport the action came from. | |
+| `outcome` | string | required | What the action did; `approved` and `denied` resolved the decision. | `approved`, `denied`, `expired`, `refused` |
+| `reason` | string | optional | Why the action was not admitted; absent when it was. | `already_answered`, `expired`, `not_owner`, `invalid_choice`, `unknown` |
+| `channel` | string | optional | The source notification channel, when known. | |
+| `actor` | string | optional | Who took the action, on the transport; recorded for a refused stranger too. | |
+| `owner` | string | optional | The verified owner the prompt was bridged to. | |
+
+**Invariants** — At most one entry for an approval has `outcome` `approved` or
+`denied`, and only those two carry no `reason`.
+
+```json
+{"type":"approval/bridged","seq":26,"time":1789000000700,"src":"gateway","data":{"turn":3,"approval_id":"a-1","transport":"slack","outcome":"approved"}}
+```
+
+**Reader hint** — To see refused or expired attempts on an approval, filter to
+entries that carry a `reason`.
 
 ## Model, compaction and plan
 
@@ -1041,8 +1034,6 @@ not written here; it rides on [`session/opened`](#sessionopened).
 **Reader hint** — To know which model served turn N, take the latest
 `model/selected` at or before it, falling back to `session/opened`.
 
-**Since** — #10091.
-
 ### `compaction/applied`
 
 A compaction, recorded as context-usage percentages.
@@ -1071,8 +1062,6 @@ percentages.
 **Reader hint** — A negative `freed_pct` is a real reading, not a bug. Do not clamp
 it to zero.
 
-**Since** — #10091.
-
 ### `plan/updated`
 
 The session's own task list, as the agent just restated it.
@@ -1099,8 +1088,6 @@ greater than `len(items)` means what is written is a prefix.
 
 **Reader hint** — Diff consecutive entries to see progress. Treat an empty `items`
 as "plan cleared", not as "no data".
-
-**Since** — type #10091; written by #11185.
 
 ## Background work and children
 
@@ -1134,8 +1121,6 @@ missing dimension means zero, not unknown.
 **Reader hint** — Add this cost to a session's total separately from
 `turn/completed`; it is real spend that belongs to no turn. Treat `kind` as an open
 set and keep an "other" bucket.
-
-**Since** — type #10091; written by #11185.
 
 ### `subagent/spawned`
 
@@ -1171,8 +1156,6 @@ no task line for it rather than an empty one.
 **Reader hint** — A missing `turn` is normal and does not mean the entry is
 damaged. Group children by `agent_id`, not by turn.
 
-**Since** — type #10091; written by #11185; `task` added by #16386.
-
 ### `subagent/steered`
 
 A correction sent into a running child.
@@ -1196,8 +1179,6 @@ none of its own.
 ```
 
 **Reader hint** — Several of these may sit between one spawn and its close.
-
-**Since** — type #10091; written by #11185.
 
 ### `subagent/dismissed`
 
@@ -1229,8 +1210,6 @@ dismissal does not change what the session dispatched or what it spent, so a spe
 figure that fell when someone tidied the panel would be wrong. The flag does not come
 back off: the log does not un-record an act.
 
-**Since** — #16386.
-
 ### `subagent/completed`
 
 A child finished its work.
@@ -1246,6 +1225,7 @@ A child finished its work.
 | `agent_id` | string | required | The child's id. | |
 | `ms` | int | optional | Elapsed time. Omitted at 0. | |
 | `credits` | number | optional | What the child billed, cumulative across every attempted turn. Positive and finite; absent when the run was unmetered. | |
+| `child_sid` | string | optional | The session the child last ran in (an earlier attempt's when a recovery got none), for finding its transcript after `result.txt` is pruned. Absent when the run never got a session, and on the crash-repair closer. | |
 
 **Invariants** — Carries no `tokens`: the subagent runtime does not measure them.
 An absent `credits` means the provider reported no credit spend, not a free run.
@@ -1256,8 +1236,6 @@ An absent `credits` means the provider reported no credit spend, not a free run.
 
 **Reader hint** — Attribute child cost from `credits` when it is present; never
 derive tokens from it.
-
-**Since** — type #10091; written by #11185.
 
 ### `subagent/failed`
 
@@ -1279,6 +1257,7 @@ rather than closed on a guess.
 | `reason` | string | optional | Redacted, clipped failure reason. | |
 | `ms` | int | optional | Elapsed time. Omitted at 0. | |
 | `credits` | number | optional | What the child billed before it stopped, cumulative across every attempted turn. Positive and finite; absent when the run was unmetered. | |
+| `child_sid` | string | optional | The session the child last ran in (an earlier attempt's when a recovery got none), for finding its transcript after `result.txt` is pruned. Absent when the run never got a session, and on the crash-repair closer. | |
 
 **Invariants** — This one type covers both non-success outcomes; `outcome` is what
 separates them. Like `subagent/completed`, it carries no `tokens`.
@@ -1289,8 +1268,6 @@ separates them. Like `subagent/completed`, it carries no `tokens`.
 
 **Reader hint** — A spawn with no close at all means the parent died while the
 child was running and no liveness predicate was available.
-
-**Since** — type #10091; written by #11185.
 
 ## The session ledger
 
@@ -1334,8 +1311,6 @@ rather than keeping a document of its own.
 ran under; a later entry's set fields overwrite an earlier one's, and an omitted
 field leaves the folded value unchanged.
 
-**Since** — #11185.
-
 ## Observed objects
 
 ### `object/observed`
@@ -1357,7 +1332,7 @@ another is recorded even though the engine delivered nothing for it.
 
 | Field | Type | Required | Meaning | Enum |
 |---|---|---|---|---|
-| `producer` | string | required | Which mechanism made the observation. Closed: the emitter refuses a value outside the vocabulary instead of coercing it, so a reader can tell a measured record from a sentence an agent typed. `probe` is the structured monitor's provider probe. | `probe` |
+| `producer` | string | required | Which mechanism made the observation. Closed: the emitter refuses a value outside the vocabulary instead of coercing it, so a reader can tell a measured record from a sentence an agent typed. `probe` is the structured monitor's provider probe, `warm_brief` the warm welcome's pull-request read. | `probe`, `warm_brief` |
 | `kind` | string | required | The monitored kind of the subject, as the monitoring registry names it — `github_pull_request`, `gitlab_merge_request`, and so on. Passed through from the armed monitor, which validated it at arm time. | |
 | `target` | string | required | The subject's full URL, exactly as the monitor was armed on it. | |
 | `fingerprint` | string | required | The probe's own dedupe digest of the facts it acts on. An entry is written only when this differs from the previous observation's, so consecutive entries for one subject are consecutive DISTINCT states. | |
@@ -1382,8 +1357,6 @@ state; an entry's `facts` is complete in itself, so nothing needs to be folded a
 entries. Read `state`, `mergeability`, `review_decision` and the `checks` buckets off
 `facts` for a review subject, and treat a member that is absent or listed in
 `facts_omitted` as unknown, never as its default.
-
-**Since** — the producer half of #12397.
 
 ## The Issue Radar crew ledger
 
@@ -1462,8 +1435,6 @@ once; an item that legitimately returns to identical fields after intervening up
 is a new update and applies. An entry naming a `crew_id` other than
 the fold's first is left out: every unit of one slot belongs to one crew.
 
-**Since** — #12303.
-
 ## The work board
 
 ### `work/recorded`
@@ -1473,8 +1444,8 @@ One work-board mutation: who acted, on which item, and the fields it set.
 **Kind and `src`** — `session`; `src` is `gateway`.
 
 **When written** — One entry per work-ledger write, appended to the ACTING
-session's log: a conductor action (`work_ledger_record`) or a worker report
-(`work_report`). A worker report is written a second time into the conductor's own
+session's log: a conductor action (`work_ledger_record`), a worker report
+(`work_report`), or a person's steer typed into a worker. A worker report is written a second time into the conductor's own
 log, and the gateway relays a sub-board's entries into its parent board's log (with
 `relay` set). The `work` fold rebuilds the board from the conductor's own units
 alone, so the ledger's files are a cache of the log rather than a record beside it;
@@ -1485,9 +1456,9 @@ the routes still read that cache.
 | Field | Type | Required | Meaning | Enum |
 |---|---|---|---|---|
 | `slot` | string | required | The board's key: the conductor slot this mutation belongs to. A worker's report names the conductor's slot, not its own, so one board folds under one key whichever party wrote the entry. | |
-| `actor` | string | required | Which party wrote this entry. The field sets the two may set are disjoint. | `conductor`, `worker` (closed) |
+| `actor` | string | required | Which party wrote this entry. The field sets a conductor and a worker may set are disjoint; a `person` entry is a steer and sets no field. | `conductor`, `worker`, `person` (closed) |
 | `by` | string | required | The acting session's slot key: equal to `slot` for a conductor entry, the bound worker's key for a report. | |
-| `action` | string | required | The one mutation this entry records. The fields below are the ones that action set; an omitted field means unchanged. | `create`, `goal`, `bind`, `decide`, `verdict`, `close`, `accept`, `report` (closed) |
+| `action` | string | required | The one mutation this entry records. The fields below are the ones that action set; an omitted field means unchanged. | `create`, `goal`, `bind`, `decide`, `verdict`, `close`, `accept`, `ask`, `report`, `steer`, `retire`, `destroy` (closed) |
 | `item_id` | string | optional | The item acted on. Absent only for `goal`, the board-level header write. | |
 | `goal` | string | optional | The board's objective, when `goal` set one. | |
 | `round` | int | optional | The board's or the item's round counter, when set. | |
@@ -1500,25 +1471,36 @@ the routes still read that cache.
 | `verdict` | string | optional | The acceptance verdict, set by `verdict`. | `pass`, `fail`, `pending`, `refused`, `error` (closed) |
 | `decision` | string | optional | The conductor's decision text, set by `decide`. | |
 | `worker_session_key` | string | optional | The worker slot bound to the item, set by `bind`. | |
+| `worker_instance_id` | string | optional | The remote crew the bound worker runs on, set by a remote `bind` beside `worker_session_key` (then the peer's slot key). | |
+| `retired_bindings` | array of object | optional | The remote bindings the hub retired, oldest first, set by `retire` and `destroy`. Each holds the pair, its branch, state (retired or destroyed), reason and stamps; `retire` logs the pair as empty when it left the item unbound. | |
 | `fails` | int | optional | The item's failed-verdict count, when it moved. | |
 | `status` | string | optional | The worker's status, set by `report`. | `progress`, `done`, `blocked`, `question`, `reply` (closed) |
+| `reason` | string | optional | Why a `blocked` or `question` report waits on a person, set by `report`. A report without it clears the item's reason. | `approval`, `needs_human` (closed) |
+| `wake_at` | string | optional | When a `progress` report's worker will resume, set by `report`. A report without it clears the item's `wake_at`. | |
+| `discussion` | object | optional | Where a discussion the worker hosts stands, set by report: phase, round, minutes, direction, agreed, disputed, checking, recent and thread, checked for shape by the fold. A report without it clears the item's discussion. | |
 | `summary` | string | optional | The worker's summary, set by `report`. | |
 | `artifacts` | object | optional | String-to-string pointers replacing the item's map, set by `report`. The members are the worker's own keys and are checked for shape. | |
 | `pr` | int | optional | The pull request number, set by `report`. | |
 | `event` | string | optional | The one-line item event this mutation appends to the item's tail. | |
-| `event_kind` | string | optional | Which kind of item event this is. Absent only for `goal`. | `create`, `bind`, `report`, `decision`, `verdict`, `close` (closed) |
+| `event_kind` | string | optional | Which kind of item event this is. Absent only for `goal`. | `create`, `bind`, `report`, `decision`, `verdict`, `close`, `steer`, `retire`, `destroy`, `ask` (closed) |
 | `event_id` | string | optional | The store's content-addressed id of the event this write appended. | |
 | `event_ts` | string | optional | The store's stamp on that event. | |
 | `created_at` | string | optional | The item's committed creation stamp, carried by `create`. | |
 | `last_report_at` | string | optional | The item's committed last-report stamp, carried by `report`. | |
+| `received_at` | string | optional | On a report the hub ingested from a remote peer: the hub's clock when it filed it (`last_report_at` is then the peer's stamp). The quiet-window rules measure from it. A report without it clears the item's `received_at`. | |
 | `closed_at` | string | optional | The item's committed close stamp, carried by `close`. | |
+| `decided_at` | string | optional | The item's committed decide stamp, carried by `decide`. | |
 | `pending_since` | string | optional | When the item's run of `pending` verdicts began, carried by a `pending` `verdict`. Any other verdict, or an `accept`, clears it. | |
+| `ask` | object | optional | What the item needs from the person, set by `ask`: `{what, why, options: [{label, outcome}], pick, pick_why, written_at}`, `written_at` the store's stamp. `decide` and `close` clear it without logging the field. | |
 | `board_round` | int | optional | The board's committed round, carried by a baseline entry. | |
 | `board_created_at` | string | optional | The board's committed creation stamp, carried by a baseline entry. | |
 | `goal_version` | int | optional | The header's goal-write count after this write, set by `goal`. | |
 | `baseline` | bool | optional | `true` when the entry carries the WHOLE committed item rather than a delta. | |
 | `board_copy` | bool | optional | True on the copy of a worker's report the gateway wrote into the board's own log. A report without it is a worker-log copy, which the rebuild's join of worker logs never lets undo a board copy. | |
 | `mirror` | bool | optional | True on the worker's own copy of a report whose board copy landed. The work and worktree folds skip it (the board copy is the record); the workers fold reads it as the worker's own report. | |
+| `peer_event_id` | string | optional | On a report the hub ingested from a remote peer: the peer's own id for that report event, verbatim (also the entry's `event_id`). The work fold files each peer event id once per binding and derives where ingest stands from the ids it holds. | |
+| `peer_seen` | array[string] | optional | On an ingested peer report: peer ids before it the hub passes over for good (reports that can never file, or, on a binding filed before peer ids were kept, the reports filed then). The work fold holds them as filed. | |
+| `peer_skipped` | int | optional | On an ingested peer report: places before it in the peer's reports the hub could not file. A peer log that rolled past where ingest stood counts one; a report that can never file counts one. | |
 | `relay` | string | optional | Set on a copy relayed up from a sub-board's log into its parent board's log: the origin entry as `<unit>:<seq>`. | |
 
 **Invariants** — A delta: only the fields the one `action` set are present,
@@ -1550,8 +1532,6 @@ and `board_created_at`.
 first, keyed by `item_id`. A bound worker's report reaches them as the board's own
 copy; an open bound item with no report there yet is waiting for the worker's next
 report. A sub-board's entries arrive with `relay` set and their own `slot`.
-
-**Since** — #12314.
 
 ### `work/charged`
 
@@ -1644,17 +1624,15 @@ publish" is answered by the durable `crew-panels/<slug>.json`, not here: the app
 best-effort, so a publish whose entry never landed leaves the fold with no record while
 the file still serves that crew's panel.
 
-**Since** — #13440.
-
 ## The dynamic dashboard
 
-A crewmate's Dashboard tab: its own copy of a template, the values it writes into
-that copy, and the writes that were refused. All three land on the crewmate's own
+A Bot's Dashboard tab: its own copy of a template, the values it writes into
+that copy, and the writes that were refused. All three land on the Bot's own
 DM session log and fold under its slot.
 
 ### `dashboard/instance_changed`
 
-One accepted change to a crewmate's own dynamic dashboard.
+One accepted change to a Bot's own dynamic dashboard.
 
 **Kind and `src`** — `session`; `src` is `gateway`.
 
@@ -1667,7 +1645,7 @@ the file is the record of the current page, and this entry is its history.
 
 | Field | Type | Required | Meaning | Enum |
 |---|---|---|---|---|
-| `slug` | string | required | Whose dashboard changed, so one entry names its crewmate without resolving the slot. | |
+| `slug` | string | required | Whose dashboard changed, so one entry names its Bot without resolving the slot. | |
 | `instance_version` | integer | required | The instance's own counter after this change. Never the template's version. | |
 | `action` | string | required | What the change was. Closed: the store clamps it to this list. | `adopted`, `edited`, `rolled_back` |
 | `template_id` | string | required | Id of the template this instance was copied from. | |
@@ -1687,11 +1665,9 @@ construction. The instance's history is a fold over these entries.
 **Reader hint** — Read the current page from the instance file, not from here. A
 change with the log off still succeeds, so a missing entry is not a missing change.
 
-**Since** — #17507.
-
 ### `dashboard/agentic_value`
 
-One agentic dashboard value the crewmate wrote, already type-checked.
+One agentic dashboard value the Bot wrote, already type-checked.
 
 **Kind and `src`** — `session`; `src` is `gateway`.
 
@@ -1719,8 +1695,6 @@ re-checks `v` against `type`, because these are bytes off a file.
 
 **Reader hint** — Unwrap `value.v`. Compare `instance_version` with the instance's
 current one to spot a value written for a field set since edited away.
-
-**Since** — #17507.
 
 ### `dashboard/agentic_refused`
 
@@ -1752,18 +1726,20 @@ correction carries `code` `corrected` and `corrects`.
 **Reader hint** — Branch on `code`, not on whether `corrects` is present. Read the
 `mistakes` fold, not the raw entries, to get each group's latest correction.
 
-**Since** — #17507.
+## A Bot's own record
 
-## A crewmate's own record
-
-Two snapshots the gateway appends to a crewmate's own DM session log so its
-Dashboard page can bind them (`dashboard/crewmate_feed.py`). Each replaces the
+Two snapshots the gateway appends to a Bot's own DM session log so its
+Dashboard page can bind them (`dashboard/crewmate_feed.py`): `dashboard/goal_recorded`
+and `dashboard/waiting_changed`. Each replaces the
 last one whole in its slot fold, so a page reading it moves when the fact does,
-with no value the crewmate typed.
+with no value the Bot typed. The same log also takes the records a script cron or
+an installed app writes for the Bot (`dashboard/custom_value`), a bound script
+cron's failed run (`dashboard/custom_failed`), and the gateway's stale-field wake
+(`dashboard/stale_wake`).
 
 ### `dashboard/goal_recorded`
 
-Kind `session`, `src` `gateway`. Written after every write of the crewmate's goal
+Kind `session`, `src` `gateway`. Written after every write of the Bot's goal
 record (a goal set, milestones applied, a reading recorded), through
 `member_goals.add_change_listener`, and only when it differs from the last one
 recorded for that thread. A write while the thread has no live session (an idle
@@ -1773,7 +1749,7 @@ the thread's next growth, when its session is known. Folded as `goal`.
 | field | type | notes |
 | --- | --- | --- |
 | `goals` | array of `{text}` | the goals, in the record's order |
-| `milestones` | array of `{text, target, current, at}` | `current` is the reading the crewmate last recorded with `key_result_progress` and `at` its time; whether the target is reached is the crewmate's own word in that reading, not judged by the gateway; at most `CREWMATE_ROW_LIMIT` rows |
+| `milestones` | array of `{text, target, current, at}` | `current` is the reading the Bot last recorded with `key_result_progress` and `at` its time; whether the target is reached is the Bot's own word in that reading, not judged by the gateway; at most `CREWMATE_ROW_LIMIT` rows |
 | `goals_total` | integer | how many goals the record holds in all |
 | `milestones_total` | integer | how many milestones the record holds in all |
 
@@ -1785,7 +1761,7 @@ the thread's next growth, when its session is known. Folded as `goal`.
 
 Kind `session`, `src` `gateway`. Written when the list
 `dashboard.member_waiting.waiting_items` reads off the thread differs from the
-last one recorded, checked after each growth of the crewmate's DM log (a reply,
+last one recorded, checked after each growth of the Bot's DM log (a reply,
 an `[OPTIONS]` chip, a card raised or pressed, a turn ending). Folded as
 `waiting`.
 
@@ -1800,16 +1776,17 @@ an `[OPTIONS]` chip, a card raised or pressed, a turn ending). Folded as
 
 ### `dashboard/custom_value`
 
-Kind `session`, `src` `gateway`. Written when a script cron bound to this crewmate
+Kind `session`, `src` `gateway`. Written when a script cron bound to this Bot
 calls `ctx.crew_log_append(type, data)`, through
 `POST /api/agent-panel/dashboard/record` (`dashboard/handlers/agent_panel_record.py`),
 or when an installed app holding the `/api/member-records/*` grant posts to
 `POST /api/member-records/<slug>` (`dashboard/handlers/agent_panel_record_app.py`); both
-routes hand the record to the same append. The body carries `type` and `data` only;
+routes hand the record to the same append. The body carries `type`, `data` and an
+optional `max_age_s` only;
 `writer`, `member` and `crew_key` are stamped by the gateway from the caller's attested
 identity (the job's scope, or the token's app claim), so neither a script nor an app can
-choose who it writes as. A job bound to no crewmate is refused; an app names the
-crewmate in the path and is refused for a slug no crewmate has or two share. An app's
+choose who it writes as. A job bound to no Bot is refused; an app names the
+Bot in the path and is refused for a slug no Bot has or two share. An app's
 `type` is stored as `<app id with - as _>__<type>`, one bindable path segment that
 splits one way, so two apps never share a key and `__` is refused in every caller's
 type. Folded as
@@ -1822,11 +1799,52 @@ as text, and nothing frames it as an instruction to an agent.
 | `type` | string | the record type the writer named (for an app, `<app id with - as _>__<type>`): one plain name without `__`, at most `CUSTOM_TYPE_NAME_LIMIT` characters |
 | `data` | object | the record, at most `CUSTOM_RECORD_BYTES` serialized and `CUSTOM_RECORD_DEPTH` deep; its members are the writer's own |
 | `writer` | string | `cron:<job id>` or `app:<app id>`, stamped by the gateway |
-| `member` | string | the slug of the crewmate written for (the job's binding, or the app route's path), stamped by the gateway |
-| `crew_key` | string | digest of that crewmate's exact name, for ownership on a shared slot |
+| `member` | string | the slug of the Bot written for (the job's binding, or the app route's path), stamped by the gateway |
+| `crew_key` | string | digest of that Bot's exact name, for ownership on a shared slot |
+| `max_age_s` | integer | optional; how many seconds the writer says the record stays current, `CUSTOM_MAX_AGE_MIN_S` to `CUSTOM_MAX_AGE_MAX_S`; the fold renders `stale_after` from the entry's own `time` plus this |
 
 ```json
 {"type":"dashboard/custom_value","seq":96,"time":1789000004500,"src":"gateway","data":{"type":"build_health","data":{"green":41,"red":2},"writer":"cron:nightly-build","member":"conductor","crew_key":"04b27504d7cf4733ace180d2bd7123c36aebb36fcfdb2aebc6525affd6383c02"}}
+```
+
+### `dashboard/custom_failed`
+
+Kind `session`, `src` `gateway`. Written by the gateway's scheduler
+(`slack/gateway_runtime/cron_fire.py` through `agent_panel_record.record_cron_failure`)
+when a run of a script cron bound to this Bot ends with `last_status` `error`: an
+exception, a refused `ctx.crew_log_append` (`quota_exceeded` among them), a timeout or a
+denial. Best-effort: a Bot with no crew log yet gets none. No script can write one,
+because the record route only appends `dashboard/custom_value`. Folded by `custom`: each
+latest record the same `writer` wrote before it gains `failed_at` and `last_error`, until
+that writer's next record replaces the row, and `custom.failures` lists the writer.
+
+| field | type | notes |
+| --- | --- | --- |
+| `writer` | string | `cron:<job id>`, from the scheduler's own record of the job |
+| `error` | string | the run's `last_error`, redacted and cut to `CUSTOM_ERROR_LIMIT` characters |
+| `member` | string | the slug of the Bot the job is bound to |
+| `crew_key` | string | digest of that Bot's exact name |
+
+```json
+{"type":"dashboard/custom_failed","seq":97,"time":1789000004600,"src":"gateway","data":{"writer":"cron:nightly-build","error":"crew_log_append() failed: this cron job has sent 30 records in the last minute; wait before sending more","member":"conductor","crew_key":"04b27504d7cf4733ace180d2bd7123c36aebb36fcfdb2aebc6525affd6383c02"}}
+```
+
+### `dashboard/stale_wake`
+
+Kind `session`, `src` `gateway`. Written by the gateway (`dashboard/stale_wake.py`,
+preview `dashboard_stale_wake`) right after it starts a hidden turn in this Bot's thread
+because agentic fields on its page went out of date. Best-effort: a Bot with no crew log
+yet gets none. No fold reads it; it is the record of a model turn no one typed, for a
+reader adding up what wakes cost.
+
+| field | type | notes |
+| --- | --- | --- |
+| `actor` | string | always `gateway` |
+| `reason` | string | `stale_fields` |
+| `fields` | array of string | the field names the turn asks the Bot to write again, sorted |
+
+```json
+{"type":"dashboard/stale_wake","seq":98,"time":1789000004700,"src":"gateway","data":{"actor":"gateway","reason":"stale_fields","fields":["headline","open_risks"]}}
 ```
 
 ## Change cards and guides
@@ -1873,8 +1891,6 @@ nothing here.
 outcome is the newest `card/finished` with the same `card_id`, and a card with none
 is still open (or its closer was not written).
 
-**Since** — the change that moved change cards into the conversation.
-
 ### `card/finished`
 
 A change card reached a finished status.
@@ -1904,8 +1920,6 @@ from the page.
 
 **Reader hint** — Take the newest entry per `card_id` as the outcome.
 
-**Since** — the change that moved change cards into the conversation.
-
 ### `guide/offered`
 
 The agent offered a guide, at this point in the conversation.
@@ -1932,8 +1946,6 @@ the append of the offer's transcript row.
 **Reader hint** — Draw the offer at its `mid`; its outcome is the `guide/finished`
 with the same `guide_id`.
 
-**Since** — the change that moved change cards into the conversation.
-
 ### `guide/started`
 
 The person started an offered guide.
@@ -1955,8 +1967,6 @@ Start. A tab re-claiming after its lease lapsed is not a second start.
 
 **Reader hint** — Its absence before a `guide/finished {cancelled}` means the
 person dismissed the offer without starting it.
-
-**Since** — the change that moved change cards into the conversation.
 
 ### `guide/finished`
 
@@ -1980,8 +1990,6 @@ A guide ended.
 
 **Reader hint** — A guide finishes once; the store holds no terminal-to-terminal
 transition.
-
-**Since** — the change that moved change cards into the conversation.
 
 ## Removed types
 

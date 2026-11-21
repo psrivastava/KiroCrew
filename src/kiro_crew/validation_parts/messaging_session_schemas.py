@@ -11,6 +11,7 @@ module never imports that facade.
 from __future__ import annotations
 
 import re
+import string
 from typing import Any
 
 from kiro_crew.config.sections import AUTOCOMPACT_PCT_MAX, AUTOCOMPACT_PCT_MIN
@@ -20,6 +21,7 @@ from kiro_crew.constants import (
     SLACK_NAMESPACE,
     WAIT_TOOL_MAX_SECS,
 )
+from kiro_crew.instances.crew_ref import MAX_CREW_REF_LEN
 from kiro_crew.validation_parts.artifact_schemas import _ARTIFACT_FOLDER_REF_MAX
 from kiro_crew.validation_parts.field_engine import FieldSpec, ToolSchema, ValidationError
 from kiro_crew.validation_parts.input_bounds import (
@@ -30,6 +32,7 @@ from kiro_crew.validation_parts.input_bounds import (
     MAX_BROADCAST_TARGETS,
     MAX_LONG_STRING,
     MAX_MEDIUM_STRING,
+    SLACK_THREAD_TS_RE,
     USER_ID_RE,
     USER_MAX_LEN,
 )
@@ -132,6 +135,7 @@ SEND_MESSAGE_SCHEMA = ToolSchema(
         FieldSpec("channel_type", str, max_len=16, pattern=re.compile(r"^[a-z]+$")),
         FieldSpec("target_id", str, max_len=512, pattern=_TARGET_ID_RE),
         FieldSpec("title", str, max_len=MAX_SHORT_STRING),
+        FieldSpec("format", str, max_len=16, pattern=re.compile(r"^(plain|markdown)$")),
         FieldSpec("blocks", list, item_type=dict, max_items=50),
         FieldSpec("channel", str, max_len=CHANNEL_MAX_LEN, pattern=CHANNEL_ID_RE),
         FieldSpec("user", str, max_len=USER_MAX_LEN, pattern=USER_ID_RE),
@@ -183,6 +187,7 @@ SEND_NOTIFICATION_SCHEMA = ToolSchema(
         # is the cheap first gate (must start with '/', not '//').
         FieldSpec("url", str, max_len=500, pattern=re.compile(r"^/(?!/)\S*$")),
         FieldSpec("group_key", str, max_len=MAX_SHORT_STRING),
+        FieldSpec("key", str, max_len=MAX_SHORT_STRING),
         # Inline actions (Phase 4 contract). Item cap mirrors the bus's
         # _MAX_ACTIONS (4); per-item shape ({id,label,url?}, length caps,
         # internal-path url) is validated by NotificationPayload at the
@@ -192,10 +197,25 @@ SEND_NOTIFICATION_SCHEMA = ToolSchema(
     ],
 )
 
+DISMISS_NOTIFICATION_SCHEMA = ToolSchema(
+    tool_name="dismiss_notification",
+    fields=[FieldSpec("key", str, required=True, max_len=MAX_SHORT_STRING)],
+)
+
 READ_SLACK_PROFILE_SCHEMA = ToolSchema(
     tool_name="read_slack_profile",
     fields=[
         FieldSpec("user", str, required=True, max_len=USER_MAX_LEN, pattern=USER_ID_RE),
+    ],
+)
+
+READ_SLACK_HISTORY_SCHEMA = ToolSchema(
+    tool_name="read_slack_history",
+    fields=[
+        FieldSpec("channel", str, required=True, max_len=CHANNEL_MAX_LEN, pattern=CHANNEL_ID_RE),
+        FieldSpec("thread_ts", str, max_len=30, pattern=SLACK_THREAD_TS_RE),
+        FieldSpec("oldest", str, max_len=30, pattern=SLACK_THREAD_TS_RE),
+        FieldSpec("limit", int, min_val=1, max_val=100),
     ],
 )
 
@@ -205,6 +225,11 @@ WAIT_SCHEMA = ToolSchema(
         FieldSpec("seconds", int, required=True, min_val=60, max_val=WAIT_TOOL_MAX_SECS),
         FieldSpec("reason", str, required=True, max_len=MAX_SHORT_STRING),
     ],
+)
+
+MCP_SERVER_WAIT_SCHEMA = ToolSchema(
+    tool_name="mcp_server_wait",
+    fields=[FieldSpec("server", str, required=True, max_len=MAX_SHORT_STRING)],
 )
 
 REGISTER_HOOK_SCHEMA = ToolSchema(
@@ -288,6 +313,22 @@ KNOWLEDGE_ADD_DOCUMENT_SCHEMA = ToolSchema(
 # ISO calendar date (YYYY-MM-DD) for the chat-history date filters.
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
+# Remote-crew scope selector for the read tools: a registered instance id or
+# display NAME. The registry accepts arbitrary display names (spaces, Unicode),
+# so the pattern must too — a tight [A-Za-z0-9_.-] set silently broke crew=<name>
+# for an ordinary name. It only bars control characters. The value is
+# url-encoded onto the proxy leg and used for an EXACT registry match (an unknown
+# value 404s), never interpolated into a path, and never echoed in a response body.
+#
+# Bounded at MAX_SHORT_STRING, the same limit SELECT_CREW_SCHEMA's own ``crew``
+# field uses, because ``Instance.validate`` enforces NO length cap at all — it
+# requires only a non-empty name (registry.py) — so any shorter bound here refuses
+# a crew the operator can see in the roster. A tighter 64 did exactly that. This
+# is a TRANSPORT bound (the value rides a proxy query leg), not a semantic one:
+# the deny-by-default gate is the exact registry match, which 404s an unknown
+# crew rather than degrading to a wider read.
+_CREW_RE = re.compile(rf"^[^\x00-\x1f\x7f]{{1,{MAX_SHORT_STRING}}}$")
+
 SEARCH_CHAT_HISTORY_SCHEMA = ToolSchema(
     tool_name="search_chat_history",
     fields=[
@@ -296,8 +337,21 @@ SEARCH_CHAT_HISTORY_SCHEMA = ToolSchema(
         FieldSpec("before", str, required=False, max_len=10, pattern=_ISO_DATE_RE),
         FieldSpec("after", str, required=False, max_len=10, pattern=_ISO_DATE_RE),
         FieldSpec("all_workspaces", bool, required=False, default=False),
+        FieldSpec("crew", str, required=False, max_len=MAX_SHORT_STRING, pattern=_CREW_RE),
     ],
 )
+
+#: The characters a transcript tool row's ``meta.tool_call_id`` (``toolu_...``) uses.
+_TOOL_CALL_ID_CHARS = frozenset(string.ascii_letters + string.digits + "_.:-")
+
+
+def _validate_get_chat_session(args: dict[str, Any]) -> None:
+    tool_call_id = args.get("tool_call_id")
+    if tool_call_id is None:
+        return
+    if not tool_call_id or any(ch not in _TOOL_CALL_ID_CHARS for ch in tool_call_id):
+        raise ValidationError("tool_call_id", "must be letters, digits, '_', '.', ':' or '-'")
+
 
 GET_CHAT_SESSION_SCHEMA = ToolSchema(
     tool_name="get_chat_session",
@@ -305,7 +359,10 @@ GET_CHAT_SESSION_SCHEMA = ToolSchema(
         FieldSpec("session_key", str, required=True, max_len=MAX_SHORT_STRING),
         FieldSpec("max_messages", int, required=False, min_val=1, max_val=200, default=50),
         FieldSpec("all_workspaces", bool, required=False, default=False),
+        FieldSpec("crew", str, required=False, max_len=MAX_SHORT_STRING, pattern=_CREW_RE),
+        FieldSpec("tool_call_id", str, required=False, max_len=MAX_SHORT_STRING),
     ],
+    custom_validator=_validate_get_chat_session,
 )
 
 LIST_SESSIONS_SCHEMA = ToolSchema(
@@ -314,6 +371,7 @@ LIST_SESSIONS_SCHEMA = ToolSchema(
         FieldSpec("limit", int, required=False, min_val=1, max_val=100, default=20),
         FieldSpec("all_workspaces", bool, required=False, default=False),
         FieldSpec("summarize", bool, required=False, default=False),
+        FieldSpec("crew", str, required=False, max_len=MAX_SHORT_STRING, pattern=_CREW_RE),
     ],
 )
 
@@ -355,6 +413,10 @@ SESSION_CREATE_SCHEMA = ToolSchema(
         # crewmate's", which an empty string would also read as, so the
         # schema leaves absence to the handler rather than spelling it.
         FieldSpec("reasoning_effort", str, required=False, max_len=32),
+        # The harness (ACP backend) the new session runs on, spelled the way
+        # ``spawn_run.backend`` spells it (``kiro``, ``claude``, ``codex``, ...).
+        # The route refuses one that cannot start here; this only bounds it.
+        FieldSpec("backend", str, required=False, max_len=MAX_SHORT_STRING),
         # The new session's own compaction threshold, the override the context
         # meter's "Auto-compact at" slider sets. This range check is the early
         # refusal; create_session repeats it with the NaN guard, because the HTTP
@@ -366,6 +428,23 @@ SESSION_CREATE_SCHEMA = ToolSchema(
             min_val=AUTOCOMPACT_PCT_MIN,
             max_val=AUTOCOMPACT_PCT_MAX,
         ),
+        # ``crew=`` (rfc-conductor-remote-dispatch.md): a remote crew's instance id
+        # or exact name. Accepted here whatever ``work_ledger.remote_dispatch`` says,
+        # so the gateway answers a call carrying it with the typed
+        # ``remote_dispatch_disabled`` rather than this schema's unknown-field error.
+        # No default: absence is what keeps a call local.
+        FieldSpec("crew", str, required=False, max_len=MAX_CREW_REF_LEN),
+        # ``work_item`` (wave 4): with ``crew`` only, the caller's own item the crew
+        # session is born bound to. The gateway refuses it without ``crew``.
+        FieldSpec("work_item", str, required=False, max_len=16),
+        # ``requires`` (rfc-conductor-remote-dispatch.md §2b): with ``crew`` or a
+        # placed ``work_item`` only, the tags and logins a crew must advertise. The
+        # gateway checks its shape (``remote_placement.parse_requires``).
+        FieldSpec("requires", dict, required=False),
+        # The new session's first turn, delivered in the same call so the caller
+        # never has to send to a key it has not read back yet. Bounded exactly as
+        # ``session_send.message`` is; the route repeats that bar before creating.
+        FieldSpec("message", str, required=False, max_len=MAX_LONG_STRING),
     ],
 )
 
@@ -389,6 +468,12 @@ SESSION_STOP_SCHEMA = ToolSchema(
     tool_name="session_stop",
     fields=[
         FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
+        # ``crew=`` (rfc-conductor-remote-dispatch.md): a remote crew's instance id
+        # or exact name. Accepted here whatever ``work_ledger.remote_dispatch`` says,
+        # so the gateway answers a call carrying it with the typed
+        # ``remote_dispatch_disabled`` rather than this schema's unknown-field error.
+        # No default: absence is what keeps a call local.
+        FieldSpec("crew", str, required=False, max_len=MAX_CREW_REF_LEN),
     ],
 )
 
@@ -479,10 +564,24 @@ SESSION_SET_COLOR_SCHEMA = ToolSchema(
     ],
 )
 
+SESSION_SET_NOTE_SCHEMA = ToolSchema(
+    tool_name="session_set_note",
+    fields=[
+        FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
+        FieldSpec("note", str, required=True, max_len=MAX_LONG_STRING),
+    ],
+)
+
 SESSION_CLOSE_SCHEMA = ToolSchema(
     tool_name="session_close",
     fields=[
         FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
+        # ``crew=`` (rfc-conductor-remote-dispatch.md): a remote crew's instance id
+        # or exact name. Accepted here whatever ``work_ledger.remote_dispatch`` says,
+        # so the gateway answers a call carrying it with the typed
+        # ``remote_dispatch_disabled`` rather than this schema's unknown-field error.
+        # No default: absence is what keeps a call local.
+        FieldSpec("crew", str, required=False, max_len=MAX_CREW_REF_LEN),
     ],
 )
 
@@ -520,6 +619,12 @@ SESSION_SEND_SCHEMA = ToolSchema(
         # in ``validate_field`` does not apply) and defaulted false, so a caller
         # that omits it keeps the queue-or-run behaviour it has today.
         FieldSpec("steer", bool, default=False),
+        # ``crew=`` (rfc-conductor-remote-dispatch.md): a remote crew's instance id
+        # or exact name. Accepted here whatever ``work_ledger.remote_dispatch`` says,
+        # so the gateway answers a call carrying it with the typed
+        # ``remote_dispatch_disabled`` rather than this schema's unknown-field error.
+        # No default: absence is what keeps a call local.
+        FieldSpec("crew", str, required=False, max_len=MAX_CREW_REF_LEN),
     ],
 )
 
@@ -544,6 +649,7 @@ WORK_DISPATCH_SCHEMA = ToolSchema(
             pattern=_MODEL_NAME_RE,
         ),
         FieldSpec("reasoning_effort", str, required=False, max_len=32),
+        FieldSpec("backend", str, required=False, max_len=MAX_SHORT_STRING),
     ],
 )
 
@@ -587,6 +693,11 @@ SESSION_STATUS_SCHEMA = ToolSchema(
     fields=[],
 )
 
+CREW_LIST_SCHEMA = ToolSchema(
+    tool_name="crew_list",
+    fields=[FieldSpec("logins", bool)],
+)
+
 SESSION_ADOPT_SCHEMA = ToolSchema(
     tool_name="session_adopt",
     fields=[
@@ -615,6 +726,12 @@ SESSION_READ_MESSAGE_SCHEMA = ToolSchema(
         FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
         FieldSpec("limit", int, required=False, min_val=1, max_val=100, default=20),
         FieldSpec("since", int, required=False, min_val=0),
+        # ``crew=`` (rfc-conductor-remote-dispatch.md): a remote crew's instance id
+        # or exact name. Accepted here whatever ``work_ledger.remote_dispatch`` says,
+        # so the gateway answers a call carrying it with the typed
+        # ``remote_dispatch_disabled`` rather than this schema's unknown-field error.
+        # No default: absence is what keeps a call local.
+        FieldSpec("crew", str, required=False, max_len=MAX_CREW_REF_LEN),
     ],
 )
 
@@ -622,5 +739,39 @@ SESSION_SUMMARY_SCHEMA = ToolSchema(
     tool_name="session_summary",
     fields=[
         FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
+    ],
+)
+
+# A queue id is ``uuid4().hex[:12]`` (``slot_queue_repository``). The field has no
+# shape check: ``queue_target`` only compares it for equality with the ids already
+# in the queue, so any other string ends in ``entry_not_found``.
+QUEUE_ENTRY_ID_MAX_CHARS = 64
+
+SESSION_QUEUE_SCHEMA = ToolSchema(
+    tool_name="session_queue",
+    fields=[
+        FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
+        FieldSpec(
+            "action",
+            str,
+            required=False,
+            allowed=frozenset({"list", "move"}),
+            default="list",
+        ),
+        FieldSpec(
+            "entry",
+            str,
+            required=False,
+            max_len=QUEUE_ENTRY_ID_MAX_CHARS,
+        ),
+        FieldSpec("position", int, required=False, min_val=0, max_val=10_000),
+    ],
+)
+
+SESSION_RUN_QUEUED_SCHEMA = ToolSchema(
+    tool_name="session_run_queued",
+    fields=[
+        FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
+        FieldSpec("queue_id", str, required=True, max_len=QUEUE_ENTRY_ID_MAX_CHARS),
     ],
 )

@@ -29,6 +29,7 @@ from kiro_crew.apps.builtins.aws_control.backend.backup_parts import _FACADE_MOD
 from kiro_crew.apps.manager import app_data_dir
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.platform_compat import file_lock, open_lock_file
+from kiro_crew.user_json import loads_user_json
 
 logger = logging.getLogger(_FACADE_MODULE)
 
@@ -157,7 +158,9 @@ def _read_state_checked() -> tuple[dict[str, Any], bool]:
         # should be loud rather than folded into "unreadable".
         return {}, False
     try:
-        data = json.loads(raw)
+        # One leading UTF-8 byte-order mark (a Windows "UTF-8 with BOM" save) is
+        # not content; plain `json.loads` would call the whole document corrupt.
+        data = loads_user_json(raw)
     except json.JSONDecodeError:
         return {}, False
     if not isinstance(data, dict):
@@ -214,10 +217,12 @@ def _read_state_for_update() -> dict[str, Any]:
     parsed to nothing usable carries nothing to lose. That covers a file which
     DECODED and then failed to parse. Bytes that are not UTF-8 never reached the
     parser, so they are the unreadable kind, not the corrupt kind, and the
-    mutation is abandoned rather than published over them.
+    mutation is abandoned rather than published over them. A leading UTF-8
+    byte-order mark is neither: the document is whole, so it is parsed past the
+    mark and every account carries forward.
     """
     try:
-        data = json.loads(_state_path().read_text(encoding="utf-8"))
+        data = loads_user_json(_state_path().read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
     except UnicodeDecodeError as exc:
@@ -544,6 +549,19 @@ MAX_RECORDED_VERSIONS = 5000
 #: that never happened. Here it is read by exactly one consumer -- the due-check -- and
 #: by the status projection that reports it.
 NIGHTLY_FAILURE_STATE_KEY = "nightly_failures"
+
+
+#: The INSTALL-GLOBAL record that the nightly loop skipped every wake because no
+#: registered key resolved to a working account at all. Top-level, NOT under
+#: ``accounts``: the skip is decided in :func:`hooks._run_once` BEFORE any account
+#: is resolved (``resolve_default_account_profile`` returned ``None``), so there is
+#: no account to key it under -- it describes the whole install's credentials, the
+#: way ``install`` does. Distinct from :data:`NIGHTLY_FAILURE_STATE_KEY`, which is a
+#: per-account per-kind record of an attempt that RAN and failed; this is the
+#: record of an attempt that could not even begin. One such record exists at a
+#: time, carrying when the streak began (``since``), its latest wake (``at``) and
+#: its length (``consecutive``), and it is cleared the moment a key resolves again.
+NIGHTLY_NO_KEY_STATE_KEY = "nightly_no_key_skip"
 
 
 #: Runs whose archive reached the bucket but whose state write did not land,

@@ -58,6 +58,17 @@ export const SURFACES = [
   { id: 'settings-about', url: '/settings?tab=about' },
   { id: 'capabilities-crews', url: '/capabilities?tab=crews' },
   { id: 'capabilities-mcp', url: '/capabilities?tab=mcp' },
+  // The MCP Servers sub-tab (`?view=mcp-servers`) mounts McpTab plus MCP
+  // Management (moved here from the Developer page in #24920). Rendering it
+  // gateway-free needs a correctly-shaped fixture for the whole MCP stack
+  // (/api/mcp, /api/mcp/scopes, /api/mcp-gateway/{status,servers}, /api/acp-backends
+  // and the always-mounted add/browse modals); the default guesses leave arrays
+  // undefined and the panel throws, so the scan would read the error boundary's
+  // English rather than the product. McpManagement's own strings are unchanged by
+  // this move (it is reparented, not rewritten) and were render-clean as the old
+  // `developer-mcp-pool` surface, and both McpTab and McpManagement carry their
+  // own i18n/component coverage — so this sub-tab is deliberately not a render
+  // surface rather than carrying a brittle full-stack fixture here.
   { id: 'capabilities-skills', url: '/capabilities?tab=skills' },
   { id: 'projects', url: '/projects' },
   { id: 'knowledge', url: '/knowledge' },
@@ -89,8 +100,8 @@ export const SURFACES = [
   // can see (dynamic keys, backend-supplied English, concatenation seams,
   // overflow) had no coverage at all.
   //
-  // `projects` above is the precedent: it is already a `/:builtinApp` route and
-  // has rendered here since Phase 5 shipped, which is what makes this safe to
+  // `projects` above was the precedent: it rendered here as a `/:builtinApp` route
+  // from Phase 5 until it became a core route, which is what made this safe to
   // extend rather than a new mechanism.
   //
   // Ordered by measured static-finding density in the backing code, so the two
@@ -131,7 +142,6 @@ export const SURFACES = [
   { id: 'developer-archive', url: '/developer?tab=archive' },
   { id: 'developer-config', url: '/developer?tab=config' },
   { id: 'developer-logs', url: '/developer?tab=logs' },
-  { id: 'developer-mcp-pool', url: '/developer?tab=mcp-pool' },
   { id: 'developer-memory', url: '/developer?tab=memory' },
   { id: 'developer-storage', url: '/developer?tab=storage' },
   { id: 'developer-telemetry', url: '/developer?tab=telemetry' },

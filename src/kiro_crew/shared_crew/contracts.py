@@ -35,6 +35,21 @@ from kiro_crew.shared_crew.codec import (
 
 #: aiohttp request key under which the trusted actor is published to handlers.
 ACTOR_REQUEST_KEY = "shared_crew_actor"
+#: Request keys the SSM listener's gate sets on a request it admitted
+#: (``dashboard.ssm_gate``). A forwarded SSM connection arrives from loopback,
+#: so every "is this machine's own user" test must read these before it trusts
+#: the peer address (``origin.is_ssm_request``).
+SSM_REQUEST_KEY = "auth_ssm"
+SSM_GUEST_REQUEST_KEY = "auth_ssm_guest"
+
+
+@dataclass(frozen=True)
+class SsmGuest:
+    """The Crew invite that admitted a request on the SSM listener."""
+
+    invite_id: str
+    alias: str
+
 
 #: Session metadata key that holds the :class:`SessionAttribution` object. It
 #: is deliberately not ``created_by``, which already names the creating slot key.
@@ -70,8 +85,15 @@ class Provenance(str, enum.Enum):
     #: Tailscale daemon ``whois`` of a peer the direct tailnet listener admitted
     #: through its access set (``tailnet_direct.DirectGate``): a verified member.
     TAILSCALE_LISTENER = "tailscale_listener"
+    #: A person holding a Crew invite who arrived on the SSM listener
+    #: (``dashboard.ssm_gate``). The invite names them; the transport proves nothing.
+    SSM_INVITE = "ssm_invite"
     #: The single local operator: a loopback or owner-minted dashboard token.
     LOCAL_OPERATOR = "local_operator"
+    #: Named by the Kiro relay in its own message and handed over by this Crew's
+    #: relay client (``dashboard/kiro_relay``). Never the local operator, so a
+    #: gate that requires that provenance still refuses a relayed caller.
+    KIRO_RELAY = "kiro_relay"
     #: Server-internal automation with a named owner component.
     INTERNAL = "internal"
     NONE = "none"
@@ -288,7 +310,7 @@ class AttributionAvailability(str, enum.Enum):
     """Whether a session's creator is known."""
 
     RECORDED = "recorded"
-    #: The session predates attribution; the creator displays as Unattributed.
+    #: The session predates attribution; it displays as the owner's.
     LEGACY_MISSING = "legacy_missing"
     #: Attribution was on but no principal could be established at creation.
     UNATTRIBUTED = "unattributed"
@@ -375,6 +397,8 @@ class ActionType(str, enum.Enum):
     RETRY = "retry"
     #: A lesson or preference write that replaced stored ones (newest wins).
     MEMORY_CHANGE = "memory_change"
+    #: Someone set the display name or picture shown for a person. Display only.
+    PERSON_DISPLAY = "person_display"
 
 
 class ActionOutcome(str, enum.Enum):
@@ -553,18 +577,32 @@ class SessionQuery:
             creator=creator, search=(params.get("q") or "")[:256], cursor=cursor, limit=limit
         )
 
-    def matches(self, creator: Principal, viewer: Principal, *, triggered: bool = False) -> bool:
+    def matches(
+        self,
+        creator: Principal,
+        viewer: Principal,
+        *,
+        triggered: bool = False,
+        viewer_ids: frozenset[str] = frozenset(),
+        local_owner_ids: frozenset[str] = frozenset(),
+    ) -> bool:
         """Whether a session with *creator* passes the creator filter for *viewer*.
 
         *triggered* is a session a schedule, a webhook or the Crew started: it
-        names its trigger, so it is not Unattributed.
+        names its trigger, so it is not Unattributed. *viewer_ids* are the other
+        principal ids that name the viewer themself (the owner's local and
+        tailnet ids), so ``mine`` finds the owner's sessions under any of them.
+        *local_owner_ids* are the local principals folded into one People row;
+        selecting any of them matches sessions created under all of them.
         """
         if self.creator == CREATOR_ALL:
             return True
         if self.creator == CREATOR_UNATTRIBUTED:
             return creator.is_unknown and not triggered
         if self.creator == CREATOR_MINE:
-            return not viewer.is_unknown and creator.id == viewer.id
+            return not viewer.is_unknown and creator.id in ({viewer.id} | viewer_ids)
+        if self.creator in local_owner_ids:
+            return creator.id in local_owner_ids
         return creator.id == self.creator
 
 

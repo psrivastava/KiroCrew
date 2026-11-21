@@ -1,21 +1,12 @@
 """Tests for ``platform_compat.host_available_mib`` on all three platforms.
 
-This reading is what stops a full test run from swapping the developer's machine:
-the xdist worker budget divides it by a per-worker reservation to decide how many
-workers to spawn. Its failure mode is silent and one-directional -- ``0`` means
-"unknown", an unknown reading is SKIPPED rather than treated as zero memory, and
-the run then proceeds at the unbounded ceiling with nothing in the log. So a
-platform whose branch is missing does not report a conservative number; it reports
-no number, and the budget it feeds becomes an identity function.
+The xdist worker budget divides this reading by a per-worker reservation. ``0`` means
+"unknown" and is SKIPPED, so a missing platform branch silently lifts the cap;
+:class:`TestEveryPlatformProducesAReading` fails if any branch stops answering.
 
-That is exactly what happened while the reading was ``/proc/meminfo`` only, and
-no test could catch it because one asserted the zero. The class that matters most
-here is therefore :class:`TestEveryPlatformProducesAReading`, which fails if any
-platform's branch stops answering.
-
-macOS and Windows cannot execute on the Linux fleet, so both are driven through
-their own C entry point: a fake ``libSystem`` injected over ``ctypes.CDLL`` for
-Mach, and a stubbed ``system_memory`` for ``GlobalMemoryStatusEx``.
+macOS and Windows are driven through their C entry points: a fake ``libSystem`` over
+``ctypes.CDLL`` for Mach, and a fake ``kernel32.GlobalMemoryStatusEx`` filling
+``MEMORYSTATUSEX``.
 """
 
 from __future__ import annotations
@@ -122,6 +113,26 @@ def as_macos(monkeypatch: pytest.MonkeyPatch):
     return _install
 
 
+@pytest.fixture
+def as_windows(monkeypatch: pytest.MonkeyPatch):
+    """Present as Windows with a fake ``GlobalMemoryStatusEx`` filling ``MEMORYSTATUSEX``."""
+
+    def _install(*, avail_phys: int, avail_commit: int, ok: bool = True) -> None:
+        def _status(ref) -> int:
+            ref._obj.ullTotalPhys = 16 * 1024**3
+            ref._obj.ullAvailPhys = avail_phys
+            ref._obj.ullAvailPageFile = avail_commit
+            return 1 if ok else 0
+
+        monkeypatch.setattr(pc, "IS_LINUX", False)
+        monkeypatch.setattr(pc, "IS_MACOS", False)
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        kernel32 = type("K32", (), {"GlobalMemoryStatusEx": staticmethod(_status)})
+        monkeypatch.setattr(ctypes, "windll", type("W", (), {"kernel32": kernel32}), raising=False)
+
+    return _install
+
+
 class TestEveryPlatformProducesAReading:
     """The regression this file exists for.
 
@@ -153,11 +164,8 @@ class TestEveryPlatformProducesAReading:
 
         assert pc.host_available_mib() == 512
 
-    def test_windows_reads_global_memory_status(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(pc, "IS_LINUX", False)
-        monkeypatch.setattr(pc, "IS_MACOS", False)
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        monkeypatch.setattr(pc, "system_memory", lambda: (16 * 1024**3, 3 * 1024**3))
+    def test_windows_reads_global_memory_status(self, as_windows) -> None:
+        as_windows(avail_phys=3 * 1024**3, avail_commit=8 * 1024**3)
 
         assert pc.host_available_mib() == 3072
 
@@ -181,13 +189,8 @@ class TestTheMacosCompositionIsConservative:
     def test_speculative_pages_are_not_added_on_top_of_free(self, as_macos) -> None:
         """``free_count`` already CONTAINS ``speculative_count``.
 
-        Darwin's own ``vm_stat`` prints ``free_count - speculative_count`` as its
-        "Pages free" line, which is the proof. Adding speculative again inflates
-        the reading -- and it inflates it on a busy machine, where speculative is
-        large, which is the one place the budget must not be optimistic.
-
-        This is the only test that stops the sum being "corrected" back to
-        ``free + inactive + speculative + purgeable``.
+        Darwin's ``vm_stat`` prints ``free_count - speculative_count`` as "Pages free".
+        Adding speculative again inflates the reading most on a busy machine.
         """
         without = as_macos(fields={"free_count": 400 * _PAGES_PER_MIB})
         baseline = pc.host_available_mib()
@@ -230,11 +233,8 @@ class TestTheMacosCompositionIsConservative:
     def test_inactive_is_bounded_by_the_file_backed_page_count(self, as_macos) -> None:
         """Inactive mixes clean file pages with DIRTY ANONYMOUS pages.
 
-        Only the file-backed share can be handed over without compressing or
-        swapping, and ``HOST_VM_INFO64`` publishes no inactive-AND-file counter --
-        so ``min(inactive, external_page_count)`` is the tightest computable bound.
-        Without it a browser holding gigabytes of inactive anonymous memory reads
-        as free, and the budget grants workers against memory that is not there.
+        ``HOST_VM_INFO64`` has no inactive-and-file counter, so
+        ``min(inactive, external_page_count)`` is the tightest bound on reclaimable pages.
         """
         as_macos(
             fields={
@@ -346,30 +346,49 @@ class TestTheMacosReadingFailsSafely:
 
 
 class TestTheWindowsReadingFailsSafely:
-    def test_an_unavailable_reading_is_unknown(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(pc, "IS_LINUX", False)
-        monkeypatch.setattr(pc, "IS_MACOS", False)
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        monkeypatch.setattr(pc, "system_memory", lambda: None)
+    def test_a_failed_call_is_unknown(self, as_windows) -> None:
+        as_windows(avail_phys=3 * 1024**3, avail_commit=3 * 1024**3, ok=False)
 
         assert pc.host_available_mib() == 0
 
-    def test_a_sub_mib_reading_truncates_to_zero_and_is_treated_as_unknown(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Documents the one place the unit choice still bites.
+    def test_a_sub_mib_reading_reads_as_full_not_unknown(self, as_windows) -> None:
+        """``0`` is this function's "unknown", and an unknown reading skips the floor.
 
-        ``GlobalMemoryStatusEx`` reports bytes, so under 1 MiB available the
-        integer division yields 0 = unknown and the bound is skipped. A Windows
-        host with under 1 MiB free has already lost, so the direction is
-        acceptable -- but it is asserted rather than left to be discovered.
+        So a successful call with under 1 MiB free answers 1: the starved host
+        keeps its floor instead of reading as unmeasured.
         """
-        monkeypatch.setattr(pc, "IS_LINUX", False)
-        monkeypatch.setattr(pc, "IS_MACOS", False)
-        monkeypatch.setattr(pc, "IS_WINDOWS", True)
-        monkeypatch.setattr(pc, "system_memory", lambda: (16 * 1024**3, 1000))
+        as_windows(avail_phys=1000, avail_commit=8 * 1024**3)
 
-        assert pc.host_available_mib() == 0
+        assert pc.host_available_mib() == 1
+
+
+class TestTheWindowsReadingCountsCommitHeadroom:
+    """A process must commit what it maps, so the smaller of the two figures binds."""
+
+    def test_commit_headroom_below_physical_binds(self, as_windows) -> None:
+        as_windows(avail_phys=6 * 1024**3, avail_commit=512 * 1024**2)
+
+        assert pc.host_available_mib() == 512
+
+    def test_physical_below_commit_headroom_binds(self, as_windows) -> None:
+        as_windows(avail_phys=2 * 1024**3, avail_commit=8 * 1024**3)
+
+        assert pc.host_available_mib() == 2048
+
+    def test_exhausted_commit_reads_as_full_not_unknown(self, as_windows) -> None:
+        as_windows(avail_phys=6 * 1024**3, avail_commit=0)
+
+        assert pc.host_available_mib() == 1
+
+    def test_sub_mib_commit_headroom_reads_as_full_not_unknown(self, as_windows) -> None:
+        as_windows(avail_phys=6 * 1024**3, avail_commit=512 * 1024)
+
+        assert pc.host_available_mib() == 1
+
+    def test_system_memory_still_reports_physical_ram(self, as_windows) -> None:
+        as_windows(avail_phys=6 * 1024**3, avail_commit=512 * 1024**2)
+
+        assert pc.system_memory() == (16 * 1024**3, 6 * 1024**3)
 
 
 class TestTheLinuxReadingIsUnchanged:

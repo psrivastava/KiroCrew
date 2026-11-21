@@ -24,20 +24,6 @@ if TYPE_CHECKING:
     from kiro_crew.session import SessionManager
 
 
-def remember_resume_sid(
-    self: SessionManager, key: str, sid: str, *, provider: str = "", cwd: str = ""
-) -> None:
-    """Pre-seed a session key's resume sid (+ provider/cwd) in the map.
-
-    Used to open a session that already exists in a backend's OWN store
-    (e.g. a native claude CLI session under ~/.claude) inside a fresh CCrew
-    slot: the next get_or_create for *key* reads this sid and issues
-    session/load, attaching to that same conversation. Thin wrapper over
-    SessionMap.set so callers do not reach into the private map.
-    """
-    self._session_map.set(key, sid, provider=provider, cwd=cwd)
-
-
 # ── Slack thread linking (persisted via SessionMap) ──
 
 
@@ -136,6 +122,17 @@ def mirror_link_nonce(self: SessionManager, key: str) -> str:
 def slack_link_nonce(self: SessionManager, key: str) -> str:
     """The per-binding nonce of the Slack thread ``get_slack_link`` returns (``""`` for none)."""
     return self._session_map.slack_link_nonce(key)
+
+
+def session_map_generation(self: SessionManager) -> tuple[int, int]:
+    """``(map identity, mutation counter)``: unchanged means no link read here can differ.
+
+    Every link, pause flag and nonce the accessors above return lives in the
+    one ``SessionMap``, whose counter moves after each mutation. The identity
+    covers a map swapped out from under the manager.
+    """
+    session_map = self._session_map
+    return id(session_map), session_map.mutation_generation()
 
 
 def set_mirror_opt_out(self: SessionManager, key: str, opted_out: bool) -> None:

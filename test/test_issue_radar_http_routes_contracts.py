@@ -34,6 +34,7 @@ from kiro_crew import llm_helpers
 from kiro_crew.apps.builtins.issue_radar.backend import github_client as gh
 from kiro_crew.apps.builtins.issue_radar.backend import provider, routes, store
 from kiro_crew.start_priority import StartPriority
+from kiro_crew.testing.synthetic_credentials import github_classic
 from kiro_crew.testing.wait import await_until, finished
 
 BASE = "/api/apps/issue-radar"
@@ -354,6 +355,24 @@ class TestProbeCoalescing(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(github_probe.call_args.args[:3], ("Acme", "W", "issue"))
         self.assertEqual(gitlab_probe.call_count, 2)
         self.assertEqual(gitlab_probe.call_args.kwargs, {"host": "gitlab.com"})
+
+    async def test_a_probe_left_by_a_torn_down_loop_is_not_awaited(self):
+        # A probe whose loop was torn down never runs _remember_probe: the same key
+        # must start a fresh probe on this loop instead of awaiting the dead one.
+        other = asyncio.new_event_loop()
+        try:
+            dead = other.create_future()
+        finally:
+            other.close()
+        routes._probe_inflight[("github", "github.com", "o", "r", "issue")] = dead
+        with mock.patch.object(gh, "probe_open_list", return_value=dict(READING)) as probe:
+            outcome = await asyncio.gather(
+                routes._poll_can_serve_cache(KEY, "issue", "open", SNAPSHOT),
+                return_exceptions=True,
+            )
+        self.assertEqual(outcome, [(True, READING)])
+        self.assertEqual(probe.call_count, 1)
+        self.assertEqual(routes._probe_inflight, {})
 
     async def test_remember_probe_ignores_cancelled_and_foreign_futures(self):
         loop = asyncio.get_running_loop()
@@ -835,7 +854,7 @@ class TestModelAdapter(unittest.IsolatedAsyncioTestCase):
             self.assertRegex(key, r"^issue-radar-ai:o/r#7:[0-9a-f]{32}$")
 
     async def test_ai_output_is_redacted_before_it_is_clamped(self):
-        token = "ghp" + "_" + "z4Kq" * 9
+        token = github_classic(seed=331)
         reply = json.dumps(
             {
                 "summary": f"leak {token}",
@@ -950,7 +969,7 @@ class TestModelOutputRedaction(unittest.IsolatedAsyncioTestCase):
     """Model text derived from untrusted issue and PR bodies is redacted before it
     is cached, proposed or returned, and before any length clamp."""
 
-    TOKEN = "ghp" + "_" + "z4Kq" * 9
+    TOKEN = github_classic(seed=332)
 
     async def test_the_pr_summary_is_redacted(self):
         reply = json.dumps({"summary": f"see {self.TOKEN}"})

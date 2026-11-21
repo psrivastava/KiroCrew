@@ -13,9 +13,16 @@ import pytest
 from kiro_crew import ui_index
 
 
-@pytest.fixture(autouse=True)
-def _fresh_cache(_floor_monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+@pytest.fixture(autouse=True, scope="module")
+def _fresh_cache() -> None:
+    # Once per module: the cache is keyed on the index file's path, mtime and size,
+    # so a stale entry from another file is re-read anyway, and nothing here writes
+    # to a loaded index. Clearing it per test re-parsed the index for every case.
     ui_index._cache.update(key=None, index=None)
+
+
+@pytest.fixture(autouse=True)
+def _no_auto_tier(_floor_monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     # The committed tiers only, whatever dashboard build this checkout has:
     # the build-time auto tier is pinned in test_find_ui_auto.py.
     _floor_monkeypatch.setattr(ui_index, "AUTO_INDEX_PATH", tmp_path / "no-auto-tier.json")
@@ -46,100 +53,100 @@ _GOLDENS = [
         "make a new crewmate",
         "en",
         "members.new",
-        ["Mates", "New mate"],
+        ["Bots", "New bot"],
         ["no_crewmates"],
     ),
-    ("新建队友", "zh-CN", "members.new", ["队友", "新建队友"], ["no_crewmates"]),
+    ("新建队友", "zh-CN", "members.new", ["Bot", "新建 Bot"], ["no_crewmates"]),
     (
         "advanced crewmate setup",
         "en",
         "members.new-advanced",
-        ["Mates", "Advanced"],
+        ["Bots", "Advanced"],
         ["no_crewmates"],
     ),
-    ("高级队友设置", "zh-CN", "members.new-advanced", ["队友", "高级"], ["no_crewmates"]),
+    ("高级队友设置", "zh-CN", "members.new-advanced", ["Bot", "高级"], ["no_crewmates"]),
     # Crewmates page: the header "Add…" menu, once a crewmate exists.
     (
         "advanced crewmate setup",
         "en",
         "members.add-menu",
-        ["Mates", "Add…"],
+        ["Bots", "Add…"],
         ["has_crewmates"],
     ),
     (
         "高级队友设置",
         "zh-CN",
         "members.add-menu",
-        ["队友", "添加…"],
+        ["Bot", "添加…"],
         ["has_crewmates"],
     ),
-    ("添加队友", "zh-CN", "members.add-menu", ["队友", "添加…"], ["has_crewmates"]),
+    ("添加队友", "zh-CN", "members.add-menu", ["Bot", "添加…"], ["has_crewmates"]),
     # Crewmates page: the open crewmate.
     (
         "edit my crewmate",
         "en",
         "members.edit",
-        ["Mates", "Profile"],
+        ["Bots", "Profile"],
         ["crewmate_selected"],
     ),
-    ("编辑队友", "zh-CN", "members.edit", ["队友", "资料卡"], ["crewmate_selected"]),
+    ("编辑队友", "zh-CN", "members.edit", ["Bot", "资料卡"], ["crewmate_selected"]),
     (
         "crewmate details",
         "en",
         "members.details",
-        ["Mates", "Dashboard & files"],
+        ["Bots", "Dashboard & files"],
         ["crewmate_selected", "crewmate_panel_not_docked"],
     ),
     (
         "队友详情",
         "zh-CN",
         "members.details",
-        ["队友", "仪表板和文件"],
+        ["Bot", "仪表板和文件"],
         ["crewmate_selected", "crewmate_panel_not_docked"],
     ),
     # Customize > Crewmates.
-    ("add a new agent", "en", "agents.add", ["Customize", "Mates", "New mate"], []),
-    ("创建代理", "zh-CN", "agents.add", ["自定义", "队友", "新建队友"], []),
+    ("add a new agent", "en", "agents.add", ["Customize", "Bots", "New bot"], []),
+    ("创建代理", "zh-CN", "agents.add", ["自定义", "Bot", "新建 Bot"], []),
     (
         "create a crewmate",
         "en",
         "agents.create-first",
-        ["Customize", "Mates", "Create your first mate"],
+        ["Customize", "Bots", "Create your first bot"],
         ["no_crewmates"],
     ),
     (
         "创建队友",
         "zh-CN",
         "agents.create-first",
-        ["自定义", "队友", "创建你的第一位队友"],
+        ["自定义", "Bot", "创建你的第一个 Bot"],
         ["no_crewmates"],
     ),
     (
         "change my crewmate's avatar",
         "en",
         "agents.edit-avatar",
-        ["Customize", "Mates", "General", "Edit avatar"],
+        ["Customize", "Bots", "General", "Edit avatar"],
         ["crewmate_editor_open"],
     ),
     (
         "修改头像",
         "zh-CN",
         "agents.edit-avatar",
-        ["自定义", "队友", "常规", "编辑头像"],
+        ["自定义", "Bot", "常规", "编辑头像"],
         ["crewmate_editor_open"],
     ),
     (
         "delete an agent",
         "en",
         "agents.delete",
-        ["Customize", "Mates", "Danger Zone", "Delete mate"],
+        ["Customize", "Bots", "Danger Zone", "Delete bot"],
         ["crewmate_editor_open"],
     ),
     (
         "删除代理",
         "zh-CN",
         "agents.delete",
-        ["自定义", "队友", "危险区域", "删除队友"],
+        ["自定义", "Bot", "危险区域", "删除 Bot"],
         ["crewmate_editor_open"],
     ),
 ]

@@ -22,13 +22,14 @@ from job_sdk_helpers import (  # noqa: F401 -- the fixture is requested by name
     _wait_terminal,
     sdk_fixture,
 )
+from redaction_structured_cases import github_classic
 
 from kiro_crew.apps import job_sdk
 from kiro_crew.apps.job_sdk import DONE, JobRun, JobSDK, JobStore
 
-# ---------------------------------------------------------------------------
-# 25. start(params=...) / JobHandle.params
-# ---------------------------------------------------------------------------
+_KEY = github_classic(seed=23)  # a token the credential plan redacts
+
+# start(params=...) / JobHandle.params
 
 
 class TestParamsReachTheRunner:
@@ -164,7 +165,7 @@ class TestParamsAreRefusedNotTrimmed:
         wrote with nothing raised anywhere, which is the silent-wrong-data
         failure this whole class exists to prevent.
         """
-        secret = "AKIAIOSFODNN7EXAMPLE"
+        secret = _KEY
         seen: list[dict[str, str]] = []
         sdk.register("work", lambda h: seen.append(h.params))
         with pytest.raises(ValueError):

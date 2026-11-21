@@ -9,9 +9,12 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from closed_peer_helpers import refused_peer_connects  # noqa: F401
 from instances_helpers import _enable, _FakeTunnel, _patch_port_probe
 
 from kiro_crew.testing.wait import await_until
+
+pytestmark = pytest.mark.usefixtures("refused_peer_connects")
 
 
 class TestInstancesStartupHooks:
@@ -62,6 +65,38 @@ class TestInstancesStartupHooks:
         asyncio.run(app.on_cleanup.send(app))
         assert called.get("shutdown") is True
 
+    def test_no_instances_key_starts_manager_and_leaves_remote_dispatch_off(
+        self, tmp_path, monkeypatch
+    ):
+        import json
+
+        from aiohttp import web
+
+        from kiro_crew.config import loader
+        from kiro_crew.dashboard.server import _register_instances_hooks
+        from kiro_crew.remote_dispatch import remote_dispatch_enabled
+        from kiro_crew.work_preview import remote_dispatch
+
+        # An untouched install: config.json names neither section.
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        (tmp_path / "config.json").write_text(json.dumps({}))
+        loader._invalidate_config_cache()
+        cfg = loader.KiroCrewConfig.load()
+        assert cfg.instances.enabled is True
+        assert cfg.work_ledger.remote_dispatch is False
+        assert remote_dispatch() is False
+        assert remote_dispatch_enabled() is False
+
+        app = web.Application()
+        state = self._state()
+        _register_instances_hooks(app, state, port=7777)
+        app.freeze()
+        asyncio.run(app.on_startup.send(app))
+        # Empty registry: the manager exists, but nothing was connected.
+        assert state.instances_manager is not None
+        assert state.instances_registry.list() == []
+        asyncio.run(app.on_cleanup.send(app))
+
     def test_disabled_skips_manager_creation(self, tmp_path, monkeypatch):
         from aiohttp import web
 
@@ -102,6 +137,7 @@ class TestPortMirror:
             ttl="20h",
             remote_port=None,
             embed_parent_port=None,
+            embed_forward_port=None,
             timeout_secs=None,
         ):
             return "TOK"
@@ -166,15 +202,9 @@ class TestPortMirror:
     async def test_reconnect_prefers_its_own_recorded_port(self, tmp_path, monkeypatch):
         """A recorded port IS preferred across a restart.
 
-        ``shutdown`` documents that it "Leaves registry hints intact", so a
-        recorded ``local_port`` survives a gateway RESTART. The loopback port is
-        the browser ORIGIN of the pane's iframe (``http://<host>:<local_port>``),
-        and origin-keyed client state — ``localStorage`` UI preferences — is lost
-        the moment that origin moves; re-minting the token and reloading the pane
-        does nothing for state the browser keys by origin, and first-free
-        allocation moves the origin whenever another instance holds the lower
-        port. connect() therefore PREFERS the recorded port: here the base port
-        is free and lower, yet the recorded one is returned.
+        The loopback port is the pane iframe's browser ORIGIN, so moving it loses
+        ``localStorage`` UI preferences. Here the base port is free and lower, yet
+        the recorded one is returned.
         """
         from kiro_crew.instances.registry import InstancesRegistry
         from kiro_crew.instances.ssh_tunnel_manager import TunnelState
@@ -202,12 +232,8 @@ class TestPortMirror:
     ):
         """A leased recorded port yields to a fresh port, not the preference.
 
-        A live hop lease means a chained credential this gateway minted still
-        routes a bearer token to that port number. The origin-stability
-        preference must never override that: binding this crew's forward on a
-        leased port would deliver another crew's token here — the confused-deputy
-        the lease exists to close. So a recorded port carrying a live lease stays
-        reserved and unpreferred, and the crew takes a different port.
+        A live hop lease still routes a minted bearer token to that port, so binding
+        this crew's forward there would deliver another crew's token (confused deputy).
         """
         import time
 
@@ -244,14 +270,9 @@ class TestPortMirror:
     ):
         """A recorded port another row still records yields to a fresh port.
 
-        Two registry rows can record the SAME port number (a duplicate hint left
-        by an earlier allocation). ``_reserved_ports`` withholds that number on
-        behalf of every row that records it, so dropping it from the exclude set
-        for this crew alone would unreserve it for the other row too — binding
-        this crew's forward on a port a hub still forwards another crew's bearer
-        token to, the confused-deputy the reservation exists to close. So a
-        recorded port another row records stays reserved and unpreferred, and the
-        crew takes a different port.
+        ``_reserved_ports`` withholds a number for every row that records it;
+        unreserving it for this crew would bind on a port a hub still forwards
+        another crew's bearer token to (confused deputy).
         """
         from kiro_crew.instances.registry import InstancesRegistry
         from kiro_crew.instances.ssh_tunnel_manager import TunnelState
@@ -283,14 +304,8 @@ class TestPortMirror:
     async def test_rebuild_never_prefers_the_recorded_port(self, tmp_path, monkeypatch):
         """A rebuild passes no port preference, gated on the flag.
 
-        A rebuild wants a DIFFERENT port — the field evidence puts every stall on
-        the first-allocated port, so a cause bound to the port itself must be
-        escaped. When a rebuild finds no live tunnel to tear down, the recorded
-        ``local_port`` is still on the registry row (nothing zeroed it) and the
-        freed-port value is absent — so an exclusion gated on the freed port
-        would let the recorded port be preferred on a rebuild, aiming straight
-        back at the very port the rebuild is escaping. Gating on the rebuild flag
-        keeps the recorded port unpreferred regardless.
+        A rebuild escapes the stalled port. With no live tunnel to tear down there is
+        no freed port, only the recorded ``local_port``, so the gate is the flag.
         """
         from kiro_crew.instances.registry import InstancesRegistry
         from kiro_crew.instances.ssh_tunnel_manager import TunnelState
@@ -367,6 +382,7 @@ class TestLastError:
             ttl="20h",
             remote_port=None,
             embed_parent_port=None,
+            embed_forward_port=None,
             timeout_secs=None,
         ):
             return "SECRET_TOK"
@@ -408,6 +424,7 @@ class TestLastError:
             ttl="20h",
             remote_port=None,
             embed_parent_port=None,
+            embed_forward_port=None,
             timeout_secs=None,
         ):
             raise TokenMintError("nope")
@@ -432,6 +449,7 @@ class TestLastError:
             ttl="20h",
             remote_port=None,
             embed_parent_port=None,
+            embed_forward_port=None,
             timeout_secs=None,
         ):
             calls["n"] += 1
@@ -458,6 +476,7 @@ class TestLastError:
             ttl="20h",
             remote_port=None,
             embed_parent_port=None,
+            embed_forward_port=None,
             timeout_secs=None,
         ):
             raise TokenMintError("nope")
@@ -493,6 +512,7 @@ class TestStatusForRetainedError:
             ttl="20h",
             remote_port=None,
             embed_parent_port=None,
+            embed_forward_port=None,
             timeout_secs=None,
         ):
             return "SECRET_TOK"
@@ -515,6 +535,7 @@ class TestStatusForRetainedError:
             ttl="20h",
             remote_port=None,
             embed_parent_port=None,
+            embed_forward_port=None,
             timeout_secs=None,
         ):
             raise TokenMintError("nope")
@@ -579,6 +600,7 @@ class TestStartupRevive:
             ttl="20h",
             remote_port=None,
             embed_parent_port=None,
+            embed_forward_port=None,
             timeout_secs=None,
         ):
             return "SECRET_TOK"
@@ -619,6 +641,7 @@ class TestStartupRevive:
             ttl="20h",
             remote_port=None,
             embed_parent_port=None,
+            embed_forward_port=None,
             timeout_secs=None,
         ):
             if "bad" in host:
@@ -655,11 +678,8 @@ class TestStartupRevive:
     async def test_instances_startup_schedules_revive_in_background(self, monkeypatch):
         """_instances_startup must NOT await the reconnect.
 
-        on_startup handlers run during runner.setup(), before the HTTP port
-        binds, so awaiting serial SSH-tunnel connects (each of which can hang
-        for its full timeout when the network is down) delays the port bind
-        past the desktop app's 30s gateway-wait window. Revive must be a
-        tracked background task so the handler returns promptly.
+        on_startup runs before the HTTP port binds, so serial connects that hang
+        offline would push the bind past the desktop app's 30s gateway-wait window.
         """
         import asyncio
         import types

@@ -1,4 +1,5 @@
 import { afterEach, describe, it, expect, vi } from 'vitest'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { act, cleanup, render, renderHook, screen, fireEvent } from '@testing-library/react'
 
 import type { ChatFolder } from '../types'
@@ -8,6 +9,7 @@ vi.mock('../components/VoicePlaybackBar', () => ({ default: () => null }))
 
 import { useComposerAboveBand } from '../pages/chat/page/composerDock'
 import { setMovedSlot } from '../hooks/useMoveSlotToFolder'
+import { COMPOSER_RADIUS } from '../components/composerRadius'
 
 const folder = (id: string, opts: Partial<ChatFolder> = {}): ChatFolder => ({
   id, name: id, order: 0, collapsed: false, parent_id: '', ...opts,
@@ -42,6 +44,9 @@ describe('folderProjectMismatch', () => {
 type BandProps = { activeSlot: string; folderId: string | undefined; project: string; locked?: boolean }
 
 function renderBand(initial: BandProps, setProject = vi.fn(async () => {})) {
+  // The band reads Shared Crew capabilities, so it needs a query client.
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  const wrapper = ({ children }: { children: React.ReactNode }) => <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
   const hook = renderHook((p: BandProps) => useComposerAboveBand({
     langGen: 0,
     controls: {
@@ -57,6 +62,7 @@ function renderBand(initial: BandProps, setProject = vi.fn(async () => {})) {
     activeSlot: p.activeSlot,
     sidebarOnScreen: true,
     folderSuggestionAccept: () => {},
+    folderSuggestionUndo: async () => {},
     folderSuggestionDecline: () => {},
     slotFolderId: p.folderId,
     slotProject: p.project,
@@ -64,8 +70,8 @@ function renderBand(initial: BandProps, setProject = vi.fn(async () => {})) {
     projectLocked: !!p.locked,
     activeTip: null,
     dismissTip: () => {},
-  }), { initialProps: initial })
-  const view = render(hook.result.current)
+  }), { initialProps: initial, wrapper })
+  const view = render(hook.result.current, { wrapper })
   return { setProject, hook, view }
 }
 
@@ -83,6 +89,12 @@ describe('composer band folder-project hint', () => {
     expect(screen.getByTestId('folder-project-hint-dismiss').textContent).toBe('Keep other')
     expect(screen.getByTestId('folder-project-hint-note').textContent).toBe(
       'Switching starts a fresh agent session in /projects/repo on your next message. The messages here stay, and the project picker can switch back.')
+  })
+
+  it('is as round as the composer it sits on', () => {
+    act(() => setMovedSlot('slot-1'))
+    renderBand(moved)
+    expect(screen.getByTestId('folder-project-hint').style.borderRadius).toBe(`${COMPOSER_RADIUS}px`)
   })
 
   it('shows no hint for a session that was not moved, such as a follow-up worktree', () => {

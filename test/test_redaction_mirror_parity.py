@@ -10,9 +10,8 @@ verbatim while the backend redacted them.
 
 Behavioural tests alone do not close that failure mode. Each copy is tested
 against its own samples, so a backend-only change leaves every mirror green
-while the mirrors do not match the pattern they mirror. The planned
-follow-up (decode segment one as a JOSE header, require `alg`/`enc`) lands in
-`security.py` FIRST by design, which is precisely when that would happen.
+while the mirrors do not match the pattern they mirror. The JSON-object header
+check sits outside the pattern on every side, so it leaves this pin alone.
 
 The expectation is derived from `_CREDENTIAL_PATTERNS` at run time, never
 restated here. `security_posture.py` records why: an earlier drift guard "could
@@ -180,9 +179,21 @@ class TestBase64BlobMirror:
     def test_backend_carries_the_spelling(self) -> None:
         assert f'r"{self.SPELLING}"' in BACKEND_EXFIL_RULES.read_text(encoding="utf-8")
 
-    def test_frontend_carries_the_spelling(self) -> None:
-        text = FRONTEND.read_text(encoding="utf-8")
-        assert f"const EXFIL_B64_RE = /{self.SPELLING}/i" in text
+
+class TestGitObjectNameCarveOutMirror:
+    """The blob signal's git-object-name carve-out is spelled identically.
+
+    Both halves judge the MAXIMAL blob match against exactly 40 lowercase
+    hex digits. A drift (one half admitting uppercase, or any length) would keep
+    a commit permalink on one surface and redact it on the other, or widen the
+    carve-out into a hex-token bypass on one of them.
+    """
+
+    SHAPE = r"[0-9a-f]{40}"
+
+    def test_backend_carries_the_shape(self) -> None:
+        text = (BACKEND_PKG / "exfil_git_object.py").read_text(encoding="utf-8")
+        assert f'_GIT_OBJECT_NAME_RE = re.compile(r"{self.SHAPE}")' in text
 
 
 class TestDeliberateNonMirrors:
@@ -278,10 +289,12 @@ class TestPrefilledIssueCarveOutParity:
             )
 
     def test_the_length_gate_is_unconditional_on_both_sides(self) -> None:
-        """The rule the waivers waived, asserted at its own site on each half.
+        """The rule the waivers waived, asserted at its own site.
 
         Reads the comparison itself rather than the absence of a symbol name, so a
-        waiver spelled with fresh identifiers still fails one of these two tests.
+        waiver spelled with fresh identifiers still fails. The frontend mirror no
+        longer carries the URL heuristics: display redaction masks only credential
+        values inside a URL, so the gate lives on the backend's blocking scan alone.
         """
         backend = BACKEND_EXFIL.read_text(encoding="utf-8")
         assert "if len(heuristic_query) >= _EXFIL_QUERY_MIN_LEN:" in backend, (
@@ -289,11 +302,7 @@ class TestPrefilledIssueCarveOutParity:
             f"{BACKEND_EXFIL.name} — something was added to its condition, or the "
             "classifier moved to another module and this guard needs repointing"
         )
-        frontend = FRONTEND.read_text(encoding="utf-8")
-        assert "query.length >= EXFIL_QUERY_MIN_LEN" in frontend
-        assert "if (!redact && query.length >= EXFIL_QUERY_MIN_LEN)" not in frontend, (
-            "the frontend length signal is behind a conditional again"
-        )
+        assert "EXFIL_QUERY_MIN_LEN" not in FRONTEND.read_text(encoding="utf-8")
 
     def test_the_trusted_channel_the_waiver_was_replaced_by_still_exists(self) -> None:
         """Deleting the waivers is only free while this seam is here.
@@ -311,3 +320,30 @@ class TestPrefilledIssueCarveOutParity:
             "the dashboard no longer renders its own anchor from the structured "
             "field — the trusted issue-link channel moved"
         )
+
+
+def test_blocked_link_card_offers_allow_only_for_hosts_the_server_accepts() -> None:
+    """The card's Allow gate mirrors the server's allowed-host shape exactly.
+
+    `RedactionCards.tsx` hides "Allow for this host" with its own copy of the
+    host regex because the browser cannot import Python. If the two drift, the
+    card offers an Allow the server always refuses, or hides one it would
+    accept. The expectation is derived from the backend regex at run time.
+    """
+    from kiro_crew.security import redaction_allow
+
+    backend = redaction_allow._HOST_RE.pattern
+    assert backend.startswith("\\A") and backend.endswith("\\Z")
+    expected = "^" + backend[2:-2].replace("\\Z", "$") + "$"
+    cards = (ROOT / "website" / "src" / "components" / "RedactionCards.tsx").read_text(encoding="utf-8")
+    match = re.search(r"^const ALLOWABLE_HOST_RE = /(.+)/$", cards, re.MULTILINE)
+    assert match, "ALLOWABLE_HOST_RE is no longer a one-line regex literal in RedactionCards.tsx"
+    assert match.group(1) == expected
+    # The loopback-name refusal sits beside the regex on both sides.
+    assert not redaction_allow.valid_host("foo.localhost")
+    suffix = re.search(r"^const LOOPBACK_SUFFIX = '([^']+)'$", cards, re.MULTILINE)
+    assert suffix and suffix.group(1) == redaction_allow.LOOPBACK_SUFFIX
+    assert "!h.endsWith(LOOPBACK_SUFFIX)" in cards
+    tld_cap = re.search(r"^const MAX_TLD_LEN = (\d+)$", cards, re.MULTILINE)
+    assert tld_cap and int(tld_cap.group(1)) == redaction_allow.MAX_TLD_LEN
+    assert "tld.length <= MAX_TLD_LEN" in cards

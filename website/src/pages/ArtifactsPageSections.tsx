@@ -249,7 +249,7 @@ export function RemoteBrowseSection({ provider, onForked, onCloned }: {
   const actionsStale = useSearch && isPlaceholderData
   return (
     <Card className="mt-4">
-      <CardTitle>{i18nT('pages.artifactsPage.on')} {provider.display_name}</CardTitle>
+      <CardTitle>{i18nT('pages.artifactsPage.on_provider', { provider: provider.display_name })}</CardTitle>
       <div className="mb-2">
         <SearchInput placeholder={i18nT('pages.artifactsPage.filter_artifacts', { provider: provider.display_name })} value={search} onChange={e => setSearch((e.target as HTMLInputElement).value)} />
       </div>
@@ -268,12 +268,18 @@ export function RemoteBrowseSection({ provider, onForked, onCloned }: {
       </div>
       {hasNextPage && (
         <div className="mt-2 flex justify-center">
-          {/* Stable aria-label: while loading the button shows only a spinner
-              icon, so it needs an accessible name in both states. */}
+          {/* While loading the button shows only a spinner icon, so it needs an
+              accessible name in both states; the loading one says why it is
+              unavailable. Busy is `aria-disabled` plus the guard, NOT
+              `disabled`, which leaves the tab order and drops a keyboard
+              user's focus while a page loads. */}
           <Btn
-            onClick={() => fetchNextPage()}
-            disabled={isFetchingNextPage}
-            aria-label={i18nT('pages.artifactsPage.load_more_artifacts', { provider: provider.display_name })}
+            onClick={() => { if (!isFetchingNextPage) void fetchNextPage() }}
+            aria-disabled={isFetchingNextPage || undefined}
+            className="aria-disabled:opacity-30 aria-disabled:cursor-default"
+            aria-label={isFetchingNextPage
+              ? i18nT('pages.artifactsPage.loading_more_artifacts', { provider: provider.display_name })
+              : i18nT('pages.artifactsPage.load_more_artifacts', { provider: provider.display_name })}
           >
             {isFetchingNextPage
               ? <Loader2 className="lucide-inline w-3.5 h-3.5 animate-spin" />

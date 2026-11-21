@@ -28,6 +28,7 @@ import pytest
 
 from kiro_crew import mcp_cron
 from kiro_crew.cron import CronJob, CronSchedule
+from kiro_crew.testing.synthetic_credentials import github_classic
 
 
 @pytest.fixture(autouse=True)
@@ -89,6 +90,56 @@ class TestShape:
     def test_mode_names_the_dispatch_shape(self) -> None:
         out = json.loads(_call([_job(script="crons/f.py:run", message="")]))
         assert out["jobs"][0]["mode"] == "script"
+
+
+class TestFolder:
+    """Each record names its Schedule-page folder, read-only from ``cron_folders.json``."""
+
+    @pytest.fixture(autouse=True)
+    def _folders(self):
+        from kiro_crew.config.loader import config_dir
+
+        config_dir().mkdir(parents=True, exist_ok=True)
+        self.path = config_dir() / "cron_folders.json"
+        self.path.write_text(
+            json.dumps([{"id": "aaaa1111", "name": "Veille", "order": 0}]), encoding="utf-8"
+        )
+
+    def test_a_filed_job_carries_the_folder_id_and_name(self) -> None:
+        rec = json.loads(_call([_job(folder_id="aaaa1111")]))["jobs"][0]
+        assert rec["folder"] == {"id": "aaaa1111", "name": "Veille"}
+
+    def test_an_ungrouped_job_carries_null(self) -> None:
+        rec = json.loads(_call([_job()]))["jobs"][0]
+        assert "folder" in rec and rec["folder"] is None
+
+    def test_an_unknown_folder_id_keeps_the_id_and_a_null_name(self) -> None:
+        # Never pass a raw id off as a name: the folder was deleted or is unknown.
+        rec = json.loads(_call([_job(folder_id="eeee5555")]))["jobs"][0]
+        assert rec["folder"] == {"id": "eeee5555", "name": None}
+
+    def test_an_oversized_stored_folder_id_is_refused_not_carried(self) -> None:
+        # A hand-edited store can hold any string; an unbounded id would push the
+        # first record past the byte budget and the response would be cut mid-JSON.
+        out = _call([_job(folder_id="f" * 200_000)])
+        rec = json.loads(out)["jobs"][0]
+        assert rec["folder"] == {"id": None, "name": None, "error": "stored folder id is too long"}
+        assert len(out) < 10_000
+
+    def test_an_unreadable_store_degrades_to_null_names(self) -> None:
+        self.path.write_text("{}", encoding="utf-8")
+        rec = json.loads(_call([_job(folder_id="aaaa1111")]))["jobs"][0]
+        assert rec["folder"] == {"id": "aaaa1111", "name": None}
+
+    def test_reading_never_writes_the_folder_file(self) -> None:
+        before = self.path.read_bytes()
+        _call([_job(folder_id="aaaa1111"), _job(id="j2")])
+        assert self.path.read_bytes() == before
+
+    def test_the_description_names_the_field(self) -> None:
+        by_name = {t["name"]: t for t in mcp_cron._list_tools()}
+        desc = by_name["cron_list"]["inputSchema"]["properties"]["json"]["description"]
+        assert "folder" in desc
 
 
 class TestOwnership:
@@ -224,7 +275,7 @@ class TestBoundsAndSafety:
 
     def test_a_credential_in_a_prompt_is_redacted_before_truncation(self) -> None:
         """Truncate-then-sanitize leaves a credential's prefix in the surviving span."""
-        secret = "AKIAIOSFODNN7EXAMPLE"
+        secret = github_classic(seed=314)  # a bare 40-character run stays visible
         out = _call([_job(message=f"Check {secret} and report the timestamp.")])
         assert secret not in out
         for n in (8, 12, 16):
@@ -259,7 +310,7 @@ class TestTextModesUnchanged:
     def test_verbose_is_still_text(self) -> None:
         with patch.object(mcp_cron.CronService, "list_jobs", return_value=[_job()]):
             out = mcp_cron._call_tool_inner("cron_list", {"verbose": True})
-        assert "• poller (✅ active) [agent]" in out
+        assert "• poller (active) [agent]" in out
 
     def test_json_wins_over_the_verbose_that_ids_forces_on(self) -> None:
         """ids implies verbose; a machine consumer still needs a document."""

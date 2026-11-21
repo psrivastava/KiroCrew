@@ -14,6 +14,7 @@ import notificationsReducer from '../store/notificationsSlice'
 import { __resetPaneDraftsForTests } from '../utils/chatPaneDrafts'
 import type { ChatMessage } from '../types'
 import * as transport from '../chat-core/transport/sendTurn'
+import { browserLiveStore } from '../hooks/useBrowserLive'
 
 // The real pane/composer/serializer/reducers; only network and unrelated rich
 // content are mocked. A deferred receipt lets each test observe the send itself.
@@ -39,7 +40,7 @@ vi.mock('../api/client', () => ({
     chatSlotAgent: vi.fn().mockResolvedValue(undefined),
     stopChat: vi.fn(),
     interruptSlot: vi.fn(),
-    resolveApproval: vi.fn().mockResolvedValue({ ok: true }),
+    decideApproval: vi.fn().mockResolvedValue({ ok: true }),
     answerQuestion: vi.fn().mockResolvedValue({ ok: true }),
   },
   SEARCH_MIN_CHARS: 2,
@@ -310,12 +311,13 @@ describe('mate responsive Send', () => {
   it('retains actionable spawn approvals even though routine subagent progress is hidden', async () => {
     const { store } = renderCrewmate({ width: 320 })
     await ready()
-    act(() => { store.dispatch(sseSubagentPending({ slot: SLOT, id: 'worker-fixed', task: 'Review report', approval_id: 'spawn-fixed' })) })
+    const target = { origin: 'coordinator' as const, id: 'spawn-fixed', slot: SLOT, instance: 'inst-spawn-fixed' }
+    act(() => { store.dispatch(sseSubagentPending({ slot: SLOT, id: 'worker-fixed', task: 'Review report', approval_id: 'spawn-fixed', approval_target: target })) })
     const card = await screen.findByTestId('spawn-approval-card')
     expect(card).toBeInTheDocument()
     expect(screen.queryByTestId('subagent-progress-probe')).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'Approve', exact: true }))
-    await waitFor(() => expect(api.resolveApproval).toHaveBeenCalledWith('spawn-fixed', 'approve'))
+    await waitFor(() => expect(api.decideApproval).toHaveBeenCalledWith(target, 'approve'))
   })
 
   it('an ordinary Sessions pane retains its engineering affordances and sends no responsive flag', async () => {
@@ -635,5 +637,46 @@ describe('the composer while a send waits for the turn that answers it', () => {
     expect(screen.getByTestId('crewmate-live-activity')).toBeInTheDocument()
     expect(screen.getByTestId('stop-button-armed')).toBeInTheDocument()
     expect(resumeShown()).toBe(false)
+  })
+})
+
+describe('a browser hand-back note no agent op took', () => {
+  it('is sent once, by the live-view store, while this crewmate pane is open; the pane sends nothing itself', async () => {
+    renderCrewmate({ running: false })
+    await ready()
+    const chat = vi.fn(async () => ({ status: 'dispatched' }))
+    const release = vi.fn(async () => ({ ok: true, delivered: 'chat' }))
+    const restore = browserLiveStore.__setWritesForTests({ chat, release })
+    try {
+      act(() => { browserLiveStore.applyEvent({ session_key: SLOT, turn_id: 't-hb', state: 'in_control', turn_over: true }) })
+      await act(async () => { await browserLiveStore.release(SLOT, { note: 'Signed in, carry on' }) })
+      expect(chat).toHaveBeenCalledTimes(1)
+      expect(chat).toHaveBeenCalledWith(SLOT, 'Signed in, carry on')
+      expect(api.sendChat).not.toHaveBeenCalled()
+    } finally {
+      browserLiveStore.__setWritesForTests(restore)
+      browserLiveStore.__resetForTests()
+    }
+  })
+
+  it('reaches this Bot now, as the pane\'s own send did: the store\'s send is responsive', async () => {
+    renderCrewmate({ running: true })
+    await ready()
+    vi.mocked(api.sendChat).mockClear()
+    // The real store sender, over the mocked client: only the release is stubbed.
+    const release = vi.fn(async () => ({ ok: true, delivered: 'chat' }))
+    const restore = browserLiveStore.__setWritesForTests({ release })
+    try {
+      act(() => { browserLiveStore.applyEvent({ session_key: SLOT, turn_id: 't-hb2', state: 'in_control', turn_over: true }) })
+      await act(async () => { await browserLiveStore.release(SLOT, { note: 'Done, go on' }) })
+      await waitFor(() => expect(api.sendChat).toHaveBeenCalledTimes(1))
+      const [message, slot, , , , steer, responsive] = vi.mocked(api.sendChat).mock.calls[0]
+      expect([message, slot]).toEqual(['Done, go on', SLOT])
+      expect(responsive).toBe(true)
+      expect(steer).toBeUndefined()
+    } finally {
+      browserLiveStore.__setWritesForTests(restore)
+      browserLiveStore.__resetForTests()
+    }
   })
 })

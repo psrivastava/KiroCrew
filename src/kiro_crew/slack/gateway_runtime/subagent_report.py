@@ -30,6 +30,7 @@ if TYPE_CHECKING:
         OUTCOME_STOPPED,
         SUBAGENT_BATCH_COMPLETION_PREFIX,
         SUBAGENT_COMPLETION_PREFIX,
+        UNVERIFIED_MODEL_NOTE,
         Any,
         GatewayOrchestrator,
         SubagentDelivery,
@@ -71,7 +72,6 @@ class _SubagentReport(NamedTuple):
     """What a completion says; see ``_compose_subagent_completion``."""
 
     status: str
-    emoji: str
     title: str
     result_path: str
     detail: str
@@ -84,10 +84,16 @@ class _SubagentReport(NamedTuple):
 
 
 class _WaveDigest(NamedTuple):
-    """The announce and card facts a completion routes; see ``_subagent_wave_digest``."""
+    """The announce and card facts a completion routes; see ``_subagent_wave_digest``.
+
+    ``carried`` names every member whose result the announce delivers: the
+    completion itself, or each member of a digest chunk. A route may skip the
+    announce only when every one of them already reached the parent inline.
+    """
 
     announce: str
     sub_meta: dict[str, Any]
+    carried: tuple[str, ...]
 
 
 def _compose_subagent_completion(info: SubagentInfo, *, _flush_only: bool) -> _SubagentReport:
@@ -98,22 +104,38 @@ def _compose_subagent_completion(info: SubagentInfo, *, _flush_only: bool) -> _S
     """
     # Three-way outcome: a user stop is neutral — neither a success nor
     # a failure. The record contract keeps ``error`` unset for stops, so
-    # every consumer below must branch on ``user_stopped`` explicitly
-    # rather than inferring success from an empty error.
-    if info.user_stopped:
+    # the status comes from the record's ending, never from an empty error.
+    # A deadline reap is named as one, so the parent can tell it from the
+    # run's own failure. Imported here: these functions run with the
+    # gateway's module globals.
+    from kiro_crew.subagent_ending import SubagentEnding
+
+    ending = info.ending
+    if ending is SubagentEnding.INTERRUPTED_BY_PARENT:
         # The stop's own origin when the record carries one (a
         # parent-end verb), so the announce does not
         # credit the user with a stop they never pressed.
-        status, emoji, single_outcome = (
+        status, word, single_outcome = (
             getattr(info, "_stop_origin", "") or "stopped by user",
-            "⏹",
+            "stopped",
             OUTCOME_STOPPED,
         )
-    elif info.error:
-        status, emoji, single_outcome = "failed", "❌", OUTCOME_FAILED
+    elif ending is SubagentEnding.REAPED:
+        # A deadline or the reaper ended the run, not the run's own error. The
+        # error text names which one (some never started), so the status stays
+        # neutral about it.
+        status, word, single_outcome = "reaped", "failed", OUTCOME_FAILED
+    elif ending is SubagentEnding.FAILED:
+        status, word, single_outcome = "failed", "failed", OUTCOME_FAILED
     else:
-        status, emoji, single_outcome = "completed", "✅", OUTCOME_OK
-    title = f"Subagent `{info.id}` {emoji}"
+        status, word, single_outcome = "completed", "completed", OUTCOME_OK
+    # The header leads with the outcome word the card reads (completed, failed,
+    # stopped); a status that does not already start with it follows a colon.
+    if status == word or status.startswith(f"{word} "):
+        header_status = status
+    else:
+        header_status = f"{word}: {status}"
+    title = f"Subagent `{info.id}` {word}"
 
     # Chat mode: inline info.result (subagent.py already trimmed it to
     # agent.completion_keep + completion_keep_chars) when it fits. When the
@@ -122,6 +144,16 @@ def _compose_subagent_completion(info: SubagentInfo, *, _flush_only: bool) -> _S
     # transcript on demand (read / grep / spawn_status) instead of re-running
     # the subagent.
     result_path = info.result_path or ""
+    # A whole answer a reap got to first: the reap owns the ending and the
+    # report, so the stop's outcome stands, but the parent still receives the
+    # answer, cut and pointed at result.txt like any other truncated result.
+    _finished_answer = ""
+    if getattr(info, "_answer_finished", False) and info.result and not info.partial:
+        _finished_answer = (
+            summarize_result(info.result, result_path)
+            if result_path and info.result_truncated
+            else info.result
+        )
     if info.user_stopped:
         _partial = info.result or ""
         # Same origin as the status line above: a parent end or a row
@@ -129,13 +161,24 @@ def _compose_subagent_completion(info: SubagentInfo, *, _flush_only: bool) -> _S
         # the digest text.
         _origin = getattr(info, "_stop_origin", "") or "stopped by user"
         _who = "Stopped by the user" if _origin == "stopped by user" else f"Stopped ({_origin})"
-        detail = (
-            f"{_who} before completing. Do NOT treat this as "
-            "a finished result or retry it unprompted."
-            + (f"\n\nPartial output:\n{_partial}" if _partial else "")
-        )
+        if _finished_answer:
+            detail = (
+                f"{_who} as it finished its answer. Do NOT retry it unprompted."
+                f"\n\nIts answer:\n{_finished_answer}"
+            )
+        else:
+            detail = (
+                f"{_who} before completing. Do NOT treat this as "
+                "a finished result or retry it unprompted."
+                + (f"\n\nPartial output:\n{_partial}" if _partial else "")
+            )
     elif info.error:
         detail = f"Error: {info.error}"
+        if _finished_answer:
+            detail += (
+                "\n\nThe run finished its answer before the stop took effect:"
+                f"\n{_finished_answer}"
+            )
         # A run that ended on a stall / cancel / transport death keeps
         # what it streamed as a flagged PARTIAL (``info.partial``, set by
         # the stop-reason classifier in subagent_manager/run_turn.py); deliver
@@ -168,19 +211,22 @@ def _compose_subagent_completion(info: SubagentInfo, *, _flush_only: bool) -> _S
     # prose already tells the parent not to treat the output as finished.
     no_tools_note = ""
     if single_outcome == OUTCOME_OK and not _flush_only and info.made_no_tool_calls:
-        no_tools_note = f"⚠ Agent `{info.id}` {NO_TOOL_CALLS_NOTE}"
+        no_tools_note = f"Warning: Agent `{info.id}` {NO_TOOL_CALLS_NOTE}"
     # A completed run whose final segment wrote a tool call as text instead of
     # running it (``SubagentInfo.leaked_tool_call``) reads as a success while
     # that call never executed. Same channel as the note above, so a lone run
     # and a wave digest line both carry it; the outcome stays completed.
     if single_outcome == OUTCOME_OK and not _flush_only and info.leaked_tool_call:
-        _leak_note = f"⚠ Agent `{info.id}` {LEAKED_TOOL_CALL_NOTE}"
+        _leak_note = f"Warning: Agent `{info.id}` {LEAKED_TOOL_CALL_NOTE}"
         no_tools_note = f"{no_tools_note}\n{_leak_note}" if no_tools_note else _leak_note
+    if single_outcome == OUTCOME_OK and not _flush_only and info.served_model_unverified:
+        _model_note = f"Warning: Agent `{info.id}` {UNVERIFIED_MODEL_NOTE}"
+        no_tools_note = f"{no_tools_note}\n{_model_note}" if no_tools_note else _model_note
     announce = (
         f"{SUBAGENT_COMPLETION_PREFIX}\n"
         f"Agent `{info.id}`"
         f"{f' ({info.agent})' if info.agent else ''}"
-        f" {status} {emoji}\n"
+        f" {header_status}\n"
         f"Task: {task_text}\n\n"
         f"Usage: {usage}\n\n"
         f"{detail}" + (f"\n\n{no_tools_note}" if no_tools_note else "")
@@ -207,7 +253,6 @@ def _compose_subagent_completion(info: SubagentInfo, *, _flush_only: bool) -> _S
         body = task_text
     return _SubagentReport(
         status=status,
-        emoji=emoji,
         title=title,
         result_path=result_path,
         detail=detail,
@@ -230,6 +275,7 @@ def _subagent_wave_digest(
     _batch_total: int,
     _no_batch_pending: bool,
     _injection_slot_name: str,
+    _nested_live: bool = False,
 ) -> _WaveDigest | None:
     """Account one completion in its wave and decide how the wave delivers it.
 
@@ -239,10 +285,12 @@ def _subagent_wave_digest(
     the completion is settled here (held for a later chunk, or nothing to release);
     otherwise the announce and card facts to route, a digest chunk's when one fires.
     """
-    status, emoji, detail = report.status, report.emoji, report.detail
+    status, detail = report.status, report.detail
     task_text, usage, result_path = report.task_text, report.usage, report.result_path
     no_tools_note = report.no_tools_note
     announce, sub_meta = report.announce, report.sub_meta
+    # A single completion carries itself; a digest chunk replaces this below.
+    carried = [info.id]
     if _batch_id:
         if _flush_only:
             # Nothing to release (wave already closed / already flushed
@@ -313,7 +361,7 @@ def _subagent_wave_digest(
         # with no consumer.
         #
         # Print the SERVED model id only (no "(requested …)" qualifier):
-        # `_res_model != _req_model` is NOT how the card decides a
+        # served != requested is NOT how the card decides a
         # downgrade — `isModelDowngrade` folds auto/default to "no pin"
         # and treats alias-vs-canonical / routing-prefix pairs as the
         # same model, so a raw inequality would print a false downgrade
@@ -340,22 +388,31 @@ def _subagent_wave_digest(
             # keep cap. Imported here: these functions run with the
             # gateway's module globals, which do not carry the notice.
             from kiro_crew.messaging.empty_turn_copy import EMPTY_TURN_NOTICE_AFTER_WORK
+            from kiro_crew.subagent_ending import SubagentEnding
 
             if (info.result or "").endswith(EMPTY_TURN_NOTICE_AFTER_WORK):
                 _kept = " (partial: ended without a closing reply after tool calls)"
             else:
                 _kept = " (partial: backend failed to generate the final response)"
+            _partial = info.ending is SubagentEnding.PARTIAL
             bp["ok_lines"].append(
-                f"— `{info.id}` ✅{_kept if info.partial else ''} {task_text[:80]}"
+                f"— `{info.id}` completed{_kept if _partial else ''} · {task_text[:80]}"
                 f"{_model_tag} · {usage}"
                 + (f"\n  → {result_path}" if result_path else "")
                 + (f"\n  {no_tools_note}" if no_tools_note else "")
             )
         else:
             bp["fail_lines"].append(
-                f"— `{info.id}` {status} {emoji} · {task_text[:80]}{_model_tag}\n"
+                f"— `{info.id}` {status} · {task_text[:80]}{_model_tag}\n"
                 f"  Usage: {usage}\n"
                 f"  {detail[:400]}{'…' if len(detail) > 400 else ''}"
+                # A finished answer the stop owned is cut at 400 here, so its
+                # transcript is named outside the slice, as an ok line's is.
+                + (
+                    f"\n  → {result_path}"
+                    if result_path and getattr(info, "_answer_finished", False)
+                    else ""
+                )
             )
         _last = bp["total"] > 0 and bp["done"] >= bp["total"]
         if not _last:
@@ -456,7 +513,12 @@ def _subagent_wave_digest(
                 bp.setdefault("held_infos", []).append(info)
                 if _oc == "completed":
                     bp["held_ok_deliveries"].append(
-                        SubagentDelivery(info.id, info.elapsed, info.credits)
+                        SubagentDelivery(
+                            info.id,
+                            info.elapsed,
+                            info.credits,
+                            leaked_process=getattr(info, "_leaked_process", False) is True,
+                        )
                     )
                 elif getattr(info, "_report_owed", False) is True:
                     # A memory-wait expiry the store owes a report until
@@ -485,6 +547,9 @@ def _subagent_wave_digest(
             # These members are released: stop the hold clock so
             # the reaper's deadline sweep does not force a second flush
             # for results this chunk already carries.
+            carried = [_held.id for _held in bp.get("held_infos", [])]
+            if not _flush_only:
+                carried.append(info.id)
             for _held in bp.get("held_infos", []):
                 _held._digest_held_at = 0.0
             bp["held_infos"] = []
@@ -526,20 +591,23 @@ def _subagent_wave_digest(
                 # "This run is complete / All results delivered" claim
                 # is reserved for a wave with no live nested work. The
                 # check is read-only and never withholds the digest.
-                try:
-                    _nested_live = bool(
-                        self.subagent_mgr
-                        and self.subagent_mgr.wave_has_live_nested_spawns(_batch_id)
-                    )
-                except Exception:
-                    _nested_live = False
+                # ``_nested_live`` arrives True when the caller's off-loop
+                # read found a member's child queued only in the task store.
+                if not _nested_live:
+                    try:
+                        _nested_live = bool(
+                            self.subagent_mgr
+                            and self.subagent_mgr.wave_has_live_nested_spawns(_batch_id)
+                        )
+                    except Exception:
+                        _nested_live = False
                 # Members a memory wait ended are dropped work, not
                 # done work. After the tally sentence, which the card
                 # regexes anchor on. "Once memory eases": a member the
                 # spent episode ended at once is counted too, and a
                 # resubmit while that episode lasts is ended at once.
                 _not_run_line = (
-                    f"{bp['not_run']} of the ❌ never started, so their "
+                    f"{bp['not_run']} of the failed runs never started, so their "
                     f"work was not done: resubmit them once memory "
                     f"eases if it is still needed. "
                     if bp.get("not_run")
@@ -548,8 +616,8 @@ def _subagent_wave_digest(
                 if _nested_live:
                     _completion_line = (
                         f"These {bp['total']} sub-agents finished: "
-                        f"{bp['ok']} ✅ · {bp['err']} ❌ · "
-                        f"{bp['stopped']} ⏹. {_not_run_line}"
+                        f"{bp['ok']} completed · {bp['err']} failed · "
+                        f"{bp['stopped']} stopped. {_not_run_line}"
                         f"Their results are below. "
                         f"NOTE: a sub-agent in this wave spawned further "
                         f"work that is still running; that nested work "
@@ -562,8 +630,8 @@ def _subagent_wave_digest(
                 else:
                     _completion_line = (
                         f"wave finished: "
-                        f"{bp['ok']} ✅ · {bp['err']} ❌ · "
-                        f"{bp['stopped']} ⏹ of {bp['total']} agents. "
+                        f"{bp['ok']} completed · {bp['err']} failed · "
+                        f"{bp['stopped']} stopped of {bp['total']} agents. "
                         f"{_not_run_line}"
                         f"All results delivered.\n"
                         f"This run is complete. Finish processing all "
@@ -609,11 +677,17 @@ def _subagent_wave_digest(
                     if _flush_only
                     else ""
                 )
+                # The text can wait in the parent's queue while the
+                # remaining members finish, so the counts are dated, in a
+                # sentence of their own: a channel row carries no meta and
+                # is parsed by its header line.
                 announce = (
                     f"{SUBAGENT_BATCH_COMPLETION_PREFIX}\n"
                     f"Batch results {_chunk_k}/{_chunk_j} — "
                     f"{bp['done']} of {bp['total']} delivered, "
                     f"{_remaining} still running.\n"
+                    f"These counts were taken when this digest was composed; "
+                    f"a running agent may have finished since.\n"
                     f"{_why}"
                     f"Process these results now, but do NOT spawn new "
                     f"sub-agents yet — more result batches from this "
@@ -636,4 +710,4 @@ def _subagent_wave_digest(
                 bp["fail_lines"] = []
                 bp["ok_lines"] = []
                 bp["held_ok_deliveries"] = []
-    return _WaveDigest(announce, sub_meta)
+    return _WaveDigest(announce, sub_meta, tuple(carried))

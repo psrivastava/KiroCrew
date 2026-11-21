@@ -12,9 +12,13 @@ from __future__ import annotations
 
 from typing import Any
 
+from redaction_structured_cases import github_classic
+
 from kiro_crew.mcp_dashboard import TABLE, _list_tools
 from kiro_crew.mcp_tools.dashboard_client import DashboardRequest, InMemoryDashboardClient
 from kiro_crew.mcp_tools.table import Caller, ToolContext
+
+_SECRET = github_classic(seed=46)
 
 _TAGS = [
     {"id": "aaaaaaaaaaaa", "name": "Active", "color": "#22c55e", "order": 0, "status": True},
@@ -159,10 +163,10 @@ class TestTagCreate:
     def test_a_credential_in_the_name_is_redacted_before_the_write(self) -> None:
         _, dash = _call(
             "chat_tag_create",
-            {"name": "key AKIAIOSFODNN7EXAMPLE"},
+            {"name": f"key {_SECRET}"},
             _reads(post={"id": "dddddddddddd", "name": "x"}),
         )
-        assert "AKIAIOSFODNN7EXAMPLE" not in _writes(dash)[-1].body["name"]
+        assert _SECRET not in _writes(dash)[-1].body["name"]
 
     def test_the_schema_refuses_an_overlong_name(self) -> None:
         out, dash = _call("chat_tag_create", {"name": "x" * 61})
@@ -210,10 +214,10 @@ class TestTagUpdate:
     def test_a_credential_in_the_new_name_is_redacted_before_the_write(self) -> None:
         _, dash = _call(
             "chat_tag_update",
-            {"tag": "Blocked", "name": "key AKIAIOSFODNN7EXAMPLE"},
+            {"tag": "Blocked", "name": f"key {_SECRET}"},
             _reads(patch={"id": "bbbbbbbbbbbb", "name": "x"}),
         )
-        assert "AKIAIOSFODNN7EXAMPLE" not in _writes(dash)[-1].body["name"]
+        assert _SECRET not in _writes(dash)[-1].body["name"]
 
     def test_an_unverifiable_caller_cannot_update(self) -> None:
         out, dash = _call("chat_tag_update", {"tag": "Blocked", "name": "X"}, caller=_UNVERIFIED)
@@ -244,6 +248,33 @@ class TestTagAssign:
         assert put.session_key == "dashboard:chat-1-100"
         assert "added `Blocked`" in out and "removed `Active`" in out
         assert "`kirocrew`, `Blocked`" in out
+
+    def test_an_empty_stored_list_is_reported_not_the_request(self) -> None:
+        """The endpoint drops a tag deleted between the GET and the PUT."""
+        out, _ = _call(
+            "chat_tag_assign",
+            {"session": "chat-3-300", "add": ["Active"]},
+            _reads(put={"ok": True, "tags": []}),
+        )
+        assert "added" not in out
+        assert "nothing changed" in out and "Tags now: none." in out
+
+    def test_a_dropped_add_is_not_reported_as_added(self) -> None:
+        out, _ = _call(
+            "chat_tag_assign",
+            {"session": "chat-3-300", "add": ["Active", "Blocked"]},
+            _reads(put={"ok": True, "tags": ["bbbbbbbbbbbb"]}),
+        )
+        assert "added `Blocked`." in out and "`Active`" not in out
+        assert "Tags now: `Blocked`." in out
+
+    def test_a_legacy_ack_without_a_list_reports_the_request(self) -> None:
+        out, _ = _call(
+            "chat_tag_assign",
+            {"session": "chat-3-300", "add": ["Active"]},
+            _reads(put={"ok": True}),
+        )
+        assert "added `Active`" in out and "Tags now: `Active`." in out
 
     def test_a_no_op_delta_writes_nothing(self) -> None:
         out, dash = _call(

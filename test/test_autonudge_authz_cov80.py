@@ -1,10 +1,8 @@
 """Coverage for ``kiro_crew.autonudge_authz`` guard clauses and audit fallbacks.
 
-``test/test_workflows_nudge_wiring.py`` already pins the happy path and the
-headline Discord/dashboard denials. This file targets the remaining rejection
-branches of BOTH chokepoints — the ones an attacker or a broken caller reaches
-first — plus the two "auditing must never break the flow" fallbacks and the
-``svc`` failure paths, where a swallowed exception would hide a security event.
+The happy path lives in ``test/test_workflows_nudge_wiring.py``. This file covers the
+other rejection branches of BOTH chokepoints, the "auditing must never break the flow"
+fallbacks, and the ``svc`` failure paths, where a swallowed exception hides a security event.
 
 Every test patches ``sel`` so nothing is written to the real security event log.
 """
@@ -46,6 +44,7 @@ from kiro_crew.monitoring.models import (
     MonitorOutcome,
     MonitorState,
 )
+from kiro_crew.testing.synthetic_credentials import github_classic
 from kiro_crew.testing.wait import async_wait_until
 
 
@@ -1906,15 +1905,16 @@ class TestNormalizeBannerTruncate:
     sliced into a raw prefix that defeats full-token detection."""
 
     def test_a_credential_straddling_the_cap_is_masked_not_sliced(self) -> None:
-        # 20-char key starts 10 chars before the cap and runs past it: a
-        # slice-before-redact (the old ``objective[:cap]``) would keep the raw
-        # 10-char prefix ``AKIAIOSFOD`` because the truncated token does not
-        # match the scanner.
-        straddling = "x" * (MAX_BANNER_CHARS - 10) + "AKIAIOSFODNN7EXAMPLE" + " tail"
+        # A 40-char GitHub token (an AWS key ID and a bare 40-character run are kept
+        # visible, so neither can stand in) starts 10 chars before the cap and runs
+        # past it: a slice-before-redact (the old ``objective[:cap]``) would keep the
+        # raw 10-char prefix because the truncated token does not match the scanner.
+        secret = github_classic(seed=113)
+        straddling = "x" * (MAX_BANNER_CHARS - 11) + " " + secret + " tail"
         value, error = normalize_banner(straddling, absent_ok=True, truncate=True)
         assert error is None
         assert len(value) <= MAX_BANNER_CHARS
-        assert "AKIA" not in value, "a raw credential prefix survived the cap cut"
+        assert secret[:10] not in value, "a raw credential prefix survived the cap cut"
 
     def test_a_long_credential_free_objective_truncates_instead_of_dropping(self) -> None:
         value, error = normalize_banner(

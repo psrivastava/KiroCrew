@@ -6,6 +6,7 @@ it relaunches the session.
 from __future__ import annotations
 
 import contextlib
+import json
 from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
@@ -22,11 +23,11 @@ if TYPE_CHECKING:
         DashboardState,
         KiroCrewConfig,
         LLMProvider,
+        SlotAgentSwitchCaller,
         _app_cancel_denied,
         _append_session_switch_notice,
         _ChatSlot,
         _context_usage_payload,
-        _history_key_for,
         _normalize_model,
         _owner_denial_response,
         _reset_slot_session,
@@ -36,10 +37,10 @@ if TYPE_CHECKING:
         _subagents_attached_response,
         _switch_target_busy,
         _sync_served_model,
+        app_owns_slot_session,
         capabilities_of,
         deny_app_slot_access,
         effective_session_key,
-        is_owner_dashboard_request,
         logger,
         model_registry,
         pick_epoch_host,
@@ -94,7 +95,7 @@ def _model_rejected_reason(
         backends: list[str] = [backend]
     else:
         from kiro_crew.crewmate_harness import CrewmateHarnessUnavailable, crewmate_backend_pin
-        from kiro_crew.members import select_provider_backend
+        from kiro_crew.members import select_provider_backend, session_backend_pick
 
         cfg = None
         try:
@@ -104,20 +105,22 @@ def _model_rejected_reason(
         except Exception:  # pragma: no cover - config load is resilient
             default_backend, member_backend = "", ""
         keys = list(session_keys or ())
-        try:
-            backends = (
-                [
-                    select_provider_backend(
-                        k,
-                        member_backend,
-                        default_backend,
-                        crew_backend=crewmate_backend_pin(cfg, k) if cfg is not None else None,
-                    )
-                    for k in keys
-                ]
-                if keys
-                else [default_backend]
+
+        def _backend_of(k: str | None) -> str:
+            if cfg is None:  # pragma: no cover - config load is resilient
+                return default_backend
+            # A session created on a harness is judged on that harness.
+            pick = session_backend_pick(k)
+            return select_provider_backend(
+                k,
+                member_backend,
+                default_backend,
+                backend_override=pick,
+                crew_backend=crewmate_backend_pin(cfg, k) if pick is None else None,
             )
+
+        try:
+            backends = [_backend_of(k) for k in keys] if keys else [default_backend]
         except CrewmateHarnessUnavailable as exc:
             # A crewmate whose pinned harness cannot start takes no model at all.
             return str(exc)
@@ -139,7 +142,7 @@ def _model_rejected_reason(
 
 
 def _is_jev_route_pick(raw: object) -> bool:
-    """Whether a request body's ``model`` is the "Auto (Jev)" sentinel.
+    """Whether a request body's ``model`` is the "Auto (decision model)" sentinel.
 
     Exact identity on a stripped string. A near-miss spelling is NOT this entry
     and falls through to the ordinary model path, where the guard refuses it --
@@ -202,6 +205,13 @@ async def _reapply_effort_after_live_switch(
         # Through the class: the shared body the provider's own set_model runs.
         return await AcpProvider.reapply_live_effort(provider, slot.reasoning_effort)
     except Exception as exc:
+        if getattr(exc, "command_refused", False) is True:
+            # kiro-cli refused the level for this model and nothing changed; a
+            # reset would cold-start on the same level and lose the live session.
+            logger.warning(
+                "Effort re-apply after live model switch refused for slot %s: %s", name, exc
+            )
+            return True
         logger.warning(
             "Effort re-apply after live model switch failed for slot %s: %s: %s"
             " — falling back to reset",
@@ -252,6 +262,10 @@ async def _try_live_model_switch(
         # Propagate so the handler answers 4xx and the slot keeps its old model.
         raise
     except Exception as exc:
+        if provider.switches_by_relaunch is True:
+            # A relaunch that failed put the prior model back on the same chat; a
+            # reset would cold-start on the refused model and fail the same way.
+            raise
         logger.warning(
             "Live set_model(%s) failed for slot %s: %s: %s — falling back to reset",
             wire,
@@ -356,6 +370,37 @@ def _broadcast_context_reset(state: "DashboardState", slot_key: str, provider: A
         logger.exception("Failed to broadcast context_usage reset for slot %s", slot_key)
 
 
+def _read_model_field(body: dict) -> tuple[str, str, web.Response | None]:
+    """The body's ``model`` as text, a warning to return, or the 400 refusing it.
+
+    ``null`` is read as the default (``""``), with a warning. Any other non-string
+    is refused: saved to the slot, it breaks every later read of ``slot.model``.
+    """
+    raw = body.get("model", "")
+    if raw is None:
+        return "", "model was null; read as the default model", None
+    if not isinstance(raw, str):
+        return (
+            "",
+            "",
+            web.json_response(
+                {"error": "model must be a string", "code": "invalid_model"}, status=400
+            ),
+        )
+    return raw, "", None
+
+
+def _with_warning(resp: web.Response, warning: str) -> web.Response:
+    """*resp* with *warning* added to its JSON body, when it is a success."""
+    if not warning or not 200 <= resp.status < 300 or resp.body is None:
+        return resp
+    payload = json.loads(resp.body)  # type: ignore[arg-type]
+    prior = payload.get("warning")
+    payload["warning"] = f"{prior} {warning}" if prior else warning
+    resp.text = json.dumps(payload)
+    return resp
+
+
 async def api_chat_slot_model(request: web.Request) -> web.Response:
     """POST /api/chat/slots/{slot}/model — set model for a chat slot.
 
@@ -378,13 +423,36 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
     if body_err is not None:
         return body_err
     assert body is not None  # read_bounded_json returns (dict, None) on success
-    # The "Auto (Jev)" entry is resolved HERE and nowhere else: every reader below
+    raw_model, warning, refusal = _read_model_field(body)
+    if refusal is not None:
+        return refusal
+    resp = await switch_slot_model(
+        state, slot, name, raw_model, SlotAgentSwitchCaller.for_request(request)
+    )
+    return _with_warning(resp, warning)
+
+
+async def switch_slot_model(
+    state: DashboardState,
+    slot: _ChatSlot,
+    name: str,
+    raw_model: Any,
+    caller: SlotAgentSwitchCaller,
+) -> web.Response:
+    """The model picker's transaction, for the HTTP route and the in-turn ``/model <id>``.
+
+    *caller* says who asked (see :class:`SlotAgentSwitchCaller`): the route passes
+    its request, the chat runner's command passes ``for_turn``, so the busy rules,
+    the deferral and the owner gate are the same for both. A turn caller is never
+    the owner, so it cannot arm "Auto (decision model)".
+    """
+    # The "Auto (decision model)" entry is resolved HERE and nowhere else: every reader below
     # -- the guard, the live switch, the reset, the session allocation, the
     # composer chip -- takes the id it produces, which is the plain ``auto`` the
     # session actually runs on until a tier is answered. The choice itself
     # survives as ``slot.jev_route`` alone.
-    jev_route = _is_jev_route_pick(body.get("model", ""))
-    if jev_route and not is_owner_dashboard_request(request):
+    jev_route = _is_jev_route_pick(raw_model)
+    if jev_route and not caller.owner:
         # Arming routing is an OWNER action: it hands the per-turn model choice to
         # the oracle, and a dear tier spends the owner's credential on a model the
         # caller never named. The cross-app gate above cannot carry that decision --
@@ -399,8 +467,12 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
             resources=f"slot={name}",
             error="non-owner identity rejected",
         )
-        return _owner_denial_response(request, "arming Jev routing is owner-only")
-    model_name = "auto" if jev_route else _normalize_model(body.get("model", ""))
+        if caller.request is not None:
+            return _owner_denial_response(caller.request, "arming Jev routing is owner-only")
+        return web.json_response(
+            {"error": "arming Jev routing is owner-only", "code": "owner_only"}, status=403
+        )
+    model_name = "auto" if jev_route else _normalize_model(raw_model)
     # Judged on THIS slot's harness: a member DM runs on agent.member_acp_backend.
     reason = _model_rejected_reason(model_name, session_keys=(effective_session_key(slot),))
     if reason:
@@ -444,7 +516,7 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
         # Re-authorize after the await above (see _slot_replaced_while_queued):
         # ``name`` can be recreated for a different app while this request
         # queued, and every read of ``slot`` below would be of the stale one.
-        if _slot_replaced_while_queued(state, slot, name, request, "chat.slot_model"):
+        if _slot_replaced_while_queued(state, slot, name, caller.scope, "chat.slot_model"):
             return slot_not_found()
         # The session the switch will probe and, on the reset path, tear
         # down. ``effective_session_key``, never ``_history_key_for`` (the
@@ -467,13 +539,13 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
         await _stack.enter_async_context(slot._model_pick_lock)
         # Two more lock-acquisition awaits, one re-check: nothing reads
         # ``slot`` between them, so a check after the last one covers both.
-        if _slot_replaced_while_queued(state, slot, name, request, "chat.slot_model"):
+        if _slot_replaced_while_queued(state, slot, name, caller.scope, "chat.slot_model"):
             return slot_not_found()
         # App isolation on the SESSION, not just the slot (the cancel
         # routes' policy): slot ownership does not imply ownership of a
         # linked channel session, so an app caller may not switch the model
         # a channel thread runs on. Denied as an indistinguishable 404.
-        denied = _app_cancel_denied(request, slot, "chat.slot_model", session_key)
+        denied = _app_cancel_denied(caller.scope, slot, "chat.slot_model", session_key)
         if denied is not None:
             return denied
         # The routing flag is committed on each SUCCESS path and nowhere else -- see
@@ -521,7 +593,7 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
                 pass
             slot._model_pick_gen += 1
             # The one place the flag is recorded on this path, and the reason it is
-            # not written before the branch: an unpinned slot picking "Auto (Jev)"
+            # not written before the branch: an unpinned slot picking "Auto (decision model)"
             # resolves to the ``auto`` it already holds and lands HERE, so a write
             # placed only in the transaction below would never run for the
             # commonest case. This shortcut is a success, so committing is correct.
@@ -529,7 +601,7 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
             state.push_slots_update()
             return web.json_response({"ok": True, "model": model_name, "jev_route": jev_route})
         provider = state.sessions.get_provider(session_key)
-        _busy = _switch_target_busy(state, slot, session_key, provider)
+        _busy = _switch_target_busy(state, slot, session_key, provider, own_turn=caller.own_turn)
         if _busy:
             # Never tear down an in-flight turn: _try_live_model_switch
             # declines a mid-turn live switch (awaiting the backend's answer
@@ -703,6 +775,16 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
             _rollback_pick()
             logger.warning("Slot %s model rejected: %s", name, exc)
             return web.json_response({"error": str(exc), "code": "model_unavailable"}, status=400)
+        except Exception as exc:
+            if provider is None or provider.switches_by_relaunch is not True:
+                raise
+            # A relaunching harness refused the pick and kept its model, so the
+            # slot keeps it too (same answer as an unavailable model).
+            _rollback_pick()
+            logger.warning("Slot %s model switch refused: %s", name, exc)
+            return web.json_response(
+                {"error": str(exc), "code": "model_switch_refused"}, status=400
+            )
         if effective_session_key(slot) != session_key:
             # The slot was bound to a different session while the live switch
             # awaited its provider RPCs (a cron/workflow slot gets linked when
@@ -755,7 +837,7 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
             # (_switch_target_busy), so a sibling alias that began
             # cold-starting during either await is refused here too.
             recheck = state.sessions.get_provider(session_key)
-            if _switch_target_busy(state, slot, session_key, recheck):
+            if _switch_target_busy(state, slot, session_key, recheck, own_turn=caller.own_turn):
                 if _live_serves_target(recheck):
                     # The turn that slipped in runs on a session that already
                     # serves the target (set_model landed before the effort
@@ -914,7 +996,10 @@ async def api_chat_slots_model(request: web.Request) -> web.Response:
     if body_err is not None:
         return body_err
     assert body is not None  # read_bounded_json returns (dict, None) on success
-    model_name = _normalize_model(body.get("model", ""))
+    raw_model, warning, refusal = _read_model_field(body)
+    if refusal is not None:
+        return refusal
+    model_name = _normalize_model(raw_model)
     # One pick lands on every slot, so it must pass on every slot's harness.
     reason = _model_rejected_reason(
         model_name, session_keys=[effective_session_key(s) for s in list(state._slots.values())]
@@ -996,11 +1081,12 @@ async def api_chat_slots_model(request: web.Request) -> web.Response:
             if _slot_replaced_while_queued(state, slot, name, request, "chat.slots_model"):
                 skipped_running.append(name)
                 continue
-            if not is_dashboard_user and session_key != _history_key_for(name):
-                # Slot ownership does not imply ownership of a linked channel
-                # session (the cancel routes' second condition): an app caller
-                # does not get to switch the model a channel thread runs on.
-                # Skipped silently, like every other slot the app does not own.
+            if not is_dashboard_user and not app_owns_slot_session(request_app, slot):
+                # Slot ownership does not imply ownership of the session the
+                # slot runs on or the transcript it writes: the per-slot
+                # checkpoint's rule, re-read inside the locks so a binding that
+                # landed while this iteration queued is the one judged. Skipped
+                # silently, like every other slot the app does not own.
                 continue
             if slot.model == model_name:
                 # The MODEL is unchanged; the routing choice may not be. A slot
@@ -1111,7 +1197,7 @@ async def api_chat_slots_model(request: web.Request) -> web.Response:
             # Explicit pick (bulk): same generation bump as the single-slot pick.
             slot._model_pick_gen += 1
             # And the same clearing of the routing choice. This surface takes no
-            # "Auto (Jev)" target -- it switches many sessions to one model, which
+            # "Auto (decision model)" target -- it switches many sessions to one model, which
             # is the opposite of a per-turn tier -- but it is an explicit pick, so
             # leaving the flag set would route the next turn away from the model
             # the owner just chose for this slot.
@@ -1145,5 +1231,6 @@ async def api_chat_slots_model(request: web.Request) -> web.Response:
             "skipped_running": skipped_running,
             "unchanged": unchanged,
             "failed": failed,
+            **({"warning": warning} if warning else {}),
         }
     )

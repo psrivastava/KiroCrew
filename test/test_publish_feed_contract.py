@@ -46,6 +46,7 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".github" / "workflows"
 MAC_WORKFLOW = WORKFLOWS / "sign-and-notarize.yml"
 LINUX_WORKFLOW = WORKFLOWS / "publish-linux.yml"
+WINDOWS_WORKFLOW = WORKFLOWS / "publish-windows.yml"
 
 # Dummy values that render the feed heredocs into parseable YAML. The
 # sha512 stand-ins are the names of the shell variables the step MUST
@@ -67,6 +68,11 @@ _SUBS = {
     "ARTIFACT_SIZE": "333",
     "FEED_PREFIX": "feed/nightly",
     "MIN_OS": "22.0.0",
+    "INSTALLER_KEY": "desktop/nightly/1.2.3/KiroCrew-Setup.exe",
+    "INSTALLER_SHA512": "INSTALLERSHA512BASE64==",
+    "INSTALLER_SIZE": "444",
+    # What scripts/feed_release_notes.py prints: one JSON string.
+    "RELEASE_NOTES": '"### Fixed\\n- version: 9.9.9"',
 }
 _CDN_BASE = "https://download.crew.kiro.dev"
 
@@ -117,7 +123,7 @@ def _rendered_feed(run_text: str) -> dict:
 
 
 def _assert_updater_layout(feed: dict, extra: frozenset[str] = frozenset()) -> None:
-    expected = {"version", "files", "path", "sha512", "releaseDate"} | extra
+    expected = {"version", "files", "path", "sha512", "releaseDate", "releaseNotes"} | extra
     assert set(feed.keys()) == expected, (
         f"feed keys {sorted(feed)} diverge from the electron-updater contract "
         f"({', '.join(sorted(expected))})"
@@ -216,7 +222,7 @@ def test_feed_destination_is_pointer_prefix_yaml() -> None:
     # format and so names the FILE literally, but the directory is per BUILD
     # (``FEED_PREFIX``): the universal DMG at the channel root, a single-arch DMG
     # one level down -- electron-updater appends no arch suffix on darwin, so
-    # the directory is the only seam (see test_mac_single_arch_legs below).
+    # the directory is the only seam (see the test_mac_single_arch_legs_* tests below).
     for path, job, destination in (
         (MAC_WORKFLOW, "publish", "${FEED_PREFIX}/latest-mac.yml"),
         (LINUX_WORKFLOW, "publish-linux", "${FEED_PREFIX}/${FEED_FILE}"),
@@ -241,9 +247,16 @@ def test_linux_arch_resolution_matches_electron_updater_channel_file_rule() -> N
     immutable: publishing one arch under the other's basename cannot be undone.
     """
     run = _step(_steps(LINUX_WORKFLOW, "publish-linux"), "Resolve arch-dependent names")["run"]
+    # The stem is the job's PUBLISHED_STEM: `KiroCrew` on every oss channel,  # brand-ok
+    # `KiroCrew-LTS` on lts (release-lts.yml).  # brand-ok
+    env = yaml.safe_load(LINUX_WORKFLOW.read_text(encoding="utf-8"))["jobs"]["publish-linux"]["env"]
+    assert (
+        env["PUBLISHED_STEM"]
+        == "${{ inputs.channel == 'lts' && 'KiroCrew-LTS' || 'KiroCrew' }}"  # brand-ok
+    )  # brand-ok
     for arch, basename, feed_file, elf_machine in (
-        ("x64", "KiroCrew-x86_64", "latest-linux.yml", "x86-64"),
-        ("arm64", "KiroCrew-aarch64", "latest-linux-arm64.yml", "aarch64"),
+        ("x64", "${PUBLISHED_STEM}-x86_64", "latest-linux.yml", "x86-64"),
+        ("arm64", "${PUBLISHED_STEM}-aarch64", "latest-linux-arm64.yml", "aarch64"),
     ):
         assert f"{arch})" in run, f"arch {arch} has no branch in the resolution step"
         assert f"LINUX_BASENAME={basename}" in run
@@ -307,8 +320,11 @@ def test_pr_desktop_matrix_gates_macos_but_never_linux() -> None:
     compute = next((s for s in jobs["desktop-matrix"]["steps"] if s.get("id") == "compute"), None)
     assert compute is not None, "desktop-matrix must have a `compute` step emitting os="
     # The queue variable reaches the script as a fixed 'true'/'false' string, so
-    # the shell comparison below never sees an unset name.
-    assert compute["env"]["QUEUE_ON"] == "${{ vars.MERGE_QUEUE_ENABLED == 'true' }}"
+    # the shell comparison below never sees an unset name; it is 'true' only on a
+    # push the merge queue made.
+    assert compute["env"]["QUEUE_ON"] == (
+        "${{ vars.MERGE_QUEUE_ENABLED == 'true' && github.actor == 'github-merge-queue[bot]' }}"
+    )
     assert compute["env"]["EVENT"] == "${{ github.event_name }}"
     script_lines = compute["run"].splitlines()
     os_lines = [line for line in script_lines if "os=[" in line]
@@ -883,7 +899,7 @@ CLI_WORKFLOW = WORKFLOWS / "publish-cli.yml"
 # The channels the publisher accepts, as documented on its workflow_call input.
 # Kept as the single source both assertions read, so a channel added to the
 # pipeline without teaching the installer about it fails here.
-_PUBLISHED_CHANNELS = ("nightly", "insider", "stable")
+_PUBLISHED_CHANNELS = ("nightly", "insider", "stable", "lts")
 
 
 def _installer_source() -> str:
@@ -959,3 +975,110 @@ def test_mac_feed_declares_the_os_floor_read_from_the_artifact() -> None:
         'MIN_OS=$(python3 scripts/feed_min_system_version.py "work/${NOTARIZED_ZIP}")'
     )
     assert derive < run.index("<<EOF"), "the floor must be derived before the feed is written"
+
+
+@pytest.mark.parametrize(
+    ("path", "job"),
+    [
+        (MAC_WORKFLOW, "publish"),
+        (LINUX_WORKFLOW, "publish-linux"),
+        (WINDOWS_WORKFLOW, "publish-windows"),
+    ],
+)
+def test_every_channel_file_carries_the_version_release_notes(path: Path, job: str) -> None:
+    """The app shows a pending update's notes only from the feed's ``releaseNotes``.
+
+    They come from the version's CHANGELOG.md section, printed in the same step
+    before the heredoc.
+    """
+    run = _feed_step(path, job)["run"]
+    feed = _rendered_feed(run)
+    assert feed.get("releaseNotes") == "### Fixed\n- version: 9.9.9"
+    derive = 'RELEASE_NOTES=$(python3 scripts/feed_release_notes.py "${VERSION}")'
+    assert derive in run, f"{path.name}: the notes must come from feed_release_notes.py"
+    assert run.index(derive) < run.index(
+        "<<EOF"
+    ), "the notes must be read before the feed is written"
+
+
+# ---------------------------------------------------------------------------
+# The macOS differential-update blockmap: optional, credential-free, and only
+# ever paired with the bytes the CDN serves.
+# ---------------------------------------------------------------------------
+
+
+def test_mac_blockmap_job_holds_no_credentials_and_runs_when_publish_does() -> None:
+    """The blockmap job installs npm packages and runs them, so it must never
+    share a job with the publish role: no environment (the OIDC subject the
+    role trusts) and no permission beyond reading the repository. Its `if` is
+    publish's own, so a blockmap exists for every publish and for no other run."""
+    jobs = _jobs(MAC_WORKFLOW)
+    blockmap = jobs["blockmap"]
+    assert blockmap.get("permissions") == {"contents": "read"}
+    assert "environment" not in blockmap
+    assert blockmap["if"] == jobs["publish"]["if"]
+    assert "blockmap" in jobs["publish"]["needs"]
+
+
+def test_a_failed_blockmap_job_never_holds_the_release() -> None:
+    """A missing blockmap makes that version's updates full downloads, which is
+    what every mac update was before it existed. It must not stop the feed."""
+    jobs = _jobs(MAC_WORKFLOW)
+    assert "needs.blockmap" not in jobs["publish"]["if"]
+    # A failed job would still fail the workflow its callers gate the GitHub
+    # release and the promotion record on.
+    assert jobs["blockmap"].get("continue-on-error") is True
+    steps = _steps(MAC_WORKFLOW, "publish")
+    for name in ("Download update blockmap", "Publish update blockmap"):
+        assert _step(steps, name).get("continue-on-error") is True, name
+
+
+def test_mac_blockmap_is_published_beside_the_zip_before_the_feed() -> None:
+    steps = _steps(MAC_WORKFLOW, "publish")
+    zip_pub = _step_index(steps, "Publish notarized artifact to distribution bucket")
+    blockmap_pub = _step_index(steps, "Publish update blockmap")
+    feed = _step_index(steps, "Write update feed")
+    assert zip_pub < blockmap_pub < feed
+    run = steps[blockmap_pub]["run"]
+    # MacUpdater fetches `<zip url>.blockmap`; any other key is never read.
+    assert '--key "${DESKTOP_KEY}.blockmap"' in run
+    assert "public, max-age=31536000, immutable" in run
+    assert "--if-none-match" in run
+
+
+def test_mac_blockmap_is_published_only_for_the_bytes_it_describes() -> None:
+    """A blockmap for other bytes makes the client rebuild a zip whose sha512
+    fails, so the update is refused. Both pairings are checked before the
+    write: the blockmap's record against the local zip, and, on a re-run that
+    kept an earlier zip, the served bytes against the local zip."""
+    run = _step(_steps(MAC_WORKFLOW, "publish"), "Publish update blockmap")["run"]
+    assert "openssl dgst -sha512 -binary" in run and "base64 -w 0" in run
+    assert '"$BUILT_FROM" != "$LOCAL_SHA512"' in run
+    assert 'if [ "$ZIP_PUT" = "kept" ]' in run
+    assert '"$SERVED_SHA512" != "$LOCAL_SHA512"' in run
+    zip_run = _step(
+        _steps(MAC_WORKFLOW, "publish"), "Publish notarized artifact to distribution bucket"
+    )["run"]
+    assert "ZIP_PUT=kept" in zip_run and 'echo "ZIP_PUT=${ZIP_PUT}" >> "$GITHUB_ENV"' in zip_run
+
+
+def test_mac_blockmap_comes_from_the_pinned_electron_builder() -> None:
+    """The client compares old and new blockmaps block by block, so every
+    version's must come from the same chunker: electron-builder's own, at the
+    exact version the build pins. A separate .blockmap file is gzip, which is
+    what electron-updater gunzips."""
+    import json
+
+    electron = ROOT / "website" / "electron"
+    script = (electron / "scripts" / "build-zip-blockmap.js").read_text(encoding="utf-8")
+    assert "require('app-builder-lib/out/targets/blockmap/blockmap')" in script
+    assert "buildBlockMap(zip, 'gzip', outBlockmap)" in script
+    pinned = json.loads((electron / "package.json").read_text(encoding="utf-8"))
+    builder = pinned["devDependencies"]["electron-builder"]
+    assert re.fullmatch(r"\d+\.\d+\.\d+", builder), "electron-builder must stay pinned exact"
+    lock = json.loads((electron / "package-lock.json").read_text(encoding="utf-8"))
+    assert lock["packages"]["node_modules/app-builder-lib"]["version"] == builder
+    steps = _steps(MAC_WORKFLOW, "blockmap")
+    install = _step(steps, "Install the pinned electron-builder")
+    assert install["working-directory"] == "website/electron"
+    assert install["run"].startswith("npm ci --ignore-scripts")

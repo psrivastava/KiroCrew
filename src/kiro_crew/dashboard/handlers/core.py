@@ -22,12 +22,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
-from aiohttp.client_exceptions import ClientConnectionResetError
 
 import kiro_crew
 import kiro_crew._facade_mirror as _facade_mirror
 import kiro_crew.config.resolution as _resolution
-from kiro_crew import aws_consent, beacon, platform_compat, stt
+from kiro_crew import aws_consent, beacon, edition, platform_compat, stt
 from kiro_crew.acp_backends import selectable_backend_values, selectable_stored_backend_values
 from kiro_crew.apps.manifest import KEBAB_RE
 from kiro_crew.computer_use.types import MAX_SCREENSHOT_MAX_PX as _CU_MAX_SCREENSHOT_MAX_PX
@@ -77,6 +76,9 @@ from kiro_crew.config.sections import (
     EXTERNAL_TERMINAL_APPS,
     FOLDER_SORT_MODES,
     JUDGE_PROVIDERS,
+    PRIVACY_ACK_VERSION_MAX,
+    REMOTE_EDITOR_HOST_PATTERN,
+    REMOTE_EDITOR_IDS,
     SESSION_SORT_MODES,
     STT_LANGUAGE_AUTO,
     TITLE_REFRESH_EVERY_TURNS_MAX,
@@ -90,6 +92,7 @@ from kiro_crew.config.sections import (
 from kiro_crew.config.superseded_defaults import ack_explicit_write
 from kiro_crew.context_management import RESULT_FILE_MAX_BYTES
 from kiro_crew.dashboard.chat_utils import drained_to_thread, run_config_write
+from kiro_crew.dashboard.dist_file_response import DistFileResponse
 from kiro_crew.dashboard.handlers._shared import (
     _owner_denial_response,
     _pip_install_channel_available,
@@ -115,7 +118,6 @@ from kiro_crew.executors import discovery_executor
 from kiro_crew.external_text import redact_external_text as _redact_external
 from kiro_crew.gateway_identity import gateway_id
 from kiro_crew.mcp_gateway.socketsec import PeerCredResult, check_peer_is_self
-from kiro_crew.metrics import provider as _metrics_provider
 from kiro_crew.security_posture import build_posture_snapshot_async, posture_counts_async
 from kiro_crew.session_workspace import is_valid_id
 from kiro_crew.stt import capabilities as stt_capabilities
@@ -162,6 +164,8 @@ _DIST_INDEX = _DIST_DIR / "index.html"
 # test_served_shell_is_auth_independent.
 _INDEX_HTML_CACHE: tuple[int, str] | None = None
 _SSE_INTERVAL_SECS = 5
+# The most unsent text the sub-agent output stream holds for the next poll.
+_AGENT_STREAM_HOLD_MAX = 1 << 16
 
 
 # Static, secret-free fallback served when the dashboard's static bundle cannot
@@ -262,8 +266,11 @@ async def logo(request: web.Request) -> web.StreamResponse:
         if _h.is_sensitive_path(cfg.dashboard.avatar):
             return web.Response(status=404)
         validated = validate_file_path(cfg.dashboard.avatar)
-        if validated and Path(validated).is_file():
-            return web.FileResponse(validated)
+        # Two ifs, not `validated and await ...`: mypy infers the right operand of
+        # `and` in the left operand's type (str | None), which rejects is_file's bool.
+        if validated:
+            if await asyncio.to_thread(Path(validated).is_file):
+                return DistFileResponse(Path(validated))
     # The DEFAULT logo is channel-aware: nightly builds serve the night-sky
     # variant so the whole in-app surface -- sidebar logo, browser favicon,
     # and native-notification avatar all resolve through /logo.png -- matches
@@ -277,25 +284,64 @@ async def logo(request: web.Request) -> web.StreamResponse:
         names.insert(0, "kirocrew-logo-nightly.png")
     for name in names:
         path = _h._STATIC_DIR / name
-        if path.is_file():
-            return web.FileResponse(path)
+        if await asyncio.to_thread(path.is_file):
+            return DistFileResponse(path)
     return web.Response(status=404)
 
 
 async def api_branding(request: web.Request) -> web.Response:
-    """GET /api/dashboard/branding — bot name and avatar config."""
-    cfg = KiroCrewConfig.load()
+    """GET /api/dashboard/branding — bot name, instance label and avatar config.
+
+    Reads the config the live watcher has already adopted. Every dashboard tab
+    asks for branding, and ``KiroCrewConfig.load()`` rebuilds every config
+    section on each call, so a load per request would hold the event loop. The
+    watcher reloads when either config file's fingerprint moves, and a
+    dashboard config write runs its cycle before answering, so a new bot name
+    reaches this route without a load of its own. Before the watcher is primed
+    (early boot, a CLI host, most tests) the load runs off the loop.
+    """
+    from kiro_crew.config import live
+
+    cfg = live.snapshot()
+    if cfg is None:
+        cfg = await asyncio.to_thread(KiroCrewConfig.load)
     # `direct_local` is the canonical client-side origin signal: true only for a
     # direct-local (loopback, no proxy) caller. The dashboard reads it to gate
     # OS-desktop file actions (open/reveal); any future consumer of origin
     # posture should reuse this flag rather than invent a second home.
+    #
+    # `desktop_launcher` is the other half of that gate: whether this host can
+    # open a file manager right now (the launcher those actions start, and on
+    # Linux a desktop session for it). Without that, `/api/reveal` can only
+    # answer a clipboard copy, so the dashboard does not offer them. It is a
+    # fact about this gateway process, read in a worker thread (a stat of a
+    # fixed system path), and no part of the request decides it.
     return web.json_response(
         {
             "bot_name": cfg.dashboard.bot_name or "Kiro Crew",
+            "instance_label": cfg.dashboard.instance_label,
             "avatar": "/logo.png",
             "direct_local": is_direct_local_request(request),
+            "desktop_launcher": await asyncio.to_thread(platform_compat.desktop_launcher_available),
+            "remote_editor": _remote_editor_branding(cfg.dashboard.remote_editor),
         }
     )
+
+
+def _remote_editor_branding(raw: dict) -> dict[str, str]:
+    """``dashboard.remote_editor`` with each value the schema refuses read as ``""``.
+
+    Both values become part of the side panel's ⋯ menu link, and a key three
+    segments deep keeps an invalid hand-edited value on load, so an unknown editor
+    or a host outside the pattern is dropped here rather than forwarded.
+    """
+    editor, host = raw.get("editor"), raw.get("host")
+    return {
+        "editor": editor if editor in REMOTE_EDITOR_IDS else "",
+        "host": (
+            host if isinstance(host, str) and re.fullmatch(REMOTE_EDITOR_HOST_PATTERN, host) else ""
+        ),
+    }
 
 
 async def _liveness_payload(request: web.Request) -> dict[str, object]:
@@ -327,11 +373,13 @@ async def _liveness_payload(request: web.Request) -> dict[str, object]:
         # The desktop production/nightly cross-app guard calls over loopback and
         # needs exact identity to decide whether it can reuse the shared port.
         # Anonymous non-loopback probes get only the liveness bit, avoiding an
-        # exact-version fingerprint on the public probe boundary.
+        # exact-version fingerprint on the public probe boundary. `edition`
+        # lets an LTS shell tell its own gateway from an oss one on the port.
         payload.update(
             {
                 "app": "kirocrew",
                 "version": kiro_crew.__version__,
+                "edition": edition.EDITION,
                 "gateway_id": await asyncio.to_thread(gateway_id),
             }
         )
@@ -461,6 +509,11 @@ async def api_ready(request: web.Request) -> web.Response:
 _LANGUAGE_TAG_RE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8}){0,2}$")
 
 
+#: A 24-hour ``HH:MM``, the value a browser's time field submits. Matched with
+#: ``fullmatch``: a ``$`` anchor would also accept a trailing newline.
+_CLOCK_TIME_RE = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]")
+
+
 def _theme_payload(cfg: KiroCrewConfig) -> dict[str, object]:
     """Workspace display preferences shared by the boot + config endpoints.
 
@@ -469,12 +522,13 @@ def _theme_payload(cfg: KiroCrewConfig) -> dict[str, object]:
     """
     return {
         "mode": cfg.dashboard.theme_mode or "",
+        "schedule_light": cfg.dashboard.theme_schedule_light or "",
+        "schedule_dark": cfg.dashboard.theme_schedule_dark or "",
         "color": cfg.dashboard.theme_color or "",
         "language": cfg.dashboard.language or "",
         "translucent_panels": cfg.dashboard.translucent_panels or "",
         "onboarded": cfg.dashboard.onboarded,
         "import_onboarded": cfg.dashboard.import_onboarded,
-        "privacy_acked": cfg.dashboard.privacy_acked,
         "crewmates_onboarded": cfg.dashboard.crewmates_onboarded,
     }
 
@@ -486,17 +540,18 @@ async def api_theme_boot(request: web.Request) -> web.Response:
     workspace theme and UI language before the token flow completes. Contains
     no secrets — only workspace-level display preferences and onboarding flags.
     """
-    cfg = KiroCrewConfig.load()
-    return web.json_response(_theme_payload(cfg))
+    # Off the loop: the payload reads config files and the policy profiles.
+    cfg = await asyncio.to_thread(KiroCrewConfig.load)
+    return web.json_response(await asyncio.to_thread(_theme_payload, cfg))
 
 
 async def api_theme_config(request: web.Request) -> web.Response:
     """GET/PUT /api/config/theme — read or update workspace display settings.
 
     GET returns the current config. PUT accepts
-    {mode?, color?, language?, translucent_panels?, onboarded?, import_onboarded?,
-    privacy_acked?, crewmates_onboarded?} and persists ONLY those ``dashboard.*``
-    keys.
+    {mode?, schedule_light?, schedule_dark?, color?, language?, translucent_panels?,
+    onboarded?, import_onboarded?, privacy_acked?, privacy_ack_version?,
+    crewmates_onboarded?} and persists ONLY those ``dashboard.*`` keys.
 
     The PUT is a locked delta read-modify-write, never a whole-document
     ``KiroCrewConfig.save()``. A momentarily unreadable ``config.json`` (a torn
@@ -510,8 +565,8 @@ async def api_theme_config(request: web.Request) -> web.Response:
     refused (500 ``config_unreadable``) with its bytes untouched.
     """
     if request.method == "GET":
-        cfg = KiroCrewConfig.load()
-        return web.json_response(_theme_payload(cfg))
+        cfg = await asyncio.to_thread(KiroCrewConfig.load)
+        return web.json_response(await asyncio.to_thread(_theme_payload, cfg))
 
     # PUT
     denied = await require_owner_dashboard_request(request, "config.theme.write")
@@ -528,9 +583,17 @@ async def api_theme_config(request: web.Request) -> web.Response:
     updates: dict[str, object] = {}
     if "mode" in body:
         mode = body["mode"]
-        if mode not in ("", "dark", "light", "system"):
-            raise web.HTTPBadRequest(text="mode must be '', 'dark', 'light', or 'system'")
+        if mode not in ("", "dark", "light", "system", "schedule"):
+            raise web.HTTPBadRequest(
+                text="mode must be '', 'dark', 'light', 'system', or 'schedule'"
+            )
         updates["theme_mode"] = mode
+    for key in ("schedule_light", "schedule_dark"):
+        if key in body:
+            value = body[key]
+            if value != "" and not (isinstance(value, str) and _CLOCK_TIME_RE.fullmatch(value)):
+                raise web.HTTPBadRequest(text=f"{key} must be '' or a 24-hour HH:MM time")
+            updates[f"theme_{key}"] = value
     if "color" in body:
         color = body["color"]
         if not isinstance(color, str) or len(color) > 64:
@@ -564,6 +627,21 @@ async def api_theme_config(request: web.Request) -> web.Response:
             if not isinstance(body[flag], bool):
                 raise web.HTTPBadRequest(text=f"{flag} must be a boolean")
             updates[flag] = body[flag]
+    # A real int only, for the same reason: ``True`` is an int in Python and
+    # would store as 1.
+    for key in ("privacy_ack_version", "kiro_telemetry_ack_version"):
+        if key not in body:
+            continue
+        version = body[key]
+        if (
+            not isinstance(version, int)
+            or isinstance(version, bool)
+            or not 0 <= version <= PRIVACY_ACK_VERSION_MAX
+        ):
+            raise web.HTTPBadRequest(
+                text=f"{key} must be an integer from 0 to {PRIVACY_ACK_VERSION_MAX}"
+            )
+        updates[key] = version
 
     if updates:
 
@@ -588,9 +666,7 @@ async def api_theme_config(request: web.Request) -> web.Response:
                 {"error": "failed to read config file", "code": "config_unreadable"}, status=500
             )
         except ConfigWriteRefused as exc:
-            return web.json_response(
-                {"error": str(exc), "code": "config_write_refused"}, status=400
-            )
+            return web.json_response({"error": str(exc), "code": exc.code}, status=400)
         except OSError:
             logger.warning("theme config PUT: config.json write failed", exc_info=True)
             return web.json_response(
@@ -599,7 +675,7 @@ async def api_theme_config(request: web.Request) -> web.Response:
             )
 
     cfg = await asyncio.to_thread(KiroCrewConfig.load)
-    return web.json_response(_theme_payload(cfg))
+    return web.json_response(await asyncio.to_thread(_theme_payload, cfg))
 
 
 async def pwa_file(request: web.Request) -> web.StreamResponse:
@@ -608,8 +684,12 @@ async def pwa_file(request: web.Request) -> web.StreamResponse:
     path = _DIST_DIR / name
     # Resolve both sides so a symlinked _DIST_DIR (dev-backend.sh points it
     # at KiroCrewWebsite/dist) still passes the traversal guard.
-    if path.is_file() and _DIST_DIR.resolve() in path.resolve().parents:
-        return web.FileResponse(path)
+    if (
+        await asyncio.to_thread(path.is_file)
+        and await asyncio.to_thread(_DIST_DIR.resolve)
+        in (await asyncio.to_thread(path.resolve)).parents
+    ):
+        return DistFileResponse(path)
     raise web.HTTPNotFound()
 
 
@@ -648,15 +728,20 @@ for _owner in _OWNERS:
     _importlib.import_module(_owner)
 if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and IDEs
     from kiro_crew.dashboard.handlers.core_config_models import (
+        _KAS_VAULT_IDENTITY_KEY,
+        _LIVE_IDENTITY_KEY,
         _ROLE_PIN_REVALIDATING,
         _ROLE_PIN_REVALIDATION_MAX_RESELECTS,
         _active_advertised_ids,
         _active_provider_and_pin_backend,
         _active_provider_name,
         _advertised_evidence_provider,
+        _kas_select_ids,
         _no_kiro_id_reason,
         _provider_backend,
+        _read_kas_vault_identity,
         _revalidate_role_pin_evidence,
+        _spawned_for_another_account,
         _validate_role_model,
     )
     from kiro_crew.dashboard.handlers.core_config_patch import (
@@ -664,30 +749,38 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _beacon_governance_pinned_off,
         _check_default_profile_is_saved,
         _ConfigKeyAlreadySet,
+        _drop_dangling_default_profile,
         _keep_omitted_session_environment_keys,
-        _keep_vm_profiles,
+        _keep_saved_profiles,
         _profile_ids,
         _session_environment_key_validators,
+        _str_list_problem,
         _tailnet_governance_pinned_off,
         _UnknownDefaultProfile,
         api_kirocrew_config_patch,
     )
     from kiro_crew.dashboard.handlers.core_config_schema import (
         _APP_MODEL_SPEC,
+        _APP_MUTE_SESSIONS_SPEC,
         _EDITABLE_CONFIG,
         _MODEL_PIN_PATTERN,
         _acp_backend_patch_values,
         _agent_values,
         _editable_config_spec,
+        _preview,
         _selectable_acp_backends,
         _tier,
     )
     from kiro_crew.dashboard.handlers.core_config_view import (
         _AGENT_UNTRUSTED_TEXT_FIELDS,
+        _DASHBOARD_LOCKS,
         _SENSITIVE_MASK,
         _changed_paths_need_restart,
+        _config_body,
         _hot_apply_after_write,
+        _kas_in_use,
         _mask_agent_free_text,
+        _mask_strings,
         _masked_config_dict,
         api_kirocrew_config,
     )
@@ -736,18 +829,21 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         api_stt_config,
     )
     from kiro_crew.dashboard.handlers.core_stt_speech import (
+        _CLIENT_GONE_POLL_SECS,
         _POLISH_MAX_CHARS,
         _POLISH_MAX_RATIO,
         _POLISH_MIN_RATIO,
         _POLISH_PROMPT,
         _POLISH_TIMEOUT_SECS,
         _POLISH_UNSPACED_SCRIPTS,
+        _ClientGone,
         _polish_is_content,
         _polish_is_ignorable,
         _polish_only_marks_differ,
         _polish_preserves_words,
         _polish_spaces_its_words,
         _polish_split,
+        _transcribe_while_connected,
         api_stt_polish,
         api_stt_transcribe,
     )
@@ -873,29 +969,71 @@ async def api_session_agent_stream(request: web.Request) -> web.StreamResponse:
     resp.headers["Cache-Control"] = "no-cache"
     await resp.prepare(request)
 
-    last_pos = 0
-    from kiro_crew.security import redact_credentials, redact_exfiltration_urls  # noqa: F811
+    from kiro_crew.security import (  # noqa: F811
+        iter_credential_matches,
+        redact_credentials,
+        redact_exfiltration_urls,
+    )
+    from kiro_crew.session_workspace_tail import ResultTail  # noqa: F811
 
-    for _ in range(1200):  # 20 min max
-        try:
-            if path.exists():
-                content = path.read_text(encoding="utf-8")
-                if len(content) > last_pos:
-                    chunk = content[last_pos:]
-                    last_pos = len(content)
-                    chunk, _ = redact_exfiltration_urls(chunk)
-                    chunk, _ = redact_credentials(chunk)
-                    await resp.write(f"data: {json.dumps(chunk)}\n\n".encode())
+    # Each poll reads only the bytes appended since the last one, in a thread:
+    # re-reading the whole file every second on the loop grows with its square.
+    tail = ResultTail(path)
+    # A poll is sent up to the start of its last line and the rest waits for the
+    # next one, so a link, or a credential with its label, is redacted whole:
+    # never a placeholder and then the rest of the link's query.
+    held = ""
+    stopped = False
+
+    def _redacted(text: str) -> str:
+        text, _ = redact_exfiltration_urls(text)
+        return redact_credentials(text)[0]
+
+    async def _send(chunk: str, *, last: bool) -> None:
+        nonlocal held, stopped
+        if stopped or not (chunk or last):
+            return
+        text = held + chunk
+        # A value can start on a line after its label (`Bearer`, a line end,
+        # the token), so the last line with text in it waits, and all of it
+        # does while the two parts redact differently apart than together, or
+        # a credential spans the cut (a kept label redacts the same either way).
+        cut = len(text) if last else text.rfind("\n", 0, len(text.rstrip())) + 1
+        whole = _redacted(text)
+        sent = _redacted(text[:cut])
+        if sent + _redacted(text[cut:]) != whole or (
+            whole != text  # text redaction left unchanged holds no match
+            and any(m.start() < cut < m.end() for m in iter_credential_matches(text))
+        ):
+            cut, sent = 0, ""
+        held = text[cut:]
+        if len(held) > _AGENT_STREAM_HOLD_MAX:
+            # Too long to hold: send it as one read and nothing after it, since
+            # the next read could carry the rest of a value it cuts.
+            sent, held, stopped = whole, "", True
+        if sent:
+            await resp.write(f"data: {json.dumps(sent)}\n\n".encode())
+
+    polls = 1200  # 20 min max
+    try:
+        for poll in range(polls):
+            chunk = await asyncio.to_thread(tail.read_new)
             # Check if the subagent is done.
             state: DashboardState = request.app["state"]
-            if state.subagents:
-                info = state.subagents.get(agent_id)
-                if info and info.done:
-                    await resp.write(b"event: done\ndata: {}\n\n")
-                    break
-        except (ConnectionResetError, ClientConnectionResetError):
-            break
-        await asyncio.sleep(1)
+            info = state.subagents.get(agent_id) if state.subagents else None
+            done = bool(info and info.done)
+            last = done or poll == polls - 1
+            if last:
+                # The decoder may still hold a final "\r"; it belongs to this
+                # last chunk, as the whole-file read gave it.
+                chunk += tail.finish()
+            await _send(chunk, last=last)
+            if done:
+                await resp.write(b"event: done\ndata: {}\n\n")
+                break
+            await asyncio.sleep(1)
+    except ConnectionResetError:
+        pass
     return resp
 
 
@@ -909,7 +1047,7 @@ async def api_logout(request: web.Request) -> web.Response:
     unauthorized revocation.
     """
     import kiro_crew.dashboard.handlers as _h  # noqa: F811
-    from kiro_crew.dashboard.token_auth import revoke_all_sessions  # noqa: F811
+    from kiro_crew.dashboard.token_auth import revoke_all_sessions_async  # noqa: F811
 
     # Reachable over loopback TCP or the dashboard's AF_UNIX socket. A unix peer
     # has an EMPTY request.remote, so the loopback test alone would 403 the
@@ -938,13 +1076,14 @@ async def api_logout(request: web.Request) -> web.Response:
         )
         return web.json_response({"error": "invalid secret"}, status=403)
 
-    # Fail-closed: bump_revocation_gen raises when the persisted counter
-    # cannot be read (bumping from an assumed base could persist a LOWER
+    # Fail-closed: the counter bump raises when neither the live nor the
+    # persisted counter can be read (bumping from an assumed base could persist a LOWER
     # counter, resurrecting revoked sessions after restart) or when the write
     # fails (the counter is left unchanged, so the revocation did not take
-    # effect). Report the failure instead of a false success.
+    # effect). Report the failure instead of a false success. Only the counter
+    # write runs on a worker thread, so a slow disk delays this request, not the loop.
     try:
-        revoke_all_sessions()
+        await revoke_all_sessions_async()
     except OSError:
         logger.warning("logout failed: could not persist session revocation", exc_info=True)
         _sel().log_api_access(
@@ -1034,9 +1173,11 @@ async def api_app_token(request: web.Request) -> web.Response:
     Apps authenticate by presenting their per-app secret (stored on disk
     at install time) via the ``X-App-Secret`` header.  On success, returns
     an HMAC token with ``app=<name>`` in the payload so downstream
-    middleware can extract the verified app identity.
+    middleware can extract the verified app identity, and ``expires_in``,
+    the seconds a caller can present it before it must exchange again.
     """
     from kiro_crew.dashboard.token_auth import generate_token, validate_app_secret  # noqa: F811
+    from kiro_crew.dashboard.token_auth_tokens import LINK_WINDOW_SECS
     from kiro_crew.sel import sel
 
     app_name = request.match_info["name"]
@@ -1051,7 +1192,8 @@ async def api_app_token(request: web.Request) -> web.Response:
         )
         return web.json_response({"error": "missing X-App-Secret header"}, status=403)
 
-    if not validate_app_secret(app_name, provided_secret):
+    # Off the loop: the check reads sealed records from disk.
+    if not await asyncio.to_thread(validate_app_secret, app_name, provided_secret):
         sel().log_api_access(
             caller=app_name,
             operation="app_token_exchange",
@@ -1059,7 +1201,18 @@ async def api_app_token(request: web.Request) -> web.Response:
             source="app_auth",
             error="invalid secret",
         )
-        return web.json_response({"error": "invalid secret"}, status=403)
+        return web.json_response(
+            {
+                "error": "invalid secret",
+                # One message for every refusal reason, so it tells a caller nothing
+                # about which check failed. The second sentence is the upgrade path.
+                "hint": (
+                    "The app must be enabled by the owner. An app installed before "
+                    "this version must be turned off and on once in the App Store."
+                ),
+            },
+            status=403,
+        )
 
     token = generate_token(app_name, app=app_name)
     sel().log_api_access(
@@ -1068,7 +1221,10 @@ async def api_app_token(request: web.Request) -> web.Response:
         outcome="granted",
         source="app_auth",
     )
-    return web.json_response({"token": token})
+    # The token authenticates as ``?token=`` until its ``exp`` (the link window) and
+    # as the session cookie until ``session_exp``. Report the shorter, so a caller
+    # renewing by it never presents an expired token on either path.
+    return web.json_response({"token": token, "expires_in": LINK_WINDOW_SECS})
 
 
 # The session sub-agent routes are owner surfaces under their own audit labels;

@@ -10,8 +10,10 @@
  * folder branch (folder picker, ignore patterns, recursive toggle) and the
  * pending-confirmation dialog that stands between a folder and a large scan.
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { render, screen, fireEvent, waitFor, act, within } from '@testing-library/react'
+import { i18nT } from '../i18n/t'
+import { confirmAction } from './confirmAction'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { ComponentProps } from 'react'
 import SourcesList from '../pages/knowledge/SourcesList'
@@ -68,19 +70,12 @@ const callsTo = (path: string, method?: string) =>
   vi.mocked(api.knowledgeApi).mock.calls.filter(([p, opts]) =>
     p === path && (!method || (opts as RequestInit | undefined)?.method === method))
 
-let confirmSpy: ReturnType<typeof vi.spyOn> | undefined
-
 beforeEach(() => {
   handler = () => ({ ok: true })
   vi.mocked(api.knowledgeApi).mockReset()
   vi.mocked(api.knowledgeApi).mockImplementation(
     (async (path: string, opts?: RequestInit) => handler(path, opts)) as unknown as never,
   )
-})
-
-afterEach(() => {
-  confirmSpy?.mockRestore()
-  confirmSpy = undefined
 })
 
 describe('SourcesList — inline folder scan panel', () => {
@@ -149,6 +144,19 @@ describe('SourcesList — inline folder scan panel', () => {
     expect(screen.getByLabelText('Expand folder details')).toBeTruthy()
   })
 
+  it('marks the folder disclosure button with aria-expanded', async () => {
+    // A screen reader has to hear whether the folder row is open or closed; the
+    // flipped chevron and the label swap alone do not convey disclosure state.
+    routeScan(filesResp({ total: 4, done: 1, failed: 1, files: scanFiles }))
+    renderList()
+    await screen.findByText('Notes folder')
+
+    expect(screen.getByLabelText('Expand folder details').getAttribute('aria-expanded')).toBe('false')
+    fireEvent.click(screen.getByLabelText('Expand folder details'))
+    await screen.findByText('1/4 (25%)')
+    expect(screen.getByLabelText('Collapse folder details').getAttribute('aria-expanded')).toBe('true')
+  })
+
   it('renders nothing for a folder the gateway has no files for', async () => {
     routeScan(filesResp())
     await expandFolder()
@@ -181,7 +189,7 @@ describe('SourcesList — inline folder scan panel', () => {
 })
 
 describe('SourcesList — row actions', () => {
-  it('syncs a manual source and disables the button while in flight', async () => {
+  it('syncs a manual source and marks the button busy while in flight', async () => {
     let releaseSync: (v: unknown) => void = () => {}
     handler = (path: string, opts?: RequestInit) => {
       if (path === '/sources') return [src()]
@@ -195,10 +203,13 @@ describe('SourcesList — row actions', () => {
 
     const button = screen.getByLabelText('Sync source')
     fireEvent.click(button)
-    await waitFor(() => expect(screen.getByLabelText('Sync source')).toHaveProperty('disabled', true))
+    // Busy is aria-disabled, not native disabled: the button stays in the tab
+    // order so a keyboard user keeps focus while the sync runs.
+    await waitFor(() => expect(screen.getByLabelText('Sync source')).toHaveAttribute('aria-disabled', 'true'))
+    expect(screen.getByLabelText('Sync source')).toHaveProperty('disabled', false)
 
     releaseSync({ synced: true })
-    await waitFor(() => expect(screen.getByLabelText('Sync source')).toHaveProperty('disabled', false))
+    await waitFor(() => expect(screen.getByLabelText('Sync source')).not.toHaveAttribute('aria-disabled'))
     expect(callsTo('/sources/s1/sync', 'POST')).toHaveLength(1)
   })
 
@@ -218,7 +229,7 @@ describe('SourcesList — row actions', () => {
     const hint = screen.getByText(/added by agent/)
     expect(hint.getAttribute('title')).toMatch(/nothing to sync/)
 
-    expect(screen.getByLabelText('Remove source')).toBeTruthy()
+    expect(screen.getByLabelText('Remove source', { selector: 'button' })).toBeTruthy()
   })
 
   it('offers Pause on a watching folder and Resume on a paused one', async () => {
@@ -279,8 +290,7 @@ describe('SourcesList — row actions', () => {
     await waitFor(() => expect(callsTo('/sources/f1/confirm', 'POST')).toHaveLength(1))
   })
 
-  it('puts the row back when the delete fails', async () => {
-    confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
+  it('puts the row back and shows the failure when the delete fails', async () => {
     handler = (path: string, opts?: RequestInit) => {
       if (path === '/sources') return [src()]
       if (path === '/sources/s1' && opts?.method === 'DELETE') throw new Error('gateway said no')
@@ -289,14 +299,63 @@ describe('SourcesList — row actions', () => {
     renderList()
     await screen.findByText('doc.md')
 
-    fireEvent.click(screen.getByLabelText('Remove source'))
+    fireEvent.click(screen.getByLabelText('Remove source', { selector: 'button' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Remove source' })
+    expect(within(dialog).getByText(i18nT('pages.knowledge.sourcesList.remove_this_source_and_all_its_ingested_items'), { selector: 'p' })).toBeInTheDocument()
+    await confirmAction('Remove source')
+    await waitFor(() => expect(callsTo('/sources/s1', 'DELETE')).toHaveLength(1))
     // The optimistic removal must be rolled back, or the source silently vanishes
     // from the UI while still being indexed.
     expect(await screen.findByText('doc.md')).toBeTruthy()
+    expect(await screen.findByTestId('source-delete-error')).toHaveTextContent('gateway said no')
+  })
+
+  it('a refused delete puts back only its own row, not one another delete removed meanwhile', async () => {
+    let refuse!: (e: Error) => void
+    handler = (path: string, opts?: RequestInit) => {
+      if (path === '/sources') return [src(), src({ id: 's2', name: 'other.md', uri: '/tmp/other.md' })]
+      if (path === '/sources/s1' && opts?.method === 'DELETE') return new Promise((_, reject) => { refuse = reject })
+      return { ok: true }
+    }
+    const { queryClient } = renderList()
+    await screen.findByText('doc.md')
+    // The rows render in list order, so the first Remove control is doc.md's.
+    fireEvent.click(screen.getAllByLabelText('Remove source')[0])
+    await confirmAction('Remove source')
+    await waitFor(() => expect(callsTo('/sources/s1', 'DELETE')).toHaveLength(1))
+    // A second delete lands while the first is in flight.
+    act(() => { queryClient.setQueryData<Source[]>(['knowledge-sources'], old => old?.filter(s => s.id !== 's2')) })
+    await act(async () => { refuse(new Error('gateway said no')) })
+    await waitFor(() => expect(queryClient.getQueryData<Source[]>(['knowledge-sources'])?.map(s => s.id)).toEqual(['s1']))
+    expect(screen.queryByText('other.md')).toBeNull()
+  })
+
+  it('removes the confirmed source and permits another row removal while that write is pending', async () => {
+    let release!: () => void
+    handler = (path: string, opts?: RequestInit) => {
+      if (path === '/sources') return [src()]
+      if (path === '/sources/s1' && opts?.method === 'DELETE') {
+        return new Promise(resolve => { release = () => resolve({ ok: true }) })
+      }
+      return { ok: true }
+    }
+    const { queryClient } = renderList()
+    fireEvent.click(await screen.findByLabelText('Remove source'))
+    const question = await screen.findByRole('dialog')
+    act(() => { queryClient.setQueryData(['knowledge-sources'], [src({ id: 's2', name: 'other.md' })]) })
+    fireEvent.click(screen.getByLabelText('Remove source', { selector: 'button' }))
+    expect(screen.getByRole('dialog')).toBe(question)
+    await confirmAction('Remove source')
+    await waitFor(() => expect(callsTo('/sources/s1', 'DELETE')).toHaveLength(1))
+    fireEvent.click(screen.getByLabelText('Remove source', { selector: 'button' }))
+    await screen.findByRole('dialog', { name: 'Remove source' })
+    await confirmAction('Remove source')
+    await waitFor(() => expect(callsTo('/sources/s2', 'DELETE')).toHaveLength(1))
+    expect(screen.queryByText('other.md')).not.toBeInTheDocument()
+    await act(async () => { release() })
   })
 
   it('does not delete when the user declines the prompt', async () => {
-    confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false)
     handler = (path: string) => {
       if (path === '/sources') return [src()]
       return { ok: true }
@@ -304,7 +363,10 @@ describe('SourcesList — row actions', () => {
     renderList()
     await screen.findByText('doc.md')
 
-    fireEvent.click(screen.getByLabelText('Remove source'))
+    fireEvent.click(screen.getByLabelText('Remove source', { selector: 'button' }))
+    const dialog = await screen.findByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
     expect(callsTo('/sources/s1', 'DELETE')).toHaveLength(0)
     expect(screen.getByText('doc.md')).toBeTruthy()
   })
@@ -379,6 +441,7 @@ describe('SourcesList — row metadata', () => {
         src({ id: 's1', name: 'Short', properties: JSON.stringify({ word_count: 500 }) }),
         src({ id: 's2', name: 'Long', properties: JSON.stringify({ word_count: 2500 }) }),
         src({ id: 's3', name: 'Unknown', properties: JSON.stringify({}) }),
+        src({ id: 's4', name: 'Single', properties: JSON.stringify({ word_count: 1 }) }),
       ]
       return { ok: true }
     }
@@ -386,8 +449,10 @@ describe('SourcesList — row metadata', () => {
     await screen.findByText('Short')
 
     expect(screen.getByText('500 words')).toBeTruthy()
-    expect(screen.getByText('~3k words')).toBeTruthy()
-    expect(screen.getAllByText(/words/)).toHaveLength(2)
+    expect(screen.getByText('~2.5K words')).toBeTruthy()
+    // The plural comes from the catalog, so one word is not "1 words".
+    expect(screen.getByText('1 word')).toBeTruthy()
+    expect(screen.getAllByText(/words?$/)).toHaveLength(3)
   })
 
   it('shows a summary topic even when the stored themes are unreadable', async () => {
@@ -414,7 +479,7 @@ describe('SourcesList — add-source dialog, file branch', () => {
   }
 
   const dropZone = () =>
-    screen.getByText('Drop files here or click to upload').closest('[role="button"]') as HTMLElement
+    screen.getByText('Drop files or a folder here, or click to choose files').closest('[role="button"]') as HTMLElement
 
   it('highlights the drop zone while a drag is over it and clears the highlight on leave', async () => {
     await openAddDialog()
@@ -436,7 +501,7 @@ describe('SourcesList — add-source dialog, file branch', () => {
 
     expect(onIngest).toHaveBeenCalledTimes(1)
     expect(onIngest.mock.calls[0][0]).toEqual([file])
-    expect(screen.queryByText('Drop files here or click to upload')).toBeNull()
+    expect(screen.queryByText('Drop files or a folder here, or click to choose files')).toBeNull()
   })
 
   it('ingests files chosen through the picker', async () => {
@@ -460,15 +525,17 @@ describe('SourcesList — add-source dialog, file branch', () => {
     await openAddDialog({
       ingestionJobs: [
         { name: 'alpha.md', status: 'done' },
-        { name: 'bravo.md', status: 'error: too large' },
-        { name: 'charlie.md', status: 'chunking' },
+        { name: 'bravo.md', status: 'error', error: 'too large' },
+        { name: 'charlie.md', status: 'uploading' },
       ],
     })
 
     expect(screen.getByText('alpha.md')).toBeTruthy()
     expect(screen.getByText('done')).toBeTruthy()
-    expect(screen.getByText('error: too large')).toBeTruthy()
-    expect(screen.getByText('chunking')).toBeTruthy()
+    // A failed row is an error, so its detail renders through ErrorNotice.
+    expect(screen.getByRole('alert').textContent).toContain('too large')
+    expect(screen.getByText('bravo.md')).toBeTruthy()
+    expect(screen.getByText('uploading')).toBeTruthy()
   })
 
   it('reports a typed namespace up to the caller', async () => {
@@ -494,7 +561,8 @@ describe('SourcesList — add-source dialog, folder branch', () => {
     }
     const utils = renderList()
     fireEvent.click(await screen.findByText('+ Add Source'))
-    fireEvent.click(screen.getByText('Local Folder'))
+    // With a native picker the button opens it; without one it adds by path.
+    fireEvent.click(await screen.findByRole('button', { name: opts.folderPicker ? /Choose folder/ : /Add folder by path/ }))
     return utils
   }
 
@@ -515,8 +583,9 @@ describe('SourcesList — add-source dialog, folder branch', () => {
       },
     })
 
-    fireEvent.click(await screen.findByLabelText('Browse for a folder'))
+    // Choose folder opened the native picker straight away.
     expect(await screen.findByText('Opening...')).toBeTruthy()
+    expect(callsTo('/pick-folder', 'POST')).toHaveLength(1)
 
     releasePick({ path: '/home/user/notes' })
     await waitFor(() =>
@@ -529,7 +598,6 @@ describe('SourcesList — add-source dialog, folder branch', () => {
       extra: (path) => (path === '/pick-folder' ? { path: null } : { ok: true }),
     })
 
-    fireEvent.click(await screen.findByLabelText('Browse for a folder'))
     await waitFor(() => expect(callsTo('/pick-folder', 'POST')).toHaveLength(1))
     expect(screen.getByLabelText('Folder path')).toHaveProperty('value', '')
   })
@@ -620,7 +688,7 @@ describe('SourcesList — pending folder confirmation', () => {
     }
     const utils = renderList()
     fireEvent.click(await screen.findByText('+ Add Source'))
-    fireEvent.click(screen.getByText('Local Folder'))
+    fireEvent.click(await screen.findByRole('button', { name: /Add folder by path/ }))
     fireEvent.change(screen.getByLabelText('Folder path'), { target: { value: '/tmp/huge' } })
     fireEvent.click(screen.getByText('Add Folder'))
     return utils

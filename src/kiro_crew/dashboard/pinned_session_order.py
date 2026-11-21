@@ -16,12 +16,12 @@ agent cannot rewrite the order on disk and have a restart load it.
 
 Rules the writers follow:
 
-* No file at all means the person never reordered. Pinned rows then keep the
-  sidebar's own sort, which is what they had before this store existed. A
-  file holding an empty list is an order that was saved and has since emptied.
+* No file at all means no order was saved yet, by a reorder or by the
+  sidebar's first-load seed. Pinned rows then keep the sidebar's own sort,
+  which is what they had before this store existed. A file holding an empty
+  list is an order that was saved and has since emptied.
 * Pinning a session appends it to the end once an order has been saved, even
-  one that has since emptied. A person who never reordered keeps the plain
-  sort.
+  one that has since emptied. With no saved order it keeps the plain sort.
 * Unpinning a session removes it, so re-pinning later puts it at the end
   instead of back in an old slot.
 * A key whose live slot is unpinned is dropped on the next write. A key with
@@ -43,6 +43,8 @@ from pathlib import Path
 from typing import Any
 
 from kiro_crew.atomic_write import atomic_write
+from kiro_crew.bounded_read import bounded_read
+from kiro_crew.owner_only_files import mkdirs_owner_only
 
 logger = logging.getLogger(__name__)
 
@@ -54,11 +56,11 @@ PINNED_ORDER_FILE = "chat_pinned_order.json"
 #: file-only mask would not cover.
 PINNED_ORDER_DIR = "pinned-order"
 
-#: The slot-row fields that describe the person's orders kept in this store: a
-#: row's place in the pinned order and in the manual order (see "The manual
-#: order" below), and each order's revision. Scoped callers (apps, members) get
-#: none of them, so every route that strips one strips all four.
-PIN_ORDER_FIELDS = frozenset({"pin_rank", "pin_rev", "manual_rank", "manual_rev"})
+#: The person's own slot-row fields kept in this directory (orders, revisions,
+#: read time). Scoped callers (apps, members) get none, so every strip drops all.
+PIN_ORDER_FIELDS = frozenset(
+    {"pin_rank", "pin_rev", "manual_rank", "manual_rev", "last_read_ts", "read_epoch"}
+)
 
 
 def next_revision(current: int, now_us: int) -> int:
@@ -118,7 +120,7 @@ def load_stored(path: Path) -> tuple[list[str], bool]:
     the two answers cannot disagree.
     """
     try:
-        data = _read_order_file(path)
+        data = read_store_file(path, MAX_PINNED_ORDER_FILE_BYTES)
     except FileNotFoundError:
         return [], False
     if data is None:
@@ -143,15 +145,15 @@ def load_stored(path: Path) -> tuple[list[str], bool]:
     return keys[:MAX_PINNED_ORDER_KEYS], True
 
 
-def _read_order_file(path: Path) -> bytes | None:
-    """The order file's bytes, or ``None`` for a file this module did not write.
+def read_store_file(path: Path, max_bytes: int) -> bytes | None:
+    """A store file's bytes, or ``None`` for a file this package did not write.
 
     The read never follows a link and never reads more than
-    :data:`MAX_PINNED_ORDER_FILE_BYTES` plus one byte, so a link to a device or
+    *max_bytes* plus one byte, so a link to a device or
     an oversized file planted at the path cannot exhaust memory on the load
     that runs at every gateway start. A link, a directory, a device or an
-    oversized file is logged and read as ``None``, so the sidebar falls back to
-    its own sort. The next save's atomic rename replaces a link, a device or an
+    oversized file is logged and read as ``None``, so the caller falls back to
+    its default. The next save's atomic rename replaces a link, a device or an
     oversized file; a directory at the path stays, and that save fails until the
     directory is removed. ``FileNotFoundError`` and other
     ``OSError`` propagate as before.
@@ -165,13 +167,9 @@ def _read_order_file(path: Path) -> bytes | None:
         if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
             logger.warning("%s is not a regular file; ignoring it", path.name)
             return None
-        data = handle.read(MAX_PINNED_ORDER_FILE_BYTES + 1)
-    if len(data) > MAX_PINNED_ORDER_FILE_BYTES:
-        logger.warning(
-            "%s is larger than %d bytes; ignoring it",
-            path.name,
-            MAX_PINNED_ORDER_FILE_BYTES,
-        )
+        data = bounded_read(handle, max_bytes + 1)
+    if len(data) > max_bytes:
+        logger.warning("%s is larger than %d bytes; ignoring it", path.name, max_bytes)
         return None
     return data
 
@@ -182,7 +180,7 @@ def save(path: Path, keys: list[str]) -> None:
     ``restrict_to_owner`` also refuses a linked parent, so a ``pinned-order``
     symlink planted before the directory was fenced cannot redirect the write.
     """
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    mkdirs_owner_only(path.parent)
     atomic_write(path, json.dumps(keys), fsync=True, restrict_to_owner=True)
 
 
@@ -264,9 +262,9 @@ def after_pin_change(
 ) -> list[str]:
     """The order after *key* is pinned or unpinned.
 
-    Unpinning removes the key. Pinning appends it once the person has ordered
-    their pins at all (*stored*: an order was saved, even one that has since
-    emptied). A person who never reordered keeps the plain sort.
+    Unpinning removes the key. Pinning appends it once an order is stored at
+    all (*stored*: an order was saved, even one that has since emptied). With
+    no saved order the pin keeps the plain sort.
     """
     rest = [k for k in current if k != key]
     if now_pinned and (stored or rest):

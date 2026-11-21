@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 
+from redaction_structured_cases import github_classic
 from test_slack_renderer import _Provider, _RecSlack
 
 from kiro_crew.acp.types import (
@@ -24,11 +25,8 @@ from kiro_crew.slack.renderer import _STATUS_WORKING, SlackRenderer
 class TestNarrationFoldsIntoSteps:
     """Interim narration is not reply text, on Slack as on the dashboard.
 
-    The dashboard folds a turn's narration ("I'll look at the open issues...")
-    into its steps and shows only the text after the last step as the reply;
-    Slack does the same. Each case drives the REAL TurnDriver, because the run
-    its stream redactor holds across a tool call is what would otherwise split
-    a sentence around a step.
+    Only text after the last step is the reply. Each case drives the REAL TurnDriver,
+    since its stream redactor holds text across a tool call.
     """
 
     @staticmethod
@@ -123,7 +121,7 @@ class TestNarrationFoldsIntoSteps:
         assert streamed == ["Started the deploy; it runs for an hour."], rec.calls
 
     def test_narration_in_a_step_is_redacted(self):
-        key = "AKIA" + "1234567890ABCDEX"
+        key = github_classic(seed=169)
         _, streamed, tasks = self._run(
             [
                 AcpEvent(kind=EVENT_TEXT_CHUNK, text=f"Using key {key} now. "),

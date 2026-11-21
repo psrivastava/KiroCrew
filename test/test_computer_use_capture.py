@@ -31,9 +31,11 @@ import ast
 import importlib
 import inspect
 import os
+import threading
 from pathlib import Path
 
 import pytest
+from regex_structure_helpers import unbounded_repeat_bodies
 
 from kiro_crew import platform_compat
 from kiro_crew.computer_use import capture_macos, macos_ffi
@@ -134,9 +136,7 @@ def _spooled(directory: Path) -> list[str]:
 def test_source_uses_tempfile_gettempdir_not_a_hardcoded_tmp():
     """The spool path must derive from ``tempfile.gettempdir()``.
 
-    Idiom and assertion shape copied from
-    ``test_mcp_playwright_proxy.py::test_source_uses_tempfile_gettempdir_not_hardcoded_slash_tmp``.
-    ``os.environ.get("TMPDIR", "/tmp")`` was the original defect there: the
+    ``os.environ.get("TMPDIR", "/tmp")`` is the defect this guards: the
     fallback does not exist on Windows and ``os.makedirs`` crashed on it.
 
     Asserted against ``macos_ffi`` and its owners (``macos_ffi_window`` owns the default
@@ -242,9 +242,14 @@ def test_persist_restricts_the_file_to_the_owner(spool: Path, monkeypatch: pytes
     left standing between the frame and another local account.
     """
     seen: list[str] = []
-    monkeypatch.setattr(
-        capture_macos.platform_compat, "restrict_to_owner", lambda path: seen.append(str(path))
-    )
+    test_thread = threading.get_ident()
+
+    def _spy(path):
+        # This thread only: the SEL writer thread re-locks its non-empty log per append.
+        if threading.get_ident() == test_thread:
+            seen.append(str(path))
+
+    monkeypatch.setattr(capture_macos.platform_compat, "restrict_to_owner", _spy)
     path = capture_macos.persist_jpeg(_JPEG)
     assert seen == [path]
 
@@ -456,7 +461,7 @@ def test_ring_trim_removes_the_oldest_first(spool: Path):
 def test_ring_trim_ignores_unrelated_files(spool: Path):
     """Only our own frames are eligible — the temp dir is shared."""
     spool.mkdir(parents=True)
-    (spool / "not-ours.txt").write_text("keep me")
+    (spool / "not-ours.txt").write_text("keep me", encoding="utf-8")
     for stamp in (1000, 2000, 3000):
         (spool / f"{SCREENSHOT_FILE_PREFIX}{stamp}{SCREENSHOT_FILE_SUFFIX}").write_bytes(_JPEG)
     capture_macos.trim_shots_dir(keep=1)
@@ -507,11 +512,13 @@ def test_ring_trim_skips_a_file_removed_concurrently(spool: Path, monkeypatch: p
     # where pytest's own tmp_path cleanup calls unlink with dir_fd=.
     def _racy(path, **kwargs):
         real_unlink(path, **kwargs)
-        raise FileNotFoundError(path)
+        if os.path.basename(path).startswith(f"{SCREENSHOT_FILE_PREFIX}1000"):
+            raise FileNotFoundError(path)
 
     monkeypatch.setattr(capture_macos.os, "unlink", _racy)
     # Must not raise; the count it reports simply excludes the racy one.
-    capture_macos.trim_shots_dir(keep=1)
+    assert capture_macos.trim_shots_dir(keep=1) == 1
+    assert _spooled(spool) == [f"{SCREENSHOT_FILE_PREFIX}3000{SCREENSHOT_FILE_SUFFIX}"]
 
 
 # ── the secure-field floor ──
@@ -773,17 +780,25 @@ class TestFramePayloadRegexIsLinear:
     """
 
     def test_a_long_non_matching_run_is_rejected_promptly(self):
-        import time
-
         from kiro_crew.computer_use import screencast
 
+        # The search is one C call, so neither a clock nor an instruction count can
+        # see the backtracking; the pattern's structure decides it instead, and is
+        # checked BEFORE the hostile input so a regressed shape fails here by name
+        # rather than hanging on 200k characters. Backtracking blows up when an
+        # unbounded repeat can split the same run more than one way: a second
+        # unbounded repeat to trade characters with, or a body of varying width.
+        unbounded = unbounded_repeat_bodies(screencast._B64_RE.pattern)
+        assert len(unbounded) == 1, f"{len(unbounded)} unbounded repeats can trade characters"
+        (body,) = unbounded
+        low, high = body.getwidth()
+        assert low == high, f"the repeated body spans {low}..{high} chars, so each split is retried"
+        assert not unbounded_repeat_bodies(body), "an unbounded repeat nests inside another"
+
         # A long charset run that CANNOT complete the match — the worst case for the
-        # vulnerable shape. Generous bound: the linear form does 400k in ~4ms, so a
-        # second means the quadratic behaviour is back.
+        # vulnerable shape.
         hostile = "A" * 200_000 + "!"
-        start = time.monotonic()
         assert screencast._B64_RE.fullmatch(hostile) is None
-        assert time.monotonic() - start < 1.0
 
     def test_real_base64_still_matches(self):
         from kiro_crew.computer_use import screencast

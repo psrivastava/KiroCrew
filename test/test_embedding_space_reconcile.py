@@ -275,11 +275,12 @@ class TestStaleIndexRemovalFailure:
         store.reconcile_embedding_space(_SIG_A)
         store._faiss_path.write_bytes(b"stale-index")
 
-        self._break_unlink(monkeypatch)
-        store.reconcile_embedding_space(_SIG_B)
-        assert store._read_meta("embedding_space_sig") == _SIG_A
+        with monkeypatch.context() as mp:
+            self._break_unlink(mp)
+            store.reconcile_embedding_space(_SIG_B)
+            assert store._read_meta("embedding_space_sig") == _SIG_A
 
-        monkeypatch.undo()  # the next boot can write again
+        # the next boot can write again
         store.reconcile_embedding_space(_SIG_B)
         assert store._read_meta("embedding_space_sig") == _SIG_B
         assert not store._faiss_path.exists()
@@ -380,7 +381,7 @@ class TestLessonVectorRepair:
         assert _lessons_with_vectors(store) == 2
 
     def test_repair_exceeds_the_lazy_five_row_cap(self, tmp_path: Path) -> None:
-        """The sweep is not bounded by _MAX_BACKFILLS_PER_CALL.
+        """The sweep embeds every lesson row it finds, not a fixed handful.
 
         The lessons need distinct VOCABULARY, not just distinct vectors:
         ``write_lesson`` also dedups on keyword overlap, so near-identical

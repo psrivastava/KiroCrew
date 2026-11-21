@@ -130,9 +130,10 @@ class GitError(RuntimeError):
 #: git ends EVERY fetch/push failure with the same access-rights boilerplate, and
 #: an SSH transport failure prints its diagnosis FIRST, so a last-3-lines tail
 #: reports a permission problem the operator does not have. Concretely, for a
-#: remote reachable only through a ``ProxyCommand`` in ``~/.ssh/config`` the
-#: sandbox's ``ssh -F /dev/null`` (see :mod:`kiro_crew.sandbox`) discards that
-#: config, DNS then fails, and the whole diagnosis is one line above the tail:
+#: remote reachable only through a ``ProxyCommand`` in ``~/.ssh/config``, where
+#: the sandbox falls back to ``ssh -F /dev/null`` (a strict tier, or a config ssh
+#: would refuse there; see :mod:`kiro_crew.sandbox`), that config is discarded,
+#: DNS then fails, and the whole diagnosis is one line above the tail:
 #:
 #:     ssh: Could not resolve hostname <host>: Name or service not known
 #:     fatal: Could not read from remote repository.
@@ -144,12 +145,15 @@ class GitError(RuntimeError):
 #: ``Could not read from remote repository`` is deliberately NOT listed: it is
 #: git's OWN boilerplate, printed for every failure. Treating it as a cause would
 #: let it be prepended when the real diagnosis is missing, leading the message
-#: with the same symptom the tail already carries.
+#: with the same symptom the tail already carries. An SSH login refusal lists the
+#: server's auth methods in any order; a local file error's ``Permission denied`` has
+#: no such list.
 _TRANSPORT_CAUSE = re.compile(
     r"^(?:ssh|ssh-\S+):"
     r"|\b(?:Could not resolve hostname"
-    r"|Host key verification failed|Permission denied \(publickey"
+    r"|Host key verification failed"
     r"|Connection refused|No route to host|Connection timed out)\b"
+    r"|\bPermission denied \([A-Za-z][A-Za-z0-9@._+-]*(?:,[A-Za-z][A-Za-z0-9@._+-]*)*\)"
 )
 
 

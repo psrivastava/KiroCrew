@@ -11,6 +11,7 @@ import os
 import re
 import sys
 import time
+import weakref
 from dataclasses import dataclass
 from typing import Any
 
@@ -232,10 +233,9 @@ class LocalOwnerProvenance:
 
     ``app`` names the app whose gateway-spawned backend owns the calling process,
     read from the backend registry; it is ``None`` for an ordinary host process
-    the registry does not know. The mint stamps it into its audit record, so an
-    owner token minted by an app is attributed to that app. It is NOT a token
-    claim: an ``app``-scoped token is refused by the owner-dashboard check, so
-    carrying it in the token would withdraw the capability this admission grants.
+    the registry does not know. ``app is not None`` means the app-backend leg
+    admitted the caller: the owner-token mint refuses such a caller outright and
+    records the name in its audit row.
     """
 
     app: str | None = None
@@ -247,9 +247,10 @@ def local_owner_bootstrap_provenance(request: Any) -> LocalOwnerProvenance | Non
     Admission is unchanged from the boolean gate: a kernel-identified peer with
     a readable process incarnation that is either an ordinary host process or a
     live backend this gateway spawned. The backend registry is consulted first
-    so that a spawned backend is attributed by name even where it also passes as
-    a host process (an unsandboxed backend shares the gateway's namespaces); the
-    order changes what is RECORDED, never what is admitted.
+    so that a spawned backend is named even where it also passes as a host
+    process (an unsandboxed backend shares the gateway's namespaces). The order
+    decides which leg names the caller; the mint then refuses every caller the
+    backend leg named, so a backend never receives a token.
     """
     try:
         pid = _request_peer_pid(request)
@@ -261,7 +262,10 @@ def local_owner_bootstrap_provenance(request: Any) -> LocalOwnerProvenance | Non
             # A registry that cannot answer names no app; the host leg below still
             # decides admission exactly as it does for a caller no backend owns.
             app = None
-        if app:
+        if app is not None:
+            # The registry owns this process, so the backend leg admits it even when
+            # the registry key is empty: truthiness would hand that caller to the host
+            # leg and an unnamed backend would pass as an ordinary host process.
             return LocalOwnerProvenance(app=str(app))
         if _verified_host_process(pid):
             return LocalOwnerProvenance()
@@ -298,6 +302,13 @@ def _gateway_spawned_app_backend(pid: int) -> str | None:
     return spawned_backend_owner(pid)
 
 
+# (pid, start id) per live loopback TCP connection: the transport key dies with the
+# connection, and a pid whose start id changed (recycled) is resolved again.
+_TCP_PEER_BY_TRANSPORT: weakref.WeakKeyDictionary[Any, tuple[int, str]] = (
+    weakref.WeakKeyDictionary()
+)
+
+
 def _request_peer_pid(request: Any) -> int | None:
     from kiro_crew.dashboard.token_auth import _unix_request_socket
     from kiro_crew.mcp_gateway.socketsec import PeerCredResult, check_peer_is_self, get_peer_pid
@@ -327,5 +338,12 @@ def _request_peer_pid(request: Any) -> int | None:
         resolve_tcp = getattr(platform_compat, "get_tcp_peer_pid", None)
         if resolve_tcp is None:
             return None
+        cached = _TCP_PEER_BY_TRANSPORT.get(transport)
+        if cached is not None and platform_compat.get_process_start_id(cached[0]) == cached[1]:
+            return cached[0]
         pid = resolve_tcp(server[:2], client[:2])
+        if isinstance(pid, int) and not isinstance(pid, bool):
+            start_id = platform_compat.get_process_start_id(pid)
+            if start_id:
+                _TCP_PEER_BY_TRANSPORT[transport] = (pid, start_id)
     return pid if isinstance(pid, int) and not isinstance(pid, bool) else None

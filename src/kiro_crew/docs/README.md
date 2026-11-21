@@ -17,13 +17,14 @@ organized for someone browsing the repository.
 | [use-cases.md](use-cases.md) | Real-world workflows. |
 | [troubleshooting.md](troubleshooting.md) | Common problems and fixes. |
 | [blocked-commands.md](blocked-commands.md) | Why a command was refused, what the agent is told to do instead, and how to check your credential setup. |
+| [tool-approvals.md](tool-approvals.md) | Auto-approving one MCP tool on KAS with a `permissions.yaml` rule, and the settings that look like they would but do not. |
 
 ## Core capabilities
 
 | Doc | Covers |
 |---|---|
 | [agents.md](agents.md) | Switching between specialized agents per conversation, thread, or cron job. |
-| [crew-members.md](crew-members.md) | Named mates, their standing DM threads, and routing work to one with `select_crew` / `route_crew`. |
+| [crew-members.md](crew-members.md) | Named Bots, their standing DM threads, and routing work to one with `select_crew` / `route_crew`. |
 | [remote-crew.md](remote-crew.md) | Reaching other machines running their own Kiro Crew gateway: the transports, the pane switcher, sessions that run on one, and federated history search. Formerly [remote-instances.md](remote-instances.md), which now points here. |
 | [agent-spec-fields.md](agent-spec-fields.md) | Every agent-spec field, what it does, and how that differs per ACP backend. |
 | [skills.md](skills.md) | Drop-in markdown knowledge packs for domain-specific workflows. |

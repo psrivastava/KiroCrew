@@ -5,7 +5,8 @@
 
 Kiro Crew supports hands-free interaction through voice input (speech-to-text)
 and voice output (text-to-speech). Input works in the dashboard and on supported
-messaging attachments; output works in the dashboard, Slack, and Telegram.
+messaging attachments; output works in the dashboard, Slack, Telegram, and
+WhatsApp.
 
 ## Voice Input (Speech-to-Text)
 
@@ -34,7 +35,7 @@ fallback).
 ### Messaging Voice Notes
 
 When STT is enabled, audio and voice attachments received through Slack, Discord,
-Teams, Telegram, Webex, WeCom, Weixin, and WhatsApp are automatically transcribed
+Feishu, Teams, Telegram, Webex, WeCom, Weixin, and WhatsApp are automatically transcribed
 through the shared attachment path. Kiro Crew responds to the transcribed text as
 if it had been typed. A channel may impose its own attachment-size and media-type
 limits before transcription.
@@ -47,7 +48,7 @@ download their selected model. For a source install, add the recognizer to the e
 gateway:
 
 ```bash
-pip install 'pywhispercpp>=1.5,<2'
+pip install "pywhispercpp>=1.5,<2"
 ```
 
 Compressed input still needs an authenticated FFmpeg decoder for WebM, M4A, and
@@ -82,7 +83,7 @@ Once the recognizer and decoder are available, there is no separate transcriptio
 program or provider-specific runtime to install. `kirocrew doctor` reports the
 recognizer, model, and resolved decoder.
 
-The other two providers, the full setting list and the retired providers are in
+The other providers (`apple`, `transcribe`, `codex`, and `off`), the full setting list and the retired providers are in
 Kiro Crew's own [configuration reference](../../../../src/kiro_crew/docs/configuration.md).
 
 ### CPU threads (many-core hosts)
@@ -180,6 +181,13 @@ Set `telegram.voice_replies: true` for the default, or use `/voice on` and
 text answer first; TTS is then delivered silently as a voice/audio message, so a
 synthesis failure never removes the usable text response.
 
+### WhatsApp Voice Replies
+
+Set `whatsapp.auto_reply_to_voice: true` and a WhatsApp voice note is answered
+with a voice note after the text answer; a text message still gets text only.
+It needs `provider: "polly"`: a WhatsApp voice note plays Ogg/Opus, which Polly
+writes directly and the built-in engine does not.
+
 ### Configuration
 
 Settings are in **Settings > Voice**, or directly in
@@ -210,13 +218,13 @@ Settings are in **Settings > Voice**, or directly in
 | `enabled` | `false` | Turn on voice replies for **every** Kiro Crew response (text-triggered). Also seeds the `auto_reply_to_voice` default — see below. |
 | `provider` | `"system"` | TTS backend: `"system"` (the host's built-in engine, nothing to install) or `"polly"` (AWS, cloud, and billed). An unrecognized value falls back to `system` with a warning logged: reaching for a paid service is not a choice a typo may make for you. The removed `"piper"`, or an absent key beside a leftover `piper_model`, also resolves to `system`, with one warning. |
 | `auto_reply_to_voice` | _follows `enabled`_ | **Voice-triggered**: when the user sends a voice memo, auto-respond with voice. Defaults to whatever `enabled` is — set explicitly to override. |
-| `rate` | `100%` | 50%–200%. Shared by `polly` and `system` |
+| `rate` | `100%` | A percentage such as `120%`; Settings offers 80%–150%, and a malformed value falls back to `100%`. Shared by `polly` and `system` |
 | **Built-in-engine-specific** | | ignored by the other providers |
 | `system_voice` | _(OS default)_ | The engine's own voice selector: a voice name for `say` and Windows, a language code for `espeak-ng`. Pick one in **Settings > Voice** rather than typing it |
 | **Polly-specific** | | ignored by the other providers |
 | `voice_id` | `Ruth` | Any [Amazon Polly voice](https://docs.aws.amazon.com/polly/latest/dg/voicelist.html) |
 | `engine` | `generative` | `generative`, `neural`, `long-form`, `standard` |
-| `pitch` | `+0%` | -20% to +20% (neural/standard only) |
+| `pitch` | `+0%` | A signed percentage such as `+10%`; Slack offers -20% to +20% (neural/standard only) |
 | `aws_profile` | _(empty)_ | AWS CLI profile; empty = default credentials |
 | `region` | _(empty)_ | AWS region for Polly; empty = CLI default |
 ### Voice-in → voice-out (symmetric voice)
@@ -268,7 +276,7 @@ Responses are cleaned for natural speech before synthesis:
   1. Run `aws configure --profile polly` (or your credential provider) in your
      terminal to set up a named profile.
   2. In **Settings > Voice**, enter `polly` in the
-     **AWS Profile** field (or set `"aws_profile": "polly"` in config.json).
+     **AWS Profile (Amazon Polly)** field (or set `"aws_profile": "polly"` in config.json).
   3. Leave the profile blank to use your default AWS CLI credentials
      (`~/.aws/credentials` default profile or environment variables).
 

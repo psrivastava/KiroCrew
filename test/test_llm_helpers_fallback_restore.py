@@ -13,6 +13,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from redaction_structured_cases import github_classic
 
 from kiro_crew.acp.client import AcpError
 from kiro_crew.llm_helpers import (
@@ -99,9 +100,7 @@ class TestProbeFallbackRestore:
         provider.set_model = AsyncMock(side_effect=_move)
         setattr(provider, TURN_FALLBACK_ATTR, ("primary-model", "fb-1"))
 
-        # flake-ok: pre-existing patch of the stdlib asyncio.sleep, scoped to this with-block; moved verbatim; tracked for a de-flake pass
-        with patch("asyncio.sleep", new_callable=AsyncMock):
-            result = await stream_and_collect(provider, "test")
+        result = await stream_and_collect(provider, "test")
 
         assert result == "ok"
         provider.set_model.assert_awaited_once_with("primary-model")
@@ -365,7 +364,10 @@ class TestCase275RoutesThroughSharedBudgetBody:
     _TRANSIENT = "Prompt error: {'message': 'Internal error: API Error: Internal server error'}"
 
     @pytest.mark.asyncio
-    async def test_forcing_the_shared_body_to_refuse_drops_candidate_retries(self) -> None:
+    async def test_forcing_the_shared_body_to_refuse_drops_candidate_retries(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import kiro_crew.llm_helpers as lh
         from kiro_crew.llm_helpers import _TRANSIENT_RETRIES
 
         call_count = 0
@@ -391,10 +393,11 @@ class TestCase275RoutesThroughSharedBudgetBody:
             provider.served_model = model_id
 
         provider.set_model = AsyncMock(side_effect=_move)
+        # The wait between attempts is a delay the product computes: zero it at that seam
+        # instead of rebinding asyncio.sleep for the whole worker.
+        monkeypatch.setattr(lh, "transient_retry_delay", lambda attempt: 0.0)
 
         with (
-            # flake-ok: pre-existing patch of the stdlib asyncio.sleep, scoped to this with-block; moved verbatim; tracked for a de-flake pass
-            patch("asyncio.sleep", new_callable=AsyncMock),
             patch.object(FallbackState, "should_retry_active", return_value=False),
             pytest.raises(AcpError),
         ):
@@ -427,14 +430,15 @@ class TestFallbackStorySafety:
         heartbeat logs the story with no redaction of its own."""
         from kiro_crew.llm_helpers import FALLBACK_STORY_ATTR, fallback_story_of
 
+        key = github_classic(seed=1)
         exc = AcpError("boom")
         setattr(
             exc,
             FALLBACK_STORY_ATTR,
-            "AKIAIOSFODNN7EXAMPLE throttled; fallbacks fb-1 also unavailable",
+            f"{key} throttled; fallbacks fb-1 also unavailable",
         )
         story = fallback_story_of(exc)
-        assert "AKIAIOSFODNN7EXAMPLE" not in story
+        assert key not in story
         assert "also unavailable" in story
 
     def test_story_read_survives_hostile_exception_attr(self) -> None:

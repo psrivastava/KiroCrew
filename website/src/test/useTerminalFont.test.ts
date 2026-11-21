@@ -5,6 +5,8 @@ import {
   setTerminalFontFamily,
   setTerminalFontSize,
   setTerminalCursorStyle,
+  setTerminalCopyOnSelect,
+  setTerminalCtrlCopyPaste,
   resetTerminalFont,
   __resetTerminalFontStore,
   DEFAULT_TERMINAL_FONT_FAMILY,
@@ -47,6 +49,8 @@ describe('terminal font store', () => {
       fontFamily: '',
       fontSize: DEFAULT_TERMINAL_FONT_SIZE,
       cursorStyle: DEFAULT_TERMINAL_CURSOR_STYLE,
+      copyOnSelect: false,
+      ctrlCopyPaste: false,
     })
   })
 
@@ -73,11 +77,15 @@ describe('terminal font store', () => {
     setTerminalFontFamily('X')
     setTerminalFontSize(20)
     setTerminalCursorStyle('bar')
+    setTerminalCopyOnSelect(true)
+    setTerminalCtrlCopyPaste(true)
     resetTerminalFont()
     expect(getTerminalFont()).toEqual({
       fontFamily: '',
       fontSize: DEFAULT_TERMINAL_FONT_SIZE,
       cursorStyle: DEFAULT_TERMINAL_CURSOR_STYLE,
+      copyOnSelect: false,
+      ctrlCopyPaste: false,
     })
   })
 })
@@ -122,5 +130,40 @@ describe('terminal cursor style', () => {
     expect(s.fontFamily).toBe('Menlo')
     expect(s.fontSize).toBe(18)
     expect(s.cursorStyle).toBe('underline')
+  })
+})
+
+describe('terminal copy on select', () => {
+  it('turns on and persists to localStorage', () => {
+    setTerminalCopyOnSelect(true)
+    expect(getTerminalFont().copyOnSelect).toBe(true)
+    const persisted = JSON.parse(localStorage.getItem('mc-terminal-font') || '{}')
+    expect(persisted.copyOnSelect).toBe(true)
+  })
+
+  it('loads a persisted true on a fresh module load', async () => {
+    localStorage.setItem('mc-terminal-font', JSON.stringify({ copyOnSelect: true }))
+    vi.resetModules()
+    const fresh = await import('../hooks/useTerminalFont')
+    expect(fresh.getTerminalFont().copyOnSelect).toBe(true)
+  })
+
+  it('reads a non-boolean stored value as off', async () => {
+    localStorage.setItem('mc-terminal-font', JSON.stringify({ copyOnSelect: 'true' }))
+    vi.resetModules()
+    const fresh = await import('../hooks/useTerminalFont')
+    expect(fresh.getTerminalFont().copyOnSelect).toBe(false)
+  })
+})
+
+describe('terminal Ctrl+C / Ctrl+V copy and paste', () => {
+  it('persists on, and a fresh load turns on only for a stored literal true', async () => {
+    setTerminalCtrlCopyPaste(true)
+    expect(JSON.parse(localStorage.getItem('mc-terminal-font') || '{}').ctrlCopyPaste).toBe(true)
+    vi.resetModules()
+    expect((await import('../hooks/useTerminalFont')).getTerminalFont().ctrlCopyPaste).toBe(true)
+    localStorage.setItem('mc-terminal-font', JSON.stringify({ ctrlCopyPaste: 'true' }))
+    vi.resetModules()
+    expect((await import('../hooks/useTerminalFont')).getTerminalFont().ctrlCopyPaste).toBe(false)
   })
 })

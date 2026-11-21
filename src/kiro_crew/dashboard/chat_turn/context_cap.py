@@ -1,6 +1,8 @@
-"""The conductor context cap (``docs/request-for-change/rfc-conductor-context-cap.md``).
+"""The context cap (``docs/request-for-change/rfc-conductor-context-cap.md``).
 
-A goal conductor's KAS chat over its marks is trimmed at a dashboard turn's start,
+A goal conductor's KAS chat (and, behind ``session.worker_context_cap``, a dispatched
+worker's) over its line is trimmed at a dashboard turn's start, and only once the
+prompt cache has expired: a warm cache is never trimmed, at any size. The trim runs
 before the turn claims its session: the KAS conversation ends through
 ``discard_conversation(replay=True)``, and the session the turn then starts is seeded
 with a trim note, the session-ledger snapshot and a longer text tail of the transcript.
@@ -31,19 +33,31 @@ if TYPE_CHECKING:
 #: Where a trim lands, in tokens. A cold request there takes about as long as a warm
 #: one at 400K.
 CONTEXT_CAP_LOW_TOKENS = 150_000
-#: Rule A: a session over this at a turn's start is trimmed, warm cache or not.
-CONTEXT_CAP_HIGH_TOKENS = 400_000
-#: Rule B: a session over this whose previous turn ended a cache life ago is trimmed.
+#: A conductor session over this whose previous turn ended a cache life ago is
+#: trimmed. There is no warm-cache line: a warm session is never trimmed, however
+#: large; the window and KAS's own compaction carry it until the cache expires.
 CONTEXT_CAP_IDLE_TOKENS = CONTEXT_CAP_LOW_TOKENS + 50_000
-#: The prompt-cache life Rule B measures the gap against, in seconds.
+#: The same line for a dispatched worker, behind ``session.worker_context_cap``.
+CONTEXT_CAP_WORKER_TOKENS = 300_000
+#: The prompt-cache life the gap is measured against, in seconds.
 CONTEXT_CAP_CACHE_SECS = 300.0
 #: A session a trim started is not trimmed again until its reading has grown this far
 #: past its first one, so a trim that lands high cannot repeat on every cold turn.
 CONTEXT_CAP_DAMPING_TOKENS = 50_000
-#: The trim's replay budget in chars: the room LOW leaves after a fresh conductor
-#: session's ~55K-token start and ~5K for the note, the snapshot and the message, at
-#: 3 chars per token. Every other cold start keeps ``_REPLAY_BUDGET_CHARS``.
-CONTEXT_CAP_TAIL_CHARS = 270_000
+#: What a trimmed session holds besides its tail, in tokens: a fresh conductor
+#: session's ~55K-token start and ~5K for the note, the snapshot and the message.
+CONTEXT_CAP_SEED_BASE_TOKENS = 60_000
+#: The trim's replay budget in tokens: the room LOW leaves after the seed base. It is
+#: turned into chars with the chat's own chars per token (``_context_cap_tail_chars``).
+#: Every other cold start keeps ``_REPLAY_BUDGET_CHARS``.
+CONTEXT_CAP_TAIL_TOKENS = CONTEXT_CAP_LOW_TOKENS - CONTEXT_CAP_SEED_BASE_TOKENS
+#: Chars per token for a chat with no measured trim yet. Mixed Chinese and English
+#: conductor text with tables reads at ~1.65, so this lands at or under LOW.
+CONTEXT_CAP_FALLBACK_CHARS_PER_TOKEN = 1.6
+#: A measured ratio is held to this range. The top is the old fixed 3, so a tail is
+#: never longer than the 270,000 chars it was before it was measured.
+CONTEXT_CAP_MIN_CHARS_PER_TOKEN = 1.0
+CONTEXT_CAP_MAX_CHARS_PER_TOKEN = 3.0
 #: Trims remembered at once, one per conductor chat key; past it the oldest goes.
 _CONTEXT_CAP_MAX_TRIMS = 256
 
@@ -51,8 +65,10 @@ _CONTEXT_CAP_MAX_TRIMS = 256
 CONTEXT_CAP_TRIM_NOTE = (
     "[Context trimmed: this chat moved to a new session at the start of this turn, to "
     "keep its context small. Its newest messages follow as text. Tool calls, their "
-    "output and older messages are not in this context. They are in this chat's "
-    "transcript: search_chat_history searches it and get_chat_session reads it.]"
+    "output and older messages are not in this context. To use an old tool result, "
+    "re-read a file you need (it may have changed since), and for any other output "
+    "call get_chat_session with this chat's session_key and that call's tool_call_id "
+    "from the list below. Older messages: search_chat_history and get_chat_session.]"
 )
 
 
@@ -70,10 +86,15 @@ class _CapTrim:
     #: start that reads it. The damping guard counts from that reading.
     sid: str = ""
     first_tokens: int = 0
+    #: The chars of the tail the seed carried, set when the seed is built.
+    tail_chars: int = 0
 
 
 #: Session key -> the trim that started the session now on that key.
 _CONTEXT_CAP_TRIMS: dict[str, _CapTrim] = {}
+#: Session key -> chars per token measured off that chat's last trim. Kept apart from
+#: ``_CONTEXT_CAP_TRIMS`` so it outlives the session the trim started.
+_CONTEXT_CAP_CHARS_PER_TOKEN: dict[str, float] = {}
 
 
 async def _cap_conductor_context(
@@ -115,10 +136,18 @@ async def _context_cap_trim(
 
     _settle_context_cap_seed(state, session_key)
     # An unreadable config reads as off: a trim is never the fallback.
-    if cfg is None or not cfg.session.context_cap:
+    if cfg is None:
         return "cap_off"
-    if str(slot.agent or "") not in WAKE_RESET_AGENTS:
+    agent = str(slot.agent or "")
+    if agent in WAKE_RESET_AGENTS:
+        on, line = bool(cfg.session.context_cap), CONTEXT_CAP_IDLE_TOKENS
+    elif agent == "kirocrew-worker":
+        on = bool(cfg.session.worker_context_cap)
+        line = CONTEXT_CAP_WORKER_TOKENS
+    else:
         return "out_of_scope"
+    if not on:
+        return "cap_off"
     if is_slash:
         return "slash_command"
     provider = state.sessions.get_provider(session_key)
@@ -131,7 +160,7 @@ async def _context_cap_trim(
     if tokens is None:
         return "unknown_reading"
     floor = _context_cap_damping_floor(state, session_key, tokens)
-    rule = _context_cap_rule(tokens, _context_cap_idle_secs(state, session_key))
+    rule = _context_cap_rule(tokens, _context_cap_idle_secs(state, session_key), line)
     if rule is None:
         return "below_marks"
     if floor is not None and tokens < floor:
@@ -169,17 +198,16 @@ async def _context_cap_trim(
     return "trimmed"
 
 
-def _context_cap_rule(tokens: int, idle_secs: float | None) -> str | None:
-    """The rule that trims a session at *tokens* whose previous turn ended *idle_secs* ago.
+def _context_cap_rule(
+    tokens: int, idle_secs: float | None, line: int = CONTEXT_CAP_IDLE_TOKENS
+) -> str | None:
+    """``"B"`` when a session at *tokens* whose previous turn ended *idle_secs* ago trims.
 
-    Rule A: over HIGH. Rule B: over the Rule B line once the cache life has passed,
-    when the next request writes a new cache either way. ``None``: neither holds.
+    Only Rule B: over *line* once the cache life has passed, when the next request
+    writes a new cache either way. A warm or unknown cache never trims, at any size.
     """
-    if tokens > CONTEXT_CAP_HIGH_TOKENS:
-        return "A"
-    if idle_secs is not None and idle_secs >= CONTEXT_CAP_CACHE_SECS:
-        if tokens > CONTEXT_CAP_IDLE_TOKENS:
-            return "B"
+    if idle_secs is not None and idle_secs >= CONTEXT_CAP_CACHE_SECS and tokens > line:
+        return "B"
     return None
 
 
@@ -231,6 +259,7 @@ def _context_cap_damping_floor(state: DashboardState, session_key: str, tokens: 
         return None
     if not trim.sid:
         trim.sid, trim.first_tokens = sid, tokens
+        _measure_context_cap_ratio(session_key, trim)
     elif trim.sid != sid:
         _CONTEXT_CAP_TRIMS.pop(session_key, None)
         return None
@@ -259,6 +288,39 @@ async def _context_cap_discard(state: DashboardState, slot: _ChatSlot, session_k
         state.broadcast_ws("mcp_report_update", {"slot": slot.key, "mcp_report": None})
     _broadcast_expired_oauth_banners(state, slot)
     return True
+
+
+def _measure_context_cap_ratio(session_key: str, trim: _CapTrim) -> None:
+    """Record the chat's chars per token off the first reading of a session its trim seeded.
+
+    That reading is the seed base plus the tail plus the first turn's own growth, so
+    the ratio reads a little low and the next trim lands at or under LOW, never over.
+    A seed not yet delivered, or a reading no larger than the base, proves nothing and
+    records nothing.
+    """
+    tail_tokens = trim.first_tokens - CONTEXT_CAP_SEED_BASE_TOKENS
+    if not trim.tail_chars or not trim.seeded or trim.seed_pending or tail_tokens <= 0:
+        return
+    ratio = trim.tail_chars / tail_tokens
+    _CONTEXT_CAP_CHARS_PER_TOKEN.pop(session_key, None)
+    while len(_CONTEXT_CAP_CHARS_PER_TOKEN) >= _CONTEXT_CAP_MAX_TRIMS:
+        _CONTEXT_CAP_CHARS_PER_TOKEN.pop(next(iter(_CONTEXT_CAP_CHARS_PER_TOKEN)))
+    _CONTEXT_CAP_CHARS_PER_TOKEN[session_key] = min(
+        CONTEXT_CAP_MAX_CHARS_PER_TOKEN, max(CONTEXT_CAP_MIN_CHARS_PER_TOKEN, ratio)
+    )
+
+
+def _context_cap_tail_chars(session_key: str) -> int:
+    """The trim tail's char budget: ``CONTEXT_CAP_TAIL_TOKENS`` at the chat's chars per token."""
+    ratio = _CONTEXT_CAP_CHARS_PER_TOKEN.get(session_key, CONTEXT_CAP_FALLBACK_CHARS_PER_TOKEN)
+    return int(CONTEXT_CAP_TAIL_TOKENS * ratio)
+
+
+def _note_context_cap_tail(session_key: str, chars: int) -> None:
+    """The seed's tail was built *chars* long: the next ratio is measured against it."""
+    trim = _CONTEXT_CAP_TRIMS.get(session_key)
+    if trim is not None:
+        trim.tail_chars = chars
 
 
 def _remember_context_cap_trim(session_key: str) -> None:
@@ -313,11 +375,12 @@ def _drop_context_cap_seed(session_key: str) -> None:
         trim.seed_pending = False
 
 
-async def _context_cap_seed_head(session_key: str) -> str:
-    """The trim note and the session-ledger snapshot that open a trimmed session's replay.
+async def _context_cap_seed_head(session_key: str, conversation_log: Any = None) -> str:
+    """The trim note, the session-ledger snapshot and the tool pointers of a trimmed replay.
 
     The snapshot is the block a patrol wake already carries (``compose_nudge_body``),
-    read off the loop; a failed read costs the snapshot, never the seed.
+    read off the loop; a failed read costs the snapshot, never the seed. So does a
+    failed pointer read.
     """
     from kiro_crew.session_ledger import ledger_key, render_snapshot
 
@@ -326,7 +389,17 @@ async def _context_cap_seed_head(session_key: str) -> str:
     except Exception:
         logger.debug("Context cap: ledger snapshot failed for %s", session_key, exc_info=True)
         snapshot = ""
+    from kiro_crew.context import build_tool_pointers  # circular: context -> chat
+
+    pointers = ""
+    if conversation_log is not None:
+        try:
+            pointers = await asyncio.to_thread(build_tool_pointers, conversation_log, session_key)
+        except Exception:
+            logger.debug("Context cap: tool pointers failed for %s", session_key, exc_info=True)
     head = CONTEXT_CAP_TRIM_NOTE + "\n\n"
     if snapshot:
         head += snapshot + "\n\n"
+    if pointers:
+        head += pointers + "\n\n"
     return head

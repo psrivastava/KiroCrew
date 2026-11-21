@@ -22,6 +22,7 @@ from types import SimpleNamespace
 import pytest
 
 from kiro_crew import cli_server, memory_backup
+from kiro_crew.doctor_checks import services
 from kiro_crew.memory_stores import DEFAULT_MEMORY_STORE, resolve_store_path
 from kiro_crew.vector_memory import VectorMemoryStore
 
@@ -181,7 +182,7 @@ def test_the_configured_retention_is_the_one_the_copy_prunes_to(
     monkeypatch.setattr(
         memory_backup,
         "prune_backups",
-        lambda path, keep=7: (seen.append(keep), real(path, keep))[1],
+        lambda path, keep=7, **kwargs: (seen.append(keep), real(path, keep, **kwargs))[1],
     )
 
     cli_server._update()
@@ -287,6 +288,7 @@ def test_an_up_to_date_wheel_install_takes_no_copy(
         lambda **kw: SimpleNamespace(managed_by="wheel", defers=False, unavailable_reason=""),
     )
     _serve_feed(monkeypatch, local_version)
+    monkeypatch.setattr(services, "_running_gateway_version", lambda port: None)
 
     db = resolve_store_path(DEFAULT_MEMORY_STORE)
     before = memory_backup.list_backups(db)

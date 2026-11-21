@@ -13,14 +13,14 @@ import {
 import { i18nT } from '../../i18n/t'
 
 /**
- * One decision point's own settings — the DETAIL half of the Decisions (Jev) card.
+ * One decision point's own settings — the DETAIL half of the Decisions card.
  *
  * Split into its own module so the CARD can be mounted synchronously while this is
  * loaded on demand. Both halves of that matter and they pull in opposite directions:
  *
  *  - the card must be synchronous, because settings search highlights a control by
  *    probing the DOM for it and gives up after 100 ms. A deep link to
- *    `developer.decisions-jev` that arrived while a chunk was still in flight found
+ *    `developer.decisions` that arrived while a chunk was still in flight found
  *    nothing and rang no control.
  *  - this panel need not be, because nothing it draws is in the settings registry:
  *    every control here takes its label from a map keyed by the SERVER's id (the
@@ -48,6 +48,9 @@ export interface DecisionsPointPanelProps {
   scopeOffered: boolean
   scopeDisabled: boolean
   onScopeChange: (value: boolean) => void
+  /** `browser.step`'s second scope: screenshots of the agent's tab, on with the consent until turned off. */
+  browserImages: boolean
+  onBrowserImagesChange: (value: boolean) => void
   /** `model.route`'s tier map, the advertised models, and the labels for both. */
   modelRoute: Record<string, string>
   modelNames: string[]
@@ -82,6 +85,8 @@ export function DecisionsPointPanel({
   scopeOffered,
   scopeDisabled,
   onScopeChange,
+  browserImages,
+  onBrowserImagesChange,
   modelRoute,
   modelNames,
   tierLabel,
@@ -139,6 +144,18 @@ export function DecisionsPointPanel({
           disabled={scopeDisabled}
         />
       )}
+      {/* `browser.step` carries a second, narrower egress switch of its own: images
+          cannot be scrubbed the way the outline is, so screenshots need their own yes.
+          Drawn on the terms the first switch is (consent stands, outlines on). */}
+      {row.id === 'browser.step' && scopeOffered && scopeGranted && (
+        <SettingsToggle
+          label={i18nT('pages.developer.featurePreviewsTab.decisions_browser_images')}
+          description={i18nT('pages.developer.featurePreviewsTab.decisions_browser_images_desc_summary')} hint={i18nT('pages.developer.featurePreviewsTab.decisions_browser_images_desc')}
+          checked={browserImages}
+          onChange={onBrowserImagesChange}
+          disabled={scopeDisabled}
+        />
+      )}
       {/* `model.route` answers a TIER, and the tier-to-model map is what turns that
           answer into a model. Three pickers fed by the same advertised-model list every
           other picker reads, so an id that cannot run cannot be chosen — and INHERIT is
@@ -190,7 +207,7 @@ export function DecisionsPointPanel({
           )}
           <SettingsSelect
             label={i18nT('pages.developer.featurePreviewsTab.decisions_judge_provider')}
-            description={i18nT(
+            hint={i18nT(
               'pages.developer.featurePreviewsTab.decisions_judge_provider_desc',
             )}
             configKey={DECISIONS_NUDGE_WAKE_PROVIDER_PATH}
@@ -202,7 +219,7 @@ export function DecisionsPointPanel({
           />
           <SettingsSelect
             label={i18nT('pages.developer.featurePreviewsTab.decisions_judge_model')}
-            description={i18nT('pages.developer.featurePreviewsTab.decisions_judge_model_desc')}
+            hint={i18nT('pages.developer.featurePreviewsTab.decisions_judge_model_desc')}
             configKey={DECISIONS_NUDGE_WAKE_MODEL_PATH}
             value={judgeModel}
             options={judgeModelOptions}

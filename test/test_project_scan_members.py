@@ -19,10 +19,12 @@ import json
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from kiro_crew import project_scan
 from kiro_crew.project_scan import (
     MAX_DECLARATION_BYTES,
     Candidate,
@@ -35,6 +37,7 @@ from kiro_crew.project_scan import (
     manifest_signal,
     scan,
 )
+from kiro_crew.testing.synthetic_credentials import github_classic
 
 _IS_WINDOWS = sys.platform == "win32"
 
@@ -129,7 +132,11 @@ class TestDeclarationParsing:
             "exclude = ['crates/legacy']\n",
         )
 
-        assert declared_patterns(str(path), str(tmp_path)) == ["crates/*", "tools/cli"]
+        assert declared_patterns(str(path), str(tmp_path)) == [
+            "crates/*",
+            "tools/cli",
+            "!crates/legacy/**",
+        ]
 
     def test_cargo_without_a_workspace_table_declares_nothing(self, tmp_path: Path) -> None:
         path = _write(tmp_path / "Cargo.toml", "[package]\nname = 'app'\n")
@@ -196,8 +203,17 @@ class TestCargoFallbackParser:
         )
         path = _write(tmp_path / "Cargo.toml", text)
 
-        assert _scan_cargo_members(text) == ["crates/*", "tools/cli"]
+        assert _scan_cargo_members(text) == ["crates/*", "tools/cli", "!crates/legacy/**"]
         assert _scan_cargo_members(text) == declared_patterns(str(path), str(tmp_path))
+
+    def test_an_exclude_that_is_not_an_array_costs_only_itself(self, tmp_path: Path) -> None:
+        # Both parsers keep the members and ignore the malformed exclude, and
+        # the fallback does not read the next key's array as excluded paths.
+        text = "[workspace]\nmembers = ['crates/*']\nexclude = 'crates/old'\nother = ['x']\n"
+        path = _write(tmp_path / "Cargo.toml", text)
+
+        assert declared_patterns(str(path), str(tmp_path)) == ["crates/*"]
+        assert _scan_cargo_members(text) == ["crates/*"]
 
     def test_a_single_line_array_is_read(self) -> None:
         assert _scan_cargo_members("[workspace]\nmembers = ['a', 'b']\n") == ["a", "b"]
@@ -246,6 +262,77 @@ class TestMemberCandidates:
 
         assert _relative_paths(tree, tmp_path) == ["crates/cli", "crates/engine"]
         assert {candidate.tier for candidate in tree.candidates} == {Tier.OFFERED}
+
+    def test_cargo_workspace_exclude_withdraws_the_member_claim(self, tmp_path: Path) -> None:
+        # Cargo's ``exclude`` removes paths the ``members`` globs would match.
+        # "crates/scratch" has no manifest, so the member list was its only
+        # reason to be offered; "crates/legacy" stays a package by its own
+        # manifest but loses the member signal.
+        _write(
+            tmp_path / "Cargo.toml",
+            "[workspace]\nmembers = ['crates/*']\nexclude = ['crates/scratch', 'crates/legacy']\n",
+        )
+        _write(tmp_path / "crates" / "core" / "Cargo.toml", "[package]\nname = 'core'\n")
+        _write(tmp_path / "crates" / "legacy" / "Cargo.toml", "[package]\nname = 'legacy'\n")
+        _make(tmp_path, "crates/scratch/notes/")
+
+        tree = scan(tmp_path)
+        signals = {
+            Path(candidate.path).relative_to(tmp_path).as_posix(): candidate.signals
+            for candidate in tree.candidates
+        }
+
+        assert sorted(signals) == ["crates/core", "crates/legacy"]
+        assert "member" in signals["crates/core"]
+        assert "member" not in signals["crates/legacy"]
+
+    def test_cargo_exclude_covers_the_whole_subtree(self, tmp_path: Path) -> None:
+        # An exclude entry is a path prefix in Cargo, so a recursive member glob
+        # cannot bring back a directory beneath an excluded one.
+        _write(
+            tmp_path / "Cargo.toml",
+            "[workspace]\nmembers = ['crates/**']\nexclude = ['crates/vendor']\n",
+        )
+        _make(tmp_path, "crates/core/src/", "crates/vendor/inner/deep/")
+
+        assert _relative_paths(scan(tmp_path), tmp_path) == [
+            "crates",
+            "crates/core",
+            "crates/core/src",
+        ]
+
+    @pytest.mark.parametrize("fallback", [False, True], ids=["toml", "fallback"])
+    def test_a_literal_member_beneath_an_exclude_stays_a_member(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fallback: bool
+    ) -> None:
+        # Cargo excludes a path only when no literal ``members`` entry is also
+        # its prefix. A glob member under the same exclude stays excluded.
+        if fallback:
+            monkeypatch.setattr(project_scan, "_toml", None)
+        _write(
+            tmp_path / "Cargo.toml",
+            "[workspace]\nmembers = ['crates/legacy/inner', 'crates/legacy/*']\n"
+            "exclude = ['crates/legacy']\n",
+        )
+        _make(tmp_path, "crates/legacy/inner/", "crates/legacy/other/")
+
+        assert _relative_paths(scan(tmp_path), tmp_path) == ["crates/legacy/inner"]
+
+    @pytest.mark.parametrize("fallback", [False, True], ids=["toml", "fallback"])
+    def test_a_malformed_exclude_keeps_every_member(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fallback: bool
+    ) -> None:
+        if fallback:
+            monkeypatch.setattr(project_scan, "_toml", None)
+        _write(
+            tmp_path / "Cargo.toml", "[workspace]\nmembers = ['crates/*']\nexclude = 'crates/old'\n"
+        )
+        _make(tmp_path, "crates/core/", "crates/old/")
+
+        tree = scan(tmp_path)
+
+        assert _relative_paths(tree, tmp_path) == ["crates/core", "crates/old"]
+        assert not any("Cargo.toml" in warning for warning in tree.warnings)
 
     def test_go_work_uses_are_offered(self, tmp_path: Path) -> None:
         _write(tmp_path / "go.work", "go 1.22\n\nuse (\n\t./api\n\t./web\n)\n")
@@ -516,10 +603,10 @@ class TestDeclarationFailures:
         assert scan(tmp_path) == scan(tmp_path)
 
 
-# AWS's documented example access-key id, split so no contiguous key-shaped
+# A synthetic 40-char AWS secret access key, split so no contiguous key-shaped
 # literal exists in this source file for a secrets scanner to flag; the joined
 # runtime value is what the redactor must catch.
-_FAKE_AWS_KEY = "AKIA" + "IOSFODNN7EXAMPLE"
+_FAKE_AWS_KEY = github_classic(seed=148)  # a token; a bare 40-character run stays visible
 
 
 class TestWarningReasonRedaction:
@@ -572,6 +659,69 @@ class TestParserStackExhaustion:
         tree = scan(tmp_path)
 
         assert any("Cargo.toml" in w for w in tree.warnings)
+
+    # The two tests above pass whether the nesting cap refuses the file or the
+    # parser recurses to the interpreter's ceiling and the RecursionError is
+    # caught: both end in a warning. Only the cap keeps stack headroom, and
+    # without it a garbage-collector finalizer that runs in those last frames
+    # overflows too and pytest reports it as an unraisable exception on whatever
+    # test is running. So these pin that over-cap nesting never reaches a
+    # recursive parser at all.
+
+    @pytest.mark.parametrize(
+        ("name", "text", "parser_attr"),
+        [
+            ("Cargo.toml", "members = " + "[" * 100_000 + "]" * 100_000, "_toml"),
+            ("package.json", "[" * 100_000 + "]" * 100_000, "json"),
+            ("pnpm-workspace.yaml", "packages: " + "[" * 100_000 + "]" * 100_000, None),
+        ],
+        ids=["cargo", "npm", "pnpm"],
+    )
+    def test_over_cap_nesting_is_refused_before_the_parser_runs(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        name: str,
+        text: str,
+        parser_attr: str | None,
+    ) -> None:
+        calls: list[int] = []
+
+        def _spy_parse(text: str) -> Any:
+            calls.append(len(text))
+            raise AssertionError("the recursive parser must not see over-cap nesting")
+
+        if parser_attr is None:
+            monkeypatch.setattr(project_scan, "_load_no_alias_yaml", _spy_parse)
+        else:
+            monkeypatch.setattr(project_scan, parser_attr, SimpleNamespace(loads=_spy_parse))
+        target = _write(tmp_path / name, text)
+
+        with pytest.raises(DeclarationError, match="nesting too deep"):
+            declared_patterns(str(target), str(tmp_path))
+
+        assert calls == []
+
+    def test_the_cap_sits_at_the_documented_depth(self) -> None:
+        cap = project_scan._MAX_DECLARATION_NESTING
+
+        assert not project_scan._nesting_too_deep("[" * cap + "]" * cap)
+        assert project_scan._nesting_too_deep("[" * (cap + 1) + "]" * (cap + 1))
+
+    def test_brackets_inside_strings_do_not_count_toward_the_cap(self) -> None:
+        brackets = "[" * 1_000
+        text = f"[workspace]\nmembers = [\"crates/{brackets}\", '{brackets}']\n"
+
+        assert not project_scan._nesting_too_deep(text)
+        assert _cargo_members_for(text) == [f"crates/{brackets}", brackets]
+        # An escaped quote does not end the string, so its brackets stay ignored.
+        assert not project_scan._nesting_too_deep(f'["esc\\"{brackets}"]')
+
+
+def _cargo_members_for(text: str) -> list[str]:
+    """Parse ``text`` as a Cargo.toml through the scan's own parser table."""
+
+    return project_scan.DECLARATION_PARSERS["Cargo.toml"](text)
 
 
 class TestSensitiveReadGate:

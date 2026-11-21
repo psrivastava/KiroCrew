@@ -101,3 +101,189 @@ def test_search_docs_reads_each_page_once_until_it_changes(tmp_path, monkeypatch
     )
     assert {r["page"] for r in mcp_guide.search_docs("slack")["results"]} == {"alpha", "beta"}
     assert reads == ["beta.md"]
+
+
+def test_search_docs_ranks_a_page_with_every_rare_word_over_a_name_match(tmp_path, monkeypatch):
+    """A page whose name holds some query words must not outrank the page that
+    holds all of them: "task-runner" lacks "background", "subagents" has it."""
+    docs = {
+        "task-runner": "# Task Runner\nRun a task from a spec. Each task runs in order.\n",
+        "subagents": "# Subagents\nRun a task in the background.\n",
+        "apps": "# Apps\nRun an app as one task.\n",
+        "other0": "# Other\nRun it.\n",
+        "other1": "# Other\nRun it.\n",
+    }
+    docs.update({f"page{i}": "# Page\nRun it in the background.\n" for i in range(4)})
+    for name, text in docs.items():
+        (tmp_path / f"{name}.md").write_text(text, encoding="utf-8")
+    monkeypatch.setattr(mcp_guide, "_DOCS_DIR", tmp_path)
+    mcp_guide._read_doc.cache_clear()
+    pages = [r["page"] for r in mcp_guide.search_docs("run a task in the background")["results"]]
+    assert pages[:2] == ["subagents", "task-runner"]
+
+
+def _named(prefix, rows):
+    return [pytest.param(query, top, id=f"{prefix}-{query}") for query, top in rows]
+
+
+@pytest.mark.parametrize(
+    ("query", "top"),
+    _named(
+        "search_docs_ranks_the_page_a_how_to_question_is_about_first",
+        [
+            ("how do I set up a one-time reminder", "cron-and-scheduling"),
+            ("how do I connect Slack", "slack-integration"),
+            ("what do I do when a command is blocked", "blocked-commands"),
+            ("how do I back up and restore my crew", "snapshot-and-restore"),
+            ("how do I run a task in the background", "subagents"),
+            ("how do I add a skill", "skills"),
+            ("how do I use artifacts", "artifacts"),
+            ("auto approve mcp tool", "tool-approvals"),
+            ("stop asking to authorize slack", "tool-approvals"),
+            ("how do I auto-approve slack read tools without Trust mode", "tool-approvals"),
+            ("always allow this tool", "tool-approvals"),
+        ],
+    )
+    + _named(
+        "search_docs_one_word_query_still_finds_its_page",
+        [("reminder", "cron-and-scheduling"), ("telegram", "telegram-integration")],
+    ),
+)
+def test_search_docs_ranks_the_page_the_query_is_about_first(query, top):
+    assert mcp_guide.search_docs(query)["results"][0]["page"] == top
+
+
+def test_the_prompt_sends_a_withheld_grant_question_to_the_page_that_answers_it():
+    """Kiro Crew withholds ``allowedTools`` / ``autoApprove`` grants with only a
+    security-log record, so an agent recommended them as the fix for approval
+    prompts. The always-read prompt bullet names that, and the search it names
+    lands on the page with the working path (a KAS ``permissions.yaml`` rule)."""
+    from pathlib import Path
+
+    prompt = (Path(mcp_guide.__file__).parent / "config" / "prompt.md").read_text("utf-8")
+    (bullet,) = [ln for ln in prompt.splitlines() if ln.startswith("- **Your agent config is")]
+    assert "`allowedTools`" in bullet and "`autoApprove`" in bullet
+    query = bullet.split('`search_docs` "', 1)[1].split('"', 1)[0]
+    top, *_rest = mcp_guide.search_docs(query)["results"]
+    assert top["page"] == "tool-approvals"
+    page = mcp_guide.search_docs(page="tool-approvals")["text"]
+    assert "permissions.yaml" in page and "capability: mcp" in page
+
+
+def test_the_documented_permissions_rule_is_the_shape_crew_already_sends_kas():
+    """The page's ``permissions.yaml`` example parses to exactly the ``mcp`` allow
+    rule the KAS projection derives for the same ``@server/tool`` grants, the
+    shape KAS's own policy loader reads from that file."""
+    import yaml
+
+    from kiro_crew.acp.kas_permissions import allowed_tools_to_permissions
+
+    page = mcp_guide.search_docs(page="tool-approvals")["text"]
+    block = page.split("```yaml\n", 1)[1].split("```", 1)[0]
+    documented = yaml.safe_load(block)
+    (rule,) = documented["rules"]
+    refs = [f"@{m}" for m in rule["match"]]
+    (derived,) = allowed_tools_to_permissions(refs)["rules"]
+    # The projection sorts `match`; KAS reads it as a set.
+    assert {**rule, "match": sorted(rule["match"])} == derived
+
+
+def test_the_page_calls_a_write_refused_only_where_the_write_gate_refuses_it():
+    """The page may say an agent's write to ``permissions.yaml`` is refused only
+    while the file-write gate refuses both spellings of that file. Otherwise it
+    promises the reader a protection that nothing enforces."""
+    import re
+
+    from kiro_crew.security import is_sensitive_write_path
+
+    page = mcp_guide.search_docs(page="tool-approvals")["text"]
+    claims_a_refusal = re.search(r"\bwrite\b[^.]*\brefused\b", page) is not None
+    refused = all(
+        is_sensitive_write_path(f"~/.kiro/settings/permissions.{ext}") for ext in ("yaml", "json")
+    )
+    assert refused or not claims_a_refusal
+
+
+def _docs(tmp_path, monkeypatch, pages: dict[str, str]) -> None:
+    for name, body in pages.items():
+        (tmp_path / f"{name}.md").write_text(body, encoding="utf-8")
+    monkeypatch.setattr(mcp_guide, "_DOCS_DIR", tmp_path)
+    mcp_guide._read_doc.cache_clear()
+
+
+def test_search_docs_matches_whole_words_from_their_start(tmp_path, monkeypatch):
+    """``do`` is not found inside ``window``; ``reminder`` finds ``reminders``."""
+    _docs(
+        tmp_path,
+        monkeypatch,
+        {
+            "alpha": "# Alpha\nopen the window\n",
+            "beta": "# Beta\nset reminders here\n",
+            "gamma": "# Gamma\nraise `max_cycles`\n",
+        },
+    )
+    assert mcp_guide.search_docs("do")["results"] == []
+    assert [r["page"] for r in mcp_guide.search_docs("reminder")["results"]] == ["beta"]
+    # ``_`` starts a word, so a part of a snake_case key still matches.
+    assert [r["page"] for r in mcp_guide.search_docs("cycles")["results"]] == ["gamma"]
+
+
+def test_search_docs_ranks_the_word_itself_above_the_start_of_a_longer_word(tmp_path, monkeypatch):
+    """``mode`` prefers a page saying "mode" over one that only says "model"."""
+    _docs(
+        tmp_path,
+        monkeypatch,
+        {
+            "alpha": "# Alpha\npick a model; the model; one more model\n",
+            "beta": "# Beta\nturn on approval mode\n",
+            "gamma": "# Gamma\nnothing here\n",
+        },
+    )
+    assert [r["page"] for r in mcp_guide.search_docs("mode")["results"]] == ["beta", "alpha"]
+
+
+@pytest.mark.parametrize(
+    ("query", "page_text"),
+    [("updates", "update it"), ("automatic", "runs automatically"), ("modes", "two modes")],
+)
+def test_search_docs_counts_a_common_ending_as_the_same_word(
+    tmp_path, monkeypatch, query, page_text
+):
+    _docs(
+        tmp_path,
+        monkeypatch,
+        {"alpha": f"# Alpha\n{page_text}\n", "beta": f"# Beta\n{query}tional {query}tional\n"},
+    )
+    assert mcp_guide.search_docs(query)["results"][0]["page"] == "alpha"
+
+
+def test_search_docs_breaks_a_tie_toward_the_shorter_page_name(tmp_path, monkeypatch):
+    _docs(tmp_path, monkeypatch, {"aa-long": "# A\nslack\n", "zz": "# Z\nslack\n"})
+    assert [r["page"] for r in mcp_guide.search_docs("slack")["results"]] == ["zz", "aa-long"]
+
+
+@pytest.mark.parametrize(
+    ("query", "page_text"),
+    [
+        ("providers", "pick a provider"),
+        ("provider", "all providers"),
+        ("replies", "one reply"),
+        ("reply", "two replies"),
+        ("policies", "a policy"),
+        ("policy", "the policies"),
+    ],
+)
+def test_search_docs_plural_and_singular_find_each_other(tmp_path, monkeypatch, query, page_text):
+    _docs(tmp_path, monkeypatch, {"alpha": f"# Alpha\n{page_text}\n", "beta": "# Beta\nother\n"})
+    assert [r["page"] for r in mcp_guide.search_docs(query)["results"]] == ["alpha"]
+
+
+def test_search_docs_drops_question_words_unless_nothing_else_is_left(tmp_path, monkeypatch):
+    _docs(
+        tmp_path,
+        monkeypatch,
+        {"alpha": "# Alpha\nhow do I do this, how, how\n", "beta": "# Beta\nslack\n"},
+    )
+    assert [r["page"] for r in mcp_guide.search_docs("how do I use slack")["results"]] == ["beta"]
+    # Only question words: they are searched rather than refused.
+    assert [r["page"] for r in mcp_guide.search_docs("how")["results"]] == ["alpha"]

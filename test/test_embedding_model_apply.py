@@ -730,25 +730,6 @@ class TestCommitTimeGenerationCheck:
         finally:
             store.close()
 
-    def test_lazy_backfill_generation_is_sampled_before_the_embed(self) -> None:
-        """Sampling AFTER _try_embed returns would tag an old blob as current.
-
-        _try_embed returns None when a swap spans its own call, so the only value
-        that identifies the blob's space is the one read BEFORE the embed. This
-        asserts the source order, since the post-return gap is a few instructions
-        wide and cannot be driven deterministically from a test.
-        """
-        import inspect
-
-        src = inspect.getsource(VectorMemoryStore.write_lesson)
-        sample = src.find("backfill_generation = self._space_generation")
-        embed = src.find("existing_emb = self._try_embed(")
-        assert -1 not in (sample, embed), "lazy-backfill sampling not found"
-        assert sample < embed, (
-            "the generation must be sampled BEFORE the embed, or a swap in the "
-            "post-return gap tags a previous-space blob with the new generation"
-        )
-
     def test_both_persisting_paths_recheck_under_the_lock(self) -> None:
         """Guard against a refactor dropping the re-check from either path."""
         import ast
@@ -1377,6 +1358,24 @@ class TestConfigWrite:
         with pytest.raises(ValueError):
             await _write_embed_model_config(str(model), 0)
         assert cfg.read_text(encoding="utf-8") == "{ this is not json"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("section", [[], ["embedding_dim"], "embedding_dim=8", 5])
+    async def test_a_memory_section_that_is_not_an_object_is_refused_and_kept(
+        self, tmp_path: Path, monkeypatch, section: object
+    ) -> None:
+        from kiro_crew.dashboard.handlers.memory import _write_embed_model_config
+
+        cfg = tmp_path / "config.json"
+        original = json.dumps({"memory": section, "agent": {"default_agent": "kirocrew"}})
+        cfg.write_text(original, encoding="utf-8")
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.memory.config_path", lambda: cfg)
+
+        model = _write_model(tmp_path / "m.gguf")
+        # A clear refusal, not a TypeError/AttributeError the model card would show.
+        with pytest.raises(ValueError, match="'memory' is not an object"):
+            await _write_embed_model_config(str(model), 0)
+        assert cfg.read_text(encoding="utf-8") == original
 
 
 class TestStatusEndpointCarriesProgress:

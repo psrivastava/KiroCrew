@@ -23,6 +23,7 @@ import urllib.parse
 from dataclasses import dataclass, field
 from typing import Dict, Mapping, Optional, Tuple
 
+from kiro_crew.constants import ENV_TRUTHY
 from kiro_crew.platform.context import PlatformCompositionError
 from kiro_crew.platform.governance_parts.archetypes import (
     MODE_ALLOW,
@@ -57,6 +58,7 @@ logger = logging.getLogger("kiro_crew.platform.governance")
 MAX_DURATION_SECS = threading.TIMEOUT_MAX
 
 _POLICY_DISTRIBUTION_URL_ENV = "KIROCREW_POLICY_URL"
+_POLICY_DISTRIBUTION_CACHE_ONLY_ENV = "KIROCREW_POLICY_CACHE_ONLY"
 
 #: Named here only so the declared-source refusal can point at it; the engine owns it.
 _POLICY_DISTRIBUTION_HEADERS_ENV = "KIROCREW_POLICY_HEADERS"
@@ -82,7 +84,9 @@ class BootControls:
     """Policy-only boot constraints (not a governed scope; checked at startup)."""
 
     require_sandbox: bool = True
-    allow_terminal: bool = False
+    #: ``None`` when no policy tier states the key: the policy has no opinion and
+    #: ``dashboard.terminal.enabled`` alone decides. ``False`` refuses the terminal.
+    allow_terminal: Optional[bool] = None
     fail_closed: bool = True
 
 
@@ -134,8 +138,9 @@ class UpdatePins:
     min_version: str = ""
     # The release channel this fleet follows (one of :data:`UPDATE_CHANNELS`), in
     # place of the local ``$KIROCREW_HOME/channel`` file (RFC
-    # crew-enterprise-edition, appendix row "Update channel"). Empty = unpinned:
-    # the local file decides, except an enterprise build follows ``stable``.
+    # crew-lts-edition, appendix row "Update channel"). Empty = unpinned:
+    # the local file decides. An LTS build follows ``lts`` whatever this
+    # says (RFC D11).
     channel: str = ""
     # The operator-authored shell commands for the command update provider. Their
     # PRESENCE is what enables the provider (there is no mechanism selector): when
@@ -151,6 +156,11 @@ class UpdatePins:
     # (e.g. "linux-x86_64", "darwin-arm64"). Falls back to the top-level
     # check_command/apply_command when the current platform has no override.
     platform_commands: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    # False stops the gateway installing an update by itself on every route: the
+    # check still runs, the badge still lights, and a person's Update applies it.
+    # A build below ``min_version`` still takes its mandatory update. True (the
+    # default, and what an absent key means) keeps today's behaviour.
+    unattended_apply: bool = True
 
     def permits_source(self, url: str) -> bool:
         """Does *url* satisfy the source pin? An empty pin permits anything.
@@ -203,6 +213,7 @@ class UpdatePins:
                 "check_command",
                 "apply_command",
                 "platform_commands",
+                "unattended_apply",
             },
             "updates",
         )
@@ -211,6 +222,11 @@ class UpdatePins:
             # UNPINNING a policy that plainly meant to pin. Fail closed instead.
             if d.get(key) is not None and not isinstance(d[key], str):
                 raise PlatformCompositionError(f"updates.{key} must be a string")
+        unattended = d.get("unattended_apply")
+        # `bool("false")` is True: coercing would turn unattended installs ON for a
+        # policy that plainly meant to turn them off. Fail closed instead.
+        if unattended is not None and not isinstance(unattended, bool):
+            raise PlatformCompositionError("updates.unattended_apply must be true or false")
         raw_platform = d.get("platform_commands")
         platform_commands: dict[str, dict[str, str]] = {}
         if raw_platform is not None:
@@ -255,6 +271,7 @@ class UpdatePins:
             check_command=str(d.get("check_command") or "").strip(),
             apply_command=str(d.get("apply_command") or "").strip(),
             platform_commands=platform_commands,
+            unattended_apply=unattended is not False,
         )
 
 
@@ -273,6 +290,35 @@ def active_update_pins() -> UpdatePins:
         logger.debug("update pins unavailable; treating as unpinned", exc_info=True)
         return UpdatePins()
     return pins if isinstance(pins, UpdatePins) else UpdatePins()
+
+
+def registry_local_control_plane_permitted() -> bool:
+    """Whether the admin's security policy opts Crew's own servers past the MCP registry.
+
+    The policy's top-level ``mcp_registry_local_control_plane``
+    (``GovernanceCeiling.mcp_registry_local_control_plane``), read from the
+    boot-frozen ceiling. ``security_policy.json`` is a keystone the sandbox mounts
+    read-only and the agent file gate refuses to write, so the opt-in is the
+    admin's alone. Absent, ``false``, no policy at all, or a ceiling that cannot be
+    read all answer ``False``: the default on a registry-governed host stays the one
+    that mounts nothing outside the catalog. The single read point for the mount
+    gate (``acp.session_mcp.kiro_control_plane_servers``) and the refusal wording
+    (``mcp_shared_policy.registry_identity_note``), so the two cannot disagree.
+    """
+    try:
+        from kiro_crew.platform.context import current_context
+
+        return (
+            getattr(current_context().governance, "mcp_registry_local_control_plane", False) is True
+        )
+    except Exception:
+        logger.warning(
+            "could not read the security policy's mcp_registry_local_control_plane; "
+            "treating it as off, so Kiro Crew's own servers get no per-session identity "
+            "element under registry mode.",
+            exc_info=True,
+        )
+        return False
 
 
 # ``distribution.on_unavailable`` dispositions.  Two values, because there are only
@@ -301,15 +347,15 @@ DEFAULT_FETCH_TIMEOUT_SECS = 10.0
 MAX_POLICY_BYTES = 1 << 20  # 1 MiB
 
 
-def _is_enterprise() -> bool:
-    """``kiro_crew.edition.is_enterprise()``, read at call time.
+def _is_lts() -> bool:
+    """``kiro_crew.edition.is_lts()``, read at call time.
 
     Imported here rather than at module scope so the facade family binds no new project
     module name (``test_governance_parts_facade`` keeps that set closed).
     """
-    from kiro_crew.edition import is_enterprise
+    from kiro_crew.edition import is_lts
 
-    return is_enterprise()
+    return is_lts()
 
 
 @dataclass(frozen=True)
@@ -560,12 +606,18 @@ class PolicyDistribution:
                     f"{sorted(_UNAVAILABLE_DISPOSITIONS)}"
                 )
 
+        # A cache-only child receives no source by design; it validates and adopts
+        # the gateway's cached policy without starting a fetch itself. Read with the
+        # same truthy rule as ``policy_distribution_source.cache_only``, so a value
+        # that does not turn cache-only mode on does not lift this refusal either.
         if (
             not source
             and not os.environ.get(_POLICY_DISTRIBUTION_URL_ENV, "").strip()
-            # An enterprise build supplies the source itself (RFC D2), so a block that
+            and os.environ.get(_POLICY_DISTRIBUTION_CACHE_ONLY_ENV, "").strip().lower()
+            not in ENV_TRUTHY
+            # An LTS build supplies the source itself (RFC D2), so a block that
             # only tunes the cadence or staleness bound is not inert there.
-            and not _is_enterprise()
+            and not _is_lts()
             and any(
                 (
                     numbers["refresh_interval_secs"],
@@ -672,16 +724,37 @@ class GovernanceCeiling:
     # Empty when omitted — runtime then uses env or a later default. A profile
     # cannot carry this key. Read through :func:`agentcore_workload_name`.
     agentcore_workload_name: str = ""
+    # Policy-only OTLP collector (``capabilities.telemetry.otlp_endpoint``), read by
+    # an LTS build only. Empty when omitted. A profile cannot carry this key.
+    # Read through :func:`telemetry_otlp_endpoint`.
+    telemetry_otlp_endpoint: str = ""
     # Policy-only cap on an auto-approve (YOLO) grant, in seconds (top-level
-    # ``yolo_max_seconds``; RFC crew-enterprise-edition, appendix row
+    # ``yolo_max_seconds``; RFC crew-lts-edition, appendix row
     # "Auto-approval duration"). 0 = no cap. Read through
     # ``safety_override_permits.yolo_ttl_cap``.
     yolo_max_seconds: int = 0
+    # Policy-only admin opt-in (top-level ``mcp_registry_local_control_plane``).
+    # ``True`` lets a registry-governed host (``agent.mcp_registry_mode``) mount
+    # Kiro Crew's own per-session identity element for ``kirocrew-core`` and
+    # ``kirocrew-cron``, which launches them from the local install rather than the
+    # admin catalog's entry. ``False`` (absent) withholds it, so identity-scoped
+    # calls from those servers are refused there. A profile cannot carry this key.
+    # Read through ``registry_local_control_plane_permitted`` below.
+    mcp_registry_local_control_plane: bool = False
     # Which precedence tier produced this ceiling (one of the ``TIER_*`` names, or
     # "" for a ceiling parsed outside the loader).  Its one consumer is the tier
     # audit in ``compose_tier_ladder``, which names authority and subordinate in the
     # SEL when two tiers compose; nothing displays it to an operator yet.
     tier: str = ""
+    # True when ``compose_tier_ladder`` folded a lower tier beneath this ceiling's
+    # authority, so a scope the authority left unnamed may come from that lower tier.
+    # Set per composition, never carried over: a refresh with no lower tier is False.
+    # Read by ``redaction_switch.owner_may_disable``.
+    lower_tier_folded: bool = False
+    # The retired rows (``catalog.RETIRED_SCOPES``) this document named, grant or deny.
+    # A policy that names one governs the host even when no live row is left, so
+    # ``redaction_switch`` never reads it as ungoverned.
+    retired_rows: Tuple[str, ...] = ()
 
     def get(self, scope: str) -> Optional[object]:
         return self.controls.get(scope)
@@ -797,6 +870,13 @@ _AGENTCORE_POSTURES = frozenset({"workload", "login"})
 
 _AGENTCORE_POLICY_ONLY = frozenset({"posture", "gateway_url", "workload_name"})
 
+_TELEMETRY_SCOPE = "capabilities.telemetry"
+
+#: Policy-only data on ``capabilities.telemetry``: the OTLP collector an enterprise
+#: build exports metrics to. An ``oss`` build does not read it and leaves it in the
+#: row, so ``CapabilityGate.from_dict`` refuses it as an unknown key, as before.
+_TELEMETRY_OTLP_ENDPOINT = "otlp_endpoint"
+
 
 def _capability_raw_for_gate(
     scope: str, raw: Mapping[str, object], *, is_policy: bool
@@ -809,7 +889,18 @@ def _capability_raw_for_gate(
     ``CapabilityGate.from_dict`` stays ``additionalProperties: false``.
     A profile (or policy fallback body) that carries either key is
     rejected — Rule 6, same fail-closed raise as ``ScopedMap.posture``.
+
+    ``capabilities.telemetry.otlp_endpoint`` gets the same treatment in an
+    LTS build only.
     """
+    if scope == _TELEMETRY_SCOPE:
+        if _TELEMETRY_OTLP_ENDPOINT not in raw or not _is_lts():
+            return raw
+        if not is_policy:
+            raise PlatformCompositionError(
+                "capabilities.telemetry.otlp_endpoint is policy-only; not allowed on a profile"
+            )
+        return {key: value for key, value in raw.items() if key != _TELEMETRY_OTLP_ENDPOINT}
     if scope != _AGENTCORE_SCOPE:
         return raw
     extra = _AGENTCORE_POLICY_ONLY.intersection(raw)
@@ -864,8 +955,8 @@ def agentcore_posture(ceiling: Optional[GovernanceCeiling]) -> Optional[str]:
     omitted, disabled, or fail-closed-disabled. The single reader later work
     must use — do not re-parse raw policy JSON for this field.
 
-    Always ``None`` in an enterprise build, which also empties the Gateway URL and
-    workload name read through it (RFC enterprise edition, Red "Workload identity"
+    Always ``None`` in an LTS build, which also empties the Gateway URL and
+    workload name read through it (RFC LTS edition, Red "Workload identity"
     and "Identity settings").
     """
     from kiro_crew.edition_locks import locked_off
@@ -964,6 +1055,56 @@ def agentcore_workload_name(ceiling: Optional[GovernanceCeiling]) -> str:
     if ceiling is None or agentcore_posture(ceiling) is None:
         return ""
     return str(ceiling.agentcore_workload_name or "")
+
+
+def _apply_telemetry_otlp_endpoint(data: Mapping[str, object], boot: "BootControls") -> str:
+    """Validate and return the policy OTLP endpoint, or empty.
+
+    LTS build only; an ``oss`` build never gets here with the key, because
+    :func:`_capability_raw_for_gate` leaves it for the gate to refuse. A present but
+    unusable value aborts when ``boot.fail_closed``; otherwise it is ignored.
+    """
+    from kiro_crew.metrics.otlp_endpoints import EntryError, _endpoint
+
+    if not _is_lts():
+        return ""
+    # Both spellings ``_parse_controls`` accepts: the flat ``"capabilities.telemetry"``
+    # key and ``capabilities: {telemetry: ...}``.
+    raw_caps = data.get("capabilities")
+    rows = (
+        data.get(_TELEMETRY_SCOPE),
+        raw_caps.get("telemetry") if isinstance(raw_caps, dict) else None,
+    )
+    where = "capabilities.telemetry.otlp_endpoint"
+    values = [
+        row[_TELEMETRY_OTLP_ENDPOINT]
+        for row in rows
+        if isinstance(row, dict) and row.get(_TELEMETRY_OTLP_ENDPOINT) not in (None, "")
+    ]
+    if not values:
+        return ""
+    try:
+        if any(value != values[0] for value in values):
+            raise EntryError(f"{where} is set twice with different values")
+        return _endpoint(values[0], where)
+    except EntryError as exc:
+        if boot.fail_closed:
+            raise PlatformCompositionError(str(exc)) from exc
+        return ""
+
+
+def telemetry_otlp_endpoint(ceiling: object) -> str:
+    """The OTLP endpoint the policy supplies, in an LTS build; else empty.
+
+    Empty unless *ceiling* is a ceiling whose ``capabilities.telemetry`` gate is on,
+    so a policy that turns telemetry off, or no policy, names no collector.
+    """
+    if not _is_lts() or not isinstance(ceiling, GovernanceCeiling):
+        return ""
+    control = ceiling.controls.get(_TELEMETRY_SCOPE)
+    if not isinstance(control, CapabilityGate) or not control.enabled:
+        return ""
+    return ceiling.telemetry_otlp_endpoint
 
 
 def compose_profiles(parent: Profile, child: Profile) -> Profile:

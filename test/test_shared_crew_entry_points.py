@@ -288,6 +288,8 @@ async def test_taskrunner_resume_inherits_admitted_principal(monkeypatch, endpoi
     admission = SimpleNamespace(
         rejected=False,
         replayed=False,
+        passthrough=False,
+        service=None,
         work=None if expected is None else SimpleNamespace(budget_key=expected),
         abandon=AsyncMock(),
         attach_child=AsyncMock(),
@@ -378,7 +380,7 @@ async def test_taskrunner_start_digest_binds_requested_work(
 
     runner = _runner(tmp_path)
     state = _state(runner)
-    monkeypatch.setattr(taskrunner, "app_disabled", lambda _app: False)
+    monkeypatch.setattr(taskrunner, "task_runner_off", lambda: None)
     monkeypatch.setattr(taskrunner, "_sel", MagicMock())
     body = {"spec": "__inline__:# Original work", "source": "dashboard"}
     first = await taskrunner.api_taskrunner_start(_admission_request(state, body))

@@ -36,6 +36,7 @@ const H = vi.hoisted(() => {
         string,
         { kind: string; purpose?: string; label?: string; ts: number; toolName?: string }
       >,
+      slotRun: {} as Record<string, { state: string }>,
     },
   }
   const onActivateRecent = vi.fn()
@@ -88,7 +89,7 @@ const H = vi.hoisted(() => {
   // direct hooks. Mock them with stable, empty-search providers
   // so the modal renders without React-Query / Router (matching the P0 mocks).
   const knowledgeProvider = { id: 'knowledge', label: 'Knowledge', icon: null, search: vi.fn(() => []) }
-  const skillsProvider = { id: 'skills', label: 'Skills', icon: null, search: vi.fn(() => []) }
+  const skillsProvider = { id: 'skills', label: 'Skills', icon: null, search: vi.fn(() => []), scope: '' }
   const promptsProvider = { id: 'prompts', label: 'Prompts', icon: null, search: vi.fn(() => []) }
   const artifactsProvider = { id: 'artifacts', label: 'Artifacts', icon: null, search: vi.fn(() => []) }
   const recentsProvider = { id: 'recents', label: 'Recent', icon: null, search: vi.fn(async () => [recentResult]) }
@@ -125,6 +126,8 @@ const H = vi.hoisted(() => {
     sessResult,
     allProvider,
     sessionsProvider,
+    // Every openSessionsKey the palette handed useSessionsProvider, in order.
+    sessionsOpenKeys: [] as Array<string | undefined>,
     pagesProvider,
     actionsProvider,
     knowledgeProvider,
@@ -157,7 +160,10 @@ vi.mock('./commandPalette/providers', () => ({
 }))
 vi.mock('./commandPalette/providers/allAggregator', () => ({ useAllAggregator: () => H.allProvider }))
 vi.mock('./commandPalette/providers/sessionsProvider', () => ({
-  useSessionsProvider: () => H.sessionsProvider,
+  useSessionsProvider: (opts?: { openSessionsKey?: string }) => {
+    H.sessionsOpenKeys.push(opts?.openSessionsKey)
+    return H.sessionsProvider
+  },
 }))
 vi.mock('./commandPalette/providers/pagesProvider', () => ({ usePagesProvider: () => H.pagesProvider }))
 vi.mock('./commandPalette/providers/actionsProvider', () => ({
@@ -216,8 +222,8 @@ const failingChunk = vi.hoisted(() => {
   }
   return { state, Overlay }
 })
-vi.mock('../apps/overlayRegistry', () => ({
-  getBuiltinOverlay: () => failingChunk.Overlay,
+vi.mock('./commandBar/CommandBarOverlay', () => ({
+  default: failingChunk.Overlay,
 }))
 
 import CommandPalette from './CommandPalette'
@@ -233,7 +239,9 @@ afterEach(() => {
   H.nav.current = null
   H.storeState.dashboard.slots = []
   H.storeState.dashboard.unreadSlots = []
+  H.sessionsOpenKeys.length = 0
   H.storeState.chat.slotStatusDetail = {}
+  H.storeState.chat.slotRun = {}
   // localStorage is file-scoped, not per-test: a chat-config write (e.g. the
   // simplifiedToolNames toggle test) would otherwise persist into siblings.
   localStorage.removeItem('mc-chat-config')
@@ -470,6 +478,16 @@ describe('CommandPalette — render', () => {
     expect(screen.getByPlaceholderText('Search for anything')).toBeInTheDocument()
   })
 
+  it('keys the sessions search on the open tab set, so a tab change re-fetches', () => {
+    H.storeState.dashboard.slots = [{ key: 'chat-b' }, { key: 'chat-a' }]
+    const { rerender } = render(<CommandPalette open onClose={vi.fn()} />, { wrapper })
+    expect(H.sessionsOpenKeys.at(-1)).toBe('chat-a\u0000chat-b')
+
+    H.storeState.dashboard.slots = [{ key: 'chat-b' }]
+    rerender(<CommandPalette open onClose={vi.fn()} />)
+    expect(H.sessionsOpenKeys.at(-1)).toBe('chat-b')
+  })
+
   it('refreshes recents when a running slot starts a real tool call', async () => {
     H.storeState.dashboard.slots = [
       { key: 'chat-1', title: 'Live session', running: true, messages: 2 },
@@ -519,6 +537,22 @@ describe('CommandPalette — render', () => {
     await waitFor(() => expect(H.recentsProvider.search).toHaveBeenCalledTimes(4))
   })
 
+  it('refreshes recents when a running slot starts compacting under an unchanged status detail', async () => {
+    // A compaction moves only the slot's run state; the status detail keeps the
+    // phase from before it, so the row's "Compacting…" depends on the key reading it.
+    H.storeState.dashboard.slots = [
+      { key: 'chat-1', title: 'Live session', running: true, messages: 2 },
+    ]
+    H.storeState.chat.slotStatusDetail = { 'chat-1': { kind: 'thinking', ts: 1 } }
+    const { rerender } = render(<CommandPalette open onClose={vi.fn()} />, { wrapper })
+    await screen.findByText('Recent Session')
+    expect(H.recentsProvider.search).toHaveBeenCalledTimes(1)
+
+    H.storeState.chat.slotRun = { 'chat-1': { state: 'compacting' } }
+    rerender(<CommandPalette open onClose={vi.fn()} />)
+    await waitFor(() => expect(H.recentsProvider.search).toHaveBeenCalledTimes(2))
+  })
+
   it('refreshes recents when last_ts advances beyond a nonempty activity timestamp', async () => {
     H.storeState.dashboard.slots = [
       {
@@ -560,8 +594,10 @@ describe('CommandPalette — render', () => {
     expect(H.recentsProvider.search).toHaveBeenCalledTimes(1)
 
     localStorage.setItem('mc-chat-config', JSON.stringify({ simplifiedToolNames: false }))
-    window.dispatchEvent(new Event('mc-config-changed'))
-    rerender(<CommandPalette open onClose={vi.fn()} />)
+    await act(async () => {
+      window.dispatchEvent(new Event('mc-config-changed'))
+      rerender(<CommandPalette open onClose={vi.fn()} />)
+    })
 
     await waitFor(() => expect(H.recentsProvider.search).toHaveBeenCalledTimes(2))
   })
@@ -622,7 +658,7 @@ describe('CommandPalette — keyboard & activation', () => {
     // "fold" uniquely prefixes nothing here. If a Folders provider is ever put
     // back into this host, the hint label appears and Tab adopts the scope — and
     // this assertion is the thing that says so, because the feature would then
-    // have two implementations (this one and `apps/command-bar/foldersProvider`)
+    // have two implementations (this one and `components/commandBar/foldersProvider`)
     // free to disagree about ranking and about what a reveal does.
     fireEvent.change(screen.getByRole('textbox', { name: 'Search everywhere' }), { target: { value: 'fold' } })
     await waitFor(() => expect(H.allProvider.search).toHaveBeenCalled())
@@ -695,6 +731,22 @@ describe('CommandPalette — keyboard & activation', () => {
 
     expect(await screen.findByPlaceholderText('Search skills…')).toBeInTheDocument()
     expect(screen.getByRole('textbox', { name: 'Search everywhere' })).toHaveValue('sla')
+  })
+
+  it('re-runs the Skills search when the provider scope moves to another chat', async () => {
+    try {
+      const { rerender } = render(<CommandPalette open onClose={vi.fn()} />, { wrapper })
+      await screen.findByText('Recent Session')
+      fireEvent.change(screen.getByRole('textbox', { name: 'Search everywhere' }), { target: { value: '$' } })
+      await screen.findByPlaceholderText('Search skills…')
+      await waitFor(() => expect(H.skillsProvider.search).toHaveBeenCalled())
+      const before = H.skillsProvider.search.mock.calls.length
+      H.skillsProvider.scope = 'scope-test-chat-b'
+      rerender(<CommandPalette open onClose={vi.fn()} />)
+      await waitFor(() => expect(H.skillsProvider.search.mock.calls.length).toBeGreaterThan(before))
+    } finally {
+      H.skillsProvider.scope = ''
+    }
   })
 
   it('Backspace on an empty scoped query pops the scope chip', async () => {
@@ -1045,6 +1097,26 @@ describe('CommandPalette — scoped provider error state (issue #1928)', () => {
     expect(screen.queryByText('No matches')).toBeNull()
   })
 
+  it('re-runs the Sessions search when a tab opens, inside the cache window', async () => {
+    H.storeState.dashboard.slots = [{ key: 'chat-a' }]
+    const { rerender } = render(<CommandPalette open onClose={vi.fn()} />, { wrapper })
+    await screen.findByText('Recent Session')
+    fireEvent.change(screen.getByRole('textbox', { name: 'Search everywhere' }), { target: { value: 'sess' } })
+    await screen.findByText('Sessions')
+    act(() => {
+      fireEvent.keyDown(window, { key: 'Tab' })
+    })
+    await screen.findByText('Session Result')
+    const before = H.sessionsProvider.search.mock.calls.length
+
+    // A tab opens; nothing else changes. The ranking reads `open`, so the
+    // outer palette query must not serve its cached rows.
+    H.storeState.dashboard.slots = [{ key: 'chat-a' }, { key: 'chat-b' }]
+    rerender(<CommandPalette open onClose={vi.fn()} />)
+
+    await waitFor(() => expect(H.sessionsProvider.search.mock.calls.length).toBeGreaterThan(before))
+  })
+
   it('the Retry button refetches the scoped provider and shows the results', async () => {
     H.sessionsProvider.search
       .mockRejectedValueOnce(new Error('transient'))
@@ -1229,6 +1301,15 @@ describe('CommandPalette — focus restore on close', () => {
     expect(document.activeElement).not.toBe(composer)
   })
 
+  it('keeps an outside press from clearing the focus the close gives back', async () => {
+    // In a browser the press's default action runs after the close (#33323).
+    const onClose = vi.fn()
+    render(<CommandPalette open onClose={onClose} />, { wrapper })
+    await screen.findByText('Recent Session')
+    expect(fireEvent.mouseDown(screen.getByRole('dialog'))).toBe(false)
+    expect(onClose).toHaveBeenCalledTimes(1)
+  })
+
   it('does not restore after a row is chosen (its action owns focus)', async () => {
     const prev = outside('button', { 'data-test-outside': '' })
     prev.focus()
@@ -1259,7 +1340,8 @@ describe('CommandPalette — fallback for a failed overlay chunk', () => {
       const onClose = vi.fn()
       render(
         <QuickSearchSurface
-          owners={{ 'quick-search': { app: 'command-bar', overlayId: 'command-bar' } }}
+          owners={{}}
+          commandBar
           open
           onClose={onClose}
         />,
@@ -1270,7 +1352,9 @@ describe('CommandPalette — fallback for a failed overlay chunk', () => {
       fireEvent.change(catcher, { target: { value: 'alice' } })
       await act(async () => { release(); await failingChunk.state.promise })
 
-      const input = await screen.findByRole('textbox', { name: 'Search everywhere' })
+      // Waits across QuickSearchSurface's `lazy(() => import('./commandBar/CommandBarOverlay'))`
+      // settling into the thrown chunk and its fallback to this palette.
+      const input = await screen.findByRole('textbox', { name: 'Search everywhere' }, { timeout: 5000 })
       expect(input).toHaveValue('alice')
       expect(await screen.findByText('All Result')).toBeInTheDocument()
       expect(H.allProvider.search).toHaveBeenCalledWith('alice')
@@ -1284,5 +1368,59 @@ describe('CommandPalette — fallback for a failed overlay chunk', () => {
       warn.mockRestore()
       error.mockRestore()
     }
+  })
+})
+
+describe('CommandPalette — keyboard isolation', () => {
+  // The palette is modal, so a key pressed inside it must not reach the page's
+  // global shortcuts behind it. Those listen in the bubble phase on `document`
+  // (useKeyboardShortcuts, useInstanceShortcuts); the quick-search gesture that
+  // toggles the palette listens on `window` (useCommandPalette) and is the one
+  // key that still travels.
+  const documentListener = vi.fn()
+  const windowListener = vi.fn()
+
+  afterEach(() => {
+    document.removeEventListener('keydown', documentListener)
+    window.removeEventListener('keydown', windowListener)
+    documentListener.mockReset()
+    windowListener.mockReset()
+  })
+
+  function mountPalette() {
+    document.addEventListener('keydown', documentListener)
+    window.addEventListener('keydown', windowListener)
+    render(<CommandPalette open onClose={vi.fn()} />, { wrapper })
+    return screen.getByPlaceholderText('Search for anything')
+  }
+
+  it.each([
+    ['the Settings chord', { key: ',', code: 'Comma', altKey: true }],
+    ['a session jump', { key: '1', code: 'Digit1', ctrlKey: true }],
+    ['the agent monitor', { key: 'g', code: 'KeyG', ctrlKey: true }],
+    ['a plain letter', { key: 'a', code: 'KeyA' }],
+  ])('keeps %s from reaching the page behind the palette', (_name, init) => {
+    const input = mountPalette()
+    fireEvent.keyDown(input, init)
+    expect(documentListener).not.toHaveBeenCalled()
+    expect(windowListener).not.toHaveBeenCalled()
+  })
+
+  it('lets the default quick-search gesture through, so it can close the palette', () => {
+    const input = mountPalette()
+    fireEvent.keyDown(input, { key: 'k', code: 'KeyK', ctrlKey: true })
+    expect(windowListener).toHaveBeenCalledTimes(1)
+  })
+
+  it('lets a recorded custom quick-search chord through, and Ctrl+K then stops', () => {
+    localStorage.setItem(
+      QUICK_SEARCH_SHORTCUT_KEY,
+      JSON.stringify({ mode: 'custom', custom: { key: 'j', ctrl: true } }),
+    )
+    const input = mountPalette()
+    fireEvent.keyDown(input, { key: 'j', code: 'KeyJ', ctrlKey: true })
+    expect(windowListener).toHaveBeenCalledTimes(1)
+    fireEvent.keyDown(input, { key: 'k', code: 'KeyK', ctrlKey: true })
+    expect(windowListener).toHaveBeenCalledTimes(1)
   })
 })

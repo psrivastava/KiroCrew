@@ -1,5 +1,5 @@
 /**
- * The Decisions (Jev) card's read model.
+ * The Decisions card's read model.
  *
  * Two sources, deliberately, because the two values live in two different
  * places on the gateway and the split IS the security design:
@@ -37,8 +37,8 @@ export const DECISIONS_STEER_POINT = 'message.steer'
  *
  *  Every DECIDING point consumes its answer, and each is reached only through a
  *  choice the owner makes somewhere else: a non-zero `skills.max_triggered` for
- *  the skill point, the send button's `Auto (Jev)` entry for the steer point, and
- *  the chat model picker's `Auto (Jev)` entry for this one. The switch on this
+ *  the skill point, the send button's `Auto (decision model)` entry for the steer point, and
+ *  the chat model picker's `Auto (decision model)` entry for this one. The switch on this
  *  card is what lets any of them be asked at all, never what arms one.
  */
 export const DECISIONS_MODEL_POINT = 'model.route'
@@ -82,6 +82,14 @@ export const DECISIONS_MEMORY_POINT = 'memory.recall'
  * would, so the setting can remove turns and never silence a loop.
  */
 export const DECISIONS_NUDGE_WAKE_POINT = 'nudge.wake'
+
+/**
+ * The point that helps the browser tool pick its next step (`browser_harness/decide.py`).
+ *
+ * Named here for the same cross-layer reason: the Decisions card lists it, with what
+ * it sends, so the person can see that a browser op may reach the decision model.
+ */
+export const DECISIONS_BROWSER_STEP_POINT = 'browser.step'
 
 /**
  * Config path of the sampling share. One of the six `decisions.*` values the config
@@ -241,6 +249,12 @@ export interface DecisionsView {
    */
   endpointMoved: boolean
   /**
+   * The administrator's policy refuses the model the config names, so nothing is
+   * sent under the recorded consent. Told apart from `endpointMoved`: switching off
+   * and on again cannot help here, since the gateway refuses the enabling write.
+   */
+  withdrawn: boolean
+  /**
    * Sampling percentage worth PRINTING, or `null` when there is nothing to say.
    *
    * `null` covers the configs that mean "do not print a rate": the section or
@@ -288,6 +302,14 @@ export interface DecisionsView {
    */
   nudgeEvidence: boolean
   /**
+   * The two `browser.step` scopes: the page OUTLINE of the agent's tab, and
+   * SCREENSHOTS of it. Read as the server reports them: both are reported true when
+   * the keystone does not mention them (on by default once consent stands), so the
+   * card draws what the gate will do.
+   */
+  browser: boolean
+  browserImages: boolean
+  /**
    * The prior-conversation CEILING the owner reviewed, in characters.
    *
    * From the KEYSTONE, not from `config.json`. The two differ exactly when an agent
@@ -313,11 +335,14 @@ const UNSUPPORTED: DecisionsView = {
   enabled: false,
   configuredEndpoint: '',
   endpointMoved: false,
+  withdrawn: false,
   bucket: null,
   toolArgs: false,
   compaction: false,
   memoryText: false,
   nudgeEvidence: false,
+  browser: false,
+  browserImages: false,
   historyBudget: 0,
   points: [],
 }
@@ -366,19 +391,24 @@ export function readConsent(body: unknown): Omit<DecisionsView, 'bucket' | 'poin
       enabled: false,
       configuredEndpoint: '',
       endpointMoved: false,
+      withdrawn: false,
       toolArgs: false,
       compaction: false,
       memoryText: false,
       nudgeEvidence: false,
+      browser: false,
+      browserImages: false,
       historyBudget: 0,
     }
   }
   const enabled = root.enabled === true
   const configuredEndpoint = typeof root.configured_endpoint === 'string' ? root.configured_endpoint : ''
-  // `permits` is the server's own verdict (enabled AND same address). Read it
-  // rather than re-deriving equality here, so the card and the gate cannot
-  // disagree about whether anything is being sent.
-  const endpointMoved = enabled && root.permits !== true
+  // `permits` is the server's own verdict (enabled AND same address AND not refused
+  // by policy). Read it rather than re-deriving equality here, so the card and the
+  // gate cannot disagree about whether anything is being sent. `withdrawn` says the
+  // refusal is the reason, which is not a moved address.
+  const withdrawn = root.withdrawn === true
+  const endpointMoved = enabled && root.permits !== true && !withdrawn
   // An exact `true`, like `enabled` above: this field decides whether a new
   // category of conversation content leaves the machine, so a truthy stand-in is
   // not a deliberate yes. An older gateway omits it entirely and reads as off.
@@ -394,6 +424,9 @@ export function readConsent(body: unknown): Omit<DecisionsView, 'bucket' | 'poin
   // `compaction` on purpose: that yes covered the owner's OWN transcript at their own
   // agent's compaction, and this one covers rows from sessions the loop watches.
   const nudgeEvidence = root.nudge_evidence === true
+  // Exact `true`s as well; an older gateway omits both and they read as off.
+  const browser = root.browser === true
+  const browserImages = root.browser_images === true
   // A whole non-negative number or nothing: an older gateway omits the field, and a
   // value nobody can read back as a budget is not one. 0 either way, which is the
   // shipped default and the least that can leave.
@@ -405,10 +438,13 @@ export function readConsent(body: unknown): Omit<DecisionsView, 'bucket' | 'poin
     enabled,
     configuredEndpoint,
     endpointMoved,
+    withdrawn,
     toolArgs,
     compaction,
     memoryText,
     nudgeEvidence,
+    browser,
+    browserImages,
     historyBudget,
   }
 }

@@ -10,8 +10,10 @@
  * find at all.
  *
  * The fix splits that bail:
- *   • edit mode still bails here, so Pierre's editor keeps the chord and
- *     #6397's `defaultPrevented` guard stops chat-find from stacking a pane;
+ *   • edit mode lets the chord reach Pierre's editor, so the editor keeps it
+ *     and #6397's `defaultPrevented` guard stops chat-find from stacking a
+ *     pane; a chord the editor did not claim (an edit-mode diff's deletion
+ *     rows and gutter sit outside its content element) is yielded (#30319);
  *   • read-only diff and read-only code preview YIELD the chord away from
  *     chat-find (capture-phase stopImmediatePropagation) WITHOUT opening a find
  *     bar — there is no in-document find for those surfaces yet (the diff
@@ -193,6 +195,38 @@ describe('MarkdownPanel — edit mode is left to Pierre + #6397', () => {
   })
 })
 
+describe('MarkdownPanel — an edit-mode diff yields a chord the editor did not claim (#30319)', () => {
+  const renderEditDiff = async () => {
+    render(<Panel filePath="/tmp/app.py" content={'new line\n'} initialDiffMode />, { wrapper })
+    await waitFor(() => expect(screen.queryByTestId('pierre-editor')).toBeTruthy())
+    fireEvent.pointerDown(panelRoot())
+    return screen.getByTestId('pierre-editor')
+  }
+
+  it('does not open chat-find when the key lands inside the panel unclaimed', async () => {
+    const row = await renderEditDiff()
+    const chatFind = withChatFind(() => { fireEvent.keyDown(row, { key: 'f', ctrlKey: true }) })
+
+    expect(chatFind).not.toHaveBeenCalled()
+    expect(tab().queryByLabelText(FIND_INPUT)).toBeNull()
+  })
+
+  it('leaves a chord the editor claimed to the editor and the defaultPrevented guard', async () => {
+    const row = await renderEditDiff()
+    const claim = (e: Event) => e.preventDefault()
+    row.addEventListener('keydown', claim)
+    let seen: boolean | undefined
+    const chatFind = withChatFind(() => {
+      document.addEventListener('keydown', e => { seen = e.defaultPrevented }, { once: true })
+      fireEvent.keyDown(row, { key: 'f', ctrlKey: true })
+    })
+    row.removeEventListener('keydown', claim)
+
+    expect(chatFind).toHaveBeenCalledTimes(1)
+    expect(seen).toBe(true)
+  })
+})
+
 describe('MarkdownPanel — markdown preview find is unchanged (regression guard)', () => {
   it('still opens its own in-document find bar on the active markdown tab', async () => {
     render(<Panel filePath="/tmp/readme.md" content={'# Readme\n\nhello hello\n'} />, { wrapper })
@@ -202,5 +236,19 @@ describe('MarkdownPanel — markdown preview find is unchanged (regression guard
     pressFind()
 
     expect(tab().getByLabelText(FIND_INPUT)).toBeTruthy()
+  })
+})
+
+describe('MarkdownPanel — Shift+Cmd/Ctrl+F is Search all chats, not the panel find', () => {
+  it('lets the chord through, unclaimed, on the active markdown tab and on a diff', async () => {
+    render(<Panel filePath="/tmp/readme.md" content={'# Readme\n\nhello hello\n'} />, { wrapper })
+    await waitFor(() => expect(panelRoot()).toBeTruthy())
+    fireEvent.pointerDown(panelRoot())
+
+    // Lower-case key with Shift down, as macOS reports it with Command held.
+    const later = withChatFind(() => { fireEvent.keyDown(document, { key: 'f', ctrlKey: true, shiftKey: true }) })
+
+    expect(later).toHaveBeenCalledTimes(1)
+    expect(tab().queryByLabelText(FIND_INPUT)).toBeNull()
   })
 })

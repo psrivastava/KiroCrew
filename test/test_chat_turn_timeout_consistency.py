@@ -1,27 +1,11 @@
 """Tests for CHAT_TURN_TIMEOUT applied uniformly across _run_chat dispatch sites.
 
-Background: the constant was originally introduced as a 600s
-recovery-path budget, scoped to a single subagent-injection failure path. It
-was later hoisted to a shared constant and added to chat_runner.py's
-queue-drain path, but the primary user-typed turn (chat_handlers.py), the
-cron injection path (handlers/messaging.py), the Slack/dashboard nudge path
-(slack/gateway.py:_handle_nudge), and the cron-script delivery path
-(slack/gateway_runtime/cron_exec.py:_deliver_script_result) remained unwrapped — depending on
-the inner ACP _DEFAULT_PROMPT_TIMEOUT (14400s) instead.
+Every dispatch site must use ``spawn_guarded_turn`` or
+``bounded_chat_turn(..., state=..., slot=...)``. The structured monitor's nested path is
+pinned by its own tests.
 
-This module verifies the cap value is correct AND that all helper-visible
-dispatch sites in the source tree use ``spawn_guarded_turn`` or the owner-aware
-``bounded_chat_turn(..., state=..., slot=...)`` wrapper. The structured
-dashboard monitor invokes ``_run_chat`` inside an authorization coroutine that
-is itself passed to ``spawn_guarded_turn``; its owning monitor tests pin that
-nested path.
-
-Why source-level checks (not behavioral): the central helpers own the timeout,
-native cancellation ordering, and visible outcome. Driving every real handler
-would require a fully mocked request, dashboard state, and slot. The source-level
-checks below verify that each dispatch reaches one of those helpers, that an
-off-loop wrapper carries the state and slot needed for owner-fenced cancellation,
-and that its outer task retrieves exceptions.
+The checks read source because the helpers own the timeout, cancellation order and
+visible outcome; driving every real handler would need a full mocked request and slot.
 """
 
 from __future__ import annotations
@@ -80,15 +64,10 @@ def test_cap_matches_inner_acp_prompt_timeout() -> None:
 
 
 def test_cap_value_is_four_hours() -> None:
-    """Regression guard against silently changing the value back to 600s.
+    """The turn cap is 14400s and matches ``AgentConfig.chat_turn_timeout_secs``.
 
-    The 600s value was sized for a recovery-path budget, not the master cap.
-    14400s covers the longest single turn the shipped budgets produce (a
-    90-minute test command plus a fix and a re-run) and aligns with the ACP
-    layer underneath. If you intend to change this, update
-    docs/system-specs/modules/learn-cron-dashboard.md too, and keep the config
-    default (``AgentConfig.chat_turn_timeout_secs``) in step: a config-less
-    context must behave exactly like a default config.
+    It covers a 90-minute test command plus a fix and a re-run, and matches the ACP layer.
+    Changing it means updating docs/system-specs/modules/learn-cron-dashboard.md.
     """
     from kiro_crew.config.loader import AgentConfig
     from kiro_crew.constants import CHAT_TURN_TIMEOUT
@@ -102,17 +81,11 @@ def _find_create_task_dispatches(path: Path) -> list[tuple[int, str]]:
 
     Two dispatch forms exist and both must be counted:
 
-    * ``spawn_guarded_turn(state, slot, _run_chat(...))`` — the preferred form.
-      The helper owns the ceiling AND retrieves the resulting exception, so a
-      turn that hits the ceiling renders a card instead of vanishing.
-    * ``asyncio.create_task(bounded_chat_turn(_run_chat(...), state=..., slot=...))`` —
-      the off-loop form used where publishing ``slot.task`` before config
-      resolution closes an injection-order race. Its caller owns the done
-      callback that consumes the exception; the wrapper renders the timeout card.
+    * ``spawn_guarded_turn(state, slot, _run_chat(...))``: owns the ceiling and the exception.
+    * ``asyncio.create_task(bounded_chat_turn(_run_chat(...), state=..., slot=...))``: the
+      off-loop form; its caller owns the done callback that consumes the exception.
 
-    Why a hand-rolled balanced-paren scan instead of regex: nested call
-    expressions go three levels deep with embedded commas, which regex does not
-    handle cleanly. We tokenize ``(`` / ``)`` until the depth returns to zero.
+    A balanced-paren scan, because the calls nest three deep with commas regex cannot split.
     """
     text = path.read_text(encoding="utf-8")
     out: list[tuple[int, str]] = []
@@ -144,14 +117,7 @@ def _find_create_task_dispatches(path: Path) -> list[tuple[int, str]]:
 def test_no_bare_run_chat_dispatch_in_source() -> None:
     """Static guard: no ``_run_chat`` dispatch may run unbounded.
 
-    A bare ``asyncio.create_task(_run_chat(...))`` has no wall-clock ceiling at
-    the dashboard layer at all. Catches regressions where a future contributor
-    adds a new dispatch site without either wrapping it or routing it through
-    ``spawn_guarded_turn``.
-
-    This test has already paid for itself once: during an earlier rebase it
-    caught a dispatch site that had landed on the base branch and would
-    otherwise have shipped unwrapped.
+    A bare ``asyncio.create_task(_run_chat(...))`` has no wall-clock ceiling at all.
     """
     src_root = _src_root()
 
@@ -173,15 +139,8 @@ def test_no_bare_run_chat_dispatch_in_source() -> None:
 def test_every_run_chat_dispatch_is_ceiling_bounded() -> None:
     """Positive guard: every dispatch is bounded by the shared ceiling.
 
-    A dispatch qualifies by going through ``spawn_guarded_turn`` or through
-    ``bounded_chat_turn`` with both ``state`` and ``slot``. Those arguments are
-    what let the deadline cancel only the exact session-lease owner. A legacy
-    inline ``wait_for`` must still reference the shared configured ceiling.
-
-    This complements ``test_no_bare_run_chat_dispatch_in_source``: that test
-    ensures no dispatch is bare, while this one ensures the bound is the shared
-    one. A contributor could otherwise wrap with ``wait_for(timeout=600)`` and
-    pass the first test.
+    ``bounded_chat_turn`` needs both ``state`` and ``slot`` so the deadline cancels only the
+    lease owner; an inline ``wait_for(timeout=600)`` would pass the bare-dispatch test.
     """
     src_root = _src_root()
 
@@ -216,20 +175,11 @@ def test_every_run_chat_dispatch_is_ceiling_bounded() -> None:
 def test_dispatch_sites_consume_their_exception() -> None:
     """Every dispatch must have something that retrieves the task's outcome.
 
-    This is the regression that made long turns die silently: a task whose only
-    done-callback was ``state._background_tasks.discard`` never had its
-    ``TimeoutError`` retrieved, so hitting the ceiling produced no error card
-    and no log the user would find — it surfaced only as a
-    garbage-collection-time "Task exception was never retrieved" line.
+    A task whose only callback is ``state._background_tasks.discard`` never retrieves its
+    ``TimeoutError``, so the turn dies with no card. A ``create_task(bounded_chat_turn(...))``
+    site needs a callback that calls ``.exception()``.
 
-    ``spawn_guarded_turn`` satisfies this by construction. A
-    ``create_task(bounded_chat_turn(...))`` site must attach its own callback
-    that calls ``.exception()``; a site whose sole callback is the bare
-    ``discard`` is the exact shape of the original defect.
-
-    Uses the AST rather than a line window because a done-callback may be
-    defined either above or below the dispatch it is attached to — a
-    directional text scan gets the answer wrong depending on local style.
+    AST, not a line window: the callback may be defined above or below the dispatch.
     """
     src_root = _src_root()
 
@@ -298,30 +248,63 @@ def _is_create_task_wrapped_run_chat_dispatch(node: ast.AST) -> bool:
     return has_run_chat and has_wrapper
 
 
-def test_dispatch_site_count_matches_expectation() -> None:
-    """Pin the expected number of helper-visible ``_run_chat`` sites at 4.
+#: The helper-visible ``_run_chat`` dispatch sites, by file. Each entry is exact, so
+#: a new site or a removed one is a visible edit to its own file's line. One line
+#: per file rather than one total keeps two changes to different files mergeable
+#: (testing-conventions.md § Merge-safe ratchets and counts).
+_DISPATCH_SITES: dict[str, int] = {
+    "src/kiro_crew/dashboard/chat_api/chat_send.py": 1,
+    "src/kiro_crew/dashboard/chat_turn/agent_started.py": 1,
+    "src/kiro_crew/dashboard/chat_turn/queue_cycle.py": 1,
+    "src/kiro_crew/dashboard/chat_turn/queue_drain.py": 1,
+}
 
-    If a new dispatch lands (or one is removed), this fails loudly so the
-    contributor updates the PR description, the spec doc
-    (``learn-cron-dashboard.md``), and the other tests in this module.
 
-    Without this check, a new dispatch site would slip past review — the
-    static guards above only fire on *missing* ceilings, not on *additional*
-    sites that need to be documented.
-    """
+def _dispatch_site_counts() -> dict[str, int]:
+    """Helper-visible ``_run_chat`` dispatch sites per scanned file, zeros omitted."""
     src_root = _src_root()
-
-    total = 0
+    counts: dict[str, int] = {}
     for rel_path in _DISPATCH_FILES:
-        path = src_root / rel_path
-        for _line_no, body in _find_create_task_dispatches(path):
-            if "_run_chat(" in body:
-                total += 1
+        found = sum(
+            "_run_chat(" in body
+            for _line_no, body in _find_create_task_dispatches(src_root / rel_path)
+        )
+        if found:
+            counts[rel_path] = found
+    return counts
 
-    assert total == 4, (
-        f"Expected 4 helper-visible _run_chat dispatch sites, found {total}.  "
-        "If you added or removed one, update:\n"
-        "  - the PR description\n"
-        "  - docs/system-specs/modules/learn-cron-dashboard.md (Per-turn timeout section)\n"
-        "  - this test's expected count"
+
+def _site_drift(counts: dict[str, int], recorded: dict[str, int]) -> list[str]:
+    """The ``_DISPATCH_SITES`` line to write for every file whose count moved."""
+    return [
+        f'    "{rel}": {counts.get(rel, 0)},  # was {recorded.get(rel, 0)}'
+        for rel in sorted(set(counts) | set(recorded))
+        if counts.get(rel, 0) != recorded.get(rel, 0)
+    ]
+
+
+def test_dispatch_site_count_matches_expectation() -> None:
+    """Pin the helper-visible ``_run_chat`` sites per file.
+
+    The guards above catch only missing ceilings; a new site must also be added to
+    ``learn-cron-dashboard.md`` and this module.
+    """
+    assert _DISPATCH_SITES, "the record must name at least one dispatch site"
+    drift = _site_drift(_dispatch_site_counts(), _DISPATCH_SITES)
+    assert not drift, (
+        "helper-visible _run_chat dispatch sites moved. If you added or removed one, "
+        "update docs/system-specs/modules/learn-cron-dashboard.md (Per-turn timeout "
+        "section) and write these _DISPATCH_SITES lines (a zero means delete the line):\n"
+        + "\n".join(drift)
     )
+
+
+def test_site_drift_names_the_line_to_write() -> None:
+    """The failure text is what the next author copies, so it is pinned."""
+    drift = _site_drift({"a.py": 2, "c.py": 1}, {"a.py": 1, "b.py": 1})
+    assert drift == [
+        '    "a.py": 2,  # was 1',
+        '    "b.py": 0,  # was 1',
+        '    "c.py": 1,  # was 0',
+    ]
+    assert _site_drift({"a.py": 1}, {"a.py": 1}) == []

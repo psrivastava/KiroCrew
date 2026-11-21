@@ -1,6 +1,8 @@
 # App Manifest Reference
 
 The app manifest (`app.json`) declares your app's identity, resources, and requirements.
+Save it as UTF-8. One leading UTF-8 byte-order mark, which Windows editors write for
+"UTF-8 with BOM", is accepted.
 
 ## Required Fields
 
@@ -25,6 +27,58 @@ The app manifest (`app.json`) declares your app's identity, resources, and requi
 | `configuration` | string[] | Concise setup or configuration steps shown on the detail page |
 | `screenshots` | string[] | Real product screenshots; paths follow the same distribution rules as hero art |
 | `screenshotsDark` | string[] | Optional dark-appearance screenshot variants |
+| `links` | object[] | Extra links shown as buttons in the detail page's Details card (see below) |
+
+### Store-page links
+
+`links` lists up to 6 extra links, for example a user guide or a wiki:
+
+```json
+"links": [
+  { "label": "User guide", "url": "https://example.com/my-app/guide" },
+  { "label": "Wiki", "url": "https://wiki.example.com/my-app" }
+]
+```
+
+Each `label` is plain text of 1 to 40 characters. Each `url` is at most 2048
+characters and must be `https:` with a plain host: no `user@host` userinfo and
+no port other than 443. Entries past the sixth, and entries that break a rule,
+are dropped with one log line; the rest of the manifest still loads. There is
+no host allowlist: each button shows the URL's host under its label, so the
+reader sees where it goes, and it opens in a new tab.
+
+### Writing `useCases`
+
+`highlights` lists what the app can do. `useCases` says when an operator should
+reach for it. Write each entry as a situation, in the shape "when X, do Y to get
+Z", not a restated feature list.
+
+- **Write 3-5 entries.**
+- **Ground every entry in what the app ships.** Each entry must follow from the
+  app's own `highlights` and from what it declares, such as its `agents`,
+  `skills` and `crons`, so a reviewer can check it against the manifest. Do not
+  describe a feature or an integration the app does not have.
+- **Name what the app declares.** If the app declares an agent, skill or cron,
+  at least one entry should show the operator using it, by name.
+
+Bad, because it restates the features and names no situation:
+
+```json
+"useCases": [
+  "Triage issues and pull requests across connected providers while retaining summaries, suggested labels, and investigation history."
+]
+```
+
+Good, for the same app (it declares no agent, skill or cron, so each entry rests
+on a highlight):
+
+```json
+"useCases": [
+  "When the morning queue fills up, read each new issue's AI summary and suggested labels, and apply the ones you agree with",
+  "When a pull request is ready, approve, merge or re-run CI from the app; the merge cannot land until the host's required reviews and checks pass",
+  "When a report looks familiar, open its investigation notes instead of investigating it again"
+]
+```
 
 ## Admission metadata
 
@@ -39,20 +93,25 @@ permissions or setting `minKiroCrewVersion`.
 The signature covers `name`, `version`, `signer` and `permissions`, plus each of
 these groups when it is non-empty: `notifications`, `crons`, `contributes`,
 `setup`, `mcpServers`, `backend`, `ui`, `agents`, `skills`, `sops`,
-`dependencies`, `platform` and `config_keys`. An empty group is left out of the signed
-bytes.
+`dependencies`, `platform`, `publishProvider`, `config_keys`, `credentialMasks`,
+`agentReadOnlyDirs`, `desktop` and `agentTools`. An empty group is left
+out of the signed bytes. `displayName`, `description` and `author` are display text
+and are not signed.
 
 A gateway computes the signed bytes from the groups it knows. A signed manifest
 that declares a group an older gateway does not sign fails verification there.
 It fails closed: the install is refused, not downgraded. Set
 `minKiroCrewVersion` on a signed app so that refusal names the version floor.
+The reverse holds too: a signature issued before a gateway started signing a group
+your manifest declares fails on that gateway. The app is refused at install, at
+enable and at gateway start until you re-sign it and the operator re-installs it.
 
 ## Resources
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `agents` | string[] | Paths to agent JSON files (relative to app root) |
-| `skills` | string[] | Paths to skill directories |
+| `skills` | string[] | Paths to skill directories. Each is linked into `~/.kiro/crew/skills/`, and `.app-skill-links.json` there names this app as the link's owner. A built-in app's skill shipped under `builtin_skills/` carries an `app:` frontmatter line instead |
 | `sops` | string[] | Paths to SOP (Standard Operating Procedure) files |
 | `mcpServers` | object | MCP server definitions (same format as `mcp.json`) |
 | `config_keys` | string[] | Top-level `config.json` object keys owned by this app. At most 200 keys may be declared, and each key may contain at most 200 characters. Declarations apply only while the app is installed |
@@ -97,7 +156,11 @@ installed against:
   argument after the script are left as written. The rewrite applies only when the
   operand resolves (links followed) to an existing file inside the app root; an
   absolute path, or a relative one that is not such a file, is left as written. A
-  relative path in `command` itself is still never rewritten.
+  relative path in `command` itself is still never rewritten. This is also the only
+  stdio shape a former built-in's repository may declare and still be adopted in
+  place of the built-in, and then only for servers the built-in declared, with no
+  `autoApprove` tool the built-in did not have and no `env` entry it did not set
+  with the same value.
 - The host CLI name `kirocrew` is pinned to the running gateway before any of
   the above applies.
 
@@ -107,6 +170,133 @@ spawns them: the server receives the literal reference text. Registration logs
 a warning naming the app, server and env key when it sees one. How an app may
 receive a vault secret is undecided
 ([#10641](https://github.com/kirodotdev/KiroCrew/issues/10641)).
+
+### Host paths in an agent file
+
+An agent file ships inside your app, so it cannot name a path that exists only
+on the host. Write one of these placeholders inside a JSON string instead, and
+the gateway fills it in when it registers the agent (on enable and at gateway
+start):
+
+| Placeholder | Value |
+|---|---|
+| `{APP_ROOT}` | your app's install directory |
+| `{APP_DATA}` | your app's data directory, the one hooks receive as `ctx.data_dir` |
+| `{UV_BIN}` | the absolute path of the `uv` the gateway resolves |
+| `{HOST_PATH}` | the gateway's `PATH`, plus LibreOffice's install directory on Windows when `soffice` is not on `PATH` |
+| `{PATH_SEP}` | the host's `PATH` separator (`:` or `;`) |
+
+The set is fixed and the same for every app. LibreOffice is the one host tool
+`{HOST_PATH}` adds, because Kiro Crew locates it for its own slide previews; find
+any other tool yourself.
+
+Join a subpath with `/`, for example `"{APP_DATA}/vendor/bin"`, and extend
+the `PATH` of a server with `"{HOST_PATH}{PATH_SEP}{APP_DATA}/bin"`. The
+gateway computes every value itself and never reads one from a file. It writes
+the rendered copy under the data home, so your agent cannot rewrite it. An
+agent that names any other `{UPPER_CASE}` placeholder, or one the host cannot
+compute (no `uv`, an empty `PATH`), is not registered. A templated agent cannot
+be a command's `agent`.
+
+### Session label for a stdio server (`x-kirocrew-session-label`)
+
+A stdio server that needs to know which chat session it serves (to tie its own
+calls to that chat, say) can opt in on its entry:
+
+```json
+"mcpServers": {
+  "notes": {
+    "command": "python3",
+    "args": ["server.py"],
+    "x-kirocrew-session-label": true
+  }
+}
+```
+
+Only the literal `true` opts in. The entry reaches the agent spec as declared,
+and when a session starts the server receives one extra variable,
+`KIROCREW_SESSION_LABEL`, holding that session's key. That is all it receives: no
+port, no session token, no `KIROCREW_SESSION_KEY`, and no internal secret. The
+label is a name, not a credential, and no Kiro Crew identity resolver reads it, so
+it cannot be presented to the gateway as the session.
+
+The label is set when the server starts and is per session: on the shared
+kiro-cli runtime it rides the session's own `mcpServers` element, and on KAS the
+session's injected agent. It is ABSENT, never stale, in these cases, and the
+server should treat a missing label as "unknown session":
+
+- a warm-pool session, which starts its servers before a chat claims it;
+- a server pooled through the MCP gateway (`mcp_gateway.stub_servers`), which is
+  shared across sessions;
+- an entry the per-session element cannot reproduce exactly, which then starts
+  natively as declared: one with `disabledTools`, `disabled`, `timeout`, `cwd`,
+  `autoApprove`, a non-stdio transport, or an `env` value holding `${NAME}` or a
+  `secret://` reference;
+- registry mode (`agent.mcp_registry_mode`), and any other ACP backend.
+
+The server's `command`, `args` and `env` are exactly what it would have started
+with without the label.
+
+### `agentTools` — MCP tools your app serves
+
+An app can give agents tools of its own without shipping an MCP server: declare them
+here, and serve every call from one route of your own API. The gateway lists each tool
+in its `kirocrew-core` MCP server under the name you give it, checks every call against
+your schema, and posts the call to your route. Your code runs where it already runs
+(your backend process, or your `backend.routes` in the gateway); none of it runs in the
+MCP server. Needs App Kit seam level 2 (`ctx.sdk_level >= 2`); an older host ignores
+the block and installs the app without the tools.
+
+Today the gateway lists the tools of first-party apps only (the apps that ship with
+Kiro Crew, including one that moved to its own repository, up to the tools its shipped
+copy declares). `kirocrew-core` is auto-approved as a whole server, and a third-party
+app's tools do not get that approval, so an installed or registry app's block
+validates and installs but lists nothing yet. Until it does, ship an MCP server of your
+own (`mcpServers`); the user approves each of its calls.
+
+A listed tool is also called without an approval card by the app's own agents (the
+ones its `agents` declare), in the app's chats and in its cron jobs. An agent of
+another app, and any other tool your agent calls, asks as usual.
+
+```json
+"agentTools": {
+  "route": "agent-tools",
+  "tools": [
+    {
+      "name": "my_app_note",
+      "title": "Post a note",
+      "description": "Post one progress note to an item.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "item_id": {"type": "string", "maxLength": 64},
+          "status": {"type": "string", "enum": ["done"]}
+        },
+        "required": ["item_id"]
+      },
+      "maxResultChars": 20000
+    }
+  ]
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `route` | string | The route that serves every call, below your app's API: a process backend receives `POST /api/<route>` through the signed app proxy; `backend.routes` receive `POST /<route>`. Lowercase segments only; no leading `/`, query, host or `..` |
+| `namespace` | string | Optional. The prefix your tool names use instead of the app name: a lowercase identifier of at most 32 characters (`pod`: `pod_...`) |
+| `tools[].name` | string | A lowercase identifier (`[a-z][a-z0-9_]{0,63}`) that must begin with your namespace, or by default your app's name with `-` read as `_`, then `_` (app `my-app`: `my_app_...`). A name a built-in core tool already has is never yours |
+| `tools[].description` | string | What the model reads, up to 4,000 characters |
+| `tools[].title` | string | Optional one-line display title, up to 80 characters |
+| `tools[].inputSchema` | object | An object schema of at most 32 arguments using only `string` (`enum`, `maxLength`), `integer` and `number` (`minimum`, `maximum`), `boolean`, and arrays of strings or integers (`maxItems`, item `maxLength`). A string with no `maxLength` is capped at 65,536 characters and an array with no `maxItems` at 256 items; a bool is refused where an integer is declared; `additionalProperties` may only be `false` |
+| `tools[].maxResultChars` | number | Where your answer is cut after redaction, 1 to 60,000; default 20,000 |
+| `tools[].timeoutSeconds` | integer | How long the core waits for your answer, 1 to 600; default 30 |
+| `tools[].result` | string | `json` (default): any JSON object, serialized and redacted by the core. `text`: model-facing text you formatted, redacted and relayed as text |
+| `tools[].strictSession` | boolean | `true`: the call is forwarded only from a directly identified session, whose key your route reads from `X-Session-Key`. Only for `backend.routes`; refused on an app with a process backend, whose proxy strips that header. Default `false` |
+
+Your route receives `{"tool": "<name>", "arguments": {...}}` holding only arguments your
+schema allows, and its JSON answer goes back to the agent, redacted. At most 16 tools per
+app. The tools are listed only while your app is enabled, and a call to a disabled app is
+refused.
 
 ## Scheduling
 
@@ -143,11 +333,11 @@ receive a vault secret is undecided
 | `every` | number | Interval in seconds (mutually exclusive with `cron_expr`) |
 | `cron_expr` | string | Cron expression (mutually exclusive with `every`) |
 | `message` | string | Prompt sent to the agent on each run |
-| `agent` | string | Agent to run (optional, uses default if omitted) |
+| `agent` | string | Agent template to run (optional, uses default if omitted). Name a template, never a Bot: an app cron is never bound to a Bot, so naming one runs that Bot's agent and workspace on the default memory store, not the Bot's own. Only the owner can give a Bot a schedule: `kirocrew cron add NAME MESSAGE --every SECONDS --agent <bot-key>`, or **New schedule** on the Bot's **Schedules** tab |
 | `agent_sequence` | string[] | Ordered agents to run |
 | `command` | string | Shell command executed without a model call; mutually exclusive with `script`. A present non-string value is rejected rather than treated as absent |
 | `script` | string | Synchronous Python callable (`file.py:function`) executed without a model call; mutually exclusive with `command`. A present non-string value is rejected rather than treated as absent. The path resolves against the app's own bundle, must stay inside it, must name a `.py` file, and is stored as an absolute path; re-enable the app after its bundle moves |
-| `env` | object | String environment variables passed to the job |
+| `env` | object | String environment variables passed to the job: its agent session, or a script or command child (for script and command jobs, process-behavior names such as `HOME`, `PATH`, `BASH_ENV`, `LD_*`, `PYTHON*` and `KIROCREW*`, and every name `agent.env` refuses as a code channel (`SHELLOPTS`, `PS4`, `GIT_*`, `*_COMMAND`, `*EDITOR`, `*PAGER`, `*OPTIONS`), are dropped, and a script with a secret grant gets none) |
 | `persistent_session` | boolean | Default `true`; retain one agent session across runs |
 | `silent` | boolean | Default `false`; suppress automatic result delivery |
 | `folder` | string | Schedule-folder name. Installing, enabling or updating the app in a running gateway creates a missing folder; a name several folders share, registration during gateway startup, or a CLI enable leaves the job ungrouped |
@@ -198,6 +388,11 @@ each replaced field with its old and new value (a WARNING line ending in
 > stays in the store but does not run while the app is disabled: each fire is
 > skipped and the run is marked as an error. It runs again once the app is
 > re-enabled.
+>
+> A job the user deletes (Schedule page, CLI or chat command) stays deleted:
+> later gateway starts, app updates and Syncs do not register it again. A
+> disable → re-enable cycle, or an uninstall and new install, registers it
+> again. A job the app removes itself through `ctx.cron` is not remembered.
 
 ## Frontend UI
 
@@ -239,6 +434,7 @@ each replaced field with its old and new value (a WARNING line ending in
 | `ui.overlays[].id` | string | | Overlay id; must match a bundled overlay component (see below) |
 | `ui.overlays[].replaces` | string | | Host overlay slot this app takes over while enabled |
 | `ui.loading.layout` | string | `"page"` | Placeholder shape shown while the bundle loads: `"page"`, `"rail"`, `"centered"` or `"split"` (see below) |
+| `ui.frameSources` | string[] | `[]` | Sites your pages may show in an `<iframe>`, at most 8. Each is an exact origin, `https://` plus one hostname: no path (not even `/`), port, query, user info or wildcard, and no IP address, `localhost` or public suffix such as `co.uk` or `github.io`. Install refuses anything else, and a repeated entry. The dashboard allows these origins in its `frame-src` only while your app is enabled and trusted, and only the ones the owner approved: install approves what it declares, and an origin a later update or edit adds waits for the owner on the app's page. The origins are allowed for the whole dashboard, not only your pages |
 | `contributes.sessionControls[].id` | string | | Control id, kebab-case; addressed as `<appName>:<id>` |
 | `contributes.sessionControls[].entryPoint` | string | | ESM bundle path for the control (relative to ui/) |
 | `contributes.sessionControls[].label` | string | | Accessible name, and the chip's tooltip |
@@ -284,7 +480,7 @@ sidebar placement. Declaring one lets an enabled app take over a host surface:
 {
   "ui": {
     "overlays": [
-      { "id": "command-bar", "replaces": "quick-search" }
+      { "id": "my-launcher", "replaces": "quick-search" }
     ]
   }
 }
@@ -312,6 +508,47 @@ so the combination fails the build rather than silently reverting the surface.
 At most one enabled app owns a slot. When two enabled apps declare the same
 `replaces`, the first by app name wins and the collision is reported -- the winner
 does not depend on which app was enabled or installed more recently.
+
+### `l10n` — Listing Copy per Locale
+
+Optional. Your app's display name, description, page label and highlights in other
+languages. The dashboard shows them in place of the English fields for a reader whose
+language matches: first the exact locale, then its base language (both matched without
+case, so `zh-cn` serves a `zh-CN` reader), then, when neither exists, the first listed
+regional entry for the same language (`pt-BR` for a `pt` reader), then the English
+field. A regional entry that can switch the script is never borrowed: a Chinese region
+(`zh-TW` for a `zh-CN` reader) or a key with a script subtag (`sr-Latn`).
+
+```json
+{
+  "l10n": {
+    "de": {
+      "displayName": "Einkaufsberater",
+      "description": "Merkt sich, was dir wichtig ist, und hilft beim Vergleichen.",
+      "pageLabel": "Einkauf",
+      "highlights": ["Merkt sich Größen und Vorlieben", "Vergleicht Angebote"]
+    },
+    "zh-CN": { "displayName": "购物顾问" }
+  }
+}
+```
+
+| Rule | Limit |
+|------|-------|
+| Locale key | `^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})?$` (`de`, `pt-BR`, `zh-CN`), at most 32 locales |
+| `displayName` | string, at most 120 characters |
+| `description` | string, at most 1000 characters |
+| `pageLabel` | string, at most 60 characters |
+| `highlights` | array of at most 12 strings, each at most 300 characters |
+
+Every field is optional. A locale with an unknown key or a value over its limit is
+**dropped** and the install logs a warning; the rest of the block, and the install,
+are unaffected. The block is listing content, not a signed field, so it is not part of
+the admission signature. A built-in's own dashboard catalog keys take precedence
+over it.
+
+The published store listing does not carry `l10n` yet, so a store row you have not
+installed shows the English fields.
 
 ## Declarative contributions
 
@@ -386,12 +623,11 @@ new glyph name by pull request.
 **The host owns the matcher; a manifest names one rather than supplying it.** The
 collected value is spliced into an instruction handed to an agent with tools, so it has
 to be checked before the prompt is built — but `kind` selects one of a fixed set the
-host implements, and there is no way to ship a regex of your own. An earlier revision
-of this contract accepted `argument.pattern`; a pattern from a manifest runs against
-the field on every keystroke on the thread that draws the launcher, and shapes like
-`^(a+)+$` or `^(a|aa)+$` are a few characters long and exponential, so an `argument`
-that still carries `pattern` is now REFUSED rather than migrated — leaving it to fall
-back on `text` would accept any non-empty string with `autoSend` still on. An unknown
+host implements, and there is no way to ship a regex of your own. An `argument` that
+carries `pattern` is REFUSED: a pattern from a manifest would run against the field
+on every keystroke on the thread that draws the launcher, and shapes like
+`^(a+)+$` or `^(a|aa)+$` are a few characters long and exponential. Falling back on
+`text` instead would accept any non-empty string with `autoSend` still on. An unknown
 `kind` is refused for the same reason.
 
 `kind: "url"` parses the value with the runtime's own URL parser and then applies
@@ -705,6 +941,660 @@ icon; an unrecognised or absent name renders a generic panel glyph.
 
 ## Backend
 
+### `contributes.linkPreviews` — Hover Cards for Links
+
+A link preview shows the app's own card when the user hovers a link in a chat
+message (links elsewhere in the dashboard never reach an app). The host owns detection (which links, the 300 ms hover delay, leave,
+Escape, scroll and blur); the app owns the card, which runs in a sandboxed frame.
+No app code runs until a link on one of the provider's `hosts` is hovered.
+
+```json
+{
+  "contributes": {
+    "linkPreviews": [
+      {
+        "id": "cards",
+        "entry": "dist/link-preview.mjs",
+        "hosts": ["tickets.example.com", ".example.dev"]
+      }
+    ]
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | string | Storage-safe slug, unique within the app |
+| `entry` | string | ESM module, relative to `ui/` (same base as `ui.entry`) |
+| `hosts` | string[] | 1-64 hostnames; a leading dot means the domain and every subdomain. Only `https:` links match. Stored lowercased, in IDNA (punycode) form and without a trailing dot. A public suffix (`co.uk`, `.github.io`) or a bare TLD (`com`) is refused |
+| `textPatterns` | object[] | Optional. Plain text in chat messages that also opens a card; see below |
+| `fullUrl` | boolean | Optional. `show` gets the URL without its query and fragment unless this is `true` and the owner approved it |
+
+**Approval.** The hosts, the text patterns (id, flags and source) and `fullUrl` are
+part of what the owner approves for the app, like `permissions.api`. An update that
+adds a host, changes a pattern or turns `fullUrl` on waits on the app's page until
+the owner approves it, and
+until then the app previews only what was approved before. An update that only
+removes entries needs nothing. When no host and no pattern is approved, the
+provider is off: no frame is made, and a live frame's capability stops renewing and
+its fetches are refused.
+
+At most **one** provider per app; a link goes to the first enabled app whose
+`hosts` claim it.
+
+**Where the module runs.** Never in the dashboard's document. On the first hover
+the dashboard creates an iframe for the provider that is `sandbox="allow-scripts"`
+with no `allow-same-origin`, and loads a frame document the gateway serves at
+`/app-frame/<app>/linkPreviews/<id>/…` with its own `Content-Security-Policy: sandbox
+allow-scripts` (behind an authenticating reverse proxy that refuses that load, the
+same document is set as the frame's `srcdoc` instead, with the policy as a `<meta>`). The frame's origin is opaque: it cannot read the dashboard's DOM,
+its cookies, its storage or its token. The iframe is `credentialless`, the frame's
+CSP starts from `default-src 'none'` (scripts and
+network on the gateway only, images from any `https:` host, no workers, frames,
+objects, forms or `<base>`), and it sends no referrer. A frame that navigates itself
+away is removed. The frame imports `entry` and calls
+`activate(ctx)` once. The dashboard sends it only the hovered URL or text, the
+anchor's rect, the theme and the modifier keys, over `postMessage`, and it
+positions and sizes the frame itself.
+
+```ts
+export function activate(ctx: {
+  appName: string
+  theme(): 'dark' | 'light'
+  /** fetch() to this app's own backend routes; `path` is relative. */
+  fetch(path: string, init?: RequestInit): Promise<Response>
+  /** Which `textPatterns` ids this app's settings turn off now. */
+  setTextPatternsOff(ids: string[]): void
+  // Overlay mode: the frame covers the viewport and is clipped to these rects.
+  setRegions(rects: { left: number; top: number; width: number; height: number }[]): void
+}): {
+  // A link: `url`. A `textPatterns` match: `text`. `rect` is where it is on screen.
+  show(link: {
+    url?: string; text?: string; theme: 'dark' | 'light'
+    rect: { left: number; top: number; width: number; height: number }
+    modifiers?: { alt: boolean; shift: boolean; ctrl: boolean; meta: boolean }
+    // Card mode: the controls for THIS show's card, placed next to its link.
+    card: {
+      open(): void
+      close(): void
+      resize(size: { width: number; height: number }): void
+      pin(pinned: boolean): void          // a pinned card stays on leave and chat scroll
+      dragBy(dx: number, dy: number): void
+      dock(edge: 'left' | 'right' | null): void
+    }
+  }): void
+  leave(): void              // the pointer left the link; the card may hold itself open
+  hide(reason: string): void // 'scroll' | 'escape' | 'blur' | 'other-provider' | 'disabled'
+  theme?(theme: 'dark' | 'light'): void
+  dispose?(): void           // the app was disabled
+}
+```
+
+Two ways to draw:
+
+- **Card mode** (the default). The module renders its card into the frame's
+  `document.body`, reports the size with `link.card.resize`, and shows it with
+  `link.card.open`. The dashboard places the frame below the link (above when there is
+  no room) and keeps it on screen. `card.pin(true)` keeps the card when the
+  pointer leaves or the chat scrolls; the next hover then gets a fresh frame, and
+  at most 8 cards stay pinned. `card.dragBy` moves it (use `screenX`/`screenY`
+  deltas: the frame moves under the pointer) and `card.dock` sticks it to an edge.
+  A scroll inside the card stays in the frame and never closes it. A scroll
+  elsewhere never closes a card that is already open, even when it moves the
+  hovered link (a streaming reply pulling the chat along): the card stays where
+  it is, and the module gets `leave` on the first pointer move outside the card
+  and the link. A scroll that moves the link while its show is still in the
+  hover delay cancels that show.
+- **Overlay mode**, for a provider that keeps windows of its own (pinned cards, a
+  dock, a settings dialog). Its first `ctx.setRegions` makes the frame cover the
+  viewport, clipped to the rects it reports; outside them the page stays
+  clickable. The frame's viewport is then the dashboard's, so `rect` is exactly
+  where the link is. Card-mode calls are ignored, and `hide` is only a notice:
+  the module decides what closes.
+
+Every `show` starts a new invocation, and its `link.card` is bound to it. Keep the
+`card` of the show you are answering: a call on an earlier show's `card`, for
+example from a slow fetch that finished after the user moved to another link, is
+dropped. A message over 8 KB, or
+past a burst of 120 messages refilled at 60 a second, is dropped unread.
+
+Links in a card open through the dashboard's link bridge, only right after a click
+in the card. A plain key pressed in the dashboard while a card shows is passed to
+the frame as a `keydown`, so a card's own shortcuts work; never while the
+dashboard is taking text (a field, or an editor inside a shadow root), and never
+with Ctrl, Alt or Meta.
+
+**`ctx.fetch`** reaches the app's own backend routes and nothing else: the routes
+it registers through `backend.routes`, or its process backend through the same
+signed proxy as `/apps/<app>/api/`. Core routes under `/api/apps/<app>/` are not
+reachable. The request carries a capability the dashboard mints for that one
+frame (`X-KiroCrew-Capability`), short-lived and renewed while the frame lives;
+no cookie is sent and no other route accepts it. Only `GET`, `POST`, `PUT`,
+`PATCH` and `DELETE` are forwarded; any other method gets `405`.
+
+If the app list cannot be read, a hover on a chat link shows the same notice and
+the list is asked for again. If the frame does not report `ready` within 10 seconds, or the module fails to
+import, or `activate` throws, or no frame can be minted for the app, the host
+logs the error and draws its own card where the app's card would be. The card
+says which of the three happened (it took too long, the app reported an error,
+the app is not available) and has **Retry**, which disposes that provider's
+failed frame and loads a new one for the same link, and a close button; Escape
+closes it too. Without Retry, the next hover at least 30 seconds later tries
+again. When the app is disabled the host sends `hide('disabled')`
+and `dispose`, then removes the frame.
+
+**Behind an authenticating reverse proxy, register your entry.** A sandboxed frame
+sends no cookie, so a proxy in front of the dashboard that signs every request in by
+cookie refuses the frame's own requests: its module import gets the proxy's login
+page. The dashboard then sets the frame document itself (`srcdoc`) when the load
+fails, and makes the frame's refused requests on its behalf (the same path, method, headers and capability).
+When the import is refused it fetches your module the same way and runs it inline,
+where no export can be read. For that path, also hand over `activate`:
+
+```js
+export function activate(ctx) { /* ... */ }
+globalThis.kirocrew?.register(activate)
+```
+
+`register` takes your `activate` function, called with `ctx` as the export is; anything
+else is ignored. It is read only on the
+inline path, so `activate` runs once either way, and the `?.` keeps the module
+loading on a host without the call. Keep the entry one self-contained file: an inline
+module's relative imports do not resolve. A module that only exports `activate` keeps
+working where its import is served (localhost, a plain port forward, a proxy that
+does not authenticate each request) and still fails behind an authenticating proxy.
+The same holds for every frame-backed point below (`messageActions`, `linkOpen`,
+`composerActions`, `selectionActions`).
+
+**Plain text (`textPatterns`).** Each entry names text that is not a link but should
+open the app's card:
+
+```json
+"textPatterns": [
+  { "id": "ticket", "pattern": "(?<![\\w-])(TK-\\d{4,})(?![\\w-])", "flags": "g" },
+  { "id": "team", "pattern": "(?<![\\w.-])(team\\.[a-z0-9]+)", "flags": "gi", "defaultOff": true }
+]
+```
+
+| Field | Description |
+|-------|-------------|
+| `pattern` | JavaScript regex source, at most 200 characters; at most 16 entries |
+| `flags` | Optional. A subset of `giu`; `g` is implied |
+| `id` | Optional slug the module names in `ctx.setTextPatternsOff` |
+| `defaultOff` | Optional. Not drawn until the module reports it on |
+
+- In chat messages only, the host wraps each match in
+  `<span class="link-preview-text" data-link-preview-text>`. It is never a link,
+  and never drawn inside code, inline code, math, raw HTML or an existing link. A
+  token an edition's autolink rule already linked stays that link.
+- Hovering the span calls `show({ text, rect })` on the app whose pattern matches
+  the span's whole text. The span carries no owner: the host re-derives it from the
+  text, so a span written in raw message HTML reaches nothing a pattern would not.
+- `ctx.setTextPatternsOff(ids)` reports which ids the app's own settings turn off.
+  The host remembers it across reloads, so the first paint after a reload already
+  follows the app's settings although the module only loads on the first hover.
+- A pattern must compile with its flags and must not match the empty string. It is
+  never run on the dashboard's thread, not even for that check: matching and the
+  empty-string test happen in a Web Worker, one batch per render, with a hard budget
+  of 250 ms per pattern, restarted as each pattern starts, so an overrun is charged
+  to the pattern that used up its own time. A pattern that matches
+  the empty string is turned off for the session. A pattern that overruns is
+  stopped (the worker is terminated), turned off for the rest of the session, and
+  logged once; the rest of the batch, and text already drawn, is matched again
+  without it, so a span it owned can move to the next app whose pattern takes it. A text node
+  longer than 2,000 characters is not scanned. Text renders plain until the worker
+  answers, then gains its spans. A span belongs to the first app (in app-list
+  order) whose pattern matches its whole text, the same in every message. At most
+  20,000 distinct text nodes are scanned per page load; later ones stay plain. If the worker does not start within 5 seconds,
+  plain-text previews are off for that page load. `textPatterns` is signed.
+
+### `contributes.messageActions` — A Button on One Chat Message
+
+A message action is a row in a chat message's More menu. When the user clicks it,
+the app gets that one message's text, in a popover next to the message. Nothing
+else: no other message, no session key, title, folder, agent, model or project, no
+attachments, tool calls or their output, no message id or position, and no DOM.
+No app code runs until the row is clicked. It runs in the same sandboxed frame as
+a link-preview card.
+
+```json
+{
+  "contributes": {
+    "messageActions": [
+      {
+        "id": "save",
+        "title": "Save to notes",
+        "entry": "dist/frame.mjs",
+        "roles": ["assistant"],
+        "format": "plain",
+        "maxChars": 32000,
+        "popover": { "width": 360, "maxHeight": 480 }
+      }
+    ]
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | string | Storage-safe slug, unique within the app |
+| `title` | string | The menu row's label, 1 to 40 UTF-16 units. The row also names the app |
+| `entry` | string | ESM module, relative to `ui/` (same base as `ui.entry`) |
+| `roles` | string[] | Optional. Which messages the row is on: `assistant` (replies, the default), `user` (the user's own messages), or both |
+| `format` | string | Optional. `plain` (default): the message's own text as the chat renders it, minus what the renderer hides, read at the click: a link gives its label, not its address; an image or a drawn diagram gives nothing; a formula gives its TeX; a code block gives its code. Styling the message's author applied counts as content. `markdown`: the markdown source |
+| `maxChars` | integer | Optional. 1 to 32,000 (default). Longer text is cut, and `truncated` says so |
+| `popover` | object | Optional. `width` 200 to 480 (default 360) and `maxHeight` 120 to 600 (default 480), in CSS px |
+
+At most **two** actions per app. A field with the wrong JSON type, or an unknown
+field, is refused at install, never coerced. Every entry is signed.
+
+**Approval.** Which roles an action is on and whether it gets markdown are part of
+what the owner approves for the app, stored per action as `<id>:role:assistant`,
+`<id>:role:user` and `<id>:format:markdown` in the `messageActions` family of the
+approved-grants file. Installing approves what is declared. An update that adds the
+`user` role, switches to `markdown` or adds an action waits on the app's page under
+**Approve new permissions**; until then the action works at its approved reach (an
+action whose `markdown` waits gets plain text). An update that only narrows needs
+nothing. An action with no approved role is not offered, its frame is not served,
+and an open frame's fetches are refused. User messages are a grant of their own
+because a user's message can hold what they pasted; an assistant reply can hold
+what the agent read, so neither role is free.
+
+**Where it shows.** In the More menu of each finished message of an approved role,
+after the host's own rows, ordered by app name. Never as a row button: the
+message footer keeps its two-control limit whatever apps are installed. Not on a
+streaming reply. On a user message, only where the row has a More menu (the
+chat surfaces that offer Quote).
+
+**Where the module runs.** In an app frame (see `linkPreviews` above for the
+sandbox, the CSP and `ctx.fetch`), served at `/app-frame/<app>/messageActions/<id>/…`, inside a
+popover the host draws below the message. The popover's header names the app and
+the action, outside the frame. Escape, a press outside, the close button or
+another action closes it.
+
+```ts
+export function activate(ctx: {
+  appName: string
+  theme(): 'dark' | 'light'
+  /** fetch() to this app's own backend routes; `path` is relative. */
+  fetch(path: string, init?: RequestInit): Promise<Response>
+}): {
+  invoke(
+    message: { text: string; format: 'plain' | 'markdown'; truncated: boolean; role: 'assistant' | 'user' },
+    call: {
+      invocationId: string
+      /** Offer text for the host's Copy button (at most 32,000 UTF-16 units). */
+      offerCopy(text: string): Promise<{ ok: true } | { ok: false; code: string }>
+      /** Offer an https URL for the host's Open button. */
+      offerOpen(url: string): Promise<{ ok: true } | { ok: false; code: string }>
+      resize(size: { width: number; height: number }): void
+      close(): void
+      error(message: string): void
+    },
+  ): void
+  cancel?(invocationId: string, reason: string): void // 'closed' | 'deadline' | 'other' | 'revoked'
+  theme?(theme: 'dark' | 'light'): void
+  dispose?(): void
+}
+```
+
+**One invocation per click.** The host mints `invocationId`; the frame cannot make
+one. The invocation ends after **2 minutes** without a `resize` or an offer, and
+when the popover closes, which the frame hears as `cancel`. Keep the `call` you
+were handed: an offer, `resize`, `close` or `error` for an earlier invocation is
+refused.
+
+**Copy and Open are the host's buttons.** The frame cannot write the clipboard or
+open a window. It offers a value, and the host draws the button under the frame:
+**Copy** writes the clipboard only when the user clicks it; **Open** shows the
+host name and opens the URL in a new tab with `noopener,noreferrer`. An offer
+replaces the earlier one of its kind. Each offer is answered: `{ ok: true }`, or
+`{ ok: false, code }` with `stale` (another or a closed invocation, or a repeated
+offer), `too_large` or `not_allowed` (not `copy` or `open`, or not an `https:` URL).
+
+A message over 64 KB of JSON, or past a burst of 120 messages refilled at 60 a
+second, is dropped unread. If the frame does not report `ready` within 10 seconds,
+or the module fails to import, or `activate` throws or returns no `invoke`, the
+popover says the app didn't open. An `error` shows that the app couldn't finish.
+
+### `contributes.linkOpen` — Open a Claimed Link in the App
+
+A link-open entry lets the user open a link in a chat message inside the app,
+instead of a new browser tab. The host owns the click and the choice; the app owns
+what it shows, in the same sandboxed frame a link preview uses. No app code runs
+until the user picks the app.
+
+```json
+{
+  "contributes": {
+    "linkOpen": [
+      {
+        "id": "open",
+        "entry": "dist/link-open.mjs",
+        "hosts": ["tickets.example.com", ".example.dev"]
+      }
+    ]
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | string | Storage-safe slug, unique within the app |
+| `entry` | string | ESM module, relative to `ui/` (same base as `ui.entry`) |
+| `hosts` | string[] | 1-64 hostnames, with the same rules as `linkPreviews.hosts`. Only `https:` links on the default port and without a user name match |
+| `fullUrl` | boolean | Optional. `open` gets the URL without its query and fragment unless this is `true` and the owner approved it |
+
+At most **one** entry per app; a click goes to the first enabled app whose `hosts`
+claim the link.
+
+**Which clicks.** A plain left click on an `https:` link in a chat message whose
+host the entry claims. A click with Ctrl, Cmd, Shift or Alt, a middle click, a link
+outside a chat message and a link no app claims all behave exactly as before. So
+does a link to the dashboard itself (an artifact or a session), even when the
+dashboard is served at a host the entry claims.
+
+**The choice.** The first click asks: open the link in the app, or in the browser.
+With **Always** checked the answer is remembered for this entry and this one host
+only, not for every host the app claims. A remembered "browser" makes the link an
+ordinary link again. The app's page lists the remembered answers, each with
+**Forget**.
+
+**Approval.** The hosts and `fullUrl` are part of what the owner approves, like
+`linkPreviews`: an update that adds a host or turns `fullUrl` on waits on the app's
+page until the owner approves it. With no host approved the entry is off: no frame,
+no capability, no fetch.
+
+**Where the module runs.** In a host dialog, in a frame created when the user picks
+the app and removed when the dialog closes. It is the shared app frame: opaque
+origin, `credentialless`, the same CSP and `ctx.fetch` as a link preview. The dialog's header
+has one **More actions** menu beside close. It always holds **Open in browser**,
+which is the host's own and always works.
+
+```ts
+export function activate(ctx: {
+  appName: string
+  theme(): 'dark' | 'light'
+  /** fetch() to this app's own backend routes; `path` is relative. */
+  fetch(path: string, init?: RequestInit): Promise<Response>
+}): {
+  // One call per open. Draw the link, then return; throw to fail it.
+  open(link: {
+    url: string                 // no query or fragment unless `fullUrl` was approved
+    theme: 'dark' | 'light'
+    invocationId: string        // the host's id for this open
+    deadlineMs: number          // how long the host waits for open() to settle
+    resize(size: { width: number; height: number }): void
+    close(): void               // the app is done: the host closes the dialog
+    error(message: string): void
+    offerCopy(text: string): Promise<{ ok: boolean; code?: string }>
+    offerOpen(url: string): Promise<{ ok: boolean; code?: string }>  // https only
+  }): void | Promise<void>
+  cancel?(invocationId: string, reason: string): void
+  theme?(theme: 'dark' | 'light'): void
+  dispose?(): void
+}
+```
+
+Each open is one invocation on the shared invocation contract. When `open()`
+settles, the frame reports its size, which tells the host the link is drawn: the
+frame is shown and the deadline stops. When `open()` throws, or `link.error()` is
+called, the open fails. If neither happens within the deadline (10 seconds after the
+module is ready), the host cancels the invocation (`cancel(id, 'deadline')`) and
+shows "couldn't open this link" with **Open in browser**; a frame that does not
+report `ready` within 10 seconds, or whose module fails to import, shows the same.
+Closing the dialog first calls `cancel(id, 'closed')`. `offerCopy` and `offerOpen`
+put a **Copy** or **Open &lt;host&gt;** item in that menu: nothing is
+copied or opened until the user picks it. Links inside the frame open through the
+dashboard's link bridge.
+
+### `contributes.composerActions` — Buttons That Put Text in the Composer
+
+A composer action is a row in the chat composer's **+** menu. When the user clicks
+it, the app's frame opens in a small popover above the composer, and the app hands
+back text. The host puts that text into the empty composer, where the user can
+read it, edit it and send it. The app never sends a message.
+
+```json
+{
+  "contributes": {
+    "composerActions": [
+      {
+        "id": "insert-snippet",
+        "title": "Insert snippet",
+        "icon": "Zap",
+        "entry": "dist/composer.mjs",
+        "popover": { "width": 360, "maxHeight": 320 }
+      }
+    ]
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | string | Storage-safe slug, unique within the app |
+| `title` | string | The row's label, at most 40 characters. The row also shows the app's name |
+| `icon` | string | Optional host glyph name: one of `Shield`, `Bot`, `Search`, `Tag`, `Users`, `Zap`, `Star`, `Package`, `Cat`, `AudioLines`, `Mic`. Any other name falls back to `Package`; a URL is refused |
+| `entry` | string | ESM module, relative to `ui/` (same base as `ui.entry`) |
+| `popover` | object | Optional. `width` 200-480 and `maxHeight` 120-600, in CSS pixels |
+
+At most **two** actions per app. A field of the wrong type, or a field not in this
+table, is refused at install. The block is signed.
+
+**What the app sees.** Nothing from the composer: not the draft, not the selection,
+not the session. The click is the whole input. An app that needs the user's
+words asks for them in its own popover.
+
+**Approval.** Each action is part of what the owner approves for the app. An update
+that adds an action waits on the app's page until the owner approves it; renaming
+one or changing its icon needs nothing. A disabled app, or an action whose approval
+is withdrawn, loses its row, and an open popover is closed.
+
+**Where the module runs.** In the same sandboxed, opaque-origin frame as a link
+preview (see `contributes.linkPreviews`), loaded from
+`/app-frame/<app>/composerActions/<id>/…`. The module exports `activate(ctx)`,
+which returns an `invoke(call)` handler. The host calls it once per click.
+
+```ts
+export function activate(ctx: {
+  appName: string
+  point: 'composerActions'
+  theme(): 'dark' | 'light'
+  /** fetch() to this app's own backend routes; `path` is relative. */
+  fetch(path: string, init?: RequestInit): Promise<Response>
+}): {
+  // Nothing from the composer is passed in: only this click's own controls.
+  invoke(call: {
+    invocationId: string
+    deadlineMs: number        // how long the click has, restarted by each resize
+    signal: AbortSignal       // aborted when the user closes the popover, or at the deadline
+    // Settles with { ok: true } when the host took it, or { ok: false, code }
+    // (`stale`, `too_large`, `not_allowed`, `not_empty`, `not_literal`) when it refused.
+    insert(text: string): Promise<{ ok: boolean; code?: string }>
+    resize(size: { width: number; height: number }): void
+    close(): void
+    error(message: string): void
+  }): void | string | Promise<void | string>  // returning text is the same as call.insert(text)
+  theme?(theme: 'dark' | 'light'): void
+  dispose?(): void
+}
+```
+
+- **One result.** The host takes one `insert` per click. A later one, one after the
+  popover closed, or one over 32,000 characters is refused (`insert` settles with `ok: false`
+  and `stale` or `too_large`).
+- **Time.** The frame must load and report ready within 5 seconds. The click then
+  has 2 minutes, restarted by each `resize`; at the deadline `signal` aborts and
+  the popover says the app took too long.
+- **Only into an empty composer, only text with nothing to resolve.** The host puts
+  your text in only when the composer is empty (no text, no collapsed paste), so
+  your text is the whole draft. If the user clicks with a draft already there, the
+  popover says the draft must be cleared first and your frame is not loaded. If the
+  user types while your frame is open, your `insert` settles `not_empty`. If
+  another tab takes the composer's typing lock, your frame is closed and a late
+  `insert` settles `stale`. Text that
+  would itself be read as more than text is refused and nothing is inserted
+  (`not_literal`): a line whose first non-blank character is `/` or `!` (a
+  terminal command), an `@` that does
+  not follow a letter or digit, a `$` before a letter or digit, the composer's
+  `[ Paste #N · M lines ]`, `[attached_file N]` or `[attached_dir N]` syntax however
+  it is spaced, markdown image syntax `![…](…)`, any raw HTML tag such as `<img>` (the transcript fetches a local image,
+  audio or video destination, decoded), or a path separator followed on the same
+  line by an image suffix. The popover shows the
+  reason and stays open, so you can offer other text. Accepted text is cleaned of
+  control characters (but tab and newline), bidirectional override characters and
+  characters that draw nothing (zero-width, tag characters, variation selectors)
+  and goes in as ordinary text the user can read and edit. Nothing marks it:
+  whatever the user types after it is their own and resolves normally.
+- **Limits.** The frame cannot write the clipboard. Links open through the
+  dashboard's link bridge, and a frame that navigates itself away is closed. A
+  message over 64 KB as JSON, or past a burst of 120 messages refilled at 60 a
+  second, closes the frame.
+
+### `contributes.selectionActions` — Items on Selected Chat Text
+
+A selection action adds an item to the toolbar that appears over text the user
+selects in a chat reply. When the user picks it, the app is handed the selected
+text and nothing else, in a sandboxed frame that opens in a popover. Selection
+elsewhere in the dashboard never reaches an app.
+
+```json
+{
+  "contributes": {
+    "selectionActions": [
+      {
+        "id": "save",
+        "title": "Save to notes",
+        "icon": "Star",
+        "entry": "dist/selection.mjs",
+        "maxLength": 4000,
+        "effects": ["copy", "open"],
+        "popover": { "width": 360, "maxHeight": 480 }
+      }
+    ]
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | string | Storage-safe slug, unique within the app |
+| `title` | string | 1-40 characters. The item's label |
+| `icon` | string | Optional. A name from the host icon set (`Star`, `Tag`, `Bot`, …, as for an app's own `icon`); an unknown name draws the host's glyph |
+| `entry` | string | ESM module, relative to `ui/` (same base as `ui.entry`) |
+| `sources` | string[] | Optional, default `["chat"]`. Where a selection may come from; `chat` (a chat reply) is the only source |
+| `minLength` | integer | Optional, default 1. A shorter selection shows a notice instead of opening the frame |
+| `maxLength` | integer | Optional, 1-8,000, default 8,000. The most text the app is handed, in UTF-16 units; longer selections are cut and `truncated` is set |
+| `effects` | string[] | Optional, default `[]`. Which host buttons the app may fill: `copy`, `open` |
+| `popover` | object | Optional. `width` 200-480 (default 360), `maxHeight` 120-600 (default 480) |
+
+At most **two** items per app. A field with the wrong JSON type is refused, never
+coerced. The block is signed.
+
+**Approval.** Each item is one entry the owner approves for the app, like
+`permissions.api`: `<id>:<sources>:<minLength>-<maxLength>:<effects>`. Installing
+approves what is declared. An update that changes any of those fields (a new
+source, more text, a new effect) waits on the app's page until the owner approves
+it, and until then that item is not offered: no frame is made, and a live frame's
+capability stops renewing and its fetches are refused. A pick from a menu that was
+read before the change is refused too, before any text reaches the app. Removing an
+item needs nothing.
+
+**In the toolbar.** One **Apps** button sits in its own row under Quote, Ask and
+Copy, so the host's row never grows. It appears only while some enabled app has an
+approved item, and also when the dashboard could not load its app list, so a failure
+never hides it silently. It opens a menu of every item, read fresh from the app list
+each time it opens; if that read fails, the menu says so and offers **Retry**. The
+menu scrolls
+when it is taller than the screen. Each item
+names its app in its tooltip and in the popover's header. On a touch device the
+native selection, its handles and its Copy callout are left alone: nothing listens
+for a long-press. The items sit in the toolbar docked above the composer, and the
+popover is a sheet at the bottom of the screen.
+
+**Where the module runs.** On the shared app frame, like a link preview (see
+above), at `/app-frame/<app>/selectionActions/<id>/…`: an iframe that is `sandbox="allow-scripts"` with no `allow-same-origin`,
+`credentialless`, loading the gateway's frame document under its own CSP, made when
+the item is picked and removed when the popover closes. Its capability and its
+frame token are bound to that one item, so they reach nothing for another item or
+point. `ctx` is `{ appName, theme(), fetch }`; `ctx.fetch` reaches the app's own
+routes as for a link preview. The module exports `activate(ctx)` and returns a handler:
+
+```js
+export function activate(ctx) {
+  return {
+    async invoke(selection, call) {
+      // selection: { text, truncated, source: 'chat' }
+      const res = await ctx.fetch('notes', { method: 'POST', body: JSON.stringify({ text: selection.text }) })
+      const { url } = await res.json()
+      document.body.textContent = 'Saved'
+      call.resize({ height: 80 })
+      await call.offerOpen(url)          // the host draws "Open notes.example.com"
+      const { ok } = await call.offerCopy(url)   // the host draws "Copy"
+    },
+    cancel(invocationId, reason) {},     // reason: 'closed', 'deadline' or 'revoked'
+  }
+}
+```
+
+`call` belongs to one invocation:
+
+| Member | What it does |
+|--------|--------------|
+| `invocationId` | The host's id for this pick |
+| `offerCopy(text)` | Offers at most 32,000 UTF-16 units for the host's **Copy** button. Resolves `{ ok: true }` when the host accepted it, or `{ ok: false, code }` with `stale`, `too_large` or `not_allowed` |
+| `offerOpen(url)` | Offers an `https:` URL (at most 2,048 characters, no userinfo) for the host's **Open** button, which names the host and opens a new tab with `noopener,noreferrer`. Resolves like `offerCopy` |
+| `resize({ height })` | The frame height; clamped to 48 and `popover.maxHeight` |
+| `close()` | Ends the invocation and closes the popover |
+| `error(message)` | Ends the invocation and shows the message, as plain text, in host chrome |
+
+**The invocation.** Each pick is one invocation with a host-made `invocationId` the
+frame cannot make. It ends once: the frame closes it, reports an error, or the host
+cancels it (the popover closed, the app went away, or 2 minutes passed with no
+`resize` or offer). Every offer names its invocation and a rising `seq` and is
+answered with an acknowledgement or an error, so an offer for a closed invocation,
+a repeated one, or one of an undeclared kind does nothing. A later offer of the
+same kind replaces the earlier one. The frame never writes the clipboard or opens
+a window: an accepted offer only fills the host's button, which acts on the user's
+click. A link clicked inside the frame goes nowhere; use `offerOpen`.
+
+**Bounds.** A frame that does not activate within 10 seconds, sends a message over
+64 KB or past its burst allowance, or navigates itself away is removed, and the
+popover says the app did not respond.
+
+### `contributes.memoryProviders` — Memory Your Backend Serves
+
+An app can offer Crew a memory provider: its backend serves a fixed JSON contract, and
+the owner picks it (`PUT /api/memory/provider`), as a replacement for Crew's
+memory or as a read-only extra source. Needs `backend.entryPoint`.
+
+```json
+{
+  "backend": { "entryPoint": "backend/server.py", "healthCheck": "/health" },
+  "contributes": {
+    "memoryProviders": [{
+      "id": "bridge",
+      "displayName": "My memory server",
+      "route": "/memory-provider",
+      "description": "Keeps memory in my own service.",
+      "settingsPage": "/settings"
+    }]
+  }
+}
+```
+
+| Field | Rule |
+|---|---|
+| `id` | `^[a-z][a-z0-9-]{0,31}$`, unique in the app; the provider is `app:<app id>/<id>` |
+| `displayName` | at most 60 characters |
+| `route` | a plain path below your app's API; the gateway posts `/api/<route>/v1/<op>` |
+| `description` | optional, at most 200 characters |
+| `settingsPage` | optional page of your app where the provider is connected |
+
+At most four providers per app; a malformed block refuses the install. The contract
+your backend answers is in [api-reference](api-reference.md#memory-provider-contract).
+
 ### `backend` — App Backend Process
 
 ```json
@@ -726,12 +1616,25 @@ icon; an unrecognised or absent name renders a generic panel glyph.
 | `backend.routes` | string | | Base route path for the backend |
 | `backend.type` | string | `""` | Backend runtime: `"python"`, `"asgi"`, `"node"`, `"exec"` (execute the entry point file as-is), or `""` (auto-detect from `entryPoint` — a `.sh` file or an extensionless executable with a non-Python shebang is treated as a shell launcher) |
 | `backend.signedPrincipal` | boolean | `false` | Add a signed `X-KiroCrew-Principal` claim to every request the reverse proxy forwards to this backend. Only the JSON boolean `true` turns it on. The claim says whether the gateway authenticated an `owner-session`, an `app-token`, an `agent-tool` call, or `none`. |
+| `backend.webOrigin` | boolean | `false` | Serve this backend on its own origin, `http://<name>.apps.localhost:<dashboard port>`, so a page the app frames rides the dashboard's own connection. Only the JSON boolean `true` turns it on, and the name must be at most 63 characters. The gateway forwards no credential and signs nothing on that origin, `Authorization` included, so the app authenticates its own pages; a framed site that signs in with bearer or Basic auth needs the backend to add that header itself. Every app origin can count as the one site `apps.localhost`, so `SameSite` cookies do not keep another app's page out: check `Origin` or a CSRF token on every route that changes state. Inside a Remote Crew pane the remote gateway serves it on the pane's forward port once the pane has signed in. Read the origin with `appWebOrigin(name)` from `@kirocrew/app-sdk` (level 8), and why there is none with `appWebOriginStatus(name)` (level 11). |
 
 > **Note:** the shell-launcher auto-detect reads the entry point's shebang
 > line, so a compiled/binary launcher (e.g. an ELF executable) cannot be
 > auto-detected — declare `"type": "exec"` explicitly for those. Exec
 > backends are POSIX-only: on native Windows the backend is refused at spawn
-> with a logged error (use a Python or Node entry point instead).
+> with a logged error (use a Python or Node entry point instead). The enable,
+> install and update responses then carry a `backend_refused` field with that
+> reason; the app itself still enables, since its other parts do not need the
+> backend.
+
+A Node backend gets its npm dependencies from the gateway, because an install
+never copies `node_modules`. Before the backend starts, the gateway runs
+`npm install --production` in every directory from the app root down to the
+entry point's own that has a `package.json` and no `node_modules`. So an
+`entryPoint` of `backend/dist/server.js` with its `package.json` in `backend/`
+gets `backend/node_modules`. This is how a local-path install gets its npm
+dependencies, since `setup.onInstall` does not run for one. A failed
+`npm install` is logged as a warning and the backend starts anyway.
 
 App backends are accessible through the Gateway's reverse proxy at
 `/apps/{name}/api/{path}`, which avoids CORS issues for dashboard UI pages.
@@ -769,6 +1672,28 @@ root (validated against `HooksConfig._HOOK_PATH_RE`).
 | `backend.hooks.on_startup` | string | `module.path:callable` invoked when the app's hooks are wired up |
 | `backend.hooks.on_shutdown` | string | `module.path:callable` invoked when the app is disabled/torn down |
 
+**The `routes` callable** receives the app context and returns a list of routes.
+Each route is any object with three attributes, so the app declares its own
+dataclass and never imports `kiro_crew`:
+
+```python
+from dataclasses import dataclass
+from typing import Any, Callable
+
+@dataclass(frozen=True)
+class Route:
+    method: str        # GET, POST, PUT, DELETE or PATCH (any case)
+    path: str          # relative to /api/apps/<app>/, at most 512 characters
+    handler: Callable  # async (request, ctx) -> response
+
+def register_routes(ctx):
+    return [Route("GET", "/items", list_items), Route("POST", "/items/{item_id}", save_item)]
+```
+
+An item whose `method` is not one of those five, whose `path` is not a string of at
+most 512 characters, or whose `handler` is not callable is skipped with a warning.
+The built-ins' `AppRoute` class is still accepted.
+
 `hooks.routes` handlers are wired up when the app is enabled **through the
 Gateway** -- the dashboard's enable action (`on_app_enable`), also re-run at
 gateway startup (`on_gateway_startup`) -- so on that path they go live without
@@ -776,10 +1701,11 @@ waiting for a Gateway restart.
 
 `kirocrew app enable` and `kirocrew app disable` apply live when a running
 Gateway is reachable through the CLI's owner-only Unix socket (POSIX only),
-including starting or stopping the backend. Otherwise the CLI records the change
-for the next Gateway start. On that file-only path, enabling an app that declares
-`backend.hooks` also prints the hooks reminder so the delayed activation is
-explicit.
+including starting or stopping the backend. Otherwise the CLI edits the files
+alone: a Gateway that is running anyway loads or unloads the hooks within a
+minute, and the backend process starts or stops at the next Gateway start. On
+that file-only path, enabling an app that declares `backend.hooks` also prints
+the hooks reminder so the timing is explicit.
 
 **Importing your own modules.** Hook entry files are loaded from their file path
 into a synthetic package named after the app, never via `sys.path`, so use a
@@ -797,7 +1723,9 @@ Python already runs in the Gateway process with full filesystem access, so a
 symlinked sibling resolves wherever it points. Do not use a bare
 `import config`: `sys.modules["config"]` is process-global, so two apps each
 shipping a `config.py` would end up sharing one module. `from kiro_crew...`
-absolute imports are for built-in apps only.
+absolute imports are for built-in apps only; an installed app reaches the host
+through its context (`ctx.require_owner`, `ctx.embed`, `ctx.scrub` and the other
+[context members](api-reference.md#owner-gate-ctxrequire_owner)).
 
 **Python dependencies.** Runtime `requirements.txt` provisioning — the
 `data/.kirocrew-deps/` tree described in the stdio `command`-resolution passage
@@ -936,9 +1864,26 @@ packages at all.
     "memory": "app-scoped",
     "network": false,
     "sessionApproval": false,
+    "memberThreads": false,
     "spawn": false,
     "jobs": false,
     "proposeCrewmate": false,
+    "agentTurns": false,
+    "chatSlots": false,
+    "hiddenSessions": false,
+    "chatLaunch": {
+      "keyPrefix": "my-app-chat-",
+      "agents": ["my-agent"],
+      "folder": "My App",
+      "memoryModes": ["persistent"]
+    },
+    "workerAutoApprove": false,
+    "reachableByUserSessions": [],
+    "desktopCapabilities": [],
+    "browserSites": [],
+    "browser": [],
+    "webhookSource": false,
+    "bots": [],
     "exposeToApps": []
   }
 }
@@ -946,7 +1891,7 @@ packages at all.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `permissions.api` | string[] | Allowed API path prefixes. `/api/member-records/*` is the one that lets the app put a value on a Dashboard page of ANY crewmate it names by slug; there is no per-crewmate form of the grant ([api-reference](api-reference.md#member-records)) |
+| `permissions.api` | string[] | Allowed API path prefixes. An entry that starts with `=` names that one path and no child (`=/api/apps` admits `GET /api/apps` and refuses `/api/apps/install`; seam level 7, and an older host matches it to nothing). `/api/member-records/*` is the one that lets the app put a value on a Dashboard page of ANY Bot it names by slug; there is no per-crewmate form of the grant ([api-reference](api-reference.md#member-records)) |
 | `permissions.events` | string[] | Allowed WebSocket event types |
 | `permissions.mcpTools` | string[] | Allowed MCP tool names |
 | `permissions.storage` | boolean | Can use app-scoped storage |
@@ -954,9 +1899,21 @@ packages at all.
 | `permissions.memory` | string | Memory access: `""` (none), `"app-scoped"`, or `"shared"` |
 | `permissions.network` | boolean | Can make external network requests |
 | `permissions.sessionApproval` | boolean | Controls existing local user sessions: send messages (including generated response-option choices, but not a change to the session's agent binding, persona settings, or a harness slash command), approve or deny pending tool requests, and change approval modes within the limits below |
+| `permissions.memberThreads` | boolean | Widens `sessionApproval` to a Bot's pinned DM thread (the live `member-*` slot the owner opened): the same actions, nothing else about the Bot. Grants nothing without `sessionApproval`; see [the scope below](#permissionsmemberthreads--a-bots-own-thread) |
 | `permissions.spawn` | boolean | May start a background agent through the host's subagent manager (`ctx.spawn`) |
 | `permissions.jobs` | boolean | May run durable background work through `ctx.job` and the app-owned `_jobs/*` routes |
-| `permissions.proposeCrewmate` | boolean | **Preview, switched off**: `ctx.crewmate` stays `None` until the owner view that lists the cards lands (#21718). May propose one crewmate from a `.crewmate` bundle through `ctx.crewmate`. Gates a real capability like `spawn`: `ctx.crewmate` is absent unless the value is literally `true`. Each proposal is an owner change card; only the owner's press creates the crewmate ([api-reference](api-reference.md#crewmate-proposals-ctxcrewmate)) |
+| `permissions.bots` | string[] | Bot scopes, `"read"` and `"wake"`; any other entry is dropped. `read` lists the Bots the owner ticked for this app with their status and goals; `wake` sends one of them a fixed line the gateway writes. The owner ticks Bots in the app's detail page, and a fresh install reaches none. Also declare `/api/members` in `permissions.api`. A scope an update adds waits for the owner's approval. Never reaches a Bot's chats, briefing or rules. Called from the app's backend with its app token ([api-reference](api-reference.md#bots-permissionsbots-from-your-backend)) |
+| `permissions.proposeCrewmate` | boolean | **Preview, switched off**: `ctx.crewmate` stays `None` until an owner view lists the cards. May propose one Bot from a `.crewmate` bundle through `ctx.crewmate`. Gates a real capability like `spawn`: `ctx.crewmate` is absent unless the value is literally `true`. Each proposal is an owner change card; only the owner's press creates the Bot ([api-reference](api-reference.md#bot-proposals-ctxcrewmate)) |
+| `permissions.agentTurns` | boolean | May run agent turns on sessions keyed `<app>-<id>` through `ctx.turns`: every tool goes through the host's tool gate under this app's identity, and every turn is admitted as Crew automation. Gates a real capability like `spawn`: `ctx.turns` is absent unless the value is literally `true` ([api-reference](api-reference.md#agent-turns-ctxturns)) |
+| `permissions.chatSlots` | boolean | May open and drive dashboard chat slots keyed `<app>-<id>` through `ctx.chat_slots`: turns through the host's own chat runner under this app's identity, the slot's queue, stop, archive, transcript and the AutoNudge loops on those slots, never another slot. Shown at the trust prompt. `ctx.chat_slots` is absent unless the value is literally `true` (App Kit seam level 7, [api-reference](api-reference.md#chat-slots-ctxchat_slots)) |
+| `permissions.hiddenSessions` | boolean | Keeps the chats this app creates out of the session lists: the chat sidebar, the Sessions page, recently closed and Older sessions. The app creates such a chat with `mode` set to its own app id on `POST /api/chat/slots`, from its backend (app token, or `ctx.chat_slots.open(state, key, hidden=True)`) or its page (the SDK adds `embed_app`); any other mode is refused with `invalid_mode`, so it never hides another app's chat or yours, and an existing chat keeps its mode. Taken only while the app is installed, enabled and trusted, and only as the literal `true`; once that stops, its closed chats are listed in Older sessions again. Hides the list row only: the chat's approvals and questions still chime and notify like any chat's, and nothing is deleted. Open them from the app's page (an embedded `ChatPanel` shows its own bound chat). Shown at the trust prompt and on the app's detail page |
+| `permissions.chatLaunch` | object | The one shape of the person's chat your page may create or reopen through `useChatLauncher().createChat`, without declaring `/api/chat/slots`: `keyPrefix` (lowercase words joined and ended by `-`, never one the host uses for its own chats such as `chat-`, `cron-`, `workflow-`, `member-` or `task-review-`), `agents` (1 to 16 agent names), `folder` (optional; the name of the folder a chat may be filed in) and `memoryModes` (optional, from `persistent`, `incognito`, `temporary`; `["persistent"]` by default). Any malformed part declares nothing. A prefix is one installed app's: while another installed app, enabled or not, declares a prefix that overlaps yours (one starts with the other), neither app's `createChat` is admitted, so start yours with your app's name. The chat is the person's and follows their approval rules. Shown whole (agents, folder, key prefix and memory modes) at the trust prompt, on the app's page and in the install summary (App Kit seam level 10, [api-reference](api-reference.md#app-sdk-hooks-dashboard-ui)) |
+| `permissions.workerAutoApprove` | boolean | May hold a bounded, audited auto-approve grant on the app's OWN worker slots through `ctx.auto_approve`, so an unattended session's tool calls run without a prompt. Absent unless the value is literally `true`; shown at the trust prompt; an update that adds it waits for the owner's approval; never above the approval-mode policy; ended when the app is disabled or removed ([api-reference](api-reference.md#worker-auto-approve-ctxauto_approve)) |
+| `permissions.reachableByUserSessions` | string[] | What the owner's own chats may do, through the session tools, to the sessions this app owns: `"read"` (`session_read_message`, `session_summary`) and `"send"` (`session_send`). Empty by default, which keeps every app session refused as `app_scoped_target`. Other entries are ignored. Shown at the trust prompt; an update that adds a verb waits for the owner's approval on the app's page. Only a persistent chat the owner opened is admitted, never an incognito, scheduled, agent-created, channel-linked or Bot session, and stop, close and revive stay refused ([session control](../system-specs/modules/session-control.md#app-sessions-the-owners-chats-may-reach)) |
+| `permissions.desktopCapabilities` | string[] | What the app's [desktop windows](#desktop--windows-and-global-shortcuts-in-the-desktop-app) may ask the desktop app for: `"screenCapture"` (be granted a screen through `getDisplayMedia`), `"localFiles"` (reveal a local file in the system file manager, open a local image in the system viewer) and `"gatewayChoice"` (list the operator's gateways, remote ones over SSH or SSM included, and load the app's windows from the one picked). Empty by default, which refuses all three. Other entries are ignored. Shown at the trust prompt and on the app's page; an update that adds one waits for the owner's approval there. The desktop app serves a capability only to a window of an app that declares it and whose owner approved it, and to a window loaded from another gateway only what the app also holds there. An app switched off on this computer keeps them in the windows a gateway chosen with `gatewayChoice` still serves it, so `screenCapture` and `localFiles` still act on this computer there |
+| `permissions.browserSites` | string[] | Pages your app's own agent may drive Crew's browser on without asking the owner at each step, at most 16. Each is an exact `https://` origin plus a path pattern: `https://www.youtube.com/watch`, `https://www.bilibili.com/video/*`. `*` matches any run of characters, `/` included; the query and fragment are not compared. The origin follows the `ui.frameSources` rules (no port, user info, wildcard, IP, `localhost` or public suffix); the path starts with `/` and has no `%`, `?`, `#`, empty, `.` or `..` segment. Install never approves them: the owner approves them on the app's page, and an update that adds one waits there. While the app is enabled, trusted and approved, only sessions your app owns get the `browser` tool without a card, and those sessions are held to these pages: opening another is refused, and a page that lands elsewhere is moved to `about:blank`. The agent types and clicks in a browser that holds the owner's logins on these pages. Your page's media buttons use [`useBrowserMedia`](api-reference.md), which needs `/api/browser/media` in `permissions.api` |
+| `permissions.browser` | string[] | What your app may do on the browser tabs of its own chat slots: `"view"` (show the live view of its own slot and draw over it), `"read"` (read that page) and `"act"` (open pages, click and type there). Empty by default; other entries are ignored. Shown at the trust prompt, but install approves no verb: the owner approves each on the app's page, and an update that adds one holds that one back while the others keep working. Has an effect only while **App browser access** (`dashboard.feature_previews.app_browser_sdk`) is on; off, the app still installs and [`ctx.browser`](api-reference.md#browser-ctxbrowser) is absent |
+| `permissions.webhookSource` | boolean | Takes inbound webhook deliveries on the app's own routes, governed by the security policy's `webhooks` scope as the source named by the app's name ([`ctx.webhook_source`](api-reference.md#webhook-source-ctxwebhook_source), seam level 7). Absent unless the value is literally `true`; shown, with the source id, at the trust prompt. Grants no route or authentication of its own |
 | `permissions.exposeToApps` | string[] | App names (or `"*"`) allowed to request cross-app visibility into this app's slots/subagents |
 
 #### `permissions.spawn` — Background Agents
@@ -974,7 +1931,40 @@ Cost is the app's to bound: an app that spawns on a timer needs its own budget
 the platform does not rate-limit spawns per app today.
 
 API: `apps/spawn_sdk.py` — `SpawnSDK`, `build_spawn_impl`, `build_done_probe`,
-`SpawnError`.
+`build_continue_impl`, `SpawnError`. The calls are described in
+[api-reference](api-reference.md#background-agents-ctxspawn).
+
+#### `permissions.memberThreads` — A Bot's own thread
+
+A scope of `permissions.sessionApproval`, not a grant of its own. With both
+declared, the four actions the grant already gives an app on a user's session —
+send a turn or one of the agent's `[OPTIONS:]` choices, approve or deny a pending
+tool request, switch the approval mode — also reach a Bot's pinned DM
+thread: the live `member-<slug>` slot the owner opened from the Bots page,
+and only that. The thread is recognised by both marks it is born with
+(`mode: "member"` and the `member-` key); a member-mode session under any other
+key stays denied. The routes are the same ones (`POST /api/chat` with
+`slot: "member-<slug>"`, `POST /api/chat/slots/member-<slug>/approve`,
+`POST /api/chat/mode`, `POST /api/approvals/{id}/{action}`), each still needing
+its `permissions.api` prefix, and the thread must be live: a `member-*` key with
+no open thread answers `404 slot_not_found`, and an app never creates one. The
+scope changes nothing else about Bots — `/api/members/*` and `/api/teams*`
+stay owner-only, the thread's transcript is not readable, and
+`POST /v1/chat/completions` still refuses a member key.
+
+Consent follows the grant's. A manifest that newly declares the scope on an app
+whose `sessionApproval` the owner already enabled is treated as a widened grant:
+the update lands disabled with `notice: "session_approval_reconsent"`, the
+detail page and the consent dialog name chats with the user's Bots when the owner
+re-enables it, and until they do no request reaches a Bot thread -- the
+scope is read from the same manifest as the grant's consent, never from a newer
+one. Declaring the scope without `sessionApproval` grants nothing and
+asks for nothing; removing it revokes the reach on the next request.
+
+Why a scope and not a widening of `sessionApproval` itself: an owner who
+consented to "your chats" did not consent to the agents they gave their own
+memory, goals and heartbeat to, and "which apps can speak to my Bots" must
+be answerable from the manifest, as `spawn` and `jobs` are.
 
 > **Not an in-process sandbox.** Most fields remain advisory for app code loaded
 > inside the gateway. The validator functions in `apps/permissions.py`
@@ -984,25 +1974,146 @@ API: `apps/spawn_sdk.py` — `SpawnSDK`, `build_spawn_impl`, `build_done_probe`,
 > page and in the install or enable consent dialog, and only the dashboard grants it.
 > `kirocrew app enable` has no consent flag or prompt: for an app whose consent is
 > pending it prints what the app asks for and the app's dashboard link, exits 1 and
-> leaves the app off. It is enforced for app-token
+> leaves the app off. A companion program on the same machine can send the user to
+> that page in the desktop app with `kirocrew://apps/detail/<name>`; the link opens
+> the page and nothing more, so the consent click stays the user's. It is enforced for app-token
 > user-session calls, in addition to `permissions.api`. The app must be enabled.
-> The grant reaches existing local user-owned sessions only; cron, system, remote,
-> member-mode, and other apps' sessions are denied. Apps retain their pre-existing
+> The grant reaches existing local user-owned sessions only; cron, system, remote
+> and other apps' sessions are denied, and a member-mode session is denied unless
+> the manifest also declares `permissions.memberThreads`, which admits a
+> Bot's live pinned thread and nothing else. Apps retain their pre-existing
 > access to their own slots. On the per-slot routes (`/api/chat/slots/{slot}/*`)
 > the grant reaches approving or denying a pending tool request only; every other
 > per-slot route answers an app `404 slot_not_found` unless the app owns the slot,
 > whatever `permissions.api` prefix it holds. Mode changes must name a live allowed slot and are
 > limited to Normal, Reads and Trust; YOLO is a process-global override and stays
-> dashboard-only. An update that newly adds the flag disables the app until the user
+> dashboard-only. An update that newly adds the flag, or newly adds
+> `memberThreads` to a held grant, disables the app until the user
 > enables it again from the detail page, which shows why. An update that adds an
 > entry to `permissions.api` or `permissions.events` keeps the app enabled but
 > withholds the new entries until the user approves them on the detail page.
-> Official catalog entries mirror this flag so users see it before
+> Official catalog entries mirror this flag and its scope so users see them before
 > install even when the store skips fetching the app manifest. Install-time path
 > traversal is blocked separately by
 > `_check_path_safety(name)` plus `manifest.validate()`. Full in-process
 > enforcement is tracked in
 > [rfc-app-sandbox-isolation.md](../request-for-change/rfc-app-sandbox-isolation.md).
+
+## Credential masks
+
+### `credentialMasks` — Files the Sandbox Hides
+
+An app that stores a credential on disk (a provider token, a session cookie) lists the
+files, relative to its own data directory (`<data home>/apps/<name>/data/`):
+
+```json
+{
+  "credentialMasks": ["secrets.json", "tokens/oauth.json"]
+}
+```
+
+Every sandboxed process (agent shells, MCP servers, other apps' backends) then sees
+each file masked, as Kiro Crew's own credential files are. A symlink at a listed file,
+or at a directory between the data home and it, refuses every sandboxed spawn until it
+is replaced with a real file or directory, and so does a second hard link outside the
+data home. Your app's own backend still reads and writes the files, and so does any
+in-gateway code your app runs.
+
+- An entry is a relative path inside your data directory: no leading `/`, no `.`, `..`
+  or empty segment, no backslash, colon, control character or lone surrogate, no segment
+  starting or ending with a space or ending with a dot, at most 240 bytes and 16
+  segments. At most 32 entries.
+- It can only add masks. A listed path outside your data directory is refused, and the
+  field never makes anything visible that the sandbox hides.
+- On Linux the mask is placed when a sandboxed process starts, so a file created after
+  that is not masked for that process. A temp file you write beside a listed file is not
+  listed either.
+- An entry names a file, unless it is one name ending in `/` (`"state/"`): that entry
+  names a directory, masked whole, so every file inside it is covered, including the temp
+  file a save writes beside its target before renaming it over. Keep a credential you
+  rewrite by rename in a listed directory: a rename over a listed FILE detaches its mask
+  from every running sandboxed process until it ends. Before each sandboxed process
+  starts, Kiro Crew creates a listed directory that is absent inside your `data/` folder
+  (created when the app is installed), so it is masked before your backend first writes
+  into it. Replace the files inside a listed directory, never the directory itself: one
+  you remove and create again is in view of every sandboxed process that started before.
+  While your app is installed but its `data/` folder is missing, no sandboxed
+  process starts. A process that started before your app was installed is not masked for
+  it until it ends. A file or a link at a
+  directory entry's name refuses every sandboxed spawn, and so does a directory at a file
+  entry's name. An entry inside a listed directory is refused.
+- Your backend gets a listed file back only while it is absent or has a single name. A
+  file with a second hard link stays masked for your backend too, until the extra link is
+  removed. A listed directory comes back while it is absent or a real directory; the
+  files inside it are not checked for a second name, as for Kiro Crew's own masked
+  directories.
+- The masks follow your data when Kiro Crew moves it: during an update, and after an
+  uninstall that keeps your data. Kiro Crew keeps a copy of the list beside your app
+  folder for that, `apps/.<name>-credential-masks.json`.
+- A sandboxed process cannot rename or remove the folders above a listed file
+  (`apps/<name>/data` and the ones between); it can still create and edit files in them.
+  On Linux the file stays masked in a session that was running when an update replaced
+  your app folder, but that session can rename the new `apps/<name>` folder until it
+  next starts.
+- The installed app folder is writable from inside the sandbox, so this protects your
+  file from an agent that reads it, not from one that rewrites your `app.json`.
+- The agent's own file tools (read, write, edit) refuse every listed file and listed
+  directory too, with the `.tmp` and `.lock` files in the folder that holds each one
+  (for `"state/"`, that is `data/`), on every host, sandbox or not. If your `app.json`
+  (or Kiro Crew's copy of the list) is there but cannot be read, they refuse your whole
+  data directory until it can.
+- Hosts at App Kit seam level 3 or later honour the field; read `ctx.sdk_level` and
+  treat a lower level as "nothing masks the file". A directory entry needs level 8: an
+  older host refuses to install a manifest that has one. Below level 10 only the sandbox
+  masks the files, not the agent's file tools.
+
+## Agent read-only directories
+
+### `agentReadOnlyDirs`: Directories Agents May Read and Never Write
+
+An app that keeps state an agent must not rewrite (a user's own notes, a record of
+answers already given) lists the directories, relative to its own data directory
+(`<data home>/apps/<name>/data/`):
+
+```json
+{
+  "agentReadOnlyDirs": ["notes", "trust"]
+}
+```
+
+Agents can then read everything inside each directory and write nothing there: an
+agent's file-edit tools are refused under it, and every sandboxed process (agent shells,
+MCP servers, other apps' backends) sees it read-only in every sandbox mode. Your app's
+own backend still writes it, and so does any in-gateway code your app runs.
+
+- An entry follows the `credentialMasks` grammar: a relative path inside your data
+  directory, no leading `/`, no `.`, `..` or empty segment, no backslash, colon,
+  control character or lone surrogate, no segment starting or ending with a space or
+  ending with a dot, at most 240 bytes and 16 segments. At most 32 entries.
+- An entry cannot be, or sit beneath, one of your `credentialMasks` entries: a file
+  mask names a file, and a directory mask (`"state/"`) already hides everything under
+  it, so the manifest is refused. A directory that holds a masked file is fine. A
+  trailing `/` is not a form here: `"notes/"` is refused as an empty segment.
+- It can only add a fence. A listed path outside your data directory is refused, and
+  the field never makes anything writable or visible that Kiro Crew fences.
+- A symlink at a listed directory, or at a directory between the data home and it,
+  refuses every sandboxed spawn until it is replaced with a real directory.
+- On Linux an absent listed directory is created (empty) before a sandboxed process
+  starts, once your app's `data/` folder exists, so it can be sealed. While Kiro Crew
+  holds your data aside for an update or uninstall there is no `data/` folder, so a
+  process started in that window finds the directory absent and only the file-tool fence
+  applies.
+- On macOS and Linux a sandboxed process cannot rename or remove the folders above a
+  listed directory; it can still create and edit other files in them.
+- The fence follows your data when Kiro Crew moves it: during an update, and after an
+  uninstall that keeps your data (`apps/.<name>-agent-readonly-dirs.json` keeps the list).
+  A Linux sandboxed process already running when the move happens keeps the seals it
+  started with, so it can write the moved directories until it restarts; every process
+  started after the move sees them read-only.
+- The installed app folder is writable from inside the sandbox, so this protects the
+  directory from an agent that writes files, not from one that rewrites your `app.json`.
+- Hosts at App Kit seam level 7 or later honour the field; read `ctx.sdk_level` and
+  treat a lower level as "nothing fences the directories".
 
 ## Notification channels
 
@@ -1059,15 +2170,18 @@ the endpoint; it does not import provider code.
 |-------|------|---------|-------------|
 | `setup.onInstall` | string | `""` | Shell command run during a registry install **and again on every registry update** (an update re-enters the install transaction), after clone/build and before the installed copy is created. Not run for a local-path install. Make it idempotent |
 | `setup.onUninstall` | string | `""` | Shell command run before uninstall |
-| `setup.onUpdate` | string | `""` | Declared and preserved in the manifest but **not executed** — no code path dispatches it. Put update-time work in an idempotent `onInstall`, which a registry update re-runs |
-| `setup.onEnable` | string | `""` | Shell command run when app is enabled |
+| `setup.onUpdate` | string | `""` | Declared and preserved in the manifest but **not executed**: no code path dispatches it. Put dependency installs into the installed folder in `onEnable`, which an update of an enabled app re-runs, and build steps in an idempotent `onInstall`, which a registry update re-runs |
+| `setup.onEnable` | string | `""` | Shell command run when app is enabled, and again after every update of an enabled app (an update replaces the installed folder, and the fresh copy never carries `node_modules` or `.venv`) |
 | `setup.onDisable` | string | `""` | Shell command run when app is disabled |
-| `setup.onEnableTimeout` | number | `30` | Timeout in seconds for `onEnable` script |
-| `setup.onDisableTimeout` | number | `30` | Timeout in seconds for `onDisable` script |
+| `setup.onEnableTimeout` | number | `30` | Timeout in seconds for `onEnable` script, 1 to 300. A numeric string such as `"60"` is read as its number and a fraction is truncated. A value below 1 (including `false`) runs at the 30s default; `true` is read as 1 second and one above 300 runs at 300, with a warning logged each time the script runs; the manifest still installs and its signature is unaffected. A value that is not a number (`"abc"`, `null`) fails validation |
+| `setup.onDisableTimeout` | number | `30` | Timeout in seconds for `onDisable` script, 1 to 300, clamped the same way as `onEnableTimeout` |
 | `setup.configSchema` | object | `{}` | JSON Schema for app configuration |
 
 If `onEnable` fails (non-zero exit), the enable is rolled back — the app
-stays disabled and any registered resources are deregistered. `onDisable`
+stays disabled and any registered resources are deregistered. If it fails when
+an update re-runs it, the app stays enabled on the new version: the update
+succeeds with an `onEnableFailed` reason, the user gets a notification, and the
+next enable or update runs the script again. `onDisable`
 failures are logged as warnings but do not block the disable operation. Local-path
 installs do not run `onInstall`; build first, then install. The `onEnable`,
 `onDisable` and `onUninstall` hooks always invoke `/bin/bash`, so they are
@@ -1183,7 +2297,8 @@ Control how Kiro Crew manages the app:
 For a **server-mode** app (every builtin), `platform.os` is a user-facing CLAIM,
 not an access control. It is rendered on the App Store detail page
 (`website/src/pages/AppDetailPage.tsx`), and that is its only non-test consumer.
-`apps/routes_enable.py` reads it once, via `_client_install_manifest()`, which returns
+The `onEnable` runner in `apps/routes_lifecycle.py` reads it, via
+`_client_install_manifest()`, which returns
 `None` unless `platform.installMode == "client"`; `handle_enable_app`'s docstring
 states the rest outright — "nothing else on the enable path consults that field".
 So omitting the block does **not** stop the app being enabled anywhere.
@@ -1243,7 +2358,7 @@ run on at all, this says which CLIENT can render it.
 the app's backend, hooks, agents and crons all run in the gateway — so a browser
 user can still turn the app on and its autonomous side works. Only the app's own
 window is unavailable. The App Store therefore keeps the Enable action in a
-browser and shows a "Desktop app" hint beside it (`AppListRow`, `FeatureCard`,
+browser and shows a "Desktop app" hint beside it (`AppListRow`, `FeaturedSpotlight`,
 `AppDetailPage`); replacing the button with a static claim left remote users with
 no way to enable the app at all.
 
@@ -1251,6 +2366,120 @@ no way to enable the app at all.
 (`lib/electron.ts::needsDesktopApp`), so it must never be the only thing standing
 between a caller and a capability. Anything that must not happen in a browser
 belongs behind an app-token scope or a server-side check.
+
+## Desktop windows
+
+### `desktop` — Windows and Global Shortcuts in the Desktop App
+
+The Kiro Crew desktop app can host windows and global shortcuts for your app. You
+declare them; the desktop shell creates every window itself, loads your module into
+it, and registers the shortcuts. No code of yours runs in the shell's main process.
+Pair it with `platform.requiresDesktopApp` when the window is the app's own interface.
+
+```json
+"desktop": {
+  "windows": [
+    { "id": "pet", "entry": "desktop/pet.mjs", "kind": "overlay", "openOnEnable": true },
+    { "id": "panel", "entry": "desktop/panel.mjs", "kind": "panel",
+      "width": 420, "height": 600, "position": "bottom-right" }
+  ],
+  "shortcuts": [
+    { "id": "toggle-panel", "accelerator": "CommandOrControl+Alt+P", "window": "panel" }
+  ]
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `desktop.windows[]` | object[] | 1 to 4 windows |
+| `desktop.windows[].id` | string | `^[a-z][a-z0-9-]{0,31}$`, unique within the app |
+| `desktop.windows[].entry` | string | ESM module mounted in the window, relative to the app's `ui/` directory (like `contributes.panelTabs[].entry`), ending in `.js` or `.mjs` |
+| `desktop.windows[].kind` | `"overlay"` \| `"panel"` \| `"background"` | `overlay`: covers the display under the cursor, transparent, always on top, click-through outside the hit regions your page reports, never focused unless it asks. `panel`: a frameless always-on-top window of the size below. `background`: a page that is never shown, for work that must keep running while the app is on (a notification socket, a reminder poll); reopened at once if it dies. At most one per app |
+| `desktop.windows[].openOnEnable` | boolean | Open while the app is served: enabled here, or switched off here while the gateway chosen for its windows with `gatewayChoice` has it on (default `false`: opened by a shortcut or by another of your windows) |
+| `desktop.windows[].displays` | `"cursor"` \| `"all"` | Overlay only. `all`: one copy on every display, with your avatar on exactly one of them; dragging it across a display edge moves it (default `cursor`). At most one per app |
+| `desktop.windows[].width` / `height` | integer | Panel only. 160 to 1600 / 120 to 1200 (default 400 / 560) |
+| `desktop.windows[].position` | string | Panel only. `bottom-right` (default), `top-right` or `center` of the work area |
+| `desktop.windows[].transparent` | boolean | Panel only (default `false`). A transparent panel draws its own shadow |
+| `desktop.windows[].gutter` | integer | Panel only. 0 to 48 (default 0): the transparent margin around the card you draw, left out when the panel opens beside an anchor |
+| `desktop.shortcuts[]` | object[] | 0 to 4 global shortcuts |
+| `desktop.shortcuts[].id` | string | Delivered to the page when pressed |
+| `desktop.shortcuts[].accelerator` | string | An Electron accelerator with two different modifier keys on every platform (`CommandOrControl+Control` is one key on Windows), one of them not `Shift`, and one letter, digit, `F1`-`F24`, arrow or `Space` key |
+| `desktop.shortcuts[].platformAccelerators` | object | Optional, App Kit seam level 8. A different default on the platforms it names: `macos`, `windows` and `linux`, each an accelerator held to the same rule. `accelerator` is the default elsewhere. No two of your shortcuts may share a chord on any one platform |
+| `desktop.shortcuts[].window` | string | The window the press is delivered to; it is opened first if closed |
+
+Any other key or value is an install refusal. A shortcut whose chord another
+program, the desktop app or another app already holds is not registered. The user
+may rebind a shortcut on their computer (below); the desktop app keeps that binding
+per app per computer and uses your default for every shortcut without one.
+
+```json
+"shortcuts": [
+  { "id": "toggle-panel", "accelerator": "Alt+Shift+M",
+    "platformAccelerators": { "macos": "CommandOrControl+Shift+M" }, "window": "panel" }
+]
+```
+
+In the window, your module reads `window.kirocrewDesktopWindow` (absent in a browser):
+call `ready()` once your first frame is painted (the window stays hidden until then),
+`setHitRegions([{ x, y, width, height }])` on an overlay for the boxes, in CSS pixels,
+that take the pointer, `setFocusable(true)` while an overlay needs the keyboard,
+`open(id)` to open another of your windows, `close()`, and `onShortcut(cb)`. Check
+`level` before using a call newer than the bridge you built against. The window is
+closed when the app is disabled, unless it loads from another gateway chosen with
+`gatewayChoice` that still has the app on (see that capability below), and a module
+that fails to load or throws closes it.
+
+Level 2 of the bridge (App Kit seam level 7) adds:
+
+- `send(id, message)` and `broadcast(message)`: a JSON message (64 Ki characters of JSON at most) to
+  another of your windows, or to all of them, received with
+  `onMessage((from, message) => ...)`. Nothing reaches another app's windows.
+- `onWindowChange((id, open) => ...)`: another of your windows opened or closed.
+- `open(id, { anchor: { x, y, width, height } })`: open a panel beside a box in your
+  page's pixels; the panel hears `onPlaced(({ side }) => ...)`. `close(id)` closes
+  another of your windows and `closeAll()` all of them.
+- On a `displays: "all"` overlay: `onActive(({ active, x, y, dragging }) => ...)` says
+  whether this copy hosts the avatar; call `beginDrag({ offsetX, offsetY, width,
+  height })` from it when the user starts dragging (the shell starts one only within 2 s
+  of a click it saw in this copy) and `endDrag()` from any copy on
+  release, and follow `onDrag((phase, x, y) => ...)` (`start`, `move`, `end`).
+  A message sent to this window goes to the copy hosting the avatar.
+- `showSession(slotKey)`: raise the dashboard on a session (resolves `true` once it
+  is there to show it), and `openExternal(url)` for an `https:` link. Each is answered
+  only within 2 s of a mouse or key press the shell saw in the window, one request per
+  press (its release does not count again), never from a background window.
+
+The trust prompt lists the window shapes you declare before the user says yes.
+
+Level 2 also adds what your [`permissions.desktopCapabilities`](#permissions--declared-capabilities)
+buy, each refused unless you declare it and the owner approved it; `capabilities` lists
+the ones this window was opened with:
+
+| Capability | In the window |
+|------------|---------------|
+| `screenCapture` | `navigator.mediaDevices.getDisplayMedia(...)` is granted a screen, the way the desktop app's own snip surfaces are. Without it the call is refused |
+| `localFiles` | `revealFile(path)` shows an existing regular file in the system file manager; `openImage(path)` resolves `true` once the system viewer opened an existing regular `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.bmp` or `.svg` file (a link is judged by what it points at) |
+| `gatewayChoice` | `listGateways()` resolves `{ state, gateways, chosen, showing }`, each gateway `{ id, name, state, connected, appEnabled }` (no host names, ports or credentials); `chooseGateway(id)` loads your windows from that gateway (`"self"` is this computer's) and resolves `{ ok, chosen, showing }`. A gateway is used only while it is connected and your app is enabled there with every window this computer opens declared and `gatewayChoice` approved, so your windows can always come back (`appEnabled` reads `false` otherwise); otherwise your windows stay on this computer's gateway, and a gateway that does not answer leaves them where they are. While the app is switched off on this computer, its windows and shortcuts are served only from the chosen gateway while the app is on there, with what it holds on both gateways; otherwise they close, and a gateway that does not answer keeps the windows that are open and opens none. To stop them, choose `"self"` or switch the app off on that gateway too. The choice is kept per computer |
+
+When the owner withdraws a capability, every window opened with it is closed (an
+`openOnEnable` one reopens without it).
+
+Level 3 of the bridge (App Kit seam level 8) adds, for every window of your app:
+
+- `shortcuts()`: resolves your declared shortcuts on this computer, each `{ id,
+  window, defaultAccelerator, accelerator, custom, registered }` (`accelerator` is `""`
+  when the user unbound it, `custom` says the user changed it, `registered` that the
+  chord is held now). Show it on your Settings page.
+- `setShortcut(id, accelerator)`: rebind one of your declared shortcuts (`""` unbinds
+  it, `null` returns it to your default). Answered only within 2 s of a mouse or key
+  press the shell saw in the window, one request per press, never from a background
+  window. A chord other than the shortcut's default must be the one the user just
+  pressed in that window, so call it from the key press your Settings page records.
+  The chord follows the `accelerator` rule above and may not be another of your
+  shortcuts'; the new chord is registered before the old one is let go, so a chord
+  another program, the desktop app or another app holds leaves the old binding and
+  its chord with your app. Resolves `{ ok, reason?, shortcuts }` (`reason`:
+  `undeclared`, `refused`, `not-pressed`, `in-use` or `unavailable`).
 
 ## Open Command
 
@@ -1271,7 +2500,16 @@ For apps that run outside the dashboard (e.g. Electron apps), the top-level
 
 `POST /api/apps/{name}/open` runs this command in the background. On a
 cloud/remote environment with no display, the endpoint returns the command for
-the user to run locally instead of executing it on the server.
+the user to run locally instead of executing it on the server. A Linux gateway
+whose own environment names no display, such as the installed service, first
+asks the user's systemd manager for the desktop login's session, the same
+lookup the dashboard's file manager uses, and launches when that session is
+live. That is a fact about the gateway host, not the caller: the window opens
+on that host's screen, as it does on macOS. On native Windows, which has no
+`/bin/sh`, the command is not run: the endpoint answers 409 with
+`code: "app_open_unsupported_platform"` and an error naming the platform. The
+same refusal covers a registry entry's `detectInstalled` probe, which reads
+not-installed there and logs one warning.
 
 #### `openCommand` — Environment
 
@@ -1297,18 +2535,29 @@ hints a desktop launch needs:
   scrub's other targets (`AWS_SECRET*` / `AWS_SESSION*`, `GNUPGHOME`,
   `GIT_ASKPASS`, the gateway's channel credentials) are not in the allowlist to
   begin with.
-- **Desktop hints copied on top**, each only when the gateway itself has it:
+- **Desktop hints copied on top**, each only when the gateway or its desktop
+  session has it:
   `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY`, `DBUS_SESSION_BUS_ADDRESS`,
-  `XDG_SESSION_TYPE`, `XDG_CURRENT_DESKTOP`.
+  `XDG_SESSION_TYPE`, `XDG_CURRENT_DESKTOP`. When the gateway names no display
+  and the desktop session above answered, each display, X cookie or desktop
+  name that session names replaces the gateway's own, each value checked
+  first; the session never supplies a bus address.
 
 The two user-bus locators, `XDG_RUNTIME_DIR` (from the allowlist) and
 `DBUS_SESSION_BUS_ADDRESS` (from the desktop hints), **reach the child** on this
 path. The sandbox's restore-then-drop of those two variables applies to spawns
-that go through `sandbox.sandboxed_spawn_argv`; `openCommand` does not. Whether
-a standard-mode launcher should hold a live user-bus address at all is under
-review in [#16520](https://github.com/kirodotdev/KiroCrew/issues/16520) — do
-not build a launcher that depends on `DBUS_SESSION_BUS_ADDRESS` being set.
-`XDG_RUNTIME_DIR` is not in question: it is where the Wayland socket lives.
+that go through `sandbox.sandboxed_spawn_argv`; `openCommand` does not. Keeping
+them is the stated policy, decided in
+[#16520](https://github.com/kirodotdev/KiroCrew/issues/16520): the standard tier
+does not keep an app's children off the user session bus. The launcher reaches
+it, and so do the app's backend and its lifecycle and install commands, which is
+the same documented residual the agent's own shell has (see
+[security.md § Sandbox Modes](../system-specs/modules/security.md#sandbox-modes)).
+Withholding the two variables would not change what the child can reach, since
+the bus socket itself stays visible to it. `XDG_RUNTIME_DIR` stays in any case:
+it is where the Wayland socket lives. `DBUS_SESSION_BUS_ADDRESS` is copied only
+when the gateway's own environment has one, so do not build a launcher that
+assumes it is set.
 
 Anything not listed above — the gateway's own model credentials, API keys you
 exported in the gateway's shell, `EDITOR`, `BROWSER`, custom `MYAPP_*`
@@ -1333,13 +2582,14 @@ before it runs your command, which is the same silent failure:
 
 ## Validation Rules
 
-- `name` must match `/^[a-z0-9]+(?:-[a-z0-9]+)*$/` (kebab-case)
+- `name` must match `/^[a-z0-9]+(?:-[a-z0-9]+)*$/` (kebab-case) and be at most 128
+  characters, because the name is used in file names
 - `name` must not be `system` (it would shadow the `system.*` notification-channel
   namespace)
 - `name` must not be `library` (the dashboard serves `/apps/library` as a static
   page — the installed-app management surface — and it registers ahead of the
   `/apps/:name` route, so an app by that name would have an unreachable page).
-- `name` must not be `registry`, `registries`, `blob`, `install`, or `register`;
+- `name` must not be `registry`, `registries`, `blob`, `install`, `register` or `market`;
   those are shared literal segments beneath `/api/apps/`, registered ahead of the
   per-app catch-all. These reserved-name refusals use the machine-readable error
   code `reserved_app_name` at every install door.
@@ -1352,7 +2602,9 @@ before it runs your command, which is the same silent failure:
 - `version` must start with `MAJOR.MINOR.PATCH`; a pre-release (`-`) or build
   (`+`) suffix may follow it
 - Paths in `agents`, `skills`, `sops`, `ui.entry`, `ui.pages[].entryPoint`,
-  `contributes.sessionControls[].entryPoint`, `contributes.panelTabs[].entry`, and
+  `contributes.sessionControls[].entryPoint`, `contributes.panelTabs[].entry`, the
+  `entry` of every `linkPreviews`, `messageActions`, `linkOpen`, `composerActions` and
+  `selectionActions` contribution, `desktop.windows[].entry`, and
   `backend.entryPoint` must be relative and stay inside the app root: absolute paths
   and `..` traversal are rejected (canonical resolve + containment when the app dir
   is known). `backend.hooks.*` are format-checked (`module.path:callable`, which
@@ -1364,7 +2616,13 @@ before it runs your command, which is the same silent failure:
 - All required fields must be non-empty strings
 - `config_keys` must be an array of at most 200 non-empty strings, each at most
   200 characters long
-- Each cron entry must specify either `every` or `cron_expr`
+- `credentialMasks` must be an array of at most 32 paths relative to the app's data
+  directory (see [Credential masks](#credential-masks))
+- `agentReadOnlyDirs` must be an array of at most 32 paths relative to the app's data
+  directory (see [Agent read-only directories](#agent-read-only-directories))
+- Each cron entry must have a `name`, must specify either `every` or `cron_expr`,
+  and at least one of `agent`, `agent_sequence`, `message`, `command` or `script`;
+  `command` and `script` are mutually exclusive
 - A non-empty `crons` requires `"cron": true` under `permissions`. Install,
   update and self-registration refuse the manifest otherwise; an app already
   installed keeps loading and firing its crons until its next update
@@ -1388,7 +2646,13 @@ before it runs your command, which is the same silent failure:
   "description": "Monitor tickets, pipelines, and alarms for your on-call rotation",
   "author": "kirocrew",
   "tags": ["oncall", "monitoring"],
-  "useCases": ["Keep a shared view of firing alerts and active investigations"],
+  "highlights": ["One board for firing alerts and active investigations"],
+  "useCases": [
+    "When you take over the on-call rotation, open the board to see every firing alert and active investigation in one place",
+    "When you would otherwise watch the queue, let the ticket-refresh cron check for new high-severity tickets every five minutes",
+    "When a new ticket needs a first read, ask the ticket-analyst agent to go through it before you do",
+    "When an alert matches a known failure, ask an agent to follow the oncall-runbook skill instead of rediscovering the fix"
+  ],
   "configuration": ["Connect an alert provider in Settings, then start in read-only mode"],
   "screenshots": ["ui/screenshots/board.png"],
   "agents": ["agents/ticket-analyst.json"],

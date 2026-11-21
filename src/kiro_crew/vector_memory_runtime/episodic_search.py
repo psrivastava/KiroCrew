@@ -136,6 +136,9 @@ def search_episodic(
     relevance_filter: bool = False,
     *,
     recall_query: _RecallQuery | None = None,
+    conversation_id: str = "",
+    session_affinity: float = 0.0,
+    recency_boost: float = 0.0,
 ) -> list[dict]:
     """Search episodic memories by vector similarity with decay scoring.
 
@@ -160,11 +163,27 @@ def search_episodic(
         with store._db_lock:
             store._check_recall_query(recall_query)
             return store.search_episodic(
-                recall_query.vector, query_text, limit, mmr, tag_filter, relevance_filter
+                recall_query.vector,
+                query_text,
+                limit,
+                mmr,
+                tag_filter,
+                relevance_filter,
+                conversation_id=conversation_id,
+                session_affinity=session_affinity,
+                recency_boost=recency_boost,
             )
     if store.algorithm_version == "v2":
         return store._search_episodic_v2(
-            query_embedding, query_text, limit, mmr, tag_filter, relevance_filter
+            query_embedding,
+            query_text,
+            limit,
+            mmr,
+            tag_filter,
+            relevance_filter,
+            conversation_id=conversation_id,
+            session_affinity=session_affinity,
+            recency_boost=recency_boost,
         )
     if (
         store._faiss_index is not None
@@ -196,6 +215,19 @@ def search_episodic(
         now = vm.datetime.now(tz=timezone.utc)
         candidates: list[dict] = []
         with store._db_lock:
+            # The checks above ran unlocked: an owner edit, a model swap, a
+            # rollback or a concurrent search can drop the index while this
+            # thread waits for the lock. Read it once here and fall back.
+            index, id_map = store._faiss_index, store._faiss_id_map
+            if index is None or index.ntotal == 0:  # type: ignore[attr-defined]
+                return store._sqlite_vector_search(
+                    query_embedding,
+                    query_text,
+                    limit,
+                    mmr=mmr,
+                    tag_filter=tag_filter,
+                    relevance_filter=relevance_filter,
+                )
             # MMR reranks from the FULL candidate pool (see the _mmr_rerank pool
             # comment: truncating toward `limit` silently drops the
             # relevant-but-diverse tail pick that is the whole point of MMR). The
@@ -214,11 +246,11 @@ def search_episodic(
             # whenever native work must stay bounded independently of lifetime
             # tombstones.
             k = (
-                min(_text_scoring._MMR_MAX_POOL, store._faiss_index.ntotal)  # type: ignore[attr-defined]
+                min(_text_scoring._MMR_MAX_POOL, index.ntotal)  # type: ignore[attr-defined]
                 if mmr and not tag_filter
-                else min(max(limit * 2, 16), store._faiss_index.ntotal)  # type: ignore[attr-defined]
+                else min(max(limit * 2, 16), index.ntotal)  # type: ignore[attr-defined]
             )
-            distances, indices = store._faiss_index.search(vec.reshape(1, -1), k)  # type: ignore[attr-defined]
+            distances, indices = index.search(vec.reshape(1, -1), k)  # type: ignore[attr-defined]
             # FAISS returns ids and distances only. Every hit is resolved in
             # a single IN (...) query over an explicit column list: one
             # "SELECT *" per hit is an N+1 that also drags each row's
@@ -228,7 +260,7 @@ def search_episodic(
             for dist, idx in zip(distances[0], indices[0]):
                 if idx == -1:
                     break
-                hits.append((store._faiss_id_map[int(idx)], float(dist)))
+                hits.append((id_map[int(idx)], float(dist)))
             hit_ids = [mem_id for mem_id, _ in hits]
             blocked = store._ineligible_ids(
                 [record_meta.record_id_for("episode", mem_id) for mem_id in hit_ids]
@@ -314,12 +346,20 @@ def search_episodic_v2(
     mmr: bool,
     tag_filter: list[str] | None,
     relevance_filter: bool,
+    conversation_id: str = "",
+    session_affinity: float = 0.0,
+    recency_boost: float = 0.0,
 ) -> list[dict]:
     """Fuse both evidence sources before admission and the result budget.
 
     Scanning the active private population also includes rows awaiting an
     embedding and avoids the FAISS top-k/tag-filter starvation of V1. No
     model calls happen inside this scan or while holding the store lock.
+
+    When *conversation_id* is non-empty and *session_affinity* > 0, episodic
+    entries from the same conversation receive a session-affinity boost.
+    When *recency_boost* > 0, entries also receive a bounded multiplicative
+    recency boost (opt-in via ``memory.recency_boost`` config key).
     """
     from kiro_crew import vector_memory as vm  # circular import: the facade imports this module
 
@@ -351,9 +391,14 @@ def search_episodic_v2(
         if created.tzinfo is None:
             created = created.replace(tzinfo=timezone.utc)
         days_old = max(0, (now - created).days)
+        same_session = bool(conversation_id and row.get("conversation_id") == conversation_id)
         score = memory_v2.rank_score(
             evidence,
             importance=row["importance"],
+            same_session=same_session,
+            session_affinity=session_affinity,
+            recency_boost=recency_boost,
+            age_days=float(days_old),
         )
         row.pop("embedding", None)
         row.update(score=score, retrieval={**evidence, "age_days": days_old})
@@ -405,7 +450,6 @@ def sqlite_vector_search(
     q = [x / norm for x in query_embedding] if norm > 0 else query_embedding
     q_len = len(q)
 
-    blocked = store._ineligible_ids()
     if vm._HAS_NUMPY:
         scoring = store._episodic_scoring_set(q_len)
         if scoring is not None:
@@ -421,7 +465,6 @@ def sqlite_vector_search(
                 tag_filter,
                 relevance_filter,
                 vm.datetime.now(tz=timezone.utc),
-                blocked,
             )
 
     # Serialized via the locked helper — two threads running a statement at
@@ -623,7 +666,6 @@ def rank_from_scoring_set(
     tag_filter: list[str] | None,
     relevance_filter: bool,
     now: datetime,
-    blocked: set[str] | None = None,
 ) -> list[dict]:
     """Score, filter and rank from the resident set; resolve winner bodies.
 
@@ -648,12 +690,6 @@ def rank_from_scoring_set(
     sims_rounded = vm.np.round(sims, 4)
 
     keep = vm.np.ones(len(scoring.ids), dtype=bool)
-    if blocked:
-        keep &= vm.np.fromiter(
-            (record_meta.record_id_for("episode", mem_id) not in blocked for mem_id in scoring.ids),
-            dtype=bool,
-            count=len(scoring.ids),
-        )
     if tag_filter:
         wanted = {t.lower() for t in tag_filter}
         keep &= vm.np.fromiter(
@@ -672,6 +708,24 @@ def rank_from_scoring_set(
     surviving = vm.np.flatnonzero(keep)
     if surviving.size == 0:
         return []
+    # Eligibility only matters for the rows the masks kept, so look it up by
+    # their record ids (the record_id PRIMARY KEY) rather than scanning all of
+    # memory_record_meta, a table that grows with every revision and forget.
+    # A row with no identity has no metadata to block it and stays ranked.
+    surviving_ids = [
+        record_meta.record_identity_or_none("episode", scoring.ids[int(i)]) for i in surviving
+    ]
+    blocked = store._ineligible_ids([rid for rid in surviving_ids if rid is not None])
+    if blocked:
+        surviving = surviving[
+            vm.np.fromiter(
+                (rid is None or rid not in blocked for rid in surviving_ids),
+                dtype=bool,
+                count=len(surviving_ids),
+            )
+        ]
+        if surviving.size == 0:
+            return []
 
     # max(0, timedelta.days): a whole-day floor, and never negative for a row
     # stamped in the future.
@@ -772,6 +826,24 @@ def get_episodic_context(
         + "\n".join(lines)
         + "\n[End of episodic memory]\n"
     )
+
+
+def _like_literal(text: str) -> str:
+    """Escape ``text`` so a ``LIKE ... ESCAPE '\\'`` pattern matches it literally."""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def tag_filter_sql(tag_filter: list[str]) -> tuple[str, tuple[str, ...]]:
+    """An SQL condition matching a row whose stored ``tags`` holds ANY of ``tag_filter``.
+
+    The ``tags`` column is the ``json.dumps`` of the lowercased tag list, so a
+    non-ASCII tag is on disk in its ``\\uXXXX`` form. Each tag is encoded the same
+    way, quotes included, so a tag only matches a whole stored tag, and every LIKE
+    wildcard in it is escaped. This is the SQL twin of :func:`matches_tags`.
+    """
+    clause = " OR ".join("tags LIKE ? ESCAPE '\\'" for _ in tag_filter)
+    params = tuple(f"%{_like_literal(json.dumps(t.lower()))}%" for t in tag_filter)
+    return f"({clause})", params
 
 
 def matches_tags(mem: dict, tag_filter: list[str]) -> bool:
@@ -878,9 +950,9 @@ def fts5_episodic_search(
     conditions = " OR ".join(["text LIKE ?" for _ in words] + ["tags LIKE ?" for _ in words])
     params: list[str] = [f"%{w}%" for w in words] * 2
     if tag_filter:
-        tag_conds = " OR ".join(["tags LIKE ?" for _ in tag_filter])
-        conditions = f"({conditions}) AND ({tag_conds})"
-        params.extend(f'%"{t.lower()}"%' for t in tag_filter)
+        tag_conds, tag_params = tag_filter_sql(tag_filter)
+        conditions = f"({conditions}) AND {tag_conds}"
+        params.extend(tag_params)
     # Serialized for the same reason as the vector fallback above: this runs
     # on the context-assembly path, concurrently with memory writes.
     rows = store._fetch_all_locked(

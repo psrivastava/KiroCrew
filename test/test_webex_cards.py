@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from redaction_structured_cases import github_classic
 
 from kiro_crew.webex.cards import (
     CARD_CONTENT_TYPE,
@@ -51,8 +52,12 @@ class TestCardShape:
     def test_the_card_is_json_serialisable(self) -> None:
         # It goes on the wire as JSON; a non-serialisable value would fail at send
         # time, inside a turn, rather than here.
-        json.dumps(approval_card("t", nonce="n", request_id="1"))
-        json.dumps(options_card(["a", "b"], nonce="n"))
+        for card in (
+            approval_card("t", nonce="n", request_id="1"),
+            options_card(["a", "b"], nonce="n"),
+        ):
+            # A round trip is lossless only when every value is a plain JSON type.
+            assert json.loads(json.dumps(card)) == card
 
     def test_a_tool_name_carries_no_markdown_control_characters(self) -> None:
         """A tool title is model-influenced text, and a TextBlock is not a shield.
@@ -76,14 +81,15 @@ class TestCardShape:
     def test_stripping_the_markup_cannot_reassemble_a_credential(self) -> None:
         """The sanitizer is itself the reassembling transformation.
 
-        ``AKIA**IOSF**ODNN7EXAMPLE`` does not match a credential pattern as the
+        A token split by ``**`` does not match a credential pattern as the
         driver streamed it, and removing the ``*`` characters — which the sanitizer
-        does on purpose — would hand the room the intact key. So the scan runs on
+        does on purpose — would hand the room the intact token. So the scan runs on
         the stripped form, after the strip.
         """
-        label = _safe_tool_label("AKIA**IOSF**ODNN7EXAMPLE")
+        token = github_classic(seed=27)
+        label = _safe_tool_label(f"{token[:10]}**{token[10:20]}**{token[20:]}")
 
-        assert "AKIAIOSFODNN7EXAMPLE" not in label
+        assert token not in label
         assert "REDACTED" in label
 
     def test_a_tool_name_keeps_its_underscores(self) -> None:
@@ -224,6 +230,14 @@ class TestLiveChoices:
         live.publish("s1", "n1", ["A", "B"])
         assert live.take("s1", "1", "n1") == "B"
 
+    def test_an_ascii_digit_press_beside_unicode_digits_still_resolves(self) -> None:
+        """``"²"`` and ``"١"`` pass ``isdigit()``; only ASCII ``"3"`` is a slot."""
+        live = LiveChoices()
+        live.publish("s1", "n1", ["A", "B", "C", "D"])
+        assert live.take("s1", "²", "n1") == ""
+        assert live.take("s1", "١", "n1") == ""
+        assert live.take("s1", "3", "n1") == "D"
+
     def test_a_press_is_one_shot(self) -> None:
         """Webex cannot retire a card that carries an attachment.
 
@@ -242,7 +256,7 @@ class TestLiveChoices:
         assert live.take("s1", "0", "n1") == ""
         assert live.take("s1", "1", "n2") == "Y"
 
-    @pytest.mark.parametrize("index", ["", "-1", "9", "abc", "0.5"])
+    @pytest.mark.parametrize("index", ["", "-1", "9", "abc", "0.5", "²", "١", "0" * 5000])
     def test_an_index_that_is_not_a_slot_resolves_to_nothing(self, index: str) -> None:
         live = LiveChoices()
         live.publish("s1", "n1", ["A", "B"])

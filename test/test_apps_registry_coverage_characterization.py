@@ -18,9 +18,7 @@ from apps_registry_coverage_helpers import cache_dir_fixture  # noqa: F401
 from kiro_crew.apps import registry
 from kiro_crew.testing.wait import finished
 
-# ---------------------------------------------------------------------------
 # Characterization: behaviour a structural move of this module must not change
-# ---------------------------------------------------------------------------
 #
 # Each case below pins a value the registry derives from where its code lives
 # (``__file__``), a byte-exact cache identity, a fixed classification, or a
@@ -51,9 +49,8 @@ class TestCacheFilenamesAreFrozen:
     _ROOT = Path("/registry-cache")
 
     @pytest.fixture(autouse=True)
-    # nosemgrep: kirocrew.test-autouse-shared-monkeypatch -- the class's own cache-root pin, moved verbatim; no test in the class calls monkeypatch.undo()
-    def _root(self, monkeypatch):
-        monkeypatch.setattr(registry, "_manifest_cache_dir", lambda: self._ROOT)
+    def _root(self, _floor_monkeypatch):
+        _floor_monkeypatch.setattr(registry, "_manifest_cache_dir", lambda: self._ROOT)
 
     def test_a_manifest_file_is_keyed_by_the_full_normalized_coordinates(self):
         entry = {

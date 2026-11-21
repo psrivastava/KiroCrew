@@ -11,7 +11,10 @@ import './lib/installBasePath'
 // Empty in the stock build. See website/src/extensions.ts.
 import './extensions'
 import { startMemoryWatch } from './lib/memoryWatch'
-import React, { StrictMode, Suspense, lazy } from 'react'
+// Side effect only: when the slow frame log is on (Settings > Developer > Debug
+// tools), it starts here so it sees the page load. Off, it creates no observer.
+import './dev/slowFrameLog'
+import React, { StrictMode, Suspense, lazy, startTransition } from 'react'
 import { createRoot } from 'react-dom/client'
 import { withCommitProfiler, installCommitProfilerConsoleApi } from './lib/commitProfiler'
 import { Provider } from 'react-redux'
@@ -25,9 +28,13 @@ import { UIModeProvider } from './hooks/useUIMode'
 import ThemeExperienceLayer from './components/ThemeExperienceLayer'
 import { NavigationLeaveGuardProvider, NavigationBackGuard } from './components/NavigationLeaveGuard'
 import { RouteHistoryTracker } from './components/NavHistoryArrows'
+import { StandaloneRouteRecorder } from './components/StandaloneRouteRecorder'
+import { restoreStandaloneLastRoute } from './lib/standaloneLastRoute'
 import { initRum } from './rum'
 import { isEmbeddedPane } from './lib/embedded'
-import { routerBasename } from './lib/basePath'
+import { BASE_PATH, appPathname } from './lib/basePath'
+import { appPopoutRouterBasename } from './utils/appPopoutRoute'
+import { desktopWindowBridge, desktopWindowTarget } from './desktopWindow/desktopWindowTarget'
 // i18n must initialize before the first render — a component rendering ahead of
 // init would emit its bare translation key instead of text. The `/lazy` entry
 // fetches a non-English catalog on demand; plain `./i18n` has no loader, so
@@ -35,6 +42,7 @@ import { routerBasename } from './lib/basePath'
 import { ensureCatalog, i18next, initI18n, isCatalogChunkError } from './i18n/lazy'
 import { DEFAULT_LANGUAGE } from './i18n/languages'
 import { LanguageProvider } from './i18n/LanguageProvider'
+import { AppMotionConfig } from './AppMotionConfig'
 import App from './App'
 import { queryClient } from './api/queryClient'
 import ErrorBoundary from './components/ErrorBoundary'
@@ -44,6 +52,7 @@ import { installStaleShellHeal } from './lib/staleShellHeal'
 import { installScrollReveal } from './lib/scrollReveal'
 import { installSwConnectedProbe } from './lib/swConnectedProbe'
 import { captureSafeReload, reloadKeepingSafe } from './lib/safeReload'
+import { captureUrlToken } from './lib/urlToken'
 import {
   hasUnreconciledKeys,
   hydrateUiPrefs,
@@ -197,6 +206,11 @@ startMemoryWatch('main')
 // element enters the tree on a normal load.
 installCommitProfilerConsoleApi()
 
+// The installed web app opens at the manifest's `/`; reopen the page it last
+// showed instead (#29497). Before the router mounts, so it reads the new URL.
+// A browser tab is left alone. See lib/standaloneLastRoute.ts.
+restoreStandaloneLastRoute()
+
 const appTree = (
   <StrictMode>
     <ErrorBoundary root scope="app-shell">
@@ -207,7 +221,11 @@ const appTree = (
               <UIModeProvider>
                 <ThemeExperienceLayer />
                 <NavigationLeaveGuardProvider>
-                  <BrowserRouter basename={routerBasename()}>
+                  {/* The build base, plus `/popout/app` when this document is an
+                      app pop-out window: the apps inside then see their own
+                      dashboard paths (see utils/appPopoutRoute.ts). Read once
+                      at load, like the shell's own popout-ness. */}
+                  <BrowserRouter basename={appPopoutRouterBasename(window.location.pathname, BASE_PATH)}>
                     {/* Inside the router (it navigates) and outside the routes
                         (it must survive every route change). Renders nothing,
                         and stays out of the history stack entirely until a page
@@ -218,6 +236,7 @@ const appTree = (
                         no route change unmounts it. Feeds the position store the
                         top-bar arrows and the ⌘/Ctrl+←/→ chords read. */}
                     <RouteHistoryTracker />
+                    <StandaloneRouteRecorder />
                     <Routes>
                       <Route path="/worlds-popout" element={<BrandingProvider><ProviderProvider><Suspense fallback={null}><WorldsPopout /></Suspense></ProviderProvider></BrandingProvider>} />
                       <Route
@@ -241,6 +260,23 @@ const appTree = (
     </ErrorBoundary>
   </StrictMode>
 )
+
+// A window the desktop shell hosts for an app mounts only that app's declared
+// module, never the dashboard (desktopWindow/DesktopWindowRoot.tsx). It is a
+// lazy chunk so the dashboard's own chunk graph does not carry it, and a chunk
+// that fails to load closes the window rather than leaving it unrevealed.
+const desktopTarget = desktopWindowTarget(appPathname())
+const DesktopWindowRoot = lazy(() =>
+  import('./desktopWindow/DesktopWindowRoot').catch((err: unknown) => {
+    // eslint-disable-next-line no-console -- the window is never revealed, so the log is the only trace
+    console.error('[DesktopWindow] could not load the window host:', err)
+    if (desktopTarget) desktopWindowBridge(desktopTarget)?.close()
+    return { default: () => null }
+  }),
+)
+const rootTree = desktopTarget
+  ? <Suspense fallback={null}><DesktopWindowRoot target={desktopTarget} /></Suspense>
+  : appTree
 
 // Restore the host-side backup of the renderer's own settings BEFORE the first
 // render, on any profile that has never successfully reached the host — a fresh
@@ -292,14 +328,27 @@ function announceBoot(stage: string): void {
   }
 }
 announceBoot('entry')
+// Tells the shell's boot-module reload in index.html that this entry and its
+// whole static import graph ran, so a module-script error it saw belongs to
+// something the app does not need, and reloading would only repeat the load.
+;(window as Window & { __kcBootEntryRan?: boolean }).__kcBootEntryRan = true
 
 // (See the block above announceBoot for why the first-time boot may reload.)
 function boot(startSync: boolean): void {
+  // The sign-in token leaves the address bar before any screen renders, the
+  // first-run setup gate included. Not earlier: the prefs-restore reload below
+  // must still carry it, or the reloaded page loses a signed link's prompt.
+  captureUrlToken()
   // catalogReady never rejects: a failed catalog fetch renders English (see its
   // definition for how the language is reconciled first).
   void catalogReady.then(() => {
     announceBoot('render')
-    createRoot(document.getElementById('root')!).render(appTree)
+    const root = createRoot(document.getElementById('root')!)
+    // The first render of the whole app is one long task when it runs
+    // synchronously. As a transition React renders it in slices and yields
+    // to the browser between them. Nothing is on screen to keep responsive yet,
+    // so the only visible effect is that this render no longer blocks input.
+    startTransition(() => { root.render(<AppMotionConfig>{rootTree}</AppMotionConfig>) })
     if (startSync) startUiPrefsSync()
   })
 }

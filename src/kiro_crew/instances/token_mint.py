@@ -26,7 +26,7 @@ import re
 import shutil
 
 from kiro_crew.config.paths import CONFIG_DIR_NAME, LEGACY_CONFIG_DIR_NAME
-from kiro_crew.deploy.engine import tool_spawn_env
+from kiro_crew.deploy.engine import _refresh_aws_bin_dir_trust, tool_spawn_env
 from kiro_crew.instances.constants import (
     DEFAULT_MINT_TIMEOUT_SECS,
     DEFAULT_SSM_MINT_TIMEOUT_SECS,
@@ -63,6 +63,10 @@ REMOTE_BIN_HINT = (
     "if kirocrew is installed elsewhere on this host, set the instance's "
     "remote_bin setting to its path, e.g. ~/.local/bin/kirocrew"
 )
+
+# The first stderr line of the candidate search's no-launcher path. A mint error
+# matches on it rather than on exit 127, which a launcher that ran can return too.
+NO_LAUNCHER_MARKER = "kirocrew binary not found in any of:"
 
 # ttl accepted by `kirocrew token --ttl`: a positive integer with an h/m suffix
 # (e.g. "20h", "30m"). Validated to keep it out of the remote command unchecked.
@@ -249,7 +253,8 @@ def build_candidate_command(
 
     When *marker_port* is given, the snippet first consults the run-marker the
     *running* gateway wrote for that port (``<data-home>/run/gateway-<port>.bin``,
-    probing ``$KIROCREW_HOME`` then ``$HOME/.kiro/crew`` then the legacy
+    probing ``$KIROCREW_HOME`` (else the launcher the default run dir's
+    ``gateway-<port>.home`` names) then ``$HOME/.kiro/crew`` then the legacy
     ``$HOME/.kirocrew`` — see :func:`_run_marker_clause`) and execs the launcher
     it names — so mint uses the same venv as the live gateway instead of whatever
     ``~/.local/bin/kirocrew`` happens to point at. Falls through to the candidate
@@ -266,7 +271,7 @@ def build_candidate_command(
             f'    exec "$b" {subcommand};',
             "  fi;",
             "done;",
-            f'echo "kirocrew binary not found in any of: {", ".join(candidates)}" >&2;',
+            f'echo "{NO_LAUNCHER_MARKER} {", ".join(candidates)}" >&2;',
             'echo "candidate diagnosis:" >&2;',
             f"for b in {expanded}; do",
             '  if [ -L "$b" ]; then',
@@ -303,7 +308,12 @@ def _run_marker_clause(subcommand: str, port: int) -> str:
     data home and ``exec``s the first launcher it names that is an executable
     file:
 
-    1. ``$KIROCREW_HOME`` — an explicit override, if exported into this shell.
+    1. ``$KIROCREW_HOME`` — an explicit override, if exported into this shell;
+       else ``$HOME/<CONFIG_DIR_NAME>/run/gateway-<port>.home`` (``home`` then
+       ``launcher`` lines, never eval'd): when that home holds the port's marker
+       and the launcher is executable, it runs with ``KIROCREW_HOME`` set to that
+       home. The pointed marker is only a liveness gate — that home is unfenced,
+       so its marker is never read or run.
     2. ``$HOME/<CONFIG_DIR_NAME>`` — the current default data home.
     3. ``$HOME/<LEGACY_CONFIG_DIR_NAME>`` — the pre-move legacy home (older remotes).
 
@@ -346,8 +356,21 @@ def _run_marker_clause(subcommand: str, port: int) -> str:
             f'"$HOME/{LEGACY_CONFIG_DIR_NAME}/{fname}"',
         ]
     )
+    pointer = f'"$HOME/{CONFIG_DIR_NAME}/run/gateway-{int(port)}.home"'
+    # The pointed home is not the default one, so a bare ``restart`` would miss this
+    # gateway. Every ``restart`` form gets the port, its idle-gated one included.
+    if subcommand == "restart" or subcommand.startswith("restart "):
+        pointed = f"restart --port {int(port)}{subcommand[len('restart'):]}"
+    else:
+        pointed = subcommand
     return " ".join(
         [
+            f'if [ -z "${{KIROCREW_HOME:-}}" ] && [ -f {pointer} ] && [ -r {pointer} ]; then',
+            f"  __kh= __kp=; {{ IFS= read -r __kh; IFS= read -r __kp; }} 2>/dev/null < {pointer};",
+            f'  if [ -n "${{__kp:-}}" ] && [ -x "$__kp" ] && [ -f "$__kh/{fname}" ]; then',
+            f'    KIROCREW_HOME="$__kh" exec "$__kp" {pointed};',
+            "  fi;",
+            "fi;",
             f"for __mk in {homes}; do",
             '  [ -n "$__mk" ] || continue;',
             '  if [ -f "$__mk" ]; then',
@@ -359,6 +382,19 @@ def _run_marker_clause(subcommand: str, port: int) -> str:
             "done;",
         ]
     )
+
+
+def custom_remote_bin(remote_bin: str) -> str | None:
+    """The user's ``remote_bin`` as the remote shell spells it, or None for the candidate search.
+
+    Empty and the default sentinel mean "try every candidate". A custom path has a
+    leading ``~/`` rewritten to ``$HOME/``, because tilde does not expand inside the
+    double quotes the path is embedded in. *remote_bin* must already be
+    charset-validated.
+    """
+    if not remote_bin or remote_bin == DEFAULT_REMOTE_BIN:
+        return None
+    return re.sub(r"^~/", "$HOME/", remote_bin)
 
 
 def build_remote_command(
@@ -376,9 +412,9 @@ def build_remote_command(
     never overridden by the marker. *remote_bin* must already be charset-validated;
     *subcommand* is a fixed/validated literal.
     """
-    if not remote_bin or remote_bin == DEFAULT_REMOTE_BIN:
+    expanded = custom_remote_bin(remote_bin)
+    if expanded is None:
         return build_candidate_command(subcommand, candidates, marker_port=marker_port)
-    expanded = re.sub(r"^~/", "$HOME/", remote_bin)
     return f'"{expanded}" {subcommand}'
 
 
@@ -388,6 +424,7 @@ def build_remote_token_command(
     ttl: str | None = None,
     port: int | None = None,
     embed_parent_port: int | None = None,
+    embed_forward_port: int | None = None,
 ) -> str:
     """Pick the remote command for the user's stored ``remote_bin``.
 
@@ -395,12 +432,25 @@ def build_remote_token_command(
     the customization, rewriting a leading ``~/`` to ``$HOME/`` (tilde does not
     expand inside double quotes) so kiro-cli resolves over SSH. *remote_bin*
     must already be charset-validated by the caller.
+
+    *embed_forward_port* is the local port of this gateway's forward to the crew,
+    where its pane loads. It travels as ``KIROCREW_EMBED_FORWARD_PORT`` rather than
+    as a flag because a crew whose CLI predates the claim would refuse an unknown
+    flag and fail the mint; it ignores the variable, and its token then
+    carries no forward claim (``apps/pane_ports.py``). Sent only beside a parent
+    port, the claim it pairs with.
     """
     if ttl is not None:
         ttl = _validate_ttl(ttl)
     port = _validate_port(port)
     embed_parent_port = _validate_port(embed_parent_port)
-    return build_remote_command(
+    embed_forward_port = _validate_port(embed_forward_port) if embed_parent_port else None
+    prefix = (
+        f"KIROCREW_EMBED_FORWARD_PORT={embed_forward_port}; " "export KIROCREW_EMBED_FORWARD_PORT; "
+        if embed_forward_port
+        else ""
+    )
+    return prefix + build_remote_command(
         remote_bin,
         _token_subcommand(ttl, port, embed_parent_port),
         candidates,
@@ -423,18 +473,30 @@ def _build_ssh_argv(
     device: every caller here runs a remote command and none of them writes the
     child's stdin, and an inherited console-less stdin keeps the channel open
     after the remote command exits (notably through a ``ProxyCommand``), so ssh
-    waits for an EOF that never arrives. ``ssh_host`` is validated by the caller
-    (registry / tunnel manager) before reaching here.
+    waits for an EOF that never arrives. ``-T`` never asks for a terminal: no
+    caller here is interactive, and a user's ``RequestTTY yes`` otherwise
+    prints "Pseudo-terminal will not be allocated" first on stderr, which then
+    reads as the failure reason.
+    ``ClearAllForwardings=yes`` drops any ``LocalForward``/``RemoteForward``/
+    ``DynamicForward`` the user's ssh_config sets for the host: with one, this
+    one-shot ssh would bind that port whenever it is free, wait after the
+    remote command exits for the connections riding it, and be killed at the
+    caller's timeout with all of them. No caller here wants a forward.
+    ``ssh_host`` is validated by the caller (registry / tunnel manager) before
+    reaching here.
     """
     return [
         "ssh",
         "-n",
+        "-T",
         "-o",
         "BatchMode=yes",
         "-o",
         f"ConnectTimeout={max(1, round(connect_timeout_secs))}",
         "-o",
         "AddressFamily=inet",
+        "-o",
+        "ClearAllForwardings=yes",
         ssh_host,
         remote_command,
     ]
@@ -475,6 +537,7 @@ def ssh_spawn_argv_env(argv: list[str]) -> tuple[list[str], dict[str, str]]:
     PATH scan; call it via ``asyncio.to_thread`` from async code.
     """
     head = resolve_ssh_bin() if argv[0] == "ssh" else argv[0]
+    _refresh_aws_bin_dir_trust()
     return [head, *argv[1:]], tool_spawn_env(head)
 
 
@@ -569,6 +632,7 @@ async def mint_remote_token(
     ttl: str = "20h",
     remote_port: int | None = None,
     embed_parent_port: int | None = None,
+    embed_forward_port: int | None = None,
     timeout_secs: float = _DEFAULT_MINT_TIMEOUT_SECS,
 ) -> str:
     """SSH to *ssh_host*, run ``kirocrew token``, and return the parsed JWT.
@@ -579,6 +643,8 @@ async def mint_remote_token(
     *embed_parent_port* is passed to ``kirocrew token --embed-parent-port`` so the
     minted token authorizes the parent (embedding) dashboard's loopback origin as
     a CSP frame-ancestor — how the embedded pane renders across ports.
+    *embed_forward_port* names the local port the pane loads on
+    (:func:`build_remote_token_command`).
 
     Raises :class:`TokenMintError` on connection failure, a non-zero remote
     exit, a timeout, or if no token can be parsed from stdout. The token itself
@@ -586,7 +652,11 @@ async def mint_remote_token(
     """
     ttl = _validate_ttl(ttl)
     remote_command = build_remote_token_command(
-        remote_bin, ttl=ttl, port=remote_port, embed_parent_port=embed_parent_port
+        remote_bin,
+        ttl=ttl,
+        port=remote_port,
+        embed_parent_port=embed_parent_port,
+        embed_forward_port=embed_forward_port,
     )
     argv, env = await asyncio.to_thread(
         ssh_spawn_argv_env,
@@ -614,6 +684,11 @@ async def mint_remote_token(
             f"through a jump host or proxy, the mint pays that handshake again; "
             f"otherwise the host may not be answering. {_mint_timeout_advice(timeout_secs)}"
         ) from e
+    except asyncio.CancelledError:
+        # A cancelled mint (an instance edit, a gateway shutdown) has no one
+        # left to store its token, so ssh is stopped like a timed-out one.
+        await kill_and_reap(proc)
+        raise
 
     stdout = stdout_b.decode("utf-8", "replace")
     stderr = stderr_b.decode("utf-8", "replace").strip()

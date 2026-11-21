@@ -646,6 +646,28 @@ async def test_grants_are_walked_in_order_and_the_first_admitted_hit_answers():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("held", [True, False])
+async def test_a_held_bot_limit_skips_every_grant_and_asks_the_person(monkeypatch, held):
+    """A call under a moved Bot's held limit (``mate_held_rules``) is never answered by a grant."""
+    from kiro_crew import mate_held_rules
+
+    monkeypatch.setattr(mate_held_rules, "held_for", lambda *a, **k: ["deny shell"] if held else [])
+    log: list = []
+    policy = _policy(
+        log,
+        gate=Judges(log, Hit("hook_auto_approve", Evidence.IDENTITY)),
+        grants=(GATE_GRANT, Offers(log, "parent", Hit("parent_policy_auto", Evidence.NONE))),
+        responders=(Scripted(log, "callback", False),),
+    )
+    settled = await settle(Ask(_event(), RecordingWire(log), "k"), policy)
+    if held:
+        assert ("ask", "callback", "Run: ls -la") in log
+        assert settled.outcome != "auto_approved"
+    else:
+        assert settled == Settled("auto_approved", "hook_auto_approve", "rule")
+
+
+@pytest.mark.asyncio
 async def test_a_refused_program_name_downgrades_to_the_next_stage(names):
     names.verdicts["Run: ls -la"] = _SHADOWED
     log: list = []
@@ -1060,7 +1082,7 @@ def test_hook_gate_reports_identity_evidence_only_for_a_verified_identity_grant(
 
 
 @pytest.mark.asyncio
-async def test_spec_hooks_consult_the_gate_only_on_a_gated_turn():
+async def test_spec_hooks_consult_the_gate_on_gated_and_ungated_turns():
     calls: list = []
 
     async def pre_tool(store, hooks, cwd, title, tool_input, **kw):
@@ -1068,7 +1090,7 @@ async def test_spec_hooks_consult_the_gate_only_on_a_gated_turn():
         return "guard.sh: hook denied"
 
     event = _event(tool_input='{"command": "ls"}', mcp_server_name="srv", harness_tool_id="bash")
-    ask = Ask(event, None, "k")
+    ask = Ask(event, AcpWire(SimpleNamespace(session_id="sess_abc")), "k")
     floor = SpecHooks(
         TurnSpecHooks(["h"], "/w", False, True),
         store=lambda: "store",
@@ -1090,13 +1112,15 @@ async def test_spec_hooks_consult_the_gate_only_on_a_gated_turn():
                 "tool_identity": "execute_bash",
                 "mcp_server": "srv",
                 "harness_tool_id": "bash",
+                "acp_session_id": "sess_abc",
                 "parent_session_key": "p",
                 "agent_role": "role",
             },
         )
     ]
     ungated = SpecHooks(TurnSpecHooks([], None, False, False), store=lambda: 1, pre_tool=pre_tool)
-    assert await ungated.refuse(ask) is None and len(calls) == 1
+    assert (await ungated.refuse(ask)).reason == "guard.sh: hook denied"
+    assert calls[1][:3] == (1, [], None)
 
 
 @pytest.mark.asyncio
@@ -1524,6 +1548,7 @@ def _subagent_ladder(
         info,
         spec=spec or TurnSpecHooks([], None, False, False),
         parent_policy=parent_policy,
+        ask_key=info.parent_session_key,
         consult=consult or (lambda event: ToolHookResult(action=hook, identity_grant=True)),
         sel=sel or _Sel(log),
         log=logging.getLogger("kiro_crew.subagent"),
@@ -1593,7 +1618,7 @@ async def test_the_subagent_ladder_asks_for_a_low_fidelity_child_under_an_unveri
     event = _low_fidelity_event(identity_verified=False)
     settled = await settle(Ask(event, RecordingWire(log), "subagent:a1"), policy)
     assert asked == [
-        "⚠️ UNVERIFIED child request (security context missing — title is "
+        "Warning: UNVERIFIED child request (security context missing — title is "
         "agent-authored): Run: ls -la"
     ]
     assert settled == Settled("rejected", "child", "person")
@@ -1806,6 +1831,8 @@ async def test_each_ladder_gives_its_spec_hooks_the_callers_identity(monkeypatch
                 "tool_identity": "execute_bash",
                 "mcp_server": "srv",
                 "harness_tool_id": "h1",
+                # The wire has no client, so no session id.
+                "acp_session_id": None,
                 **identity,
             },
         )
@@ -1860,8 +1887,8 @@ async def _ladder_rungs(policy: Policy, ask: Ask) -> tuple[set[str], set[str]]:
         responders.append(policy.child.responder)
     for responder in responders:
         assert responder.attended, f"responder {responder.name!r} is not attached"
-        # A person's yes is approved under the responder's name, a no refused under it.
-        refusals.add(responder.name)
+        # A yes is approved under its name, a no refused under it, an unanswered one as expired.
+        refusals |= {responder.name, "approval_expired"}
         approvals.add(responder.name)
     return refusals, approvals
 
@@ -1948,3 +1975,24 @@ def test_the_ladder_answers_the_wire_in_exactly_one_adapter():
         ("_refuse", "refuse"),
     ]
     assert tool_permission._steer_host_deny is llm_helpers._steer_host_deny
+
+
+@pytest.mark.asyncio
+async def test_a_held_bot_limit_asks_the_responder_as_a_persons_call(monkeypatch):
+    """The responder sees the call marked held, so an approver that would answer on its
+    own (an auto source, YOLO) asks a person instead (``mate_held_rules.held_call``)."""
+    from kiro_crew import mate_held_rules
+
+    monkeypatch.setattr(mate_held_rules, "held_for", lambda *a, **k: ["deny shell"])
+    seen: list = []
+
+    class _Sees(Scripted):
+        async def ask(self, ask: Ask) -> Answer:
+            seen.append(mate_held_rules.call_is_held())
+            return await super().ask(ask)
+
+    log: list = []
+    policy = _policy(log, responders=(_Sees(log, "callback", False),))
+    await settle(Ask(_event(), RecordingWire(log), "taskrunner:1:task1", "zxc"), policy)
+
+    assert seen == [True]

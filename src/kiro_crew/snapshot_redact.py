@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Iterator
 
+from kiro_crew import memory_record_metadata
 from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.config.loader import config_dir
 from kiro_crew.memory import INDEX_DB_FILE
@@ -287,7 +288,10 @@ def outbound_redaction_enabled() -> bool:
     if not path.is_file():
         return False
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        # The undecoded bytes let ``json.loads`` detect the encoding, so a switch saved by a
+        # Windows tool as UTF-8 with a byte-order mark or as UTF-16 reads as its value.
+        # Bytes that decode as no JSON encoding raise ``UnicodeDecodeError``, a ``ValueError``.
+        raw = json.loads(path.read_bytes())
     except (ValueError, OSError) as e:
         raise RedactionSwitchUnreadable(f"{path} could not be read as JSON ({e})") from e
     if not isinstance(raw, dict):
@@ -882,6 +886,11 @@ def _redact_database(path: Path, report: RedactionReport, rel: str, *, product: 
     """
     try:
         with closing(sqlite3.connect(str(path))) as conn:
+            if product:
+                # The staged copy only: the startup reconcile's triggers would note every
+                # key this pass rewrites, and a restore of the copy rebuilds them anyway.
+                memory_record_metadata.strip_reconcile_state(conn)
+                conn.commit()
             _refuse_credential_in_schema(conn, rel)
             fts_tables, skip_tables = _fts_layout(conn)
             # BEFORE any UPDATE runs: a trigger's effects cannot be undone once fired.

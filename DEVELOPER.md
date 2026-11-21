@@ -6,7 +6,7 @@
 > approach — so a reviewer can understand the delta at a glance, and so the fork
 > can be re-based on future upstream pulls without re-deriving intent.
 >
-> **Branch:** `main` · **Fork base:** upstream commit `bde5de12e` (synced 2026-10-30;
+> **Branch:** `main` · **Fork base:** upstream commit `bdc652697` (synced 2026-11-20;
 > originally forked at `64f3b5811`). Every upstream sync is recorded in §9.
 
 ---
@@ -17,9 +17,8 @@
    provider module, endpoints) over edits to shared upstream code, so
    `git pull upstream` stays conflict-free. Where an edit to a shared file is
    unavoidable, keep it minimal and localized.
-2. **Never touch upstream's own data stores.** CCrew reads `~/.claude` but never
-   writes into it. CCrew-side concepts (titles, pins, tags, colors) live in a
-   **separate sidecar** under CCrew's own data home.
+2. **Never touch upstream's own data stores.** CCrew never writes into
+   `~/.claude`; any CCrew-side state lives under CCrew's own data home.
 3. **Run alongside an installed KiroCrew, not on top of it.** Distinct profile,
    data home, and port so the two never collide.
 4. **Honor the upstream contracts.** i18n catalog parity (all 12 locales +
@@ -143,103 +142,43 @@ CCrew registered it too, CCrew.app could take KiroCrew's deep links.
 ### 3.1 Lime glyph tint
 The sidebar ghost glyph is a raster `logo.png` (purple), so it can't be recolored
 by a token. A `.ccrew-logo-tint` CSS class hue-rotates it to lime on both glyph
-`<img>` sites. Reversible, no new asset.
-- `website/src/index.css` (`.ccrew-logo-tint`), applied in `website/src/App.tsx`
-  (`MobileNavGlyph`) and `website/src/shell/nav/railChrome.tsx` (`RailHeaderGlyph`).
-- Claude-session API methods live in `website/src/api/client/sessions.ts`
-  (upstream split `api/client.ts` into per-domain modules).
+sites (upstream's `PackLoaderImage`, which forwards `className` to its `<img>` or
+reduced-motion `<canvas>`). Reversible, no new asset.
+- `website/src/index.css` (`.ccrew-logo-tint`), applied in
+  `website/src/shell/topbar/shellHeader.tsx` (`MobileNavGlyph`) and
+  `website/src/shell/nav/railChrome.tsx` (`RailHeaderGlyph`).
+- Keep the class AFTER the box classes (`w-6 h-6 rounded-md … object-contain
+  ccrew-logo-tint`): upstream's `narrowFirstBaseline` test reads the logo box from a
+  className that starts with `w-N h-N`.
 
 ### 3.2 Active-backend chip
 The chat only ever showed the **agent-spec name** ("default") — never the ACP
-**backend** (claude / codex / kiro), which lived only in Developer → Agent
-Backend. These are two independent axes, which is why switching the backend never
+**backend** (claude / codex / kiro), which lived only in the agent switcher
+(now Settings → Agent Harness). These are two independent axes, which is why switching the backend never
 changed the "default" label. The `BackendChip` sits beside the agent label in the
 composer shelf, names the live backend, turns green (`--ok`) when a CLI backend is
-driving, and click-navigates to `/developer?tab=agent-backend`.
+driving, and click-navigates to Settings → Agent Harness
+(`settingsPath({ tab: AGENT_HARNESS_SETTINGS_TAB })`). Its tooltip reuses
+`settings.tabs.agent.label`. The router is optional (`useInRouterContext`, as in
+`BrowserLiveCard`), because `ChatInput` renders without a Router in its tests.
 - `website/src/components/BackendChip.tsx`; wired in `ChatInput` (in `App.tsx`).
-
-### 3.3 Claude CLI sessions in the sidebar (first-class)
-A dedicated, self-contained sidebar section listing the claude CLI's **own**
-native sessions (started from a bare terminal), grouped by working directory,
-below CCrew's own sessions. Rows are clickable, scrollable, and carry CCrew
-overlay metadata + a context menu.
-- Frontend: `website/src/components/ClaudeCliSessions.tsx` (rendered by
-  `ChatSidebar`).
-- **Not** merged into CCrew's own history/"Older Sessions" list — that is a
-  CCrew-history-only data source (Redux `s.chat.history`, `closed=true` tabs) and
-  has no knowledge of native `.jsonl` files.
 
 ---
 
-## 4. Backend added (all additive modules + endpoints)
+## 4. Backend added
 
-### 4.1 Native session reader
-`src/kiro_crew/providers/claude_sessions.py` — enumerates
-`~/.claude/projects/<slug>/<uuid>.jsonl` (honoring `CLAUDE_CONFIG_DIR`), projects
-each into a sidebar row shaped like the native `/api/sessions` rows, redacts
-titles/cwd through the same scrubbers the native list uses. **Read-only** for
-listing. Codex is deliberately excluded (its Amazon build keeps sessions in
-SQLite, unsafe to mirror as a sidebar source).
-
-### 4.2 Metadata overlay (CCrew sidecar)
-`src/kiro_crew/providers/claude_session_overlay.py` —
-`<config_dir>/claude_session_overlay.json`, keyed by native UUID, holding
-`title` / `pinned` / `tags` / `color`. Atomic tmp+rename write; tolerant reads
-(corrupt file → empty overlay). `apply_overlay` merges onto rows (custom title
-overrides, original kept as `cli_title`; pinned sorts first). `forget_entry`
-drops an entry when the native session is deleted. **Never written into
-`~/.claude`.** There is deliberately NO `archived` flag (see §4.4).
-
-### 4.3 Resume-open (the round-trip that makes rows first-class)
-`POST /api/claude-sessions/{uuid}/open` seeds a freshly-created CCrew slot's
-resume sid = the native UUID (+ cwd + claude provider label) via
-`SessionPool.remember_resume_sid`. The next `get_or_create` for that slot issues
-ACP `session/load`, attaching to the **same** claude conversation — the native
-`.jsonl` and the CCrew slot then share one transcript (true bidirectionality).
-- Seam chain: `client.set_resume_session_id` → `session/load` (when
-  `_can_load_session`); `session_allocation.py` pulls the resume sid from
-  `session_map`; `SessionPool.remember_resume_sid` wraps `session_map.set`.
-
-### 4.4 Close = confirm-gated delete (no archive)
-Regular CCrew sessions distinguish close (archive to history) from delete
-(permanent). A native claude session has NO CCrew history lane to be archived
-into, so that distinction collapses: **for a CLI session, "close" IS a
-confirm-gated permanent delete.** There is deliberately no intermediate archive
-state (decided after weighing it — an "Archived" subsection would have duplicated
-the concept of the existing CCrew-only "Older Sessions" section without being
-able to share it).
-- **Delete** = **permanent** unlink of the native `.jsonl`
-  (`claude_sessions.delete_claude_session` + `overlay.forget_entry`), via
-  `DELETE /api/claude-sessions/{uuid}`, path re-resolved server-side from the UUID
-  and containment-checked against the projects root (no traversal). UI-gated
-  behind an inline confirm because it destroys the user's own claude data.
-- The regular-session `_close_slot` (archive to CCrew history) and
-  `_delete_history_session` (permanent CCrew-transcript unlink) do **not** apply
-  to a native claude session, which has no CCrew transcript/history record.
-
-### 4.5 Endpoints & routes
-Handlers in `src/kiro_crew/dashboard/handlers/claude_sessions.py` (CCrew-owned
-module, imported by `handlers/__init__.py`), registered in
-`src/kiro_crew/dashboard/routes/system.py`. `SessionManager.remember_resume_sid`
-lives in `session_parts/links.py`, bound in `session.py`:
-- `GET  /api/claude-sessions` — list (reader + overlay merge)
-- `PATCH  /api/claude-sessions/{uuid}` — set overlay (title/pin/tags/color)
-- `POST /api/claude-sessions/{uuid}/open` — seed resume sid onto a slot
-- `DELETE /api/claude-sessions/{uuid}` — permanent native delete + overlay forget
+None at present. The Claude CLI sessions sidebar (native `~/.claude/projects`
+reader, metadata overlay, resume-open, confirm-gated delete and the
+`/api/claude-sessions` routes) was removed on 2026-11-09 as unused.
 
 ---
 
 ## 5. Tests
 
-- `test/test_claude_session_overlay.py` — overlay validation/coercion, clear-on-
-  empty, atomic round-trip, `apply_overlay` merge/sort.
-- `test/test_claude_session_delete.py` — permanent native delete against a
-  **temp** `CLAUDE_CONFIG_DIR`, path-traversal rejection, containment,
-  `forget_entry`.
-- `test/test_claude_sessions.py` — reader.
-
-Frontend verification: `tsc`, `eslint`, `vite build`, and the i18n catalog-parity
-suite (must stay all-locales-green).
+CCrew-specific tests live with the feature they cover: managed-mode
+auto-update in `website/electron/test/auto-update.managed.test.js`, the
+seatbelt skip in the harness-parity and sandbox suites, and the CCrew identity
+in the Electron packaging tests.
 
 ---
 
@@ -254,10 +193,6 @@ suite (must stay all-locales-green).
 - **Icons:** `lucide-react` + `className="lucide-inline"`, never `size={N}` in
   new code (a couple of shelf siblings use `size` as a local exception).
 - **Colors:** design tokens only (`--ok`, `--danger`, `--accent`, …).
-- **Big files:** `ClaudeCliSessions.tsx` is self-contained on purpose — keep CLI-
-  session logic there rather than surgically editing the ~9600-line `ChatSidebar`.
-- **Never delete native `~/.claude` files except through the confirm-gated
-  delete endpoint**, which re-resolves the path server-side.
 - **Never wrap a harness that carries its own OS sandbox in Crew's seatbelt on
   macOS** — nesting `sandbox-exec` fails EPERM (§2.2). "Carries its own OS
   sandbox" is a distinct capability (`ACP_BACKENDS_SKIP_CREW_SEATBELT_MACOS`),
@@ -275,9 +210,6 @@ suite (must stay all-locales-green).
 
 ## 7. Open / pending
 
-- **Live round-trip verification:** the resume-open wiring is unit-safe but the
-  end-to-end "click a CLI row → attaches to the same claude conversation" needs a
-  live `./ccrew.sh` turn to confirm.
 - **Phase 2 permission mapping:** Normal/Reads/Trust/YOLO → CLI, needs a live turn.
 - **Icon/favicon recolor:** the sidebar glyph is tinted in the DOM via CSS
   `hue-rotate` (§3.1); the browser favicon (`/logo.png`) and desktop `.app`/Dock
@@ -314,8 +246,6 @@ PATH="$HOME/.local/share/mise/installs/node/22.23.2/bin:$PATH" \
   UNIVERSAL=0 CCREW=1 CCREW_ALLOW_UNAUTH_VOICE=1 bash packaging/build-desktop.sh
 # → website/electron/dist/mac-arm64/
 
-# Backend tests for the CLI-session feature
-.venv/bin/python -m pytest test/test_claude_session*.py -q
 ```
 
 ### 8.1 Build & share the desktop app package
@@ -393,6 +323,73 @@ parity and logo-glyph tests, and record the entry below.
 - **Other fallout:** <behavior changes, renamed APIs, new specs to read>.
 - **Verified:** <tests/builds run and results>. **Not run:** <what and why>.
 ```
+
+### 2026-11-20 — `bdc652697` (branch `sync/upstream-2026-11-20`)
+- **Range:** `73e3275d9..bdc652697`, 2932 upstream commits. Stacked on the
+  never-merged `sync/upstream-2026-11-09` branch, so this PR carries both
+  syncs. CCrew side had 3 commits since that sync: `fed74f462` local ignore
+  files and skills, `78d2d19cc` removal of the Claude CLI sessions sidebar,
+  and `af11af5fc` (BackendChip router-optional and pointed at Settings →
+  Agent Harness; logo tint moved after the box classes).
+- **Conflicts:** 2 files, no relocations. `website/src/shell/nav/railChrome.tsx`
+  (`RailHeaderGlyph`) and `website/src/shell/topbar/shellHeader.tsx`
+  (`MobileNavGlyph`): upstream swapped the logo `<img>` for `PackLoaderImage`
+  (animated pack logos hold a first frame under reduced motion). Took
+  upstream's component and re-added `ccrew-logo-tint` after the box classes.
+- **Other fallout:** none in CCrew code. Every CCrew-added line since
+  `73e3275d9` was checked against the merged tree (50 files); only the two
+  glyph lines above differ. `isCCrewBuild()` guard, no `build.protocols`,
+  `ccrewAppName()` / `com.ccrew.app`, the seatbelt re-export and its
+  `HARNESS_EXEMPT_SETS` entry, and `KIROCREW_HOME` in `ccrew.sh` all intact.
+  `packaging/build-desktop.sh` is 1916 lines. `scripts/ccrew-tint-icons.py`
+  got black's blank line after the docstring; that was a pre-existing failure.
+- **Verified:** black/isort/flake8 on the 13 CCrew-delta `.py` files; harness parity
+  (script + `test/test_harness_parity.py`); `npm ci`, `tsc -b`, `npm run build`,
+  `i18n:check`; Electron `npm test` 4067/4084 (3 known: 2 `packaging.test.js`
+  CCrew-identity cases, 1 `gateway-shim-tree-kill` `ps` sandbox).
+- **Not run:** backend pytest, vitest, `mypy --platform linux` (full suites exhaust
+  local memory; left to CI), desktop .app build, a live Claude turn.
+
+### 2026-11-09 — `73e3275d9` (branch `sync/upstream-2026-11-09`)
+- **Range:** `bde5de12e..73e3275d9`, 4309 upstream commits; CCrew side had 2
+  commits since the previous sync (`e5fc90e5e` managed-mode auto-update, and
+  local `.gitignore` / `CLAUDE.md` entries).
+- **Conflicts:** 4 files, no relocations:
+  - `agent_sdk/backends.py`: kept the `ACP_BACKENDS_SKIP_CREW_SEATBELT_MACOS`
+    re-export beside upstream's new `CODEX_CLI_*` re-exports.
+  - `website/electron/main.js`: upstream added an LTS edition with its own
+    app name and Windows app ID. `ccrewAppName()` and `com.ccrew.app` still
+    win under the CCrew identity; LTS applies only to upstream builds.
+  - `website/src/pages/ChatSidebar.tsx`: both imports kept
+    (`ClaudeCliSessions`, `askAppConfirm`).
+  - `website/electron/test/auto-update.managed.test.js`: both sides appended
+    tests at the end; kept CCrew's three managed-mode tests and upstream's
+    `relaunchPath` / session-end tests.
+- **Other fallout:** `packaging/build-desktop.sh` reached 2021 lines, past
+  the 2000-line cap; the CCrew blocks were folded into one-line `if`s to land
+  at exactly 2000 (no baseline row). `auto-update.js` merged cleanly with the
+  `isCCrewBuild()` guard intact; `package.json` still has no
+  `build.protocols`. Every CCrew-added line from the previous base was
+  checked against the merged tree (74 files); only the `main.js` lines
+  rewritten above differ.
+- **Verified:** black, isort, flake8, comment-history, brand and line-cap
+  gates clean; `mypy --platform linux --python-version 3.12` clean (4406
+  files; the local 3.14 venv adds one `PidfdChildWatcher` error that is
+  environmental). Harness parity 101 passed; managed auto-update 69/69.
+  Backend: only the 6 `test_harness.py` cases that need `ps` fail (the agent
+  sandbox blocks it; file is byte-identical to upstream). Frontend `npm ci`,
+  `tsc -b` and build clean; suite 67373 passed, 18 failed, none from the
+  merge: 10 `ChatPage.reasoningEffort` (BackendChip `useNavigate()` outside a
+  Router, fails on fork main) and 8 upstream ratchets tripping on CCrew's
+  `ClaudeCliSessions` / nav avatar (api-key order, i18n key reference,
+  render scan x2, context sidecar, switchSlot classification, narrow-first
+  avatar, and the new `statusTextContrast` danger tint). The first 7 fail
+  identically on `ad1d3cbaf`; follow-up is to bring `ClaudeCliSessions` up
+  to those ratchets. Electron: the 3 known upstream failures plus 2 new
+  upstream `packaging.test.js` cases that pin `productName` `KiroCrew` and
+  the LTS `nsis.guid` from `build.appId`; both fail by design under the
+  CCrew identity (`CCrew`, `com.ccrew.app`).
+- **Not run:** full CI suite, a live Claude turn.
 
 ### 2026-10-30 — `bde5de12e` (branch `sync/upstream-2026-10-30`)
 - **Range:** `150605b8e..bde5de12e`, 3397 upstream commits; no new CCrew commits
@@ -476,3 +473,52 @@ parity and logo-glyph tests, and record the entry below.
   passed. Electron host-config + CCrew identity tests 118 passed / 2 skipped.
 - **Not run:** full test suite (CI), `mypy --platform linux`, desktop `.app`
   build (must run from a terminal, §8).
+
+---
+
+## 10. CI on the fork
+
+Upstream's workflows assume resources the fork does not have. The workflows
+below are **disabled in the fork's Actions settings** (`gh workflow disable`).
+Nothing in the repo was edited to skip them, so a sync never conflicts on
+`.github/workflows/`. Their results on a sync PR are expected to be absent, not
+red.
+
+| Workflow | Why it cannot pass on the fork |
+|---|---|
+| Docker Smoke Test, Build, macOS Tests (on demand) | `runs-on` a self-hosted runner group `kirocrew-runners` that does not exist; jobs fail with "runner group not found" or queue forever |
+| Build ffmpeg decoder | Its macOS job uses the same runner group (Windows and Linux jobs do pass) |
+| Opus 5.5 Review, GPT 6.1 Review, UX Review, Design Review, First Principles Review | Need model credentials held as upstream secrets |
+| Security Scope Review | Needs the same credentials; also fails closed on diffs over 1 MB, which every sync exceeds |
+| Internal Content Scan, Internal Content Scan Gate | Need `KIRO_RELEASE_GATE_ROLE_ARN` / `KIRO_RELEASE_GATE_BUCKET` |
+
+**Left enabled:** the `Fork …` variants (Fork UX Review, Fork Security Scope Review, Fork Opus 5.5 Review, …), which are upstream's fork-aware counterparts, plus the checks below that run on GitHub-hosted runners: CI, Fast Gate, PR Policy,
+PR Hygiene, Dependency License Gate, Crew Image Build, Denial Differential,
+Python Client Tests.
+
+**Known red on a sync PR even with the above:**
+- *Fast Gate → Flake Pattern Ratchet* times out (>300 s) on the hosted runner,
+  where the user-namespace probe fails with EPERM. Environmental; re-run once,
+  then treat as accepted.
+- *PR Hygiene* needs a `## Backwards compatibility` section with
+  `Reader: <path>:<symbol> -- <chat|cron|subagent|app|crew page|release> -- <why it still works | test name>`
+  lines for every removed public def. "Removes nothing:" is not accepted
+  (`docs/system-specs/common/take-away-changes.md`).
+- *PR Policy* wants screenshot evidence when the PR touches `website/src/pages/**`,
+  and flags absolute POSIX paths / `/` joins in upstream-added lines (Cross-Platform
+  Portability); both come from upstream code, not the fork.
+
+**One-time repo setting:** enable the dependency graph (Settings → Advanced
+Security), otherwise Dependency License Gate fails with HTTP 403.
+
+**Restore / re-disable:**
+
+```bash
+R=psrivastava/KiroCrew
+gh -R $R workflow list --all                 # ids and states
+gh -R $R workflow enable  <id>               # turn one back on
+gh -R $R workflow disable <id>               # turn one off
+```
+
+Disabling stops future runs only; check results already attached to an open PR
+stay until the PR's head changes.

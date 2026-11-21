@@ -25,6 +25,7 @@ from kiro_crew.dashboard.handlers.members_access import (
     _deny_app_caller,
     _member_names_for_slug,
     _sel,
+    _teammate_admitted,
 )
 from kiro_crew.dashboard.handlers.members_roster import (
     _SEQ_NO_LOG,
@@ -107,10 +108,13 @@ async def api_member_projections(request: web.Request) -> web.Response:
     denied = await _deny_app_caller(request, "members.projections")
     if denied is not None:
         return denied
-    owner_denied = await require_owner_dashboard_request(request, "members.projections.read")
-    if owner_denied is not None:
-        return owner_denied
-    _audit_owner_read(request, "members.projections.read")
+    if not await _teammate_admitted(
+        request, "members.projections.read", slug=request.match_info["slug"]
+    ):
+        owner_denied = await require_owner_dashboard_request(request, "members.projections.read")
+        if owner_denied is not None:
+            return owner_denied
+        _audit_owner_read(request, "members.projections.read")
     slug = request.match_info["slug"]
     try:
         members_mod.validate_slug(slug)
@@ -149,7 +153,7 @@ async def api_member_projections(request: web.Request) -> web.Response:
         )
     if member not in cfg.agents:
         return web.json_response(
-            {"error": "no crew member for this slug", "code": "member_not_found"}, status=404
+            {"error": "no Bot for this slug", "code": "member_not_found"}, status=404
         )
     # Two rows folding to one slug is the case the roster blanks for BOTH of them,
     # and it has to blank here too: neither member can be told apart in a slug-keyed
@@ -225,7 +229,7 @@ async def api_member_activity(request: web.Request) -> web.Response:
     Response entries carry an allowlist of fields only: ``ts`` (epoch
     seconds), ``via`` (how the member was engaged — ``chat`` is a session
     the user opened with it, ``select_crew`` is a routing decision, ``spawn``
-    is a delegated run, ``auto-improvement`` is an auto-improvement run), and
+    is a delegated run, and an app's id is a run that app's own runner made), and
     ``project``. Session keys stay out of the payload: the drawer renders
     what happened, not handles into other sessions.
 
@@ -240,10 +244,13 @@ async def api_member_activity(request: web.Request) -> web.Response:
     denied = await _deny_app_caller(request, "members.activity")
     if denied is not None:
         return denied
-    owner_denied = await require_owner_dashboard_request(request, "members.activity.read")
-    if owner_denied is not None:
-        return owner_denied
-    _audit_owner_read(request, "members.activity.read")
+    if not await _teammate_admitted(
+        request, "members.activity.read", slug=request.match_info["slug"]
+    ):
+        owner_denied = await require_owner_dashboard_request(request, "members.activity.read")
+        if owner_denied is not None:
+            return owner_denied
+        _audit_owner_read(request, "members.activity.read")
     slug = request.match_info["slug"]
     try:
         members_mod.validate_slug(slug)
@@ -455,7 +462,7 @@ async def api_member_briefing(request: web.Request) -> web.Response:
         )
     if member not in cfg.agents:
         return web.json_response(
-            {"error": "no crew member for this slug", "code": "member_not_found"}, status=404
+            {"error": "no Bot for this slug", "code": "member_not_found"}, status=404
         )
     if _member_names_for_slug(cfg, slug) != [member]:
         return web.json_response(

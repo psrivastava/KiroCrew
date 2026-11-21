@@ -18,7 +18,9 @@ from slack_sdk.web import WebClient
 
 from kiro_crew import platform_compat, slack_manifest
 from kiro_crew.acp.client import KIRO_CLI_BIN
+from kiro_crew.agent_sdk import kas_bundle
 from kiro_crew.cli_chat import _ensure_default_agent_in_config
+from kiro_crew.cli_setup_progress import SetupProgress, abort_message, rerun_command
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.config.loader import (
     _WORKSPACE_DIR_NAME,
@@ -28,10 +30,11 @@ from kiro_crew.config.loader import (
     ConfigReadError,
     EnvFileWideEncodingError,
     _default_workspace_base,
+    _env_name_key,
+    _read_saved_workspace_dir,
     _workspace_dir_file,
     coerce_config_field,
     config_path,
-    env_bom_prefix,
     env_path,
     normalize_workspace_path,
     read_config_text,
@@ -41,15 +44,18 @@ from kiro_crew.config.loader import (
     unsandboxed_exec_platform_default,
     update_config_locked,
 )
+from kiro_crew.config.superseded_defaults import ack_explicit_write
 from kiro_crew.constants import MIN_NODE_VERSION, format_node_version
 from kiro_crew.dashboard.urls import _resolve_hostname_bounded
-from kiro_crew.hidden_leaf_staging import EnvStagingRefused, publish_env
+from kiro_crew.hidden_leaf_staging import EnvStagingRefused
+from kiro_crew.host_timezone import LOCAL_TIMEZONE, detect_host_timezone, is_local_timezone
 from kiro_crew.sandbox import unavailable_kind
 from kiro_crew.secrets.migrate import _env_lock_path
 from kiro_crew.security import redact
 from kiro_crew.sel import sel
 from kiro_crew.skills import remove_retired_conductor_skill
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
+from kiro_crew.terminal_safe import safe_terminal_line
 from kiro_crew.validation import USER_ID_RE
 
 
@@ -107,7 +113,8 @@ def _manifest(alias: str | None = None, output: str | None = None, url: bool = F
     command = slack_manifest.slash_command(alias)
     switches = ", ".join(f"slack.{f}" for f in slack_manifest.FEATURES if f in features)
     hint = (
-        f"   Slash command: /{command} — the gateway answers it once slack.command matches:\n"
+        f"   Slash command: /{command} — the gateway answers it as soon as the app is installed.\n"
+        f"   Save the name so help text and manifest updates keep it (applies live, no restart):\n"
         f"   kirocrew config set slack.command {command}\n"
         f"   Slack Code switches rendered: {switches or 'none'}\n"
     )
@@ -117,9 +124,17 @@ def _manifest(alias: str | None = None, output: str | None = None, url: bool = F
         print(hint)
     elif output:
         out = Path(output)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(rendered, encoding="utf-8")
-        print(f"✅ Manifest written to {output} (name: KiroCrew-{alias})")
+        try:
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(rendered, encoding="utf-8")
+        except OSError as exc:
+            # A directory at the path, a file where a folder should be or a
+            # read-only target: one line, not a traceback.
+            shown = safe_terminal_line(str(output))
+            reason = safe_terminal_line(str(exc.strerror or exc))
+            print(f"❌ Could not write {shown}: {reason}", file=sys.stderr)
+            sys.exit(1)
+        print(f"✅ Manifest written to {output} (name: KiroCrew-{alias})")  # brand-ok
         print(hint)
     else:
         print(rendered)
@@ -178,12 +193,19 @@ def _ensure_prerequisites() -> bool:
             header_printed = True
 
     # Node is required for the dashboard build (and for MCP servers shipped as
-    # npm packages, e.g. the Playwright browser MCP).
+    # npm packages, e.g. the Playwright browser MCP). On the KAS bundle route the
+    # engine runs the Node its bundle ships, so `kirocrew doctor`'s node row
+    # calls a missing one not needed, and setup says the same.
     if not shutil.which("node"):
         _header()
-        print(
-            f"  ⚠️  node not found on PATH — install Node.js >= v{format_node_version(MIN_NODE_VERSION)} from https://nodejs.org\n"
-        )
+        if kas_bundle.kas_bundle_route():
+            engine = kas_bundle.installed_bundle()
+            own = f"Node {engine.node_version}" if engine and engine.node_version else "Node"
+            print(f"  ⏭  node not on PATH; not needed (KAS runs its engine bundle's own {own})\n")
+        else:
+            print(
+                f"  ⚠️  node not found on PATH — install Node.js >= v{format_node_version(MIN_NODE_VERSION)} from https://nodejs.org\n"
+            )
 
     # kiro-cli is the agent backend. Note its absence so the user can install it.
     if not shutil.which(KIRO_CLI_BIN):
@@ -230,48 +252,69 @@ def _print_no_desktop_sources() -> None:
     )
 
 
-def _setup_electron() -> None:
-    """Build and install the KiroCrew desktop app (macOS only)."""
+def _run_desktop_build_step(label: str, cmd: list[str], cwd: Path, timeout: int) -> bool:
+    """Run one desktop-app build command; print why it failed and return False."""
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=str(cwd),
+            capture_output=True,
+            # npm and electron-builder are node programs: their pipes carry
+            # UTF-8, not the locale's code page.
+            **UTF8_TEXT,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"  ❌ {label} timed out after {timeout}s.")
+        print("     Check your network and re-run: kirocrew setup --electron-only")
+        return False
+    except OSError as exc:
+        print(f"  ❌ {label} could not start: {exc}")
+        return False
+    if result.returncode != 0:
+        # npm / electron-builder print the failing error LAST: redact the whole
+        # stream (it can echo registry URLs with tokens), then keep the tail.
+        print(f"  ❌ {label} failed: {redact(result.stderr.strip())[-200:]}")
+        return False
+    return True
+
+
+def _setup_electron() -> bool:
+    """Build and install the Kiro Crew desktop app (macOS only).
+
+    Returns False when the install was attempted and failed, so
+    ``setup --electron-only`` can exit non-zero. A platform without the app and
+    a packaged install with no sources to build are not failures.
+    """
     if platform.system() != "Darwin":
         print("  ⚠️  Kiro Crew desktop app is only available on macOS.")
-        return
+        return True
 
     electron_dir = _find_electron_dir()
     if electron_dir is None:
         _print_no_desktop_sources()
-        return
+        return True
 
     if not shutil.which("node"):
         print("  ❌ Node.js not found — required to build the desktop app.")
         print("     Install Node.js and re-run: kirocrew setup --electron-only")
-        return
+        return False
 
     print("  🔨 Building Kiro Crew desktop app…")
-    npm_install = subprocess.run(
+    if not _run_desktop_build_step(
+        "npm install",
         ["npm", "install", "--no-audit", "--no-fund", "--loglevel=error"],
-        cwd=str(electron_dir),
-        capture_output=True,
-        # npm and electron-builder are node programs: their pipes carry UTF-8,
-        # not the locale's code page.
-        **UTF8_TEXT,
-        timeout=120,
-    )
-    if npm_install.returncode != 0:
-        # npm / electron-builder print the failing error LAST: redact the whole
-        # stream (it can echo registry URLs with tokens), then keep the tail.
-        print(f"  ❌ npm install failed: {redact(npm_install.stderr.strip())[-200:]}")
-        return
-
-    build = subprocess.run(
+        electron_dir,
+        120,
+    ):
+        return False
+    if not _run_desktop_build_step(
+        "Electron build",
         ["npx", "electron-builder", "--mac", "--dir"],
-        cwd=str(electron_dir),
-        capture_output=True,
-        **UTF8_TEXT,
-        timeout=300,
-    )
-    if build.returncode != 0:
-        print(f"  ❌ Electron build failed: {redact(build.stderr.strip())[-200:]}")
-        return
+        electron_dir,
+        300,
+    ):
+        return False
 
     arch = "mac-arm64" if platform.machine() == "arm64" else "mac"
     app_src = electron_dir / "dist" / arch / "KiroCrew.app"
@@ -282,7 +325,7 @@ def _setup_electron() -> None:
                 break
     if not app_src.is_dir():
         print("  ❌ Build succeeded but KiroCrew.app not found in dist/")
-        return
+        return False
 
     app_dest = Path.home() / "Applications" / "KiroCrew.app"
     app_dest.parent.mkdir(parents=True, exist_ok=True)
@@ -291,6 +334,7 @@ def _setup_electron() -> None:
     shutil.copytree(str(app_src), str(app_dest))
     print("  ✅ KiroCrew.app installed to ~/Applications")
     print("     Launch via Spotlight (⌘+Space → KiroCrew) or Finder → ~/Applications")
+    return True
 
 
 def _setup(
@@ -301,6 +345,7 @@ def _setup(
     whatsapp: bool = False,
 ) -> None:
     """Install agent config and optionally configure credentials."""
+    progress = SetupProgress()
     try:
         _setup_impl(
             agent_only=agent_only,
@@ -308,14 +353,17 @@ def _setup(
             clean=clean,
             slack=slack,
             whatsapp=whatsapp,
+            _progress=progress,
         )
     except _SetupAborted as exc:
-        # A closed/piped stdin mid-wizard. One clean line instead of a stack
+        # A closed/piped stdin mid-wizard. A clean message instead of a stack
         # trace at whichever prompt hit it first — every guarded prompt raises,
-        # so the exit point is deterministic. Bare `input()` calls still exist
-        # in some steps and traceback the old way; converting them all is a
-        # sweep for its own change.
-        print(f"\n⏭  Setup aborted: {exc}. Re-run interactively to finish.")
+        # so the exit point is deterministic — naming the steps it did not
+        # finish and the command that finishes them. Bare `input()` calls still
+        # exist in some steps and traceback the old way; converting them all is
+        # a sweep for its own change.
+        command = rerun_command(agent_only=agent_only, clean=clean, slack=slack, whatsapp=whatsapp)
+        print(abort_message(str(exc), progress, command))
 
 
 def _setup_impl(
@@ -324,16 +372,35 @@ def _setup_impl(
     clean: bool = False,
     slack: bool = False,
     whatsapp: bool = False,
+    _progress: SetupProgress | None = None,
 ) -> None:
     from kiro_crew.agent import install_agent  # circular import: agent imports cli
     from kiro_crew.cli import _project_dir_file  # circular import: cli -> cli_setup -> cli
 
     if electron_only:
         print("── Desktop App ──\n")
-        _setup_electron()
+        if not _setup_electron():
+            # The desktop app was the whole ask: a failed build is a failed run.
+            sys.exit(1)
         return
 
     print("Kiro Crew Setup 👻\n")
+
+    # The steps below, in the order they run, so an abort can name the ones it
+    # did not reach. The names are what the user reads in that message.
+    progress = _progress if _progress is not None else SetupProgress()
+    steps = [] if agent_only else ["workspace folder"]
+    steps += ["agent config", "sandbox check"]
+    if not agent_only:
+        if slack:
+            steps += ["Slack tokens", "slash command"]
+        if whatsapp:
+            steps.append("WhatsApp")
+        steps += ["timezone", "dashboard URL"]
+        if platform.system() == "Darwin":
+            steps.append("desktop app")
+        steps.append("AWS launch offer")
+    progress.plan(steps)
 
     # Report on optional prerequisites.
     _ensure_prerequisites()
@@ -347,12 +414,24 @@ def _setup_impl(
 
     # 1. Choose workspace directory (skip for agent-only — not relevant)
     if not agent_only:
+        progress.begin("workspace folder")
         _setup_workspace_dir()
 
     # 2. Install the agent config
+    progress.begin("agent config")
     print("Installing agent config...")
-    agent_path = install_agent(clean=clean)
-    print(f"  ✅ Agent installed: {agent_path}")
+    wrote_out: list[bool] = []
+    agent_path = install_agent(clean=clean, _wrote_out=wrote_out)
+    if wrote_out == [False]:
+        # The rebuild left the spec as it was: this instance may not rewrite a
+        # shared agent home, or the existing spec could not be read. The log
+        # names which; reporting it installed would claim a write that did not land.
+        print(
+            f"  ⚠️  Agent config left unchanged: {agent_path} "
+            "(see the log for why it was not rewritten)"
+        )
+    else:
+        print(f"  ✅ Agent installed: {agent_path}")
 
     # 2a. Ensure `kirocrew` is reachable on PATH (the packaged Electron app
     #     doesn't run install.sh) and purge stale predecessor MCP entries left
@@ -383,6 +462,7 @@ def _setup_impl(
     # 2d. Offer the unconfined-exec opt-in on a host with no sandbox backend.
     #     Runs BEFORE the agent-only early return: the servers this unblocks are
     #     the ones install_agent() just wrote, so `--agent-only` needs it too.
+    progress.begin("sandbox check")
     _setup_sandbox_consent()
 
     if agent_only:
@@ -406,11 +486,14 @@ def _setup_impl(
     #    dashboard or its setup guide.
     if slack or whatsapp:
         if slack:
+            progress.begin("Slack tokens")
             _setup_slack_tokens()
 
             # 3b. Slash command name (Slack-only concept)
+            progress.begin("slash command")
             _setup_slash_command()
         if whatsapp:
+            progress.begin("WhatsApp")
             _setup_whatsapp()
     else:
         print("── Messaging Channels ──\n")
@@ -422,48 +505,54 @@ def _setup_impl(
         print("  guided setup.\n")
 
     # 4. Timezone
+    progress.begin("timezone")
     _setup_timezone()
 
     # 5. Dashboard URL (remote access)
+    progress.begin("dashboard URL")
     _maybe_setup_dashboard_url()
 
     _maybe_setup_custom_domain()
 
     # 6. Desktop app (macOS only)
     if platform.system() == "Darwin":
+        progress.begin("desktop app")
         print("── Desktop App ──\n")
         if _find_electron_dir() is None:
             _print_no_desktop_sources()
             print()
         else:
             answer = (
-                input("  Install Kiro Crew desktop app to ~/Applications? [Y/n]: ").strip().lower()
-            )
+                _input_or_skip("  Install Kiro Crew desktop app to ~/Applications? [Y/n]: ") or ""
+            ).lower()
             if answer in ("", "y", "yes"):
                 _setup_electron()
             else:
                 print("  ⏭  Skipped. Install later: kirocrew setup --electron-only\n")
 
     # 7. Cloud (run KiroCrew on the user's own AWS EC2) — optional, delegated.
+    progress.begin("AWS launch offer")
     _maybe_setup_cloud()
 
-    print("\n👻 Done! Try: kirocrew doctor && kirocrew gateway")
+    # No `&&`: Windows PowerShell 5.1 cannot parse it. The words keep its condition.
+    print("\n👻 Done! Run `kirocrew doctor`; when it reports no issues, run `kirocrew gateway`.")
 
 
 def _builtin_cloud_lane_offered() -> bool:
     """Whether the composed platform offers the built-in ``aws_ec2`` lane.
 
-    Reads the list through ``dashboard/handlers_cloud.py::_provisioners`` itself,
-    the same read and degraded-seam fallback the Set-up tab is drawn from, so the
-    wizard and the tab cannot disagree about whether this deployment offers EC2.
+    Reads the list through ``platform.provisioner_listing``, the same read and
+    degraded-seam fallback the Set-up tab is drawn from, so the wizard and the
+    tab cannot disagree about whether this deployment offers EC2. Not through
+    ``dashboard/handlers_cloud.py``: importing that graph cold kept the terminal
+    silent for seconds before this prompt, and an Enter typed into the silence
+    answered the prompt before it was ever seen.
     ``PlatformCompositionError`` still propagates, per ``safe_context_call``.
     """
-    # Deferred: the dashboard handler module pulls in the cloud/dashboard graph,
-    # which only this last, optional wizard step needs.
-    from kiro_crew.dashboard.handlers_cloud import _provisioners
     from kiro_crew.platform.interfaces import BUILTIN_PROVISIONER_ID
+    from kiro_crew.platform.provisioner_listing import offered_provisioners
 
-    return any(r.id == BUILTIN_PROVISIONER_ID for r in _provisioners())
+    return any(r.id == BUILTIN_PROVISIONER_ID for r in offered_provisioners())
 
 
 def _maybe_setup_cloud() -> None:
@@ -526,33 +615,44 @@ def _maybe_setup_cloud() -> None:
 
 
 def _setup_workspace_dir() -> None:
-    """Prompt user for workspace directory, falling back to platform default."""
+    """Prompt for the workspace directory; a refused typed answer keeps the folder shown.
+
+    At a terminal a refused typed answer is asked again. Off one it is not, for
+    the reason :func:`_prompt_verified_slack_value` gives: a re-ask would read the
+    next line of a piped answer file.
+    """
     platform_default = _default_workspace_base() / _WORKSPACE_DIR_NAME
     default = platform_default
     label = "Default"
-    if _workspace_dir_file().is_file():
-        configured = _workspace_dir_file().read_text(encoding="utf-8").strip()
-        if configured:
-            default = normalize_workspace_path(configured)
-            label = "Configured"
+    configured = _read_saved_workspace_dir(_workspace_dir_file())
+    if configured:
+        default = normalize_workspace_path(configured)
+        label = "Configured"
     print("── Workspace Directory ──\n")
     print("  LLM sessions and task output are stored in a workspace directory.")
     print(f"  {label}: {default}\n")
-    # EOF (piped / closed stdin) keeps the default rather than raising a
-    # traceback out of the wizard — this step runs FIRST, so a bare input() here
-    # made `kirocrew setup < /dev/null` fail before any later guard could help.
-    answer = _input_or_skip(f"  Workspace path [{default}]: ") or ""
-    chosen = default if answer.lower() in ("", "y", "yes") else normalize_workspace_path(answer)
-    try:
-        if not chosen.is_absolute():
-            raise OSError("not an absolute path")
-        chosen.mkdir(parents=True, exist_ok=True)
-        _workspace_dir_file().parent.mkdir(parents=True, exist_ok=True)
-        _workspace_dir_file().write_text(str(chosen) + "\n", encoding="utf-8")
-        print(f"  ✅ Workspace: {chosen}\n")
-    except OSError as e:
-        print(f"  ❌ Cannot create {chosen}: {e}")
-        print(f"  Falling back to platform default: {platform_default}\n")
+    while True:
+        # EOF raises _SetupAborted, which _setup reports as a message, not a traceback.
+        answer = _input_or_skip(f"  Workspace path [{default}]: ") or ""
+        chosen = default if answer.lower() in ("", "y", "yes") else normalize_workspace_path(answer)
+        try:
+            if not chosen.is_absolute():
+                raise OSError("not an absolute path")
+            chosen.mkdir(parents=True, exist_ok=True)
+            _workspace_dir_file().parent.mkdir(parents=True, exist_ok=True)
+            _workspace_dir_file().write_text(str(chosen) + "\n", encoding="utf-8")
+            print(f"  ✅ Workspace: {chosen}\n")
+            return
+        except OSError as e:
+            print(f"  ❌ Cannot create {chosen}: {e}")
+        if chosen == default:
+            # The folder shown is unusable, so the runtime falls back from a configured one.
+            print(f"  Falling back to platform default: {platform_default}\n")
+            return
+        if not _stdio_is_interactive():
+            print(f"  Keeping the {label.lower()} folder: {default}\n")
+            return
+        print("  Enter an absolute path, or press Enter to keep the folder shown.")
 
 
 #: Per-call timeout, in seconds, for the Slack API round-trips that check a
@@ -714,8 +814,29 @@ def _prompt_verified_slack_value(
     return None, ""
 
 
+def _fold_env_spellings(pairs: dict[str, str], name: str) -> None:
+    """Leave *name* as the one spelling of its ``os.environ`` entry in *pairs*.
+
+    Windows ``os.environ`` is case-insensitive, so ``slack_bot_token`` and
+    ``SLACK_BOT_TOKEN`` are one entry, and boot keeps the first non-empty
+    spelling in file order. *name* takes that value and the other spellings go.
+    On POSIX the only spelling is *name*, which is left as it is.
+    """
+    canon = _env_name_key(name)
+    spellings = [k for k in pairs if _env_name_key(k) == canon]
+    live = next((pairs[k] for k in spellings if pairs[k]), "")
+    for k in spellings:
+        if k != name:
+            del pairs[k]
+    if spellings:
+        pairs[name] = live
+
+
 def _read_env_pairs(cred_path: Path) -> dict[str, str]:
     """Parse ``KEY=VALUE`` lines of *cred_path*; ``{}`` when it does not exist.
+
+    Each Slack name this step writes is folded to one spelling holding the value
+    in force, so the prompts show it and the save replaces it.
 
     Raises :class:`EnvFileWideEncodingError` for a UTF-16 or UTF-32 file,
     which the caller reports instead of rewriting.
@@ -723,9 +844,14 @@ def _read_env_pairs(cred_path: Path) -> dict[str, str]:
     pairs: dict[str, str] = {}
     if cred_path.exists():
         for line in read_env_text(cred_path, encoding="utf-8").splitlines():
+            # Stripped first, as the boot parser does, so an indented
+            # ``  # KEY=value`` comment is a comment and not a ``# KEY`` key.
+            line = line.strip()
             if "=" in line and not line.startswith("#"):
                 k, _, v = line.partition("=")
                 pairs[k.strip()] = v.strip()
+    for name in (CRED_SLACK_APP_TOKEN, CRED_SLACK_BOT_TOKEN, CRED_OWNER_ID):
+        _fold_env_spellings(pairs, name)
     return pairs
 
 
@@ -748,7 +874,10 @@ def _setup_slack_tokens() -> None:
         return
 
     print("── Slack Credentials ──\n")
-    print("  See docs/guides/slack-setup.md for how to create a Slack app.\n")
+    print(
+        "  How to create a Slack app: "
+        "https://github.com/kirodotdev/KiroCrew/blob/main/docs/guides/slack-setup.md\n"
+    )
 
     answer = input("  Configure Slack tokens? [Y/n]: ").strip().lower()
     if answer in ("n", "no"):
@@ -823,6 +952,11 @@ def _setup_slack_tokens() -> None:
         owner_rejected = True
     if owner_name:
         print(f"  ✅ Owner verified: {owner_name} ({owner_id})")
+    elif not owner_id:
+        print(
+            "  No member ID saved. Once the gateway runs, use 'Claim in Slack' under "
+            "Settings → Messaging channels → Slack to become the owner from a DM.\n"
+        )
 
     if not app_token or not bot_token:
         print("  ⚠️  Missing tokens — Slack integration will be disabled.\n")
@@ -860,10 +994,12 @@ def _setup_slack_tokens() -> None:
             # overwrite it.
             _print_wide_env_remedy(cred_path, exc)
             return
-        merged[CRED_SLACK_APP_TOKEN] = app_token
-        merged[CRED_SLACK_BOT_TOKEN] = bot_token
+        updates: dict[str, str | None] = {
+            CRED_SLACK_APP_TOKEN: app_token,
+            CRED_SLACK_BOT_TOKEN: bot_token,
+        }
         if owner_id:
-            merged[CRED_OWNER_ID] = owner_id
+            updates[CRED_OWNER_ID] = owner_id
         elif owner_rejected and merged.get(CRED_OWNER_ID):
             # The operator's member ID was rejected, so `merged` still holds the
             # PREVIOUS one, re-read from disk — and the tokens above are brand new.
@@ -880,7 +1016,7 @@ def _setup_slack_tokens() -> None:
             stale_owner = merged[CRED_OWNER_ID]
             stale_ok, stale_detail = _verify_slack_owner_id(bot_token or "", stale_owner)
             if stale_ok is False:
-                del merged[CRED_OWNER_ID]
+                updates[CRED_OWNER_ID] = None
                 print(
                     f"  ⚠️  Also dropped the saved member ID {stale_owner} — it is not "
                     f"valid for these tokens ({stale_detail}). Set it with "
@@ -888,18 +1024,30 @@ def _setup_slack_tokens() -> None:
                 )
             else:
                 print(f"  ℹ️  Keeping the saved member ID {stale_owner}.\n")
-        lines = [f"{k}={v}" for k, v in merged.items()]
-        # publish_env, not write_text + chmod(0o600) or a plain atomic_write: a
-        # bare chmod is a silent no-op for Windows ACLs, and a plain atomic_write
-        # stages its temp beside .env, at a name no sandbox mask covers. The
-        # helper stages inside the masked staging directory, locks the temp down
+        if CRED_OWNER_ID not in updates and CRED_OWNER_ID in merged:
+            # A kept member ID is written back under its one folded spelling.
+            updates[CRED_OWNER_ID] = merged[CRED_OWNER_ID]
+        # Only the lines of the keys above are replaced (every case-equivalent
+        # spelling of each, as the read above folds them); every other line --
+        # comments, blank lines, unrelated keys -- is kept byte for byte, and a
+        # key not yet in the file is appended. The dashboard credential writer
+        # does the same, so this reuses its locked rewrite: the .env lock is
+        # already held here, and that function never takes it. Imported here,
+        # not at module top, so the wizard loads the dashboard handlers only
+        # when it saves.
+        from kiro_crew.dashboard.handlers.messaging import _write_env_updates_locked
+
+        # That rewrite publishes through publish_env, not write_text +
+        # chmod(0o600) or a plain atomic_write: a bare chmod is a silent no-op
+        # for Windows ACLs, and a plain atomic_write stages its temp beside
+        # .env, at a name no sandbox mask covers. publish_env stages inside the masked staging directory, locks the temp down
         # to its owner before any content reaches it and renames only on success,
         # so the tokens never sit under a wider mode or an unmasked name, and a
         # failure leaves the previous .env untouched. A refused lockdown of the
         # temp file warns, as the dashboard credential writers do. An unusable
         # staging directory refuses the save and prints its fix, not a traceback.
         try:
-            publish_env(cred_path, env_bom_prefix(cred_path) + "\n".join(lines) + "\n")
+            _write_env_updates_locked(cred_path, updates)
         except EnvStagingRefused as exc:
             print(f"  ⚠  Nothing was saved. {exc}\n")
             return
@@ -930,12 +1078,9 @@ def _setup_whatsapp() -> None:
     neonize or opens the session store: the wizard reports on the credential's
     path, never through it.
     """
+    from kiro_crew import extras
     from kiro_crew.config.paths import data_home
-    from kiro_crew.whatsapp.client import (
-        MISSING_EXTRA_HINT,
-        default_db_path,
-        neonize_available,
-    )
+    from kiro_crew.whatsapp.client import default_db_path, neonize_available
 
     print("── WhatsApp ──\n")
     print("  WhatsApp links as a device on your OWN account. There is no bot")
@@ -947,8 +1092,14 @@ def _setup_whatsapp() -> None:
     if neonize_available():
         print("  ✅ The 'whatsapp' dependency extra is installed")
     else:
-        print("  ⚠️  The 'whatsapp' extra is NOT installed, so the channel cannot start")
-        print(f"     {MISSING_EXTRA_HINT}")
+        print("  ⚠️  The 'whatsapp' extra (neonize) is NOT installed, so the channel cannot start")
+        # Same rule as the doctor's rows: name THIS interpreter, and only where
+        # pip can install into it (never on the desktop app's bundled Python).
+        if extras.pip_install_channel_available():
+            print(f"     Install: {extras.pip_install_command('whatsapp')}")
+        else:
+            print("     This install's Python cannot add packages with pip;")
+            print("     see Settings → Messaging Channels → WhatsApp")
 
     store = default_db_path(data_home())
     if store.exists():
@@ -1024,10 +1175,13 @@ _CUSTOM_DOMAIN = "kirocrew.localhost"
 
 
 def _configured_port() -> int:
-    """Return the dashboard port using the same resolution as other CLI commands."""
-    from kiro_crew.cli_server import (
-        resolve_client_port,  # local import keeps cli_server (heavy import graph) out of cli_setup's import time
-    )
+    """Return the dashboard port using the same resolution as other CLI commands.
+
+    Read from ``port_resolution``, the chain's own light module, not from
+    ``cli_server``: importing that graph cold stalled the wizard's output for
+    seconds between the timezone answer and the next prompt.
+    """
+    from kiro_crew.port_resolution import resolve_client_port
 
     return resolve_client_port(None)
 
@@ -1035,40 +1189,10 @@ def _configured_port() -> int:
 def _detect_system_timezone() -> str:
     """Return the system IANA tz name, or empty string if it can't be detected.
 
-    ``TZ`` and ``/etc/localtime`` are POSIX-only. On Windows the zone lives in
-    the registry as a Windows zone id ("Pacific Standard Time") that needs a
-    Windows->IANA mapping, so without a Windows branch this returned "" there and
-    the whole product silently fell back to UTC — cron schedules and the agent's
-    "today" were off by the local offset. ``tzlocal`` (a Windows-marked dep whose
-    only requirement, ``tzdata``, we already ship) resolves it via the CLDR
-    windowsZones table; it is imported lazily so a source checkout without it
-    degrades to the old skip-and-ask flow rather than crashing.
+    The read lives in :func:`kiro_crew.host_timezone.detect_host_timezone`, which a
+    running gateway also uses to follow a laptop that changes zone.
     """
-    tz_env = os.environ.get("TZ", "").lstrip(":")
-    if tz_env and not tz_env.startswith("/"):
-        return tz_env
-    try:
-        p = Path("/etc/localtime")
-        if p.is_symlink():
-            target = str(p.resolve())
-            if "zoneinfo/" in target:
-                return target.split("zoneinfo/", 1)[1]
-    except Exception:
-        pass
-    if platform_compat.IS_WINDOWS:
-        try:
-            # tzlocal ships no type stubs; it is a Windows-only lazy import, so
-            # ignore the missing-stub error rather than add a types-* dep.
-            import tzlocal  # type: ignore[import-untyped]
-
-            name = tzlocal.get_localzone_name()
-            if name:
-                return str(name)
-        except Exception:
-            # No tzlocal / unmappable zone: fall through to the ask-or-skip path
-            # rather than crash the setup wizard.
-            pass
-    return ""
+    return detect_host_timezone()
 
 
 class _SetupAborted(Exception):
@@ -1426,6 +1550,10 @@ def _setup_sandbox_consent() -> None:
                 return None
             section = {}
             data["agent"] = section
+        # A false written here is the operator's answer, so ack it before the
+        # write: unacked, the next load on Windows would adopt it as the stale
+        # pre-0.6.0 false (``superseded_defaults``).
+        ack_explicit_write("agent.sandbox_allow_unsandboxed_exec", granting)
         section["sandbox_allow_unsandboxed_exec"] = granting
         return data
 
@@ -1489,13 +1617,25 @@ def _setup_timezone() -> None:
             return
         tz_val = answer
     elif detected:
+        # The default is "local", not the detected name: a fixed name is right only
+        # until the laptop travels, and "local" keeps following it.
         print(f"  Detected: {detected}")
-        answer = _input_or_skip(f"  Timezone [{detected}]: ")
-        tz_val = answer or detected
+        print(f"  '{LOCAL_TIMEZONE}' follows this computer's time zone wherever it is.")
+        answer = _input_or_skip(f"  Timezone [{LOCAL_TIMEZONE}]: ")
+        tz_val = answer or LOCAL_TIMEZONE
     else:
-        raw = _input_or_skip("  IANA timezone (e.g. America/Los_Angeles): ")
+        # The runtime reads the zone the same way, so "local" means UTC here until
+        # the zone can be detected (TZ set, or /etc/localtime linked to a zone).
+        print(
+            f"  Could not detect this computer's time zone; '{LOCAL_TIMEZONE}' "
+            "runs in UTC until it can be."
+        )
+        raw = _input_or_skip(f"  IANA timezone (e.g. America/Los_Angeles), or '{LOCAL_TIMEZONE}': ")
         if not raw:
-            print("  ⏭  Skipped. Cron schedules will show UTC.\n")
+            print(
+                "  ⏭  Skipped. Cron schedules run in UTC until this computer's "
+                "time zone can be detected.\n"
+            )
             return
         tz_val = raw
 
@@ -1522,6 +1662,9 @@ def _setup_timezone() -> None:
     }
     max_retries = 3
     for attempt in range(max_retries):
+        if is_local_timezone(tz_val):
+            tz_val = LOCAL_TIMEZONE
+            break
         try:
             ZoneInfo(tz_val)
             break  # valid
@@ -1596,7 +1739,10 @@ def _maybe_setup_dashboard_url() -> None:
         print("  Leave blank for localhost-only.\n")
 
     hint = f" [{current}]" if current else ""
-    answer = input(f"  Dashboard URL (e.g. http://{hostname}:{_configured_port()}){hint}: ").strip()
+    answer = (
+        _input_or_skip(f"  Dashboard URL (e.g. http://{hostname}:{_configured_port()}){hint}: ")
+        or ""
+    )
 
     if answer == "" and current:
         print(f"  ✅ Keeping: {current}\n")
@@ -1652,4 +1798,5 @@ def _maybe_setup_custom_domain() -> None:
                 " && sudo mv /tmp/hosts.clean /etc/hosts\n"
             )
     except Exception:
+        # An unreadable /etc/hosts only skips this hint.
         pass

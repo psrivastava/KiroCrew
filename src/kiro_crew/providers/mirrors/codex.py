@@ -67,8 +67,14 @@ from typing import Any, Mapping
 from kiro_crew.acp import session_mcp
 from kiro_crew.acp.session_mcp import CONTROL_PLANE_SERVERS, session_mcp_projection
 from kiro_crew.acp_backends import ACP_BACKEND_CODEX
+from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS
+from kiro_crew.mcp_gateway import STUB_MODULE
+from kiro_crew.mcp_gateway.claim import STUB_SESSION_TOKEN_ENV
+from kiro_crew.mcp_gateway.hashing import expand_stub_flags
 from kiro_crew.members import MEMBER_DISPATCH_SERVER
 from kiro_crew.providers.mirrors.base import (
+    RESOURCES_NO_READER,
+    TOOLS_SETTINGS_GATE_CHANNEL,
     AgentConfigMirror,
     Concern,
     Disposition,
@@ -77,6 +83,7 @@ from kiro_crew.providers.mirrors.base import (
 )
 from kiro_crew.providers.mirrors.identity import (
     control_plane_identity_env,
+    control_plane_instance_env,
     identity_bound_crew_servers,
     with_env,
     withheld_servers,
@@ -90,6 +97,99 @@ _D = Disposition
 #: element with no ``type`` at all is this one: ACP v1 spells ``McpServer`` as
 #: ``serde(tag = "type")`` with the stdio variant as the untagged fallback.
 _ACP_BASELINE_TRANSPORT = "stdio"
+
+
+def _stub_registered_servers(args: Any) -> list[str] | None:
+    """Every ``--server`` value a broker-stub argv names, or ``None`` if it is not one.
+
+    ``None`` when the argv is not a list of strings, its flag envelope cannot be
+    read, or it does not run :data:`~kiro_crew.mcp_gateway.STUB_MODULE` -- an
+    element that is not the gateway's stub is not vouched for by the gateway.
+    """
+    if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+        return None
+    try:
+        argv = expand_stub_flags(args)
+    except ValueError:
+        return None
+    if not any(
+        token == "-m" and i + 1 < len(argv) and argv[i + 1] == STUB_MODULE
+        for i, token in enumerate(argv)
+    ):
+        return None
+    servers: list[str] = []
+    for i, token in enumerate(argv):
+        if not isinstance(token, str):
+            return None
+        if token == "--server":
+            if i + 1 >= len(argv) or not isinstance(argv[i + 1], str):
+                return None
+            servers.append(argv[i + 1])
+        elif token.startswith("--server="):
+            servers.append(token.partition("=")[2])
+    return servers
+
+
+def is_session_bound_crew_stub(stub: Mapping[str, Any], session_token: str) -> bool:
+    """Whether *stub* is the gateway's broker stub for one of Crew's servers, for THIS session.
+
+    Crew's identity-bound servers are withheld on codex because an element the
+    spec describes cannot carry this session's identity. A broker stub is the one
+    form that can still work here: the gateway rewriter authored it from the
+    managed launch, the session it serves is named by the stub token the broker
+    checks on every call, and gatewayd hands the server that caller per call. So
+    this admits exactly that shape and nothing near it:
+
+    * the name is one of Crew's identity-bound servers
+      (:func:`_identity_bound_crew_servers`) that consumes the per-call caller
+      gatewayd injects (``managed_server_is_session_bound`` is False for it). A
+      server that reads identity from its own process could serve only one
+      session from a pooled backend, so it is not admitted;
+    * it is a stdio element whose argv runs the broker stub module and registers
+      under exactly one ``--server``, that same name;
+    * its ``env`` is exactly one pair: :data:`STUB_SESSION_TOKEN_ENV` carrying
+      *session_token*, which must be nonempty. The gateway clears a stub's env and
+      the client adds only that token, so any other pair, a second token, or a
+      token naming another session means the element is not this session's stub.
+
+    Fails closed: anything unreadable answers ``False``. Grants and restrictions
+    are not decided here; the caller still applies them.
+    """
+    from kiro_crew.mcp_discovery_managed import managed_server_is_session_bound
+
+    if not session_token:
+        return False
+    server = stub.get("name")
+    if not isinstance(server, str) or server not in _identity_bound_crew_servers():
+        return False
+    if managed_server_is_session_bound(server):
+        return False
+    return _is_stub_for(stub, server, session_token)
+
+
+def _is_stub_for(stub: Mapping[str, Any], server: str, session_token: str) -> bool:
+    """Whether *stub* is exactly the broker-stub shape for *server* bound to *session_token*."""
+    if not session_token:
+        return False
+    if stub.get("name") != server:
+        return False
+    if str(stub.get("type") or _ACP_BASELINE_TRANSPORT) != _ACP_BASELINE_TRANSPORT:
+        return False
+    command = stub.get("command")
+    if not isinstance(command, str) or not command:
+        return False
+    if _stub_registered_servers(stub.get("args")) != [server]:
+        return False
+    env = stub.get("env")
+    if not isinstance(env, list) or len(env) != 1:
+        return False
+    pair = env[0]
+    return (
+        isinstance(pair, Mapping)
+        and set(pair) == {"name", "value"}
+        and pair.get("name") == STUB_SESSION_TOKEN_ENV
+        and pair.get("value") == session_token
+    )
 
 
 def drop_unadvertised_transports(
@@ -264,7 +364,10 @@ def codex_elements(
     appearing unusable -- :func:`codex_withheld_servers` drops them upstream of
     this function. The projection additionally reconstructs an explicitly granted
     dashboard entry before attaching identity; its broker stub may carry verified
-    per-call identity instead. The work ledger remains withheld.
+    per-call identity instead. Every other identity-bound server is admitted only
+    as the gateway's broker stub bound to this session's token
+    (:func:`is_session_bound_crew_stub`); a spec-described entry for one stays
+    withheld and is never handed a credential.
 
     A folded name is still claimed only once, first writer keeping it: two spec
     entries CAN legitimately fold together (``"my server"`` and ``"my_server"``),
@@ -333,10 +436,14 @@ def codex_projection(
     the stub NAMES the translation already yields to, lets the withhold rule run
     over both halves in one place instead of being re-spelled at the call site.
 
-    Stubs are appended as given rather than run through :func:`codex_elements`: they
-    are gateway-authored, their env is the broker's own, and none of them is Crew's
-    control plane (a session-strict server is never pooled), so there is no identity
-    to add and no name the fold could collide with. They ARE held to the spec's
+    Stubs are not run through :func:`codex_elements`: they are gateway-authored and
+    carry their session as a token, so there is no session identity to add and no
+    name the fold could collide with. A stub for one of Crew's OWN servers is the
+    exception on one axis: ``kirocrew-core`` can be pooled (it is the stub leader),
+    and when the broker is unreachable its stub execs the real server with the
+    environment codex gave it, so it carries the instance env
+    (:func:`~kiro_crew.providers.mirrors.identity.control_plane_instance_env`) that
+    names the gateway this session belongs to. They ARE held to the spec's
     ``tools`` allowlist, from the same parse that filtered the translated half: the
     overlay is written per agent from the global settings file too, so it can carry
     a stub for a server this agent never references, and a stub is that server.
@@ -353,6 +460,8 @@ def codex_projection(
         agent,
         stub_server_names=stub_server_names,
         work_dir=work_dir,  # type: ignore[arg-type]
+        # A crewmate's worker reads its own spec by its session's record.
+        session_key=session_key,
     )
     withheld = codex_withheld_servers(projection.restricted)
     kept: list[dict[str, Any]] = []
@@ -381,14 +490,20 @@ def codex_projection(
     out: list[dict[str, Any]] = codex_elements(
         kept, session_key=session_key, channel_id=channel_id, session_token=session_token
     )
+    instance_env: dict[str, str] | None = None
     for stub in stub_elements:
         if not isinstance(stub, Mapping):
             continue
         name = stub.get("name")
         # A dashboard stub is produced by the gateway rewriter, which rebuilds
-        # managed launches and verifies each caller. Keep the spec restrictions.
+        # managed launches and verifies each caller. Any other Crew server's stub
+        # is admitted only in its exact gateway shape, bound to this session's
+        # token. All keep the spec restrictions.
+        admissible = name == MEMBER_DISPATCH_SERVER or is_session_bound_crew_stub(
+            stub, session_token
+        )
         if name in withheld and not (
-            name == MEMBER_DISPATCH_SERVER
+            admissible
             and name not in projection.restricted
             and name not in projection.disabled_servers
         ):
@@ -410,6 +525,19 @@ def codex_projection(
                 "half applies to a stub of the same name",
                 name,
             )
+            continue
+        if name in KIROCREW_BIN_MCP_SERVERS:
+            # A stub for one of Crew's own servers is the one stub whose fallback
+            # runs Crew's code. codex clears the child environment, so without the
+            # instance env here that fallback starts with no bound port and no home
+            # override and finds its gateway by guess (control_plane_instance_env).
+            # Instance only: the stub already carries the session token, and the
+            # session-bound shape check above ran on the stub as given. The added
+            # pairs name the gateway, never the session, so the token stays the
+            # only credential a session-bound stub carries.
+            if instance_env is None:
+                instance_env = control_plane_instance_env(label="codex")
+            out.append(with_env(dict(stub), instance_env))
             continue
         out.append(dict(stub))
     denied = frozenset((codex_name(server), tool) for server, tool in projection.disabled_tools)
@@ -456,7 +584,11 @@ class CodexMirror(AgentConfigMirror):
                 "holding it. Every OTHER managed Crew server is withheld rather than "
                 "mounted credential-less, since it would answer not_bound to every "
                 "call, and that set is DERIVED as the managed servers minus the "
-                "control plane -- see _identity_bound_crew_servers. The array and "
+                "control plane -- see _identity_bound_crew_servers. Gateway "
+                "broker stubs are the exceptions, since gatewayd verifies their "
+                "caller and supplies it per call: a granted dashboard stub, and any "
+                "other caller-aware Crew server's stub only in its exact shape bound "
+                "to this session's stub token (is_session_bound_crew_stub). The array and "
                 "the withhold set come from ONE parse of the spec "
                 "(session_mcp_projection), so a narrowing that lands between two "
                 "reads of a user-writable file cannot leave a narrowed server "
@@ -556,22 +688,44 @@ class CodexMirror(AgentConfigMirror):
             ),
             Concern.RESOURCES: Ruling(
                 _D.WITHHELD,
-                "same as PROMPT -- steering files are injected as context text, not "
-                "projected into a backend's config",
+                RESOURCES_NO_READER,
             ),
             Concern.HOOKS: Ruling(
                 _D.NO_CHANNEL,
-                "codex runs hooks natively (codex-rs app-server-protocol ships "
-                "HookEventName, ConfiguredHookMatcherGroup and hooks/list), and "
-                "codex-acp's build_session_config carries no hooks field -- so a "
-                "user's per-agent hooks block reaches kiro-cli and no other "
-                "backend, exactly the gap claude records. Crew's OWN hooks "
-                "(hooks.py, fired on ACP tool events) are unaffected and work on "
-                "this backend already; this gap is only the spec block",
+                "codex-acp's build_session_config carries no hooks field, so the "
+                "harness never sees the spec's hooks block; Crew's turn loop fires "
+                "its postToolUse, userPromptSubmit, agentSpawn and stop hooks "
+                "instead (agent_sdk/spec_hooks.py, "
+                "ACP_BACKENDS_CREW_FIRES_SPEC_OBSERVER_HOOKS). Their matchers meet a "
+                "call through codex's row in acp/harness_tool_names.py "
+                "(CODEX_TOOL_IDS_BY_KIRO_TOOL), read off what codex-acp writes and "
+                "never off the title, so a command is execute_bash and a file change "
+                "fs_write; a postToolUse matcher for a built-in outside that row "
+                "(grep, glob, web_fetch, use_subagent, code) meets no codex call and "
+                "a new session gets a notice naming it. preToolUse is the gap: under "
+                "read-only, codex runs reads and sandboxed commands without a "
+                "permission request, so a Crew-fired gating hook would be skipped on "
+                "those, and a new session whose spec has one gets a notice. codex "
+                "runs hooks natively (codex-rs app-server-protocol ships "
+                "HookEventName, ConfiguredHookMatcherGroup and hooks/list) from its "
+                "own config layers only. Crew's OWN hooks (hooks.py, fired on ACP "
+                "tool events) are unaffected",
                 channel="a hooks field on the codex-acp session/new element set, or "
                 "a Crew-owned CODEX_HOME overlay under create-or-decline -- Crew "
                 "writes no codex file today, which is why this needs a decision "
                 "rather than a writer",
+            ),
+            Concern.TOOLS_SETTINGS: Ruling(
+                _D.NO_CHANNEL,
+                "kiro-cli's per-tool settings (shell denyByDefault and allowedCommands, the "
+                "write allowlist, deniedPaths, web_fetch.blocked) have no field on codex-acp's "
+                "session/new and Crew writes no codex file, and Crew feeds this session's "
+                "permission requests no spec allowlist, so the field is applied nowhere. Its "
+                "subagent.availableAgents is the exception: Crew's spawn gate reads it from the "
+                "parent's spec on every backend (subagent_parts/agent_policy.py), so no notice "
+                "names it. A new chat session whose spec sets it gets one notice naming what of "
+                "it goes unapplied (dashboard/chat_turn/turn_spec_hooks.py)",
+                channel=TOOLS_SETTINGS_GATE_CHANNEL,
             ),
         }
 

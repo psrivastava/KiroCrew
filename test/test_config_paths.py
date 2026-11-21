@@ -1,13 +1,8 @@
 """Tests for the pure path-primitives leaf ``kiro_crew.config.paths``.
 
-These pin two properties of the config-loader decoupling refactor:
-
-1. The path primitives behave identically to their historical
-   ``kiro_crew.config.loader`` definitions (back-compat).
-2. ``kiro_crew.config.paths`` is a genuine leaf — importing it pulls in **no**
-   ``kiro_crew`` modules (in particular not the heavy ``config.loader``), so the
-   modules that only need ``config_dir()`` don't transitively load the DTOs,
-   schema validation, the process-global cache, and the provider factory.
+Pins that the primitives match the ``kiro_crew.config.loader`` names, and that
+importing ``kiro_crew.config.paths`` pulls in no ``kiro_crew`` module, so callers of
+``config_dir()`` skip the heavy ``config.loader``.
 """
 
 from __future__ import annotations
@@ -153,17 +148,10 @@ class TestScratchRootOverride:
     def test_override_is_refused_off_windows(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, platform: str, caplog
     ) -> None:
-        # The relocated scratch root is masked by a pathname-anchored rule that protects
-        # the tree it is bound over, not a later allocation created after the root's own
-        # ancestor is renamed and recreated. On a non-Windows platform, under an
-        # operator-writable parent, an agent could rename an ancestor of the relocated root
-        # and recreate it, so a later session's scratch is built at the original pathname
-        # while the existing mask stays beneath the renamed-aside tree -- leaving those
-        # later trees reachable from another session. The override is therefore honoured on
-        # Windows only; on every other platform it is refused with reason "unsupported
-        # platform" and ``scratch_root()`` falls back to the guarded default. A valid
-        # off-home target that WOULD be accepted on Windows is used, so only the platform
-        # decides the refusal.
+        # The mask is pathname-anchored, so off Windows an agent could rename an ancestor
+        # and get later scratch built outside it. The override is refused there with
+        # "unsupported platform". The target is one Windows would accept, so only the
+        # platform decides.
         target = tmp_path / "data-drive" / "scratch"
         monkeypatch.setenv("KIROCREW_SCRATCH_ROOT", str(target))
         monkeypatch.setattr(sys, "platform", platform)
@@ -304,16 +292,10 @@ class TestScratchRootOverride:
     def test_cyclic_symlink_override_is_refused_without_raising(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        # A self-referential symlink override makes ``Path.resolve()`` raise ``RuntimeError``
-        # on CPython 3.12. ``allocate_scratch``'s fallback catches only ``OSError`` /
-        # ``ScratchBoundaryError``, so an uncaught resolution error would propagate out of
-        # ``scratch_root()`` and abort agent startup. The override must instead be refused
-        # fail-safe (fall back to the guarded default root) and ``scratch_root()`` must not
-        # raise. The resolution failure is INJECTED rather than created from a real symlink
-        # loop, so the refusal is exercised on every platform without the symlink privilege a
-        # real loop needs: ``Path.resolve`` is wrapped to raise ``RuntimeError`` for the
-        # override path (what a loop raises) and to defer to the real resolve for anything
-        # else, so the rest of the resolution chain is untouched.
+        # A symlink loop makes ``Path.resolve()`` raise ``RuntimeError`` (CPython 3.12),
+        # which ``allocate_scratch`` does not catch; the override must be refused and
+        # ``scratch_root()`` must not raise. The error is injected for the override path
+        # only, so no symlink privilege is needed.
         import kiro_crew.agent_scratch as agent_scratch
 
         monkeypatch.setattr(sys, "platform", "win32")
@@ -358,18 +340,10 @@ class TestScratchRootOverride:
     def test_different_case_real_dir_is_accepted_when_realpath_renormalises(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        # A plain REAL directory typed in a spelling that ``realpath`` renormalises
-        # (Windows upper-cases the drive letter and expands short 8.3 names, and
-        # ``ntpath.realpath`` returns the on-disk casing) is ACCEPTED: the link guard tests
-        # the override NAME with ``is_link_or_junction``, and a real directory is not a
-        # link whatever its casing. A lexical ``realpath`` vs ``abspath`` comparison would
-        # instead refuse ``d:\scratch`` because it resolves to ``D:\scratch``, silently
-        # keeping scratch on the system drive on the one platform the override exists for.
-        #
-        # Drive the user path: the directory genuinely exists at ``target`` and the operator
-        # types exactly that path, while ``realpath`` is forced to return a renormalised
-        # spelling (upper-cased leaf) of the SAME real directory, reproducing the Windows
-        # on-disk-casing behaviour on any runner. The name-only link check accepts it.
+        # A real directory that ``realpath`` respells (Windows drive case, 8.3 names) is
+        # accepted: the guard checks the name with ``is_link_or_junction``. A lexical
+        # ``realpath`` vs ``abspath`` compare would refuse ``d:\scratch``. ``realpath`` is
+        # forced to an upper-cased leaf to mimic Windows on any runner.
         monkeypatch.setattr(sys, "platform", "win32")
         monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home" / ".kiro" / "crew"))
         target = tmp_path / "data-drive" / "scratch"
@@ -462,6 +436,66 @@ class TestWindowsSystemDirExtendedLength:
         # A path that is genuinely NOT under a protected dir is still accepted.
         monkeypatch.setattr(paths, "_windows_system_dirs", lambda: [Path("C:\\ProgramData")])
         assert paths._is_windows_system_dir(Path("\\\\?\\D:\\kirocrew-scratch")) is False
+
+
+class TestScratchRootExtendedLengthSpelling:
+    @staticmethod
+    def _windows_with_verbatim_resolve(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+        # On Windows ``resolve()`` keeps a ``\\?\`` prefix the operator typed while the crew
+        # homes and the workspace base resolve plain. A no-op ``resolve()`` lets the prefix
+        # survive into the validator exactly that way on every runner.
+        user_home = tmp_path / "home"
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setenv("HOME", str(user_home))
+        monkeypatch.setenv("USERPROFILE", str(user_home))
+        monkeypatch.setenv("KIROCREW_HOME", str(user_home / ".kiro" / "crew"))
+        monkeypatch.setattr(paths, "_windows_system_dirs", lambda: [])
+        monkeypatch.setattr(Path, "resolve", lambda self, *a, **k: self)
+        return user_home
+
+    @pytest.mark.parametrize(
+        ("target", "expected_reason"),
+        [
+            ("data_home", "a crew home"),
+            ("profiles", "a crew home"),
+            ("user_home", "a crew home"),
+            ("workspace", "the workspace"),
+        ],
+    )
+    @pytest.mark.parametrize("prefixed", [False, True], ids=["plain", "extended"])
+    def test_every_spelling_of_a_protected_tree_is_refused(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        target: str,
+        expected_reason: str,
+        prefixed: bool,
+    ) -> None:
+        import kiro_crew.agent_scratch as agent_scratch
+
+        user_home = self._windows_with_verbatim_resolve(monkeypatch, tmp_path)
+        protected = {
+            "data_home": paths.config_dir(),
+            "profiles": paths.config_dir() / "profiles",
+            "user_home": user_home,
+            "workspace": user_home / "workplace",
+        }[target]
+        value = ("\\\\?\\" + str(protected)) if prefixed else str(protected)
+        monkeypatch.setenv("KIROCREW_SCRATCH_ROOT", value)
+        monkeypatch.setattr(paths, "_scratch_root_override_pin", paths._UNSET)
+
+        assert paths._validate_scratch_root_override() == (None, expected_reason)
+        assert agent_scratch.scratch_root() == paths.config_dir() / "scratch"
+
+    def test_extended_spelling_of_an_unprotected_root_is_kept_as_typed(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        self._windows_with_verbatim_resolve(monkeypatch, tmp_path)
+        value = "\\\\?\\" + str(tmp_path / "elsewhere" / "scratch")
+        monkeypatch.setenv("KIROCREW_SCRATCH_ROOT", value)
+        monkeypatch.setattr(paths, "_scratch_root_override_pin", paths._UNSET)
+
+        assert paths._validate_scratch_root_override() == (Path(value), None)
 
 
 class TestLedgerRoot:
@@ -725,9 +759,10 @@ class TestLeafPurity:
         env = dict(os.environ)
         env["PYTHONPATH"] = src_dir + os.pathsep + env.get("PYTHONPATH", "")
         out = subprocess.run(
-            [sys.executable, "-c", code],
+            [sys.executable, "-X", "utf8", "-c", code],
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=True,
             env=env,
         )

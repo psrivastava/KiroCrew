@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from chat_runner_coverage_helpers import _slot, _state
 
+from kiro_crew import platform_compat
 from kiro_crew.dashboard import chat_runner
 
 # ── PreToolUse hook verdicts ──────────────────────────────────────────────
@@ -154,19 +155,17 @@ class TestCommandParsing:
         assert chat_runner._matches_trusted_pattern("ls 2>&1", {"ls*"}) is not None
 
     def test_an_escaped_quote_does_not_hide_a_real_separator(self):
-        """A closing quote followed by `\\'` leaves quoted context, so the `;`
-        after it is a separator the shell acts on.
+        """After a closing quote, `\\'` is not quoted context, so the `;` splits segments.
 
-        Reading that `\\'` as an OPENING quote makes the remainder look quoted, the
-        separator gets masked, the line collapses to one segment, and an appended
-        command inherits whatever the first segment was allowed to do. Verified
-        against a real shell: `echo 'foo'\\'; cmd` runs `cmd`.
+        Read as an opening quote it would mask the `;`. A real shell runs `cmd` in
+        `echo 'foo'\\'; cmd`.
         """
         command = "echo 'foo'\\'; whoami"
-        _, segments = chat_runner._split_command_segments(command) or ("", [])
+        with patch.object(platform_compat, "IS_WINDOWS", False):
+            _, segments = chat_runner._split_command_segments(command) or ("", [])
 
-        assert len(segments) == 2, segments
-        assert chat_runner._matches_trusted_pattern(command, {"echo*"}) is None
+            assert len(segments) == 2, segments
+            assert chat_runner._matches_trusted_pattern(command, {"echo*"}) is None
 
     def test_an_escaped_double_quote_keeps_the_quote_open(self):
         """Inside double quotes `\\"` is an escaped literal, so the quote stays
@@ -175,7 +174,8 @@ class TestCommandParsing:
         at all rather than executing a second command, so there is nothing here
         for segmentation to protect against."""
         command = 'echo "foo\\"; whoami'
-        _, segments = chat_runner._split_command_segments(command) or ("", [])
+        with patch.object(platform_compat, "IS_WINDOWS", False):
+            _, segments = chat_runner._split_command_segments(command) or ("", [])
 
         assert len(segments) == 1, segments
 

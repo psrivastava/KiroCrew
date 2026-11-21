@@ -1,12 +1,12 @@
 /**
- * The rail's "Connect your phone" owner (`shell/nav/mobileConnect.tsx`): only
+ * The rail's "Connect your phone" owner (`components/mobileConnect.tsx`): only
  * kinds this build can draw count, the dialog is the lazy modal, and any
  * navigation — or a refresh that leaves nothing drawable — closes it.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { act, render, renderHook, screen, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { useMobileConnect, MobileConnectDialog } from '../shell/nav/mobileConnect'
+import { useMobileConnect, MobileConnectDialog } from '../components/mobileConnect'
 import { api } from '../api/client'
 
 vi.mock('../components/MobileConnectModal', () => ({
@@ -55,5 +55,26 @@ describe('useMobileConnect', () => {
     expect(result.current.mobileConnectOpen).toBe(false)
     const { container } = render(<MobileConnectDialog mobileConnect={{ ...result.current, mobileConnectOpen: true }} />)
     expect(container).toBeEmptyDOMElement()
+  })
+
+  it('a teammate gets no row: pairing a phone is the machine owner\'s', async () => {
+    vi.spyOn(api, 'mobileConnectMethods').mockResolvedValue({ methods: [{ id: 'a', kind: 'login_link' }] } as never)
+    vi.spyOn(api, 'viewerOwnerOk').mockResolvedValue(false)
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const { result } = renderHook(() => useMobileConnect('k'), {
+      wrapper: ({ children }: { children: React.ReactNode }) => <QueryClientProvider client={client}>{children}</QueryClientProvider>,
+    })
+    // Both reads settled: the methods would draw a row, and the owner check said no.
+    await waitFor(() => expect(result.current.mobileConnectQuery.isSuccess).toBe(true))
+    await waitFor(() => expect(client.isFetching()).toBe(0))
+    expect(result.current.hasRenderableMobileConnect).toBe(false)
+    expect(result.current.mobileConnectKinds).toEqual([])
+  })
+
+  it('the owner keeps the row', async () => {
+    vi.spyOn(api, 'mobileConnectMethods').mockResolvedValue({ methods: [{ id: 'a', kind: 'login_link' }] } as never)
+    vi.spyOn(api, 'viewerOwnerOk').mockResolvedValue(true)
+    const { result } = renderHook(() => useMobileConnect('k'), { wrapper: wrapper() })
+    await waitFor(() => expect(result.current.hasRenderableMobileConnect).toBe(true))
   })
 })

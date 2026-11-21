@@ -54,11 +54,12 @@ async def test_flag_off_reaches_no_workspace_so_no_credentialed_git(choices, mon
             reached.append("coder")
             raise Reached
 
-    section = SimpleNamespace(coder_url="https://c.example", profiles=[])
+    section = SimpleNamespace(coder_url="https://c.example", profiles=[], kiro_cloud_profiles=[])
     monkeypatch.setattr(
         "kiro_crew.config.live.snapshot", lambda: SimpleNamespace(session_environments=section)
     )
     monkeypatch.setattr(session_launch, "CoderSessionEnvironments", Provider)
+    monkeypatch.setattr(session_launch, "chosen_provider", lambda *_a: session_launch.PROVIDER_ID)
     with pytest.raises(Reached):
         await session_launch.prepare_for_session("dashboard:remote")
     assert reached == ["coder"]
@@ -129,8 +130,8 @@ def test_a_bound_session_whose_choice_is_lost_is_refused_not_run_here(choices, l
 
 
 def test_every_way_a_row_leaves_takes_its_marker(choices, monkeypatch):
-    """A row ends by being cleared, by an inherited row ageing out, or by a child
-    whose parent runs here; none of them may leave a marker that later refuses."""
+    """A row that ages out after inheriting, or is cleared, leaves no marker that
+    later refuses the session."""
     from kiro_crew.coder import session_launch
 
     choices.inherit("dashboard:child", "dashboard:remote")

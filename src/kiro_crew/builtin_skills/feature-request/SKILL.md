@@ -1,7 +1,7 @@
 ---
 name: feature-request
-description: Conversational workflow for gathering user feedback and filing GitHub Issues on the Kiro Crew repository. Load when the user clicks "Request a Feature", wants to report a bug, or suggest an improvement.
-triggers: request a feature, request feature, feature request, report a bug, bug report, file an issue, github issue, I have an idea, something's broken, suggestion
+description: Gathers a bug report, feature request or feedback in conversation and routes it to the in-app Report a Problem dialog, the public issue forms, or SECURITY.md for a vulnerability (never a public issue); load when the user wants to report a problem, send feedback or suggest an improvement.
+triggers: request a feature, request feature, feature request, report a bug, bug report, file an issue, github issue, I have an idea, something's broken, suggestion, report a problem, send feedback, submit feedback
 ---
 
 # Feature Request / Issue Report
@@ -9,8 +9,9 @@ triggers: request a feature, request feature, feature request, report a bug, bug
 Conversational workflow for gathering user feedback and creating GitHub Issues
 on the Kiro Crew repository.
 
-**Trigger:** User says "report a bug", "feature request", "I have an idea",
-"something's broken", or names `$feature-request`. The dashboard's "Request a
+**Trigger:** User says "report a bug", "report a problem", "feature request",
+"send feedback", "I have an idea", "something's broken", or names
+`$feature-request`. The dashboard's "Request a
 Feature" button does NOT load this skill: it seeds the self-contained prompt
 `FEATURE_REQUEST_PROMPT_FALLBACK` in `website/src/prompts/featureRequest.ts`,
 which must be kept in step with the workflow below.
@@ -20,6 +21,38 @@ which must be kept in step with the workflow below.
 ```
 https://github.com/kirodotdev/KiroCrew
 ```
+
+## Route it first
+
+Before gathering details, decide where the report belongs. Take the first case
+that fits:
+
+1. **A security vulnerability.** Do not draft it, search for it or file it.
+   Give the user the security policy and tell them to report it privately by
+   the email address that file lists, with the `[SECURITY]` subject prefix —
+   never in a public issue:
+
+   ```
+   https://github.com/kirodotdev/KiroCrew/blob/main/SECURITY.md
+   ```
+
+2. **Something broke on this install.** Point the user to the **Report a
+   Problem** dialog (Settings › About › Support › **Report a Problem**, or the
+   nav rail's **Report issue** link). It collects a redacted diagnostics bundle
+   and opens a pre-filled bug report on this install's tracker. Without the
+   dashboard, `kirocrew doctor --bundle` builds the same bundle and prints the
+   link. If the user would rather file it from this conversation, continue with
+   the workflow below as a bug report.
+
+3. **A question, or an idea not yet ready to be a request.** Point the user to
+   Discussions:
+
+   ```
+   https://github.com/kirodotdev/KiroCrew/discussions
+   ```
+
+4. **Anything else** — a feature request, a bug to file from this conversation,
+   or feedback. Continue with the workflow below.
 
 ## Shell safety (READ FIRST)
 
@@ -63,6 +96,27 @@ Guide the user to describe:
 Don't force structure. Ask follow-up questions if the description is vague.
 Two to three exchanges is usually enough.
 
+**For a feature request, dig to the real need with a 5 Whys chain.** Reason
+from first principles: a request usually arrives as a solution ("add a button
+for X"), so set that solution aside and find the basic need underneath it. Ask
+"why?" one question at a time, and build each question from the user's last
+answer, not from a generic prompt:
+
+```text
+I want: a button to export my chat history.
+Why do you want to export chat history?
+  -> So I can share a session with a teammate.
+Why do you need to share a session with a teammate?
+  -> They need to see how I got the agent to fix a bug.
+```
+
+Stop as soon as an answer names who hits this, what they are trying to get
+done, and what it costs them today. Five is the most, not the goal. If an
+answer is still a solution or restates the feature, ask the next "why". Finish
+the chain before you search for duplicates (step 3) or draft (step 4): the root
+need is what both should be built from. Keep the questions and answers as the
+user gave them; the draft carries the chain. Bug reports skip this step.
+
 ### 3. Check for Duplicates
 
 Every `gh` call below targets Kiro Crew's own public repository — a fixed target on
@@ -100,22 +154,98 @@ submit it. Do not silently proceed as if submission will work and only reveal
 the gap at the submit step. The duplicate search can still be skipped on failure;
 losing it does not block filing.
 
+**If the search succeeded, also check whether this account can attach labels.**
+Run this once:
+
+```bash
+gh repo view "$REPO" --json viewerPermission -q .viewerPermission
+```
+
+GitHub keeps labels on a new issue only from an account with push access, and
+silently drops them for anyone else: `gh issue create` still succeeds, with no
+labels and no error. So labels are allowed only when this prints `ADMIN`,
+`MAINTAIN` or `WRITE`. Any other answer (`TRIAGE`, `READ`, `NONE`, empty), or a
+failed probe, means no labels. Steps 5 and 6 use this result.
+
 ### 4. Draft the Issue
 
-Compose a clean title and markdown body from the conversation. Structure:
+Compose a clean title and a body shaped like the repository's issue form, so an
+issue filed from this conversation reads the same as one filed on github.com.
+Each field of the form is one `###` heading, spelt exactly as the field's label
+in `.github/ISSUE_TEMPLATE/feature_request.yml` or `bug_report.yml`, in the
+form's order. Triage reads the answers under those headings (the bug form's
+Release channel and Platform pick labels), so never rename, merge or reorder
+them. A dropdown answer is one of the form's options, verbatim; an optional
+field with nothing to say gets `_No response_`. A red CI run or a flaky test
+uses `ci_failure.yml`'s labels the same way, and a docs fix `documentation.yml`'s.
+
+A feature request:
 
 ```markdown
-## What
+### Existing issues
 
-[One paragraph describing the feature/bug]
+- [x] I searched open issues and this is not already requested.
 
-## Why
+### Problem
 
-[Why this matters / what problem it solves]
+[What the user is trying to do, and what stops them today]
 
-## Additional Context
+### Why does this matter? (5 Whys)
 
-[Any extra details, reproduction steps, environment info]
+[The 5 Whys chain from step 2, each question and its answer in order, ending
+at the root need]
+
+### Proposed behaviour
+
+[What should happen instead, and where the user would expect to find it]
+
+### Alternatives considered
+
+[Other approaches, or "None"]
+
+### Anything else
+
+[Mockups, prior art, related discussion]
+```
+
+A bug report:
+
+```markdown
+### Existing issues
+
+- [x] I searched open issues and this is not already reported.
+
+### KiroCrew version
+
+[The version the user runs, as the form's hint asks]
+
+### Release channel
+
+[Stable | Insider (prerelease) | Nightly | Not sure]
+
+### How is it installed?
+
+[Desktop app | Desktop app (deb) | Desktop app (rpm) | pip / pipx | Docker | From source | Not sure]
+
+### Platform
+
+[macOS | Windows | Linux | Not platform-specific]
+
+### What happened
+
+[What the user observed, and what they expected instead]
+
+### Steps to reproduce
+
+[Numbered steps from a known starting state]
+
+### Relevant log output
+
+[Log lines the form's hint asks for, redacted]
+
+### Anything else
+
+[Screenshots, related config, workarounds tried]
 ```
 
 Show the draft to the user for confirmation before submitting.
@@ -155,13 +285,20 @@ Rules:
   request has no way to know those apply, and the workflows that own them will
   set them.
 
-Collect the chosen names for the submit step below.
+If the permission check in step 3 did not allow labels, or never ran, pass no
+`--label` flag at all and never tell the user labels will be attached. Tell them
+triage will label the issue. You may list the labels you would suggest in the
+body under Anything else; put them in the draft before you show it, or show
+the changed draft again before submitting.
+
+Otherwise, collect the chosen names for the submit step below.
 
 If `gh` is unavailable or unauthenticated, `gh label list` fails and you cannot
-read the taxonomy. Still apply a type label in that case — bug for defects,
+read the taxonomy. Still pick a type label in that case — bug for defects,
 enhancement for feature requests, the two that have always existed — and skip
 the grouping dimensions, which are the part that grows. Do not guess a grouping
-value you could not read.
+value you could not read. Nothing can attach it on this path, so name it in the
+draft and leave the labeling to triage.
 
 ### 6. Submit — Offer the Options
 
@@ -170,14 +307,9 @@ all three options below may apply. If it did not, Option 3 is unavailable on thi
 host; offer Option 1, and Option 2 only when its query string is short (see
 below).
 
-Lead with the routes that reliably reach the user. Crew's chat redacts any
-model-written URL whose query string is 200 characters or longer, with no
-exception for issue links (this is intentional — injected content could hide
-private context in a prefilled `body=`, and the issue it creates is public). A
-prefilled link carrying a drafted title and body almost always crosses that
-length and would render as `[REDACTED: suspicious URL]` rather than a clickable
-link, so Option 1 is the primary route and Option 2 is offered only in the rare
-short-query case where it survives redaction.
+Lead with the routes that reliably reach the user. A prefilled issue link carries
+the drafted title and body in its query string, and GitHub truncates a long URL, so
+Option 1 is the primary route and Option 2 is offered only in the short-query case.
 
 **Option 1: Copy/paste** (always works, nothing to install)
 
@@ -191,10 +323,12 @@ https://github.com/kirodotdev/KiroCrew/issues/new
 
 The user pastes the title and body into that form and submits. This needs only
 that they are signed in to GitHub in their own browser. You can also point them
-at the feature-request template form, whose only query parameter is short enough
+at the matching template form — the bug-report form for a defect, the
+feature-request form for a request — whose only query parameter is short enough
 to survive redaction:
 
 ```
+https://github.com/kirodotdev/KiroCrew/issues/new?template=bug_report.yml
 https://github.com/kirodotdev/KiroCrew/issues/new?template=feature_request.yml
 ```
 
@@ -208,20 +342,18 @@ https://github.com/kirodotdev/KiroCrew/issues/new?title=URL_ENCODED_TITLE&body=U
 
 Do **not** add a `labels=` parameter: GitHub answers 404 to a `labels` query
 from anyone without permission to label issues in this repo, which is most
-users (chosen labels apply only through Option 3, and triage labels the rest).
+users (chosen labels apply only through Option 3, and only for an account with
+WRITE permission or above; triage labels the rest).
 **Percent-encode the title and body in full**, not just their spaces: an
 unencoded `&` starts a new query param and an unencoded `#` pushes the remainder
 into the URL fragment, either of which silently drops the drafted body from the
 pre-filled issue.
 
 You build this URL, so you know its length: offer it **only when its query
-string is under 200 characters** (a short title and little or no body). At or
-above 200, Crew redacts it in chat as a suspicious URL (intentional, no
-exception for issue links), so do not offer it — leave it out silently and use
-Option 1 rather than handing the user a link that renders as a
-`[REDACTED: suspicious URL]` placeholder. (A URL over ~4000 chars may also be
-truncated by GitHub, another reason the short-query case is the only one worth
-offering here.)
+string is under 200 characters** (a short title and little or no body). Above
+that, leave it out silently and use Option 1: a long prefilled link is hard to
+check before the user submits it, and GitHub may truncate one over about 4000
+characters.
 
 **Option 3: Direct creation via `gh` CLI** (only if the step 3 check succeeded)
 
@@ -248,7 +380,8 @@ gh issue create --repo "$REPO" \
 Pass one `--label` flag per name chosen in step 5, each **single**-quoted. Label
 names can contain spaces, and single quotes also keep a `$` or backtick in a name
 literal — double quotes would let the shell expand it. Omit the extra flags when
-no grouping label applies.
+no grouping label applies, and pass no `--label` flag at all when the permission
+check in step 3 did not allow labels.
 
 This requires `gh auth` on the user's machine. If it fails with auth errors,
 fall back to Option 1 (copy/paste).

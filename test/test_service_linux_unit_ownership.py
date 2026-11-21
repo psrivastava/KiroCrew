@@ -40,18 +40,17 @@ class TestLinuxServiceScopesOwnership:
     """
 
     @pytest.fixture(autouse=True)
-    # nosemgrep: kirocrew.test-autouse-shared-monkeypatch -- pre-existing autouse fixture on the shared monkeypatch, moved verbatim; tracked for a de-flake pass
-    def _not_root(self, monkeypatch, tmp_path):
+    def _not_root(self, _floor_monkeypatch, tmp_path):
         from kiro_crew.service import linux as svc_linux
 
-        monkeypatch.setattr(svc_linux.os, "geteuid", lambda: 1000, raising=False)
-        monkeypatch.setenv("USER", "tester")
+        _floor_monkeypatch.setattr(svc_linux.os, "geteuid", lambda: 1000, raising=False)
+        _floor_monkeypatch.setenv("USER", "tester")
         # No system unit file unless a test writes one: uninstall's system-scope
         # probe is a stat of this path. The per-user unit's own path is the
         # remedy's layout under tmp_path, so a test that writes there owns the
         # file by path and one that writes elsewhere owns it by the marker.
-        monkeypatch.setattr(svc_linux, "UNIT_PATH", tmp_path / "absent" / _UNIT)
-        monkeypatch.setattr(
+        _floor_monkeypatch.setattr(svc_linux, "UNIT_PATH", tmp_path / "absent" / _UNIT)
+        _floor_monkeypatch.setattr(
             svc_linux,
             "user_unit_file_path",
             lambda: tmp_path / ".config" / "systemd" / "user" / _UNIT,
@@ -114,7 +113,7 @@ class TestLinuxServiceScopesOwnership:
         assert rc == 0
         out = capsys.readouterr().out
         assert "system scope: stopped (its unit file " in out
-        assert "✅ kirocrew service stopped and removed." in out
+        assert "kirocrew service stopped and removed." in out
         assert "No kirocrew service was removed" not in out
 
     def test_a_running_system_unit_left_not_found_by_a_daemon_reload_is_refused_not_not_installed(
@@ -144,8 +143,9 @@ class TestLinuxServiceScopesOwnership:
         assert report.unfinished == frozenset({"system"})
         assert not any("stop" in c or "disable" in c or "rm" in c for c in run.calls), run.calls
         assert rc == 1
-        assert "⚠️ system scope: left in place (an active unit whose load state is not-found" in (
-            capsys.readouterr().out
+        assert (
+            "Warning: system scope: left in place (an active unit whose load state is not-found"
+            in (capsys.readouterr().out)
         )
 
     def test_a_runtime_masked_system_unit_with_no_file_is_reported_not_claimed_removed(self):

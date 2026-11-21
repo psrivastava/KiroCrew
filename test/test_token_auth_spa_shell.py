@@ -23,6 +23,7 @@ from aiohttp import web
 from token_auth_helpers import (  # noqa: F401 -- the autouse fixture registers by import
     _make_request,
     _ok_handler,
+    _session_token,
     clear_nonces,
 )
 
@@ -66,8 +67,7 @@ async def test_signin_recovery_preserves_destination_path() -> None:
     # was tapped (a session deep link, /chat?sid=...&token=<stale>, served 403
     # inline). It must round-trip that destination -- keep the path + query and
     # swap ONLY the pasted token -- instead of redirecting to the dashboard root
-    # and discarding /chat?sid=..., which is the "tap and get nowhere" dead end
-    # this PR exists to remove (UX stale-tap finding).
+    # and discarding /chat?sid=..., which is the "tap and get nowhere" dead end.
     mw = token_auth_middleware()
     req = _make_request(path="/dashboard", method="POST", remote="10.0.0.1")  # No token
     resp = await mw(req, _ok_handler)
@@ -300,7 +300,7 @@ async def test_shell_bypass_does_not_preempt_ip_mismatch() -> None:
     stays 403' invariant: this test fails if the bypass is ever moved above
     validation/IP-binding."""
     mw = token_auth_middleware(spa_shell_handler=_shell_handler)
-    token = generate_token("ipuser", ttl_seconds=300)
+    token = _session_token("ipuser", ttl_seconds=300)
     bind_token_ip(token, "10.0.0.1")
     mark_consumed(token)
     req = _make_request(

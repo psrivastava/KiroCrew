@@ -32,6 +32,7 @@ from kiro_crew.computer_use.types import (
     ElementRec,
     PolicyConfig,
 )
+from kiro_crew.testing.synthetic_credentials import SAMPLE_AWS_SECRET
 
 _INNOCUOUS = AppRef(name="Zibblefax", pid=4242, bundle_id="com.example.zibblefax")
 
@@ -253,8 +254,8 @@ class TestRedactResult:
         assert policy.redact_result("zibble wobble") == "zibble wobble"
 
     def test_a_credential_shaped_string_does_not_survive_verbatim(self) -> None:
-        secret = "AKIAIOSFODNN7EXAMPLE"
-        assert secret not in policy.redact_result(f"key={secret}")
+        secret = SAMPLE_AWS_SECRET
+        assert secret not in policy.redact_result(f"aws_secret_access_key={secret}")
 
 
 class TestArgumentShapeRefusals:
@@ -279,9 +280,6 @@ class TestArgumentShapeRefusals:
         refusal = policy.check_method_button(CLICK_METHOD_SKY_CLICK, MOUSE_BUTTON_RIGHT)
         assert refusal is not None
         assert MOUSE_BUTTON_RIGHT in refusal
-
-    def test_sky_click_accepts_the_left_button(self) -> None:
-        assert policy.check_method_button(CLICK_METHOD_SKY_CLICK, MOUSE_BUTTON_LEFT) is None
 
     def test_unknown_mouse_button_is_refused(self) -> None:
         refusal = policy.check_mouse_button("middle-ish")

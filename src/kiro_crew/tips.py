@@ -19,7 +19,8 @@ from typing import TYPE_CHECKING
 
 from aiohttp import web
 
-from kiro_crew.atomic_write import atomic_write
+from kiro_crew.atomic_write import atomic_write, read_bytes_with_retry
+from kiro_crew.background_failure_log import log_background_failure
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.config.paths import config_dir
 from kiro_crew.context import ContextBuilder, ui_language_tag
@@ -29,10 +30,11 @@ from kiro_crew.memory_stores import DEFAULT_MEMORY_STORE
 from kiro_crew.platform import PROFILE_STANDALONE, current_context, safe_context_call
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.tips_allowlist import TIP_DOC_ALLOWLIST
+from kiro_crew.tips_metrics import record_tip_feedback_metric, tip_metric_labels
 
-# Re-exported: ``tips.CatalogEntry`` is the historical import path, and the
-# dataclass moved to the import-light ``tips_pool`` so an edition composition
-# root can build a pool without importing this aiohttp-bearing module.
+# Re-exported: callers import ``tips.CatalogEntry``, while the dataclass lives in
+# the import-light ``tips_pool`` so an edition composition root can build a pool
+# without importing this aiohttp-bearing module.
 from kiro_crew.tips_pool import (
     PUBLIC_POOL_ID,
     WITHHELD_POOL_ID,
@@ -40,6 +42,7 @@ from kiro_crew.tips_pool import (
     TipsPool,
 )
 from kiro_crew.tips_text import first_prose_paragraph, strip_decoration, truncate_summary
+from kiro_crew.user_json import loads_user_json
 
 if TYPE_CHECKING:
     from kiro_crew.dashboard.state import DashboardState
@@ -208,6 +211,13 @@ class TipsState:
     # stable doc identity and doc-level dismissal would silently fail.
     # Bounded: pruned to the most recent 32 entries.
     shown_docs: dict[str, str] = field(default_factory=dict)
+    # In memory only, never saved. ``load_failed``: tips_state.json exists but
+    # could not be read, so these are defaults that must never replace it
+    # (_save_state skips the write, get_tips_cache does not keep it).
+    # ``unparseable``: it was read but did not parse, so the first save keeps
+    # its bytes aside as ``tips_state.json.corrupt-<UTC stamp>`` first.
+    load_failed: bool = field(default=False, compare=False)
+    unparseable: bool = field(default=False, compare=False)
 
 
 def _state_path() -> Path:
@@ -223,13 +233,26 @@ def _load_state() -> TipsState:
     if not path.exists():
         return TipsState()
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        raw = read_bytes_with_retry(path)
+    except FileNotFoundError:
+        return TipsState()
+    except OSError as exc:
+        # Present but unreadable (a sharing violation, EACCES, EIO): the
+        # defaults serve this request, and load_failed keeps them off disk.
+        logger.warning(
+            "%s could not be read (%s); using defaults without saving them",
+            path,
+            type(exc).__name__,
+        )
+        return TipsState(load_failed=True)
+    try:
+        data = loads_user_json(raw.decode("utf-8"))
         # Structural validation: a syntactically valid but
         # non-dict/mistyped state file must degrade to defaults, not raise and
         # 500 every tips endpoint until the file is repaired by hand.
         if not isinstance(data, dict):
             logger.warning("tips_state.json has non-dict root; using defaults")
-            return TipsState()
+            return TipsState(unparseable=True)
 
         def _typed(key: str, expected: type, default):  # type: ignore[no-untyped-def]
             v = data.get(key, default)
@@ -297,12 +320,15 @@ def _load_state() -> TipsState:
             ],
             offered=_sanitize_persisted_tip(data.get("offered")),
         )
-    except (OSError, ValueError, TypeError, OverflowError):
-        # ValueError covers json.JSONDecodeError; OverflowError defense-in-depth.
-        return TipsState()
+    except (ValueError, TypeError, OverflowError):
+        # ValueError covers json.JSONDecodeError and UnicodeDecodeError;
+        # OverflowError defense-in-depth.
+        logger.warning("%s could not be parsed; using defaults", path)
+        return TipsState(unparseable=True)
     # Outside the try: a migration bug must surface as an error, not silently
     # degrade to "discard all user state" via the except above.
     _migrate_relinked_curated_state(st)
+    _remove_retired_curated_state(st)
     return st
 
 
@@ -311,9 +337,42 @@ def _load_state() -> TipsState:
 # carry the catalog doc as these tips' identity, keeping the cross-suppression
 # the split fixes alive across the upgrade; _load_state migrates it.
 _RELINKED_CURATED_DOCS: dict[str, str] = {
-    "subagent-parallelism": "dynamic-subagent-sizing.md",
     "zero-token-cron": "cron-and-scheduling.md",
 }
+
+# Tips absent from the public pool. Retired ids name removed curated tips;
+# retired docs name docs dropped from the tip allowlist, so a generated tip
+# citing one (under whatever id it was given) is retired too.
+_RETIRED_CURATED_IDS = frozenset({"subagent-parallelism"})
+_RETIRED_TIP_DOCS = frozenset({"issue-radar-pipeline.md"})
+
+
+def _is_retired_tip(t: object) -> bool:
+    if not isinstance(t, dict):
+        return False
+    return t.get("id") in _RETIRED_CURATED_IDS or bool(
+        {t.get("doc"), t.get("doc_link")} & _RETIRED_TIP_DOCS
+    )
+
+
+def _remove_retired_curated_state(st: TipsState) -> None:
+    """Drop cached retired tips without transferring their feedback to new tips.
+
+    Run on every load, independently of the one-shot doc relink repair. Keep
+    dismissal, snooze and shown histories intact; they belong to the old IDs.
+    Only the public pool retired these tips: an edition pool may reuse an id or
+    doc for its own tip, so its state is left alone.
+    """
+    if st.pool_id != PUBLIC_POOL_ID:
+        return
+    st.tips = [t for t in st.tips if not _is_retired_tip(t)]
+    if _is_retired_tip(st.offered):
+        st.offered = None
+    st.shown_docs = {
+        tid: doc
+        for tid, doc in st.shown_docs.items()
+        if tid not in _RETIRED_CURATED_IDS and doc not in _RETIRED_TIP_DOCS
+    }
 
 
 def _migrate_relinked_curated_state(st: TipsState) -> None:
@@ -356,9 +415,36 @@ def _migrate_relinked_curated_state(st: TipsState) -> None:
     st.relink_migrated = True
 
 
+def _keep_unparseable_aside(path: Path) -> None:
+    """Rename *path* to ``<name>.corrupt-<UTC stamp>`` so a save never destroys it.
+
+    The file is renamed, never rewritten, so the copy holds the exact bytes. A
+    rename that fails raises ``OSError``, the same error a failed save raises.
+    """
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    target = path.with_name(f"{path.name}.corrupt-{stamp}")
+    suffix = 1
+    while target.exists() or target.is_symlink():
+        target = path.with_name(f"{path.name}.corrupt-{stamp}-{suffix}")
+        suffix += 1
+    try:
+        path.rename(target)
+    except FileNotFoundError:
+        return
+    logger.warning("%s could not be parsed; kept its contents at %s", path, target.name)
+
+
 def _save_state(st: TipsState) -> None:
     path = _state_path()
+    if st.load_failed:
+        # Defaults standing in for a file that could not be read: writing them
+        # would replace dismissals, snoozes and the opt-out the file holds.
+        logger.debug("tips state not saved: %s could not be read at load", path)
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
+    if st.unparseable:
+        _keep_unparseable_aside(path)
+        st.unparseable = False
     atomic_write(
         path,
         json.dumps(
@@ -410,6 +496,10 @@ class TipsCache:
     # user-facing pool. Empty by default so unit tests that build TipsCache()
     # directly are unaffected; populated only by get_tips_cache in production.
     curated: list[dict] = field(default_factory=list)  # type: ignore[type-arg]
+    # Edition curated tip ids the feedback counter may name (see
+    # ``TipsPool.metric_tip_ids``); empty for the public pool, whose shipped ids
+    # the counter already knows.
+    metric_tip_ids: frozenset[str] = frozenset()
     state: TipsState = field(default_factory=TipsState)
     # LoopBoundLock, not asyncio.Lock: the cache is stored on the
     # long-lived DashboardState, which outlives any single event loop.
@@ -491,11 +581,10 @@ _CURATED_FILE = Path(__file__).resolve().parent / "data" / "tips_curated.json"
 def _load_curated_tips() -> list[dict]:  # type: ignore[type-arg]
     """Load the hand-authored, action-first tips shipped with the package.
 
-    These cover KiroCrew-native features (keyboard shortcuts, Settings toggles,
-    config keys) that have no docs/*.md entry and so can never surface through
-    the doc-scan catalog. Each entry is validated through the SAME field checks
-    as generated tips (the allowlisted fields as strings, with optional fields
-    defaulting to ""; id/title/body non-empty).
+    These cover approved Kiro Crew behaviors, including capabilities that also
+    appear in the docs scan. Each entry is validated through the SAME field
+    checks as generated tips (the allowlisted fields as strings, with optional
+    fields defaulting to ""; id/title/body non-empty).
     Returns [] if the file is missing or malformed — a bad file must never
     crash cache init or take down the tips endpoints.
     """
@@ -606,6 +695,31 @@ def _sanitize_pool(pool: TipsPool) -> tuple[list[dict], list[CatalogEntry]]:  # 
     return curated, catalog
 
 
+# A tip id the feedback counter may carry as a name: a lowercase slug, the shape
+# every shipped curated id has.
+_METRIC_TIP_ID_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+_METRIC_TIP_ID_MAX_CHARS = 64
+
+
+def _pool_metric_tip_ids(pool: TipsPool, curated: list[dict]) -> frozenset[str]:  # type: ignore[type-arg]
+    """The ids in ``pool.metric_tip_ids`` that the feedback counter may name.
+
+    Kept only when the id is a short slug AND a curated tip of this pool that
+    passed validation, so the edition cannot name a tip it does not serve and
+    the value is always one the edition ships. Anything else is dropped, never
+    an error: a bad entry costs one name in the metrics, not the pool.
+    """
+    served = {t.get("id") for t in curated}
+    return frozenset(
+        i
+        for i in pool.metric_tip_ids
+        if isinstance(i, str)
+        and len(i) <= _METRIC_TIP_ID_MAX_CHARS
+        and _METRIC_TIP_ID_RE.fullmatch(i)
+        and i in served
+    )
+
+
 def _reconcile_pool(st: TipsState, pool_id: str) -> bool:
     """Drop cached tips that were generated against a DIFFERENT pool.
 
@@ -657,6 +771,7 @@ async def get_tips_cache(state: DashboardState) -> TipsCache:
                 loop = asyncio.get_running_loop()
                 pool = await loop.run_in_executor(None, _resolve_pool)
                 catalog: list[CatalogEntry]
+                metric_tip_ids: frozenset[str] = frozenset()
                 if pool is not None:
                     # Full replacement: neither the bundled/scanned public
                     # catalog nor the bundled curated file is consulted, so no
@@ -664,6 +779,7 @@ async def get_tips_cache(state: DashboardState) -> TipsCache:
                     # through the same validation as the public pool's.
                     curated, catalog = await loop.run_in_executor(None, _sanitize_pool, pool)
                     pool_id = pool.pool_id
+                    metric_tip_ids = _pool_metric_tip_ids(pool, curated)
                     logger.debug(
                         "Tips pool %r composed by the edition (%d curated, %d catalog)",
                         pool_id,
@@ -705,7 +821,12 @@ async def get_tips_cache(state: DashboardState) -> TipsCache:
                 cache = TipsCache()
                 cache.catalog = catalog
                 cache.curated = curated
+                cache.metric_tip_ids = metric_tip_ids
                 cache.state = st
+                if st.load_failed:
+                    # Serve this request from defaults, but keep nothing: the
+                    # next request reads the file again.
+                    return cache
                 state._tips_cache = cache  # type: ignore[attr-defined]
     return state._tips_cache  # type: ignore[attr-defined]
 
@@ -723,7 +844,9 @@ def _select_tip(
 
     Weight = recency_decay ** tier, where the tier ranks a tip's catalog recency
     (doc file mtime) among the distinct mtimes present, newest first. Tips
-    sharing an mtime are equally recent and so share a tier and a weight.
+    sharing an mtime are equally recent and so share a tier and a weight. A tip
+    with no catalog doc or id match has no recency signal; all such tips share
+    the oldest tier.
     """
     if not candidates:
         return None
@@ -733,7 +856,7 @@ def _select_tip(
 
     # Build mtime lookups from catalog: key by doc filename (authoritative —
     # LLM-generated tips carry the catalog doc in "doc" but usually invent
-    # their own id, so id-keyed lookup alone degenerates to insertion order)
+    # their own id, so id-keyed lookup alone would leave them no recency)
     # and by the catalog-derived id (for catalog fallback
     # tips whose doc field may have been sanitized away).
     mtime_by_doc: dict[str, float] = {entry.doc: entry.mtime for entry in catalog}
@@ -741,17 +864,19 @@ def _select_tip(
         entry.doc.replace(".md", "-tip"): entry.mtime for entry in catalog
     }
 
-    def _tip_mtime(t: dict, index: int) -> float:  # type: ignore[type-arg]
+    def _tip_mtime(t: dict) -> float:  # type: ignore[type-arg]
         doc = t.get("doc", "")
         if doc in mtime_by_doc:
             return mtime_by_doc[doc]
         tid = t.get("id", "")
         if tid in mtime_by_id:
             return mtime_by_id[tid]
-        # Unknown provenance: insertion order as a stable last-resort proxy
-        return float(index)
+        # Unknown provenance (a curated tip carries no catalog doc): no recency
+        # signal, so all such tips share the oldest tier and are picked
+        # uniformly within it. List position must not rank them.
+        return 0.0
 
-    mtimes = {id(t): _tip_mtime(t, i) for i, t in enumerate(candidates)}
+    mtimes = {id(t): _tip_mtime(t) for t in candidates}
 
     # Sort candidates newest-first by mtime
     sorted_candidates = sorted(candidates, key=lambda t: mtimes[id(t)], reverse=True)
@@ -761,11 +886,9 @@ def _select_tip(
     #
     # Ranking by list position instead would make a stable sort's tie order --
     # catalog insertion order, i.e. alphabetical by doc filename -- decide
-    # exposure among tips that are equally recent. That is not hypothetical: one
-    # sweeping commit that edits many docs at once gives every doc it touches the
-    # same git commit time, collapsing them into a single large tie group whose
-    # tail then sits at 0.6**20 and is effectively never surfaced. Tips that are
-    # equally recent must carry equal weight.
+    # exposure among tips that are equally recent. One commit that edits many
+    # docs gives them all the same commit time, and the tail of that tie group
+    # would sit at 0.6**20 and never surface. Equally recent tips carry equal weight.
     tier_of = {
         mtime: tier
         for tier, mtime in enumerate(sorted({mtimes[id(t)] for t in candidates}, reverse=True))
@@ -1142,8 +1265,8 @@ async def generate_tips(state: DashboardState) -> list[dict]:  # type: ignore[ty
         text = await run_bg_oneliner(
             state.sessions, prompt, model=tips_model, sel_source="tips", timeout=90
         )
-    except Exception:
-        logger.warning("Tips generation failed; using catalog fallback", exc_info=True)
+    except Exception as exc:
+        log_background_failure(logger, "Tips generation failed; using catalog fallback", exc)
         return _fallback_tips(cache.catalog, st)
 
     tips = _parse_tips(text, allowed_docs={e.doc for e in cache.catalog})
@@ -1162,8 +1285,8 @@ async def refresh_tips(state: DashboardState, cache: TipsCache) -> None:
     """
     try:
         tips = await generate_tips(state)
-    except Exception:
-        logger.warning("Tips generation failed", exc_info=True)
+    except Exception as exc:
+        log_background_failure(logger, "Tips generation failed", exc)
         return
     async with cache._lock:
         cache.state.tips = tips
@@ -1209,7 +1332,10 @@ async def api_tips_next(request: web.Request) -> web.Response:
     cache = await get_tips_cache(state)
     st = cache.state
 
-    if st.opted_out:
+    if st.opted_out or st.load_failed:
+        # load_failed: the saved state (an opt-out, the cadence, a running
+        # generation) is unknown, so serve nothing and start no generation
+        # until a read succeeds.
         return web.Response(status=204)
 
     # Trigger background refresh if stale
@@ -1242,9 +1368,9 @@ async def api_tips_next(request: web.Request) -> web.Response:
         if not cadence_open:
             return web.json_response({"tip": None, "glow": False})
 
-        # Gather eligible candidates. Curated actionable tips (hand-authored,
-        # action-first, for features with no docs entry) are the primary pool;
-        # LLM-generated tips augment them. Dedupe by id — curated wins.
+        # Gather eligible candidates. Curated actionable tips (hand-authored
+        # and action-first) are the primary pool; LLM-generated tips augment
+        # them. Dedupe by id — curated wins.
         curated_candidates = [t for t in cache.curated if _is_eligible(t, st, now, snooze_hours)]
         curated_ids = {t.get("id", "") for t in curated_candidates}
         generated_candidates = [
@@ -1327,6 +1453,21 @@ async def api_tips_status(request: web.Request) -> web.Response:
     )
 
 
+async def api_tips_all(request: web.Request) -> web.Response:
+    """GET /api/tips/all — every curated tip of the active pool, for Settings to list.
+
+    Read-only: it records no feedback and ignores dismissals, snoozes and the
+    opt-out, so a tip the user dismissed can be found again. Empty when
+    ``tips_enabled`` is off.
+    """
+    loop = asyncio.get_running_loop()
+    cfg = await loop.run_in_executor(None, KiroCrewConfig.load)
+    if not cfg.dashboard.tips_enabled:
+        return web.json_response({"tips": []})
+    cache = await get_tips_cache(request.app["state"])
+    return web.json_response({"tips": _redact_tips(cache.curated)})
+
+
 # Cap on the `id` a feedback call may name. Tip ids are catalog- or
 # curated-authored slugs; the bound exists so an unbounded client string is
 # never carried into the persisted dismissal state.
@@ -1388,9 +1529,21 @@ async def api_tips_feedback(request: web.Request) -> web.Response:
     if action not in valid_actions:
         return web.json_response({"error": "invalid action", "code": "invalid_action"}, status=400)
 
+    if st.load_failed:
+        # The saved state could not be read, so this action cannot be saved
+        # without replacing it. Say so rather than answer ok for a dropped
+        # dismissal or opt-out; the next request reads the file again.
+        return web.json_response(
+            {"error": "tips state could not be read; try again", "code": "tips_state_unreadable"},
+            status=503,
+        )
+
     now = time.time()
 
     async with cache._lock:
+        # Labelled BEFORE the action mutates state: "shown" and "ack" clear the
+        # offered tip, which is one of the places the doc is read from.
+        tip_source, tip_doc = tip_metric_labels(cache, st, tip_id)
         if action == "shown":
             # Display-time signal: start cadence + release the offered slot, but
             # keep the tip eligible (NOT dismissed) for future re-selection.
@@ -1466,4 +1619,5 @@ async def api_tips_feedback(request: web.Request) -> web.Response:
 
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, _save_state, st)
+    record_tip_feedback_metric(action, tip_source, tip_doc, tip_id, cache.metric_tip_ids)
     return web.json_response({"ok": True})

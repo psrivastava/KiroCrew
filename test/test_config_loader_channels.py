@@ -1,6 +1,6 @@
 """The messaging channel sections load fail-closed.
 
-Slack reactions, tracking channels, enterprise ids and the Home tab cap; the
+Slack reactions, tracking channels, enterprise ids, the Home tab cap and switch; the
 Feishu, Telegram and WeChat (``weixin``) allow-lists; the legacy ``wechat`` key
 that still populates WeCom; and the shared ``messaging`` scope and reset fields. A
 malformed value degrades to the safe default, never to an open gate. The WeCom
@@ -13,21 +13,33 @@ import json
 import unittest.mock
 from pathlib import Path
 
+import pytest
 from config_loader_helpers import _load_from_dict, _load_from_dict_with_logs
 
 from kiro_crew.config.loader import KiroCrewConfig
 
 
 def test_slack_home_tab_sessions_per_kind_parsed_and_round_trips():
-    # Regression: slack.home_tab_sessions_per_kind was declared + consumed (the
-    # Slack Home Tab per-category cap) and emitted by to_dict(), but NOT parsed
-    # in load(), so an operator value was silently ignored (stuck at 5) and
-    # overwritten on the next save().
+    # load() must parse this Home Tab per-category cap that to_dict() emits, or an
+    # operator value is ignored and overwritten on the next save().
     loaded = _load_from_dict({"slack": {"home_tab_sessions_per_kind": 42}})
     assert loaded.slack.home_tab_sessions_per_kind == 42
     # Survives a to_dict() -> load() round-trip.
     reloaded = _load_from_dict(loaded.to_dict())
     assert reloaded.slack.home_tab_sessions_per_kind == 42
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [(False, False), (True, True), ("false", True), (0, True), (None, True)],
+)
+def test_slack_home_tab_builtin_reads_true_unless_stored_false(stored, expected):
+    # Only a real boolean false turns the built-in Home tab page off; a missing or
+    # non-boolean value keeps it, and the value survives a round-trip.
+    loaded = _load_from_dict({"slack": {"home_tab_builtin": stored}})
+    assert loaded.slack.home_tab_builtin is expected
+    assert _load_from_dict(loaded.to_dict()).slack.home_tab_builtin is expected
+    assert _load_from_dict({"slack": {}}).slack.home_tab_builtin is True
 
 
 class TestReactionsEmptyStringFiltering:
@@ -179,11 +191,8 @@ class TestAllowedEnterpriseIdsFiltering:
 class TestFeishuConfigCoercionFailsClosed:
     """A malformed feishu section must degrade to deny, never open a gate.
 
-    Two layers hold this: the schema type check rejects a wrong-typed value and
-    substitutes the field default, and the per-channel parse uses ``_safe_bool``
-    / ``_coerce_opaque_str_ids`` rather than raw ``bool()`` and comprehensions.
-    These tests pin the OBSERVABLE end state, so the guarantee survives either
-    layer being refactored.
+    The schema type check and the ``_safe_bool`` / ``_coerce_opaque_str_ids`` parse
+    both hold it; the tests pin the OBSERVABLE end state so either can be refactored.
     """
 
     def test_string_false_does_not_open_the_group_gate(self) -> None:

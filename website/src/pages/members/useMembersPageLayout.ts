@@ -8,10 +8,10 @@
  * a component's effects in registration order, so moving one is a behaviour
  * change even when every test of the moved code still passes.
  */
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type SetStateAction } from 'react'
 import { isAssistantMember } from '../../lib/assistantMember'
 import { usePersistedBool } from '../../hooks/usePersistedBool'
-import { safeGetSessionItem, safeSetSessionItem } from '../../utils/safeStorage'
+import { safeGetItem, safeGetSessionItem, safeSetItem, safeSetSessionItem } from '../../utils/safeStorage'
 import { useIsMobile } from '../../hooks/useIsMobile'
 import { hasNoCrewmates } from './rosterFilter'
 import { useMobileRosterBar, type MobileRosterBarState } from '../../components/MobileNavRailContext'
@@ -21,17 +21,43 @@ import { loadRosterWidth, panelChrome, panelSitsBeside, ROSTER_MAX, ROSTER_MIN, 
 import { type MembersPageRosterRead } from './useMembersPageRoster'
 import { type MembersPageTeamsRead } from './useMembersPageTeams'
 
-/** Whether the DOCKED side panel is shown. Same `mc-` family and the same one
- *  key per origin as the roster filters (MembersPageRoster.tsx): the panel is
- *  the page's furniture, not a per-member state, so the choice follows the user
- *  across members and reloads exactly as the chat page's own panel flag does. */
+/** Whether the DOCKED side panel is shown, for a crewmate with no choice of its
+ *  own (`MEMBER_PANEL_OPEN_PREFIX`). Read, live-synced across tabs, never
+ *  written by a toggle: it holds the default, or a page-wide choice already
+ *  saved under it. */
 const PANEL_OPEN_KEY = 'mc-members-panel-open'
+
+/** One crewmate's own docked-panel choice, `mc-members-panel-open:<name>`, so
+ *  switching crewmates shows each one's panel as it was left there, the way the
+ *  chat page keeps one flag per chat (`mc-activity-open:<slot>`). Keyed by the
+ *  member NAME, not the slot key: the slot is unknown until the thread POST
+ *  confirms it, and the name is what the route carries. Not swept by
+ *  `utils/storageGc.ts`, whose prefixes are keyed by session id.
+ *  shortcut: a removed crewmate's key stays in localStorage; add a sweep if
+ *  rosters ever churn. */
+const MEMBER_PANEL_OPEN_PREFIX = 'mc-members-panel-open:'
+
+function readMemberPanelOpen(name: string): boolean | null {
+  if (!name) return null
+  const v = safeGetItem(MEMBER_PANEL_OPEN_PREFIX + name)
+  return v === null ? null : v === '1'
+}
 
 /** The Assistant's docked panel choice, hidden until the user opens it. The
  *  Assistant is the landing chat for a first-time user, so its page opens on
  *  the conversation alone; opening the panel there is remembered here without
  *  moving the choice every other crewmate reads from `PANEL_OPEN_KEY`. */
 const ASSISTANT_PANEL_OPEN_KEY = 'mc-members-assistant-panel-open'
+
+/** Whether the OVERLAID side panel is up, on a desktop window too narrow to
+ *  dock it (issue #27334). Its own key, apart from `PANEL_OPEN_KEY`: dismissing
+ *  the narrow overlay must not hide the docked column the next time the window
+ *  widens. A visit wide enough to dock clears it, so an old overlay cannot lie
+ *  in wait and pop over the thread later. The Assistant keeps its own, as it
+ *  does for the docked column. A phone never reads or writes either: there the
+ *  overlay fills the viewport, so it stays a per-visit choice. */
+const OVERLAY_OPEN_KEY = 'mc-members-overlay-open'
+const ASSISTANT_OVERLAY_OPEN_KEY = 'mc-members-assistant-overlay-open'
 
 /** Whether "Show the full roster" pinned the roster beside the thread. Per tab
  *  (sessionStorage), so it survives leaving the page and coming back, not a
@@ -145,23 +171,70 @@ export function useMembersPageLayout({ rosterRead, teamsRead, activeName }: Memb
   // the phone, where the panel keeps its own resizable width in both
   // placements — the docked/overlay split is panelSitsBeside's, not this.
   const panelFillWidth = isMobile ? Math.max(SIDE_PANEL_MIN_W, winW) : undefined
-  const [overlayOpen, setOverlayOpen] = useState(false)
-  // `overlayOpen` is overlay-mode state only. Reset it whenever the panel docks
-  // (a widening window, a narrower roster), so an open overlay does not lie in
-  // wait and pop back over the thread the moment the window narrows again.
-  useEffect(() => { if (beside) setOverlayOpen(false) }, [beside])
+  const onAssistant = useMemo(() => {
+    const open = members.find((m) => m.name === activeName)
+    return !!open && isAssistantMember(open)
+  }, [members, activeName])
+  // `overlayOpen` is overlay-mode state only. On a desktop window it is
+  // remembered (OVERLAY_OPEN_KEY); on a phone it is per visit.
+  const [memberOverlaySaved, setMemberOverlaySaved] = usePersistedBool(OVERLAY_OPEN_KEY, false)
+  const [assistantOverlaySaved, setAssistantOverlaySaved] = usePersistedBool(ASSISTANT_OVERLAY_OPEN_KEY, false)
+  const [phoneOverlayOpen, setPhoneOverlayOpen] = useState(false)
+  const overlayOpen = isMobile ? phoneOverlayOpen : onAssistant ? assistantOverlaySaved : memberOverlaySaved
+  const setOverlayOpen = isMobile ? setPhoneOverlayOpen : onAssistant ? setAssistantOverlaySaved : setMemberOverlaySaved
+  // Reset it whenever the panel docks (a widening window, a narrower roster),
+  // so an open overlay does not lie in wait and pop back over the thread the
+  // moment the window narrows again -- this visit or a later one.
+  useEffect(() => {
+    if (!beside) return
+    setPhoneOverlayOpen(false)
+    setMemberOverlaySaved(false)
+    setAssistantOverlaySaved(false)
+  }, [beside, setMemberOverlaySaved, setAssistantOverlaySaved])
   // Docked visibility, persisted and cross-window synced, shown by default so
   // the page opens the way it always has. Kept SEPARATE from `overlayOpen`
   // because the two placements answer different questions — whether the
   // permanent column is wanted at all, and whether the drawer is up right now
   // — so dismissing the drawer must not also hide the column the next time the
   // window widens.
-  const [memberDockedOpen, setMemberDockedOpen] = usePersistedBool(PANEL_OPEN_KEY, true)
+  // Per crewmate: its own saved choice, else the bare key (shown by default).
+  // A toggle writes the crewmate's own key only, so closing the panel on one
+  // crewmate leaves every other crewmate's panel as it was. A `Map`, not an
+  // object, so a crewmate named after an `Object.prototype` key (`constructor`)
+  // never reads an inherited value in place of its saved choice.
+  const [lastDockedOpen] = usePersistedBool(PANEL_OPEN_KEY, true)
+  const [ownDockedOpen, setOwnDockedOpen] = useState<ReadonlyMap<string, boolean>>(() => new Map())
+  // Cross-window sync, as the bare key has through usePersistedBool: another
+  // window's toggle (the DOM `storage` event) replaces this window's cached
+  // choice for that crewmate, a removed key drops it, and a cleared store
+  // drops them all. Nothing received is written back.
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === null) { setOwnDockedOpen(new Map()); return }
+      if (!e.key.startsWith(MEMBER_PANEL_OPEN_PREFIX)) return
+      const name = e.key.slice(MEMBER_PANEL_OPEN_PREFIX.length)
+      setOwnDockedOpen((m) => {
+        const next = new Map(m)
+        if (e.newValue === null) next.delete(name)
+        else next.set(name, e.newValue === '1')
+        return next
+      })
+    }
+    window.addEventListener('storage', onStorage)
+    return () => window.removeEventListener('storage', onStorage)
+  }, [])
+  const memberOwnDocked = useMemo(
+    () => ownDockedOpen.get(activeName) ?? readMemberPanelOpen(activeName),
+    [ownDockedOpen, activeName],
+  )
+  const memberDockedOpen = memberOwnDocked ?? lastDockedOpen
+  const setMemberDockedOpen = useCallback((next: SetStateAction<boolean>) => {
+    const value = typeof next === 'function' ? next(memberDockedOpen) : next
+    if (!activeName) return
+    safeSetItem(MEMBER_PANEL_OPEN_PREFIX + activeName, value ? '1' : '0')
+    setOwnDockedOpen((m) => (m.get(activeName) === value ? m : new Map(m).set(activeName, value)))
+  }, [activeName, memberDockedOpen])
   const [assistantDockedOpen, setAssistantDockedOpen] = usePersistedBool(ASSISTANT_PANEL_OPEN_KEY, false)
-  const onAssistant = useMemo(() => {
-    const open = members.find((m) => m.name === activeName)
-    return !!open && isAssistantMember(open)
-  }, [members, activeName])
   const dockedOpen = onAssistant ? assistantDockedOpen : memberDockedOpen
   const setDockedOpen = onAssistant ? setAssistantDockedOpen : setMemberDockedOpen
   const { panelVisible, showOpener } = panelChrome({ beside, dockedOpen, overlayOpen })

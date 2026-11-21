@@ -307,6 +307,43 @@ describe('WebexPanel allowed-email editor', () => {
 /* ── save payload ─────────────────────────────────────────────────────────── */
 
 describe('WebexPanel save payload', () => {
+  it('keeps an address added while the save was in flight', async () => {
+    const { settle } = seed({}, { save: { pending: true } })
+    await hydrated()
+    // The refetch after the save answers a changed config (now connected)
+    // that still holds only the first address.
+    vi.mocked(api.getWebexConfig).mockResolvedValue(config({ connected: true, configured: true }))
+    fireEvent.click(saveBtn())
+    fireEvent.change(emailInput(), { target: { value: 'during-save@example.com' } })
+    fireEvent.keyDown(emailInput(), { key: 'Enter' })
+    await act(async () => { settle(OK) })
+    await waitFor(() => expect(vi.mocked(api.getWebexConfig).mock.calls.length).toBeGreaterThan(1))
+    await screen.findByText('Active')
+    expect(screen.getByText('during-save@example.com')).toBeInTheDocument()
+  })
+  it('keeps a folder name cleared while a named folder was being saved', async () => {
+    const { settle } = seed({ session_folder: 'Work' }, { save: { pending: true } })
+    await hydrated()
+    vi.mocked(api.getWebexConfig).mockResolvedValue(config({ session_folder: 'Work', connected: true }))
+    fireEvent.click(saveBtn())
+    fireEvent.change(screen.getByPlaceholderText('Webex'), { target: { value: '' } })
+    await act(async () => { settle(OK) })
+    await screen.findByText('Active')
+    expect(screen.getByPlaceholderText('Webex')).toHaveValue('')
+  })
+  it('keeps a token typed during the first token save in its editor', async () => {
+    const { settle } = seed({}, { save: { pending: true } })
+    await hydrated()
+    vi.mocked(api.getWebexConfig).mockResolvedValue(
+      config({ connected: true, bot_token_set: true, bot_token_preview: 'Zm9v••••abcd' }),
+    )
+    fireEvent.change(screen.getByLabelText('Webex bot token'), { target: { value: 'first-token' } })
+    fireEvent.click(saveBtn())
+    fireEvent.change(screen.getByLabelText('Webex bot token'), { target: { value: 'second-token' } })
+    await act(async () => { settle(OK) })
+    await screen.findByText('Active')
+    expect(screen.getByLabelText('Webex bot token')).toHaveValue('second-token')
+  })
   it('forwards the enable toggle with an unfiled folder and reports success', async () => {
     const { save } = seed()
     await hydrated()
@@ -572,8 +609,9 @@ describe('WebexPanel group spaces', () => {
     seed({ allow_group_rooms: true })
     await hydrated()
 
+    expect(screen.getByText('Empty means no space is answered.')).toBeInTheDocument()
     expect(
-      screen.getByText(/turning the switch on alone grants nothing/i),
+      screen.getByTitle(/turning the switch on alone grants nothing/i),
     ).toBeInTheDocument()
   })
 
@@ -622,7 +660,7 @@ describe('WebexPanel group spaces', () => {
     seed({ allow_group_rooms: true })
     await hydrated()
 
-    expect(screen.getByText(/webexapis\.com\/v1\/rooms/)).toBeInTheDocument()
+    expect(screen.getByTitle(/webexapis\.com\/v1\/rooms/)).toBeInTheDocument()
   })
 })
 
@@ -648,7 +686,13 @@ describe('WebexPanel threshold validation', () => {
     fireEvent.click(saveBtn())
 
     expect(save).not.toHaveBeenCalled()
-    expect(await screen.findByText(/Hard context threshold must be a whole number/i)).toBeInTheDocument()
+    const error = await screen.findByText(/Hard context threshold must be a whole number/i)
+    // Announced, and tied to the hard field it is about, not to the valid soft one.
+    const alert = error.closest('[role="alert"]') as HTMLElement
+    expect(alert).not.toBeNull()
+    expect(screen.getByDisplayValue('140')).toHaveAttribute('aria-describedby', alert.id)
+    expect(screen.getByDisplayValue('140')).toHaveAttribute('aria-invalid', 'true')
+    expect(screen.getByDisplayValue('80')).not.toHaveAttribute('aria-invalid')
   })
 
   it('refuses an inverted pair rather than letting the server reorder it', async () => {

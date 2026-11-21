@@ -45,7 +45,10 @@ class TestGenerateSourceSummary:
         """Should return early when items have no summaries."""
         sid = store.add_source("test", "local_file", "/tmp/test.md")
         store.add_item("title", "content", "doc", source_id=sid)  # no summary
+        pipeline.extractor._pool.send.return_value = '{"topic": "made up", "themes": ["x"]}'
         await pipeline.generate_source_summary(sid)
+        row = store.db.execute("SELECT summary_topic FROM sources WHERE id = ?", (sid,)).fetchone()
+        assert row["summary_topic"] is None
         pipeline.extractor._pool.send.assert_not_called()
 
     @pytest.mark.asyncio
@@ -78,13 +81,18 @@ class TestGenerateSourceSummary:
         """Themes containing sensitive content should be dropped (not fall back to original)."""
         sid = store.add_source("test", "local_file", "/tmp/test.md")
         store.add_item("title", "content", "doc", source_id=sid, summary="Some summary")
+        from redaction_structured_cases import github_classic
+
+        token = github_classic(seed=59)
         # Simulate LLM returning a theme that _redact strips entirely
-        pipeline.extractor._pool.send.return_value = '{"topic": "safe topic", "themes": ["safe", "AKIA1234567890ABCDEF"]}'
+        pipeline.extractor._pool.send.return_value = json.dumps(
+            {"topic": "safe topic", "themes": ["safe", token]}
+        )
         await pipeline.generate_source_summary(sid)
         row = store.db.execute("SELECT summary_themes FROM sources WHERE id = ?", (sid,)).fetchone()
         themes = json.loads(row["summary_themes"])
-        # The AWS key pattern should be redacted away, not preserved via 'or t'
-        assert "AKIA1234567890ABCDEF" not in str(themes)
+        # The token should be redacted away, not preserved via 'or t'
+        assert token not in str(themes)
 
     @pytest.mark.asyncio
     async def test_handles_malformed_llm_response(self, pipeline, store):

@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextvars import ContextVar
 from pathlib import Path
 
@@ -36,14 +36,38 @@ from kiro_crew.hooks import is_unc_shape, unc_probe_allowed
 # `D:\Users\...`, so backslash and the drive-letter colon MUST be allowed there or
 # EVERY Windows hook path is rejected (autoimport silently loads nothing). `\` and
 # `:` are not shell-injection vectors for an argv path, and the is_sensitive_path
-# + absolute-path + resolve() checks below still apply. POSIX keeps the original,
-# tighter allowlist (no backslash/colon).
+# + absolute-path + resolve() checks below still apply. A Windows profile folder is
+# often named after its owner (`C:\Users\José`), and autoimport scans under it, so
+# the Windows class also admits Unicode letters and digits: `\w` in a str pattern,
+# which still refuses the space, every shell metacharacter and their fullwidth
+# forms. POSIX keeps the original, tighter allowlist (ASCII, no backslash/colon).
 if platform_compat.IS_WINDOWS:
-    _SAFE_PATH_RE = re.compile(r"^[a-zA-Z0-9/_.\-\\:]+$")
+    _SAFE_PATH_RE = re.compile(r"^[\w/.\-\\:]+$")
 else:
     _SAFE_PATH_RE = re.compile(r"^[a-zA-Z0-9/_.\-]+$")
 _SAFE_MATCHER_RE = re.compile(r"^[a-zA-Z0-9_.*\-]+$")
 _MAX_MATCHER_LEN = 200
+# kiro-cli's own matcher for MCP tools: ``@server`` (every tool of one server) or
+# ``@server/tool`` (one tool, where the tool part may glob with ``*``). kiro-cli
+# documents both, and ``_SAFE_MATCHER_RE`` has no ``@`` or ``/``, so this pattern is
+# what lets a config hook scoped to an MCP server reach the materialized spec.
+# The server part takes a non-leading ``:`` because an app's bridge is keyed
+# ``<app>:<server>`` in the spec (``action-radar:ledger``); it never holds a ``/``,
+# which ``mcp_server_alias`` strips from every key.
+_KIRO_CLI_MCP_MATCHER_RE = re.compile(r"@[A-Za-z0-9_.\-][A-Za-z0-9_.:\-]*(?:/[A-Za-z0-9_.*\-]+)?")
+
+
+def _first_refused_char(text: str) -> str:
+    """The first character of ``text`` the hook-path class refuses, rendered for a log.
+
+    A refused-path warning names it, so a user whose hook did not load can see which
+    character in the folder name stopped it. ``ascii`` keeps a control character or a
+    look-alike visible; the code point removes any doubt about which one it was.
+    """
+    for char in text:
+        if not _SAFE_PATH_RE.match(char):
+            return f"{char!a} (U+{ord(char):04X})"
+    return "none (empty path)"
 
 
 def _validate_hook_command(command: str, event: str) -> str | None:
@@ -59,8 +83,9 @@ def _validate_hook_command(command: str, event: str) -> str | None:
     # first — the same rule the SEL writer applies on its own side.
     if not _SAFE_PATH_RE.match(command):
         agent_mod.logger.warning(
-            "kiro_hooks[%s]: command contains disallowed characters: %s",
+            "kiro_hooks[%s]: command contains disallowed characters (first refused: %s): %s",
             event,
+            _first_refused_char(command),
             agent_mod._hook_diagnostic(command),
         )
         return None
@@ -88,8 +113,9 @@ def _validate_hook_command(command: str, event: str) -> str | None:
         return None
     if not _SAFE_PATH_RE.match(resolved):
         agent_mod.logger.warning(
-            "kiro_hooks[%s]: resolved path contains disallowed characters: %s",
+            "kiro_hooks[%s]: resolved path contains disallowed characters (first refused: %s): %s",
             event,
+            _first_refused_char(resolved),
             agent_mod._hook_diagnostic(resolved),
         )
         return None
@@ -112,7 +138,13 @@ def _validate_hook_command(command: str, event: str) -> str | None:
 # specs (kiro-cli rejects unknown keys). Excluded when deriving _VALID_HOOK_EVENTS
 # from bundled defaults below, so an internal key never round-trips as an event.
 _INTERNAL_HOOK_KEYS = frozenset(
-    {"auto_approve_tools", "auto_deny_tools", "auto_replies", "transforms"}
+    {
+        "auto_approve_tools",
+        "auto_approve_tool_identities",
+        "auto_deny_tools",
+        "auto_replies",
+        "transforms",
+    }
 )
 
 # Valid kiro-cli hook event names — the UNION of the hardcoded baseline (kiro-cli's
@@ -343,6 +375,24 @@ def _hook_matcher_ok(matcher: object) -> bool:
     )
 
 
+def _kiro_cli_matcher_ok(matcher: object) -> bool:
+    """Whether ``matcher`` can go into the spec kiro-cli runs itself.
+
+    The object form's rules (:func:`_hook_matcher_ok`), plus kiro-cli's MCP forms
+    ``@server`` and ``@server/tool`` under the same length cap. Only the paths that
+    write the kiro-cli spec use it: the config merge, the config array form and
+    autoimport headers. Hooks Crew fires itself keep their own rule
+    (``agent_sdk.spec_hooks._matcher_ok``).
+    """
+    if _hook_matcher_ok(matcher):
+        return True
+    return (
+        isinstance(matcher, str)
+        and len(matcher) <= _MAX_MATCHER_LEN
+        and _KIRO_CLI_MCP_MATCHER_RE.fullmatch(matcher) is not None
+    )
+
+
 def _event_for_hook_trigger(trigger: object) -> str | None:
     """kiro-cli event name a document's trigger can be emitted as, or None."""
     if not isinstance(trigger, str):
@@ -393,8 +443,14 @@ def _hook_document_action(action: object, *, index: int) -> dict | None:
     return {"type": action_type, payload_key: payload}
 
 
-def _hook_document_from_document(entry: object, *, index: int) -> dict | None:
-    """Validate one KAS hook document, returning the normalized copy or None."""
+def _hook_document_from_document(
+    entry: object, *, index: int, matcher_ok: Callable[[object], bool] = _hook_matcher_ok
+) -> dict | None:
+    """Validate one KAS hook document, returning the normalized copy or None.
+
+    *matcher_ok* is the matcher rule: the object form's by default, which is what
+    kiro-cli's materialized spec receives.
+    """
     if not isinstance(entry, dict):
         _document_warning("kiro_hooks[%d]: hook document is not an object, skipping", index)
         _document_rejected(_HOOK_SPEC_AUDIT_TAG, str(entry), "hook document is not an object")
@@ -448,7 +504,7 @@ def _hook_document_from_document(entry: object, *, index: int) -> dict | None:
         _document_warning("kiro_hooks[%d]: name is empty, skipping", index)
         _document_rejected(_HOOK_SPEC_AUDIT_TAG, "", "name is empty")
         return None
-    if "matcher" in entry and not _hook_matcher_ok(entry["matcher"]):
+    if "matcher" in entry and not matcher_ok(entry["matcher"]):
         _document_warning(
             "kiro_hooks[%d]: matcher contains disallowed characters or is too long, skipping", index
         )
@@ -469,7 +525,9 @@ def _hook_document_from_document(entry: object, *, index: int) -> dict | None:
     return doc
 
 
-def _hook_documents_from_array_form(hooks: list) -> list[dict]:
+def _hook_documents_from_array_form(
+    hooks: list, matcher_ok: Callable[[object], bool] = _hook_matcher_ok
+) -> list[dict]:
     """Normalize a KAS array of hook documents to the document list."""
     if len(hooks) > _MAX_SPEC_HOOK_DOCUMENTS:
         _document_warning(
@@ -480,14 +538,20 @@ def _hook_documents_from_array_form(hooks: list) -> list[dict]:
         _document_rejected(_HOOK_SPEC_AUDIT_TAG, str(len(hooks)), "document limit exceeded")
     docs: list[dict] = []
     for index, entry in enumerate(hooks[:_MAX_SPEC_HOOK_DOCUMENTS]):
-        doc = _hook_document_from_document(entry, index=index)
+        doc = _hook_document_from_document(entry, index=index, matcher_ok=matcher_ok)
         if doc is not None:
             docs.append(doc)
     return docs
 
 
-def normalize_spec_hooks(value: object) -> list[dict]:
+def normalize_spec_hooks(
+    value: object, *, matcher_ok: Callable[[object], bool] = _hook_matcher_ok
+) -> list[dict]:
     """Normalize a KAS array of hook documents to the internal document list.
+
+    *matcher_ok* defaults to the object form's matcher rule, which kiro-cli's
+    materialized spec keeps. Crew's own spec-hook conversion passes its wider
+    rule (``agent_sdk.spec_hooks._matcher_ok``), since it fires the hooks itself.
 
     A rejected element is warned about and SEL-audited rather than raising, which
     is how a spec's ``hooks`` has always treated bad input.
@@ -501,7 +565,7 @@ def normalize_spec_hooks(value: object) -> list[dict]:
     straight to that merge instead.
     """
     if isinstance(value, list):
-        return _hook_documents_from_array_form(value)
+        return _hook_documents_from_array_form(value, matcher_ok)
     _document_warning("kiro_hooks is not an array of hook documents, ignoring")
     _document_rejected(_HOOK_SPEC_AUDIT_TAG, str(value), "hooks is not an array of hook documents")
     return []
@@ -675,6 +739,16 @@ def hook_document_unsent_reason(doc: dict) -> str | None:
     return None
 
 
+def _normalize_config_hook_documents(value: object) -> list[dict]:
+    """:func:`normalize_spec_hooks` for an ``agent.kiro_hooks`` array.
+
+    That array is written into the spec kiro-cli runs, so its matchers are held to
+    kiro-cli's rule (:func:`_kiro_cli_matcher_ok`). Install and the Hooks page both
+    read it through here, so the two cannot disagree on which documents are valid.
+    """
+    return normalize_spec_hooks(value, matcher_ok=_kiro_cli_matcher_ok)
+
+
 def unsent_hook_documents(hooks: object) -> list[dict]:
     """The documents in an array-form ``hooks`` that validate but reach no kiro-cli spec.
 
@@ -682,7 +756,7 @@ def unsent_hook_documents(hooks: object) -> list[dict]:
     :func:`hook_document_unsent_reason`. Empty for the object form, which drops
     nothing for these reasons, and for anything that is not a list.
 
-    Validation runs exactly as on install, through :func:`normalize_spec_hooks`,
+    Validation runs exactly as on install, through :func:`_normalize_config_hook_documents`,
     with its warnings and audit lines muted: the install pass already wrote them,
     and this is a read the Hooks page makes on every load. A document that fails
     validation is not here, because it is not a hook Crew accepted.
@@ -691,7 +765,7 @@ def unsent_hook_documents(hooks: object) -> list[dict]:
         return []
     token = _document_audit_muted.set(True)
     try:
-        documents = normalize_spec_hooks(hooks)
+        documents = _normalize_config_hook_documents(hooks)
     finally:
         _document_audit_muted.reset(token)
     unsent: list[dict] = []
@@ -898,7 +972,8 @@ def _autoimport_kiro_hooks(hooks_dir: Path) -> dict[str, list[dict[str, str]]]:
 
     Security parity with the explicit config path:
       * Each script's resolved path goes through ``_validate_hook_command``.
-      * ``# matcher:`` headers are validated against ``_SAFE_MATCHER_RE`` / ``_MAX_MATCHER_LEN``.
+      * ``# matcher:`` headers are validated by ``_kiro_cli_matcher_ok`` (``_SAFE_MATCHER_RE``
+        or kiro-cli's ``@server`` / ``@server/tool`` form, capped at ``_MAX_MATCHER_LEN``).
       * Non-executable files are skipped (INFO log).
       * Sensitive paths are skipped (via ``_validate_hook_command``).
 
@@ -1056,7 +1131,7 @@ def _autoimport_kiro_hooks(hooks_dir: Path) -> dict[str, list[dict[str, str]]]:
 
         entry_dict: dict[str, str] = {"command": validated_command}
         if matcher_header is not None:
-            if len(matcher_header) > _MAX_MATCHER_LEN or not _SAFE_MATCHER_RE.match(matcher_header):
+            if not _kiro_cli_matcher_ok(matcher_header):
                 # An invalid matcher is treated as a validation failure:
                 # promoting a tool-scoped hook to unscoped (firing on every
                 # tool call) would be a silent privilege expansion.
@@ -1196,9 +1271,7 @@ def _merge_kiro_hooks(hooks: dict, user_hooks: dict) -> dict:
                 )
                 agent_mod._sel_hook_rejected(event, entry["command"], "non-string matcher")
                 continue
-            if isinstance(matcher, str) and (
-                len(matcher) > _MAX_MATCHER_LEN or not _SAFE_MATCHER_RE.match(matcher)
-            ):
+            if isinstance(matcher, str) and not _kiro_cli_matcher_ok(matcher):
                 agent_mod.logger.warning(
                     "kiro_hooks[%s]: matcher contains disallowed characters or is too long, skipping",
                     event,
@@ -1219,11 +1292,11 @@ def _merge_kiro_hooks(hooks: dict, user_hooks: dict) -> dict:
 
 
 def _user_kiro_hooks_locked() -> bool:
-    """Whether an enterprise build withholds the user's kiro hooks from the agent.
+    """Whether an LTS build withholds the user's kiro hooks from the agent.
 
     kiro-cli runs these scripts itself, so the Crew script-hook gate never sees
-    them. In an enterprise build they follow ``capabilities.script_hooks`` like
-    every other hook (RFC enterprise edition, Red "Hooks by name"), asked on the
+    them. In an LTS build they follow ``capabilities.script_hooks`` like
+    every other hook (RFC LTS edition, Red "Hooks by name"), asked on the
     host key because the agent file is built for the whole host. An unreadable
     answer withholds them. An ``oss`` build returns False without asking.
     """
@@ -1248,7 +1321,7 @@ def _user_kiro_hooks_locked() -> bool:
 def _drop_refused_kiro_hook_events(hooks: dict) -> dict:
     """*hooks* without the events the policy's ``script_hooks`` events list refuses.
 
-    Enterprise builds only, for the reason :func:`_user_kiro_hooks_locked` gives;
+    LTS builds only, for the reason :func:`_user_kiro_hooks_locked` gives;
     an ``oss`` build returns *hooks* without asking. kiro-cli spells an event
     ``preToolUse`` where a policy writes ``PreToolUse``; the identifier matcher is
     case-insensitive, so one list covers both. An unreadable answer drops the event.
@@ -1280,6 +1353,81 @@ def _drop_refused_kiro_hook_events(hooks: dict) -> dict:
     return kept
 
 
+def resolve_kiro_hooks_dir(agent_cfg: dict, *, audit: bool = True) -> Path:
+    """The ``~/.kiro/hooks`` directory for *agent_cfg*, HOME-contained.
+
+    ``agent.kiro_hooks_dir`` when set and safe, else the default
+    ``~/.kiro/hooks``. ``config.json`` is LLM-writable, so a custom override is
+    required to resolve UNDER the user's HOME (not equal to it) and outside a
+    sensitive location; any failure falls back to the default rather than turning
+    the directory off. Shared by the ``*.sh`` script autoimport and the standalone
+    ``*.json`` hook-file loader
+    (:func:`kiro_crew.agent_sdk.spec_hooks.user_hook_files`) so the two agree on
+    exactly one directory and its containment rule.
+
+    *audit* controls whether a rejected override writes the WARNING and the SEL
+    rejection event. The install path leaves it ``True`` (the rejection is logged
+    and audited once, where it happens). The per-turn resolution
+    (:func:`kiro_crew.agent.resolved_kiro_hooks_dir`) passes ``False``: it runs on
+    every KAS turn, so auditing there would fill the log and the SEL trail with the
+    same rejection on each turn. The fallback itself is unchanged -- only the
+    reporting is suppressed.
+    """
+    hooks_dir = agent_mod._DEFAULT_KIRO_HOOKS_DIR
+    if not isinstance(agent_cfg, dict):
+        return hooks_dir
+    custom_dir = agent_cfg.get("kiro_hooks_dir")
+    if not (isinstance(custom_dir, str) and custom_dir):
+        return hooks_dir
+    # config.json is LLM-writable; a malicious override could point hooks_dir at
+    # /tmp, a world-writable mount, or ~/Downloads. Require the resolved path to
+    # live under the user's HOME and not match a sensitive location. On any
+    # failure, log + SEL audit and fall back to the default (~/.kiro/hooks)
+    # rather than turning the directory off entirely - the safe default is still
+    # available.
+    requested = Path(os.path.expanduser(custom_dir))
+    try:
+        resolved = requested.resolve()
+        home = Path.home().resolve()
+    except (OSError, ValueError):
+        # OSError: ENAMETOOLONG, ELOOP (symlink loop), EACCES.
+        # ValueError: Path() / resolve() reject strings with null bytes
+        # (``"\x00"``) or similar malformed Unicode. An LLM-writable
+        # ``kiro_hooks_dir: "\x00"`` would otherwise propagate ValueError up
+        # through install_agent() and crash agent bootstrap (denial of service).
+        resolved = None
+        home = None
+    if (
+        resolved is None
+        or home is None
+        # Strict containment: require ``resolved`` to be *under* HOME, not equal
+        # to it. ``~`` alone would otherwise scan the entire home directory,
+        # auto-registering anything a user (or attacker) drops anywhere under
+        # ``$HOME``. ``Path.parents`` of e.g. ``/srv/op`` is ``(/, /srv)`` and
+        # does NOT include ``/srv/op`` itself, so a bare ``home not in parents``
+        # rejects ``resolved == home``.
+        or home not in resolved.parents
+        or agent_mod.is_sensitive_path(str(resolved))
+    ):
+        if audit:
+            agent_mod.logger.warning(
+                "kiro_hooks_dir %s rejected (must resolve under %s and not be "
+                "sensitive), falling back to %s",
+                agent_mod._hook_diagnostic(custom_dir),
+                home,
+                agent_mod._DEFAULT_KIRO_HOOKS_DIR,
+            )
+            agent_mod._sel_hook_rejected(
+                "autoimport", str(requested), "kiro_hooks_dir outside HOME or sensitive"
+            )
+        return agent_mod._DEFAULT_KIRO_HOOKS_DIR
+    # Return the already-resolved path, not the unresolved ``requested``. Keeping
+    # ``requested`` would leave a symlink-swap window: a path component could be
+    # swapped between this resolve() and a later one, bypassing the HOME
+    # containment check just performed.
+    return resolved
+
+
 def _apply_user_kiro_hooks(config: dict, mc_cfg: dict) -> None:
     """Merge user-defined kiro_hooks from kirocrew config into *config* (additive).
 
@@ -1309,61 +1457,7 @@ def _apply_user_kiro_hooks(config: dict, mc_cfg: dict) -> None:
     if isinstance(agent_cfg, dict):
         if "kiro_hooks_autoimport" in agent_cfg:
             autoimport_enabled = bool(agent_cfg.get("kiro_hooks_autoimport"))
-        custom_dir = agent_cfg.get("kiro_hooks_dir")
-        if isinstance(custom_dir, str) and custom_dir:
-            # config.json is LLM-writable; a malicious override could point
-            # hooks_dir at /tmp, a world-writable mount, or ~/Downloads.
-            # Require the resolved path to live under the user's HOME and
-            # not match a sensitive location.  On any failure, log + SEL
-            # audit and fall back to the default (~/.kiro/hooks) rather
-            # than turning autoimport off entirely - the safe default is
-            # still available.
-            requested = Path(os.path.expanduser(custom_dir))
-            try:
-                resolved = requested.resolve()
-                home = Path.home().resolve()
-            except (OSError, ValueError):
-                # OSError: ENAMETOOLONG, ELOOP (symlink loop), EACCES.
-                # ValueError: Path() / resolve() reject strings with null
-                # bytes (``"\x00"``) or similar malformed Unicode.  An
-                # LLM-writable ``kiro_hooks_dir: "\x00"`` would otherwise
-                # propagate ValueError up through install_agent() and
-                # crash agent bootstrap (denial of service).
-                resolved = None
-                home = None
-            if (
-                resolved is None
-                or home is None
-                # Strict containment: require ``resolved`` to be *under*
-                # HOME, not equal to it.  ``~`` alone would otherwise scan
-                # the entire home directory for executable ``*.sh`` files,
-                # auto-registering anything a user (or attacker) drops
-                # anywhere under ``$HOME``.  ``Path.parents`` of e.g.
-                # ``/srv/op`` is ``(/, /srv)`` and does NOT include
-                # ``/srv/op`` itself, so a bare ``home not in parents``
-                # rejects ``resolved == home``.
-                or home not in resolved.parents
-                or agent_mod.is_sensitive_path(str(resolved))
-            ):
-                agent_mod.logger.warning(
-                    "kiro_hooks_autoimport: kiro_hooks_dir %s rejected "
-                    "(must resolve under %s and not be sensitive), "
-                    "falling back to %s",
-                    agent_mod._hook_diagnostic(custom_dir),
-                    home,
-                    agent_mod._DEFAULT_KIRO_HOOKS_DIR,
-                )
-                agent_mod._sel_hook_rejected(
-                    "autoimport", str(requested), "kiro_hooks_dir outside HOME or sensitive"
-                )
-            else:
-                # Store the already-resolved path, not the unresolved
-                # ``requested``.  Keeping ``requested`` would leave a
-                # symlink-swap window: a path component could be swapped
-                # between this resolve() and the one inside
-                # _autoimport_kiro_hooks, bypassing the HOME containment
-                # check we just performed.
-                hooks_dir = resolved
+        hooks_dir = resolve_kiro_hooks_dir(agent_cfg)
 
     # Both spec shapes are accepted. The object form goes to the merge below
     # exactly as it is read: that merge is the object form's own validator and
@@ -1383,7 +1477,7 @@ def _apply_user_kiro_hooks(config: dict, mc_cfg: dict) -> None:
         # Every other value, a list included, goes through the normalizer, so a
         # ``hooks`` that is neither shape is audited rather than dropped in
         # silence.
-        documents = normalize_spec_hooks(user_hooks)
+        documents = _normalize_config_hook_documents(user_hooks)
         explicit_hooks = hook_documents_to_object_form(documents)
         # Read from the raw value, BEFORE validation: a document that says
         # ``enabled: false`` and is rejected for an unrelated field must still

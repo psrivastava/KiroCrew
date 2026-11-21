@@ -12,7 +12,10 @@ import logging
 import uuid
 from typing import Any
 
-from kiro_crew.dashboard.chat_utils_injected_rows import SUBAGENT_DELIVERY_KINDS
+from kiro_crew.dashboard.chat_utils_injected_rows import (
+    SUBAGENT_DELIVERY_KINDS,
+    teardown_hold_active,
+)
 from kiro_crew.dashboard.chat_utils_slots import dashboard_slot_key, effective_session_key
 from kiro_crew.dashboard.state import DashboardState, _ChatSlot
 
@@ -254,7 +257,8 @@ async def background_wake_absent(state: DashboardState, slot: _ChatSlot) -> bool
     For a caller about to tell the person nothing will wake the session. On top
     of :func:`background_wake_pending` it counts a sub-agent result being
     delivered and any entry waiting in the slot queue, in-memory sub-agent work still
-    owed to this session (a pending follow-up watcher) and an enabled scheduled job this
+    owed to this session (a pending follow-up watcher), an MCP resource subscription
+    this session holds and an enabled scheduled job this
     session created or whose runs land in this session: a cron job is not "continuing" work for the completion
     sound, but it is a wake. A probe that fails answers False, so an unknown
     state never becomes that claim.
@@ -275,6 +279,13 @@ async def background_wake_absent(state: DashboardState, slot: _ChatSlot) -> bool
         if subs is not None and (
             subs.has_in_memory_pending_work_for(effective_session_key(slot)) is not False
         ):
+            return False
+        # An MCP resource subscription wakes this session when its resource
+        # changes; a subscribed set that cannot be read is not a definite "none".
+        from kiro_crew.dashboard.slot_retention import resource_subscribed_slot_keys
+
+        subscribed = await resource_subscribed_slot_keys()
+        if subscribed is None or slot.key in subscribed:
             return False
         crons = getattr(state, "crons", None)
         if crons is None:
@@ -328,10 +339,35 @@ async def chat_done_payload(
     turn = slot._turn_generation
     turn_gen = chunk_generation()
 
+    # Restored cards the user has not sent wait for them: no drain runs them, so
+    # a queue holding only those is not work that continues. Imported here so the
+    # two keys do not become names this facade owner serves.
+    from kiro_crew.dashboard.slot_queue_repository import (
+        RESTORED_QUEUE_KEY,
+        RESTORED_SEND_CHOSEN_KEY,
+    )
+
+    queue = getattr(slot, "_queue", None)
+    only_restored_cards = (
+        isinstance(queue, list)
+        and bool(queue)
+        and all(
+            isinstance(item, dict)
+            and item.get(RESTORED_QUEUE_KEY)
+            and not item.get(RESTORED_SEND_CHOSEN_KEY)
+            for item in queue
+        )
+    )
     try:
         continuing = bool(
             continuing
-            or (slot.queue_depth and not queue_held and not slot._last_turn_auth_required)
+            or (
+                slot.queue_depth
+                and not queue_held
+                and not only_restored_cards
+                and not slot._last_turn_auth_required
+                and not teardown_hold_active(state, slot)
+            )
             or await background_wake_pending(state, slot, "completion_sound")
         )
     except Exception:
@@ -369,3 +405,60 @@ def wire_session_subagent_probe(state: DashboardState) -> None:
         return await subagents_attached_async(state, slot, session_key, "rss_recycle")
 
     state.sessions.set_subagent_probe(_probe)
+    # The idle-compaction probe reads the same slots and is wired at the same
+    # two points, so it is installed with this one.
+    wire_session_idle_compaction_probe(state)
+
+
+def idle_compaction_blocker(state: DashboardState, session_key: str) -> str | None:
+    """What keeps *session_key*'s chat from being idle, or ``None`` when nothing does.
+
+    The dashboard half of the ``session.idle_compaction`` check: the manager
+    reads its own turn permit, queue, recycle marker and probes, and asks this
+    for the signals only the dashboard holds. Synchronous and in-memory, because
+    the manager reads it in the step it commits the compaction. A session with no
+    open tab is refused too: no one is about to return to it through the
+    dashboard.
+    """
+    slot_key = dashboard_slot_key(session_key)
+    slot = state.get_slot(slot_key) if slot_key else None
+    if slot is None:
+        return "no_slot"
+    if slot.running:
+        return "slot_turn"
+    wake = slot._wake_starting_task
+    if wake is not None and not wake.done():
+        return "slot_turn"
+    if slot.queue_depth:
+        return "slot_queue"
+    if slot._question_pending:
+        return "question"
+    if slot._compacting or slot._pending_synthesis or slot._subagent_deliveries_inflight:
+        return "slot_activity"
+    approvals = getattr(state, "_pending_approvals", {}) or {}
+    if any(record.get("slot") == slot.key for record in approvals.values()):
+        return "approval"
+    # An unfinished workflow run delivers into this session and starts a turn
+    # there; the same registry signal ``background_wake_pending`` reads.
+    workflows = getattr(state, "workflow_service", None)
+    if workflows is not None and workflows.registry.has_pending_work_for(session_key):
+        return "workflow"
+    # Avoid a circular import: autonudge's slot lookup imports dashboard.state.
+    from kiro_crew.autonudge import get_instance
+
+    service = get_instance()
+    loop = service.get_by_slot(slot.key) if service is not None else None
+    if loop is not None and loop.active:
+        return "monitor_loop"
+    return None
+
+
+def wire_session_idle_compaction_probe(state: DashboardState) -> None:
+    """Hand ``SessionManager`` the probe its idle compaction consults (see above).
+
+    A manager double without the setter is left alone: it runs no idle
+    compaction, and its manager answers every idle check busy.
+    """
+    setter = getattr(state.sessions, "set_idle_compaction_probe", None)
+    if callable(setter):
+        setter(lambda session_key: idle_compaction_blocker(state, session_key))

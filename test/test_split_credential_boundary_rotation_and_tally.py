@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 import inspect
 
+import split_credential_boundary_checks
 from split_credential_boundary_helpers import (
     HEAD,
     KEY,
@@ -39,7 +40,9 @@ def _discord_renderer_tree() -> ast.Module:
     )
 
 
-class TestDiscordRotatesWithoutHandingOverAKey:
+class TestDiscordRotatesWithoutHandingOverAKey(
+    split_credential_boundary_checks.TheBudgetAloneHandsTheReaderTheKey
+):
     """Discord seals every chunk but the last as its own message, like Telegram.
 
     Its rotation redacts each segment alone, so a boundary between the halves of a
@@ -52,13 +55,6 @@ class TestDiscordRotatesWithoutHandingOverAKey:
     def _body(self) -> str:
         """Filler, then the key's halves either side of a line break."""
         return ("w " * 980) + HEAD + "\n" + TAIL + " and some trailing words after it"
-
-    def test_the_budget_alone_hands_the_reader_the_key(self) -> None:
-        """The control: without the redactor this is exactly what ships."""
-        chunks = split_markdown_safe(self._body(), self.BUDGET)
-        assert len(chunks) > 1
-        assert _rejoins(chunks)
-        assert KEY in _on_screen(chunks)
 
     def test_the_rotation_cut_moves_instead(self) -> None:
         chunks = split_markdown_safe(self._body(), self.BUDGET, redactor=_discord_redact_all)
@@ -383,10 +379,11 @@ class TestTheRepairStaysOnTheTableAwarePath:
         assert KEY not in _on_screen(chunks)
         table_chunks = [c for c in chunks if "|" in c]
         assert table_chunks, "the table run must survive as table text"
-        for chunk in table_chunks:
-            for line in chunk.splitlines():
-                if line.strip():
-                    assert "|" in line, "a row was cut mid-body and reads as prose"
+        # The repair may deliver the table and the prose after it as one message;
+        # what must hold is that no row is cut mid-body.
+        lines = [line for chunk in chunks for line in chunk.splitlines()]
+        for i in range(12):
+            assert f"r{i} | value number {i}" in lines, "a row was cut mid-body"
 
     def test_the_repaired_body_still_honours_the_source_budget(self) -> None:
         """The repaired sequence stays under the source cap it was graded against."""

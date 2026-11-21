@@ -43,6 +43,9 @@ from kiro_crew.telegram.renderer import TelegramApprovalDecider
 
 pytestmark = pytest.mark.xdist_group(name="tree_scan_telegram_dispatch")
 
+SHARED_FACADE_CHECKS = ("the_class_body_scan_can_fail",)
+
+
 FACADE = "kiro_crew.telegram.transport_dispatch"
 FACADE_PATH = Path(td.__file__).resolve()
 DISPATCH_DIR = FACADE_PATH.with_name("dispatch")
@@ -84,9 +87,11 @@ BASE_NAMES = frozenset(
         "ConversationState",
         "DENY_CAUSE_APPROVAL_TIMEOUT",
         "DM_SCOPE_UNIFIED",
+        "EmbedAdmissionTimeout",
         "InboundMessage",
         "InboundRoute",
         "IngestLimits",
+        "LiveDefaultAgent",
         "NamedTuple",
         "ReceiptQueue",
         "ReceiptSurface",
@@ -114,7 +119,6 @@ BASE_NAMES = frozenset(
         "_AUDIO_MIMES",
         "_BUSY_OPTIONS_REFUSAL",
         "_CHANNEL",
-        "_DEFAULT_KIROCREW_AGENT",
         "_DETACH_EXEMPT_COMMANDS",
         "_FAILURE_REASON_MAX_CHARS",
         "_HELP_TEXT",
@@ -198,7 +202,6 @@ BASE_NAMES = frozenset(
         "parse_mid_turn_override",
         "parse_session_key",
         "persisted_session_agent",
-        "predecessor_sid",
         "privacy_mode",
         "process_telegram_attachments",
         "publish_turn_identity",
@@ -357,7 +360,10 @@ BASE_MEMBERS = {
         "(self, route: 'tuple[str, str]', chat_id: 'int', thread_id: 'int | None', "
         "user_id: 'int', chat_type: 'str') -> 'str'",
     ),
-    "_configured_agent": ("function", "(self) -> 'str'"),
+    "_configured_agent": (
+        "function",
+        "(self, route: 'tuple[str, str] | None' = None) -> 'str'",
+    ),
     "_consume_picker": (
         "function",
         "(self, cb: \"'TelegramCallback'\", data: 'str', table: 'dict[str, _Picker]', *, "
@@ -533,7 +539,7 @@ BASE_MEMBERS = {
     "deliver_spawn_approval": (
         "function",
         "(self, request_id: 'str', description: 'str', "
-        "parent_session_key: 'str') -> 'bool | None'",
+        "parent_session_key: 'str') -> 'bool | HostSpawnDecision | None'",
     ),
     "handle_message": (
         "function",
@@ -881,7 +887,9 @@ async def test_a_facade_patch_reaches_each_moved_reader(monkeypatch: pytest.Monk
     monkeypatch.setattr(td, "channel_inbound_permitted", AsyncMock(return_value=True))
 
     granted: list[Any] = []
-    monkeypatch.setattr(td, "add_trusted_session", lambda key, sessions=None: granted.append(key))
+    monkeypatch.setattr(
+        td, "add_trusted_session", lambda key, sessions=None, strict=False: granted.append(key)
+    )
 
     class _Decider:
         @staticmethod
@@ -1013,6 +1021,7 @@ def test_the_package_initializer_imports_nothing() -> None:
 #: test_close_guard_parity scans the owners for it.
 _FACADE_PINNED = {
     "a redactor call": "test_security_posture: the 'Telegram failure reason' sink",
+    "a row redactor call": "test_autonudge_row_scrub: the _persist_turn user-row scrub",
     "begin_turn": "test_turn_ceiling: GATED composes the ceiling around begin_turn",
     "the turn ceiling": "test_turn_ceiling: GATED (turn_ceiling.gate, TurnCeilingExceeded)",
     "the muted renderer": "test_turn_ceiling: MUTE_AWARE (SilentRenderer, render_refusal)",
@@ -1037,6 +1046,7 @@ _FORBIDDEN_IN_THE_FACADE_TOO = frozenset(
 #: package, so this table is what fixes the file each construct lives in.
 _PINNED_HOME = {
     "a redactor call": "transport_dispatch",
+    "a row redactor call": "turn_engine",
     "begin_turn": "turn_engine",
     "the turn ceiling": "turn_engine",
     "the muted renderer": "turn_engine",
@@ -1070,7 +1080,8 @@ def _facade_pinned_shapes(source: str) -> list[str]:
         [n for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom))]
     )
     held = {
-        "a redactor call": bool(_REDACTOR_CALL_RE.search(source)),
+        "a redactor call": bool(_REDACTOR_CALL_RE.search(_without_row_scrubs(source))),
+        "a row redactor call": any(scrub in source for scrub in _ROW_SCRUBS),
         "begin_turn": "begin_turn" in called,
         "the turn ceiling": "turn_ceiling.gate" in dotted or "TurnCeilingExceeded" in named,
         "the muted renderer": bool({"SilentRenderer", "render_refusal"} & named),
@@ -1116,8 +1127,18 @@ def test_each_guarded_construct_lives_in_the_file_its_guard_reads() -> None:
 
 
 #: One planted construct per ``_FACADE_PINNED`` label, for the scan's self-test.
+_ROW_SCRUBS = ('_redact_at_write_boundary("user", ', '_redact_at_write_boundary("assistant", ')
+
+
+def _without_row_scrubs(source: str) -> str:
+    for scrub in _ROW_SCRUBS:
+        source = source.replace(scrub, "")
+    return source
+
+
 _PLANTED = {
     "a redactor call": "def f(text):\n    return redact(text)\n",
+    "a row redactor call": 'def f(t):\n    return _redact_at_write_boundary("user", t)\n',
     "begin_turn": "def f(self, key):\n    self.sessions.begin_turn(key)\n",
     "the turn ceiling": (
         "def f(turn_ceiling, key):\n    with turn_ceiling.gate(key):\n        pass\n"
@@ -1188,11 +1209,6 @@ def test_no_owner_needs_the_class_body() -> None:
         if (hits := _class_body_reads(source))
     }
     assert offenders == {}
-
-
-def test_the_class_body_scan_can_fail() -> None:
-    planted = "def f(self):\n    super().g()\n    return __class__, self.__secret, self.__dict__\n"
-    assert _class_body_reads(planted) == ["2: super()", "3: __class__", "3: __secret"]
 
 
 def test_dashboard_imports_stay_call_time() -> None:

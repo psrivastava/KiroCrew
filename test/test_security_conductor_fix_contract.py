@@ -25,6 +25,8 @@ checkout to exercise the contract step through the gate that calls this one.
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -80,6 +82,55 @@ def write_contract(worktree: Path, contract: dict) -> Path:
     return path
 
 
+#: The base checkout every ``build_repo`` call without ``base_files`` starts from, built
+#: once per session by ``_base_repo_template``. Empty outside a test that requested it.
+_BASE_TEMPLATE: dict[str, Path] = {}
+
+
+def _init_base(worktree: Path, base_files: tuple[str, ...] = ()) -> None:
+    git(worktree, "init", "-q", "-b", "work")
+    git(worktree, "config", "user.email", "harness@example.invalid")
+    git(worktree, "config", "user.name", "harness")
+    (worktree / "README.md").write_text("base\n", encoding="utf-8")
+    for relative in base_files:
+        target = worktree / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("already on main\n", encoding="utf-8")
+    git(worktree, "add", "-A")
+    git(worktree, "commit", "-q", "-m", "base")
+    git(
+        worktree,
+        "update-ref",
+        "refs/remotes/origin/main",
+        git(worktree, "rev-parse", "HEAD").strip(),
+    )
+
+
+@pytest.fixture(scope="session")
+def _base_repo_template(tmp_path_factory: pytest.TempPathFactory, _git_global_config: Path) -> Path:
+    """The plain base checkout, built once: seven git children per case add up on Windows.
+
+    A session fixture runs before the per-test ``_git_identity``, so it applies the same
+    hermetic identity and config itself; host settings such as ``commit.gpgsign`` would
+    otherwise reach the base commit.
+    """
+    template = tmp_path_factory.mktemp("security-conductor-base") / "base"
+    template.mkdir()
+    with pytest.MonkeyPatch.context() as patch:
+        for role in ("AUTHOR", "COMMITTER"):
+            patch.setenv(f"GIT_{role}_NAME", "Test")
+            patch.setenv(f"GIT_{role}_EMAIL", "test@example.com")
+        patch.setenv("GIT_CONFIG_GLOBAL", str(_git_global_config))
+        patch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
+        _init_base(template)
+    return template
+
+
+@pytest.fixture(autouse=True)
+def _use_base_template(_base_repo_template: Path, _floor_monkeypatch: pytest.MonkeyPatch) -> None:
+    _floor_monkeypatch.setitem(_BASE_TEMPLATE, "base", _base_repo_template)
+
+
 def build_repo(
     root: Path,
     name: str,
@@ -104,23 +155,14 @@ def build_repo(
     about, and a second copy of this would be a second thing to keep correct.
     """
     worktree = root / name
-    worktree.mkdir(parents=True)
-    git(worktree, "init", "-q", "-b", "work")
-    git(worktree, "config", "user.email", "harness@example.invalid")
-    git(worktree, "config", "user.name", "harness")
-    (worktree / "README.md").write_text("base\n", encoding="utf-8")
-    for relative in base_files:
-        target = worktree / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text("already on main\n", encoding="utf-8")
-    git(worktree, "add", "-A")
-    git(worktree, "commit", "-q", "-m", "base")
-    git(
-        worktree,
-        "update-ref",
-        "refs/remotes/origin/main",
-        git(worktree, "rev-parse", "HEAD").strip(),
-    )
+    template = _BASE_TEMPLATE.get("base")
+    if template is not None and not base_files:
+        # Each case gets its own copy, so nothing one case writes reaches another.
+        root.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(template, worktree)
+    else:
+        worktree.mkdir(parents=True)
+        _init_base(worktree, base_files)
     if contract is not None and contract_committed:
         write_contract(worktree, contract)
     for relative in committed:
@@ -395,6 +437,44 @@ class TestAContractNobodyCanReadIsNeverAPass:
         assert result.returncode == EXIT_UNREADABLE
         assert "Traceback" not in result.stderr
         assert "does not parse" in payload(result)["problems"][0]
+
+    @pytest.mark.parametrize(
+        "bom, encoding",
+        [(b"\xff\xfe", "utf-16-le"), (b"\xfe\xff", "utf-16-be")],
+        ids=["utf-16-le", "utf-16-be"],
+    )
+    def test_a_utf16_contract_is_twenty_and_not_a_traceback(self, repo, bom, encoding) -> None:
+        """UTF-16 with its BOM, the default of Windows PowerShell 5.1 ``>``.
+
+        Neither BOM is valid UTF-8, so the decode raises ``UnicodeDecodeError``, a
+        ``ValueError`` the ``OSError`` clause never caught. (Without a BOM, ASCII JSON
+        in UTF-16 decodes as UTF-8 with NULs and already fails at the JSON parse.)
+        """
+        worktree = repo("utf16", committed=("test/test_x.py",))
+        (worktree / CONTRACT_FILENAME).write_bytes(bom + json.dumps(CONTRACT).encode(encoding))
+        result = run(worktree)
+        assert result.returncode == EXIT_UNREADABLE, result.stderr
+        assert "Traceback" not in result.stderr
+        body = payload(result)
+        assert body["verdict"] == "unreadable"
+        assert "not UTF-8" in body["problems"][0]
+
+    def test_load_contract_returns_a_utf16_problem_instead_of_raising(
+        self, mod, tmp_path: Path
+    ) -> None:
+        path = tmp_path / CONTRACT_FILENAME
+        path.write_bytes(json.dumps(CONTRACT).encode("utf-16"))
+        contract, problems = mod.load_contract(path)
+        assert contract == {}
+        assert len(problems) == 1 and "not UTF-8" in problems[0]
+
+    def test_a_utf8_bom_contract_keeps_its_parse_problem(self, repo) -> None:
+        """The BOM case is unchanged: still unreadable, still the JSON parser's reason."""
+        worktree = repo("utf8-bom", committed=("test/test_x.py",))
+        (worktree / CONTRACT_FILENAME).write_bytes(b"\xef\xbb\xbf" + json.dumps(CONTRACT).encode())
+        result = run(worktree)
+        assert result.returncode == EXIT_UNREADABLE
+        assert "Unexpected UTF-8 BOM" in payload(result)["problems"][0]
 
     @pytest.mark.parametrize(
         "field, value",

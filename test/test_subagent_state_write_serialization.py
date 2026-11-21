@@ -1,18 +1,8 @@
 """``update_state`` serializes its read/merge/rewrite for OFF-LOOP writers.
 
-``update_state`` is a read / merge / rewrite whose two halves are separated by a
-blocking ``_atomic_write`` (fsync + rename). A run writes ``state.json`` from
-BOTH the event loop (PID, session id, provider, retention ``keep``) and the
-thread pool (model provenance, CC-path model refinement, per-turn diagnostics --
-all via ``asyncio.to_thread``). Without serialization the second writer's read
-predates the first writer's write, so its rewrite restores a stale WHOLE-FILE
-snapshot and silently rolls back every field the first writer had just landed.
-
-The lock is taken by OFF-LOOP callers only: making an on-loop caller wait on a
-pool thread's fsync would be a blocking call on the event loop. So these tests
-pin two things -- that two pool writers do serialize, and that an on-loop caller
-does NOT wait on the lock (the on-loop interleave stays open, tracked separately
-as the loop-side offload).
+Unserialized, a second writer's stale whole-file rewrite rolls back the first writer's
+fields. Only off-loop callers take the lock: an on-loop caller waiting on a pool thread's
+fsync would block the event loop, so these tests also pin that it does not wait.
 """
 
 from __future__ import annotations
@@ -24,6 +14,7 @@ import time
 import pytest
 
 from kiro_crew import subagent_persistence as sp
+from kiro_crew.testing.wait import FALLBACK_TIMEOUT_SECS
 
 # ``SubagentManager.spawn`` refuses -- registering no task -- while the host
 # looks short of memory, which is the runner's state, not this test's input.
@@ -35,14 +26,6 @@ pytestmark = pytest.mark.usefixtures("healthy_host_memory")
 #: this wait is expected to time out -- that timeout is the fix working, and it
 #: bounds the test instead of deadlocking it.
 _PARK_TIMEOUT = 1.0
-
-
-# How long the holder thread keeps the lock in the on-loop / off-loop pair.
-# Both tests derive their bounds from it: one asserts the on-loop caller does
-# NOT wait this out, the other that the off-loop caller does. Naming it keeps
-# the two from drifting apart, and keeps either bound from being read as a
-# statement about absolute speed rather than about queueing.
-_HOLD_SECS = 1.5
 
 
 def _new_agent(agent_id: str) -> None:
@@ -178,50 +161,79 @@ class TestOnLoopCallerDoesNotWait:
         held = sp._lock_for_agent("a3")
         # The holder must be ANOTHER thread. Holding it here would make the
         # coroutine re-acquire a non-reentrant lock on its own thread, so a
-        # regression would DEADLOCK instead of failing -- a useless signal. With
-        # a separate holder that releases on a timer, a regression instead shows
-        # up as elapsed time and the test always terminates.
+        # regression would DEADLOCK instead of failing -- a useless signal. The
+        # holder keeps the lock until ``holder_release`` is set: by this test once
+        # the call returned, or by the lost-run timer below, never on its own.
         holder_release = threading.Event()
         holding = threading.Event()
 
         def holder() -> None:
             held.lock.acquire()
             holding.set()
-            holder_release.wait(timeout=10.0)
+            holder_release.wait(timeout=2 * FALLBACK_TIMEOUT_SECS)
             held.lock.release()
 
         keeper = threading.Thread(target=holder, daemon=True)
         keeper.start()
         assert holding.wait(timeout=5.0), "holder never took the lock"
 
-        # Release the lock well after the assertion window: if the on-loop
-        # caller wrongly waits, it waits this long and fails on elapsed.
-        timer = threading.Timer(_HOLD_SECS, holder_release.set)
+        # The agent's lock refuses a BLOCKING acquire on the loop thread and
+        # records it; a non-blocking probe and every other thread go through.
+        real_lock = held.lock
+        loop_thread = threading.get_ident()
+        blocking_acquires: list[tuple[bool, float]] = []
+
+        class _RefuseBlockingOnLoop:
+            def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+                if blocking and threading.get_ident() == loop_thread:
+                    blocking_acquires.append((blocking, timeout))
+                    raise AssertionError(
+                        "on-loop update_state took a blocking acquire on the agent lock"
+                    )
+                return real_lock.acquire(blocking, timeout)
+
+            def release(self) -> None:
+                real_lock.release()
+
+            def locked(self) -> bool:
+                return real_lock.locked()
+
+            __enter__ = acquire
+
+            def __exit__(self, *_exc: object) -> None:
+                real_lock.release()
+
+        held.lock = _RefuseBlockingOnLoop()  # type: ignore[assignment]
+        # Lost-run release: a caller that waits some other way (offloading and
+        # joining, polling the lock) returns only once this fires, and then fails
+        # by name below instead of riding out the pytest timeout.
+        timer = threading.Timer(FALLBACK_TIMEOUT_SECS, holder_release.set)
         timer.daemon = True
         timer.start()
         try:
 
-            async def on_loop_write() -> tuple[bool, float]:
-                begin = time.monotonic()
-                ok = sp.update_state("a3", keep=True)
-                return ok, time.monotonic() - begin
+            async def on_loop_write() -> bool:
+                return sp.update_state("a3", keep=True)
 
-            wrote, elapsed = asyncio.run(on_loop_write())
+            wrote = asyncio.run(on_loop_write())
+            released_before_return = holder_release.is_set()
         finally:
             timer.cancel()
+            held.lock = real_lock
             holder_release.set()
-            keeper.join(timeout=10.0)
+            keeper.join(timeout=FALLBACK_TIMEOUT_SECS)
 
-        # Did not queue behind the holder. The bound is DERIVED from the hold, not a
-        # bare constant: what this test can distinguish is "returned promptly" from
-        # "waited out a holder that keeps the lock for _HOLD_SECS", and a caller that
-        # queued measures the full hold. A tighter absolute number does not sharpen
-        # that distinction -- it only fails on scheduler noise, which is what a
-        # 0.5s bound did on a loaded Windows runner at 0.515s while the caller had
-        # plainly not queued behind a 1.5s holder.
-        assert elapsed < _HOLD_SECS * 0.66, (
-            f"on-loop caller waited {elapsed:.2f}s with the lock held for "
-            f"{_HOLD_SECS:.2f}s, so it queued behind the holder instead of "
+        # Returned while the holder still held the lock, so it did not wait it out.
+        assert not released_before_return, (
+            "on-loop update_state returned only after the holder released the "
+            "agent lock, so it waited on the holder"
+        )
+
+        # Did not queue behind the holder: the on-loop caller never asked the
+        # held lock to wait.
+        assert blocking_acquires == [], (
+            f"on-loop caller waited on the agent lock {blocking_acquires!r} while "
+            "another thread held it, so it queued behind the holder instead of "
             "offloading the write"
         )
         assert wrote is True
@@ -330,11 +342,8 @@ class TestLockRegistry:
     def test_entry_survives_while_a_writer_still_references_it(self, agent_root):
         """The property that makes explicit eviction unnecessary AND unsafe.
 
-        While any writer holds or is queued on the lock, the entry must stay --
-        otherwise the next caller mints a FRESH lock and enters state.json
-        alongside the writer still inside it. Dropping an entry explicitly (a
-        folder delete, the tombstone pruner) is exactly that bug, which is why
-        the registry holds its values weakly instead.
+        Dropping a held entry lets the next caller mint a fresh lock beside the writer still
+        inside, so the registry holds its values weakly instead of evicting on folder delete.
         """
         _new_agent("held1")
         holder = sp._lock_for_agent("held1")
@@ -436,15 +445,9 @@ def _mock_ctx_builder_for_run():
 class TestOnLoopKeepWriteAgainstACancelledRunsWorker:
     """The on-loop retention ``keep`` write must not be rolled back.
 
-    ``_promote_conversation`` / ``release_conversation`` write ``keep`` from the
-    event loop, where ``update_state`` deliberately takes no lock -- so a
-    concurrent pool writer's stale whole-file rewrite erases it. Both are reached
-    only through the ``_conversation_busy`` gate, which refuses while a run is in
-    flight, so the one writer that can still be concurrent is a DETACHED worker:
-    one whose ``to_thread`` await was cancelled while the write was in flight.
-    Draining every off-loop writer on cancellation removes that
-    population, which closes this interleave too -- a pool writer cannot
-    outlive the run it belongs to.
+    The on-loop ``keep`` write takes no lock, and ``_conversation_busy`` refuses while a run is
+    in flight, so only a detached (cancelled) worker could race it. Draining off-loop writers
+    on cancellation removes those.
     """
 
     @pytest.mark.asyncio
@@ -494,7 +497,7 @@ class TestOnLoopKeepWriteAgainstACancelledRunsWorker:
         assert state.get("keep") is True, (
             "the on-loop keep write was rolled back by a detached worker's stale "
             "whole-file rewrite -- retention is lost, so the tombstone pruner "
-            "deletes session files the conversation needs (#6298)"
+            "deletes session files the conversation needs"
         )
         # The worker's own field still landed: the drain waits for it, it is not
         # discarded.

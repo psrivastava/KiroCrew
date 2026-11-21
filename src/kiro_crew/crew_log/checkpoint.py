@@ -90,13 +90,15 @@ leaving it on disk for a collector that does not exist.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import logging
 import time
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Final, NamedTuple, TypeVar
 
+from kiro_crew.crew_log import slot_state_codec
 from kiro_crew.crew_log.errors import CrewLogError
 from kiro_crew.crew_log.lease import LEASE_FILE
 from kiro_crew.crew_log.lease import acquire as acquire_lease
@@ -119,6 +121,7 @@ from kiro_crew.crew_log.projection import (
 )
 from kiro_crew.crew_log.projection_session_log import _log_identity
 from kiro_crew.crew_log.store import (
+    ConsumedSpan,
     CrewLog,
     ResumePoint,
     crew_log_dir,
@@ -185,9 +188,14 @@ CHECKPOINT_DIR: Final[str] = "projections"
 #: Inside the NEWEST unit's directory, which is the only unit a continuation lets grow
 #: and the one whose bytes the witness is a digest of. Two consequences, both wanted: the
 #: file inherits the ``crew-log`` fence and is removed with the unit, and a slot that
-#: gains a unit (a session reset) finds no savepoint at its new newest unit and folds
-#: cold once -- exactly what the warm cell already does for a changed unit list.
+#: gains a unit (a session reset) finds no savepoint at its new newest unit. A warm cell
+#: in the same process carries over that rollover; a new process folds cold once.
 SLOT_CHECKPOINT_DIR: Final[str] = "slot-projections"
+
+#: Set only in a backfill child (:mod:`kiro_crew.crew_log.slot_backfill_child`): the
+#: directory :func:`save_slot` writes a unit's slot savepoints to instead of the unit's
+#: own, taking no lease. ``None`` in every other process.
+slot_save_dir: "Callable[[CrewLog], Path | None] | None" = None
 
 #: Largest savepoint file this package reads or writes, and the number the kernel
 #: store ENFORCES (:data:`~kiro_crew.projection.MAX_PAYLOAD_BYTES`). Every fold's
@@ -758,13 +766,15 @@ def prefix_witness(handle: CrewLog, seq: int) -> PrefixWitness | None:
 
     ``None`` when the boundary does not resolve or the walk falls short of it, which
     costs a savepoint rather than recording one nothing can check.
+
+    One walk finds the boundary and hashes the records up to it, the same bytes
+    :func:`prefix_unchanged` hashes again.
     """
-    records = handle.raw_records_through(seq)
+    hasher = hashlib.sha256()
+    records = handle.raw_records_through(seq, hasher=hasher)
     if records is None:
         return None
-    sha, hashed = handle.raw_prefix_digest(records)
-    if hashed != records:
-        return None
+    sha = hasher.hexdigest()
     return with_extent(handle, PrefixWitness(seq=seq, records=records, sha=sha))
 
 
@@ -826,6 +836,8 @@ def save(
     *,
     prefix: "PrefixWitness | CutWitness | None",
     owes_point: bool = False,
+    final: bool = False,
+    span: "ConsumedSpan | None" = None,
 ) -> SessionProjections:
     """*bundle*, with its savepoints on disk brought forward when a write is owed.
 
@@ -841,6 +853,12 @@ def save(
     state folded from its earlier value, and every later resume would recompute the
     same changed bytes, match, and serve that state instead of folding cold. ``None``
     -- no witness, or one whose prefix moved during the pass -- writes nothing.
+
+    *span* is the digest of the records the pass framed, taken as it read them. It is
+    framed again from disk just before the write, and a difference writes nothing:
+    the (size, mtime) fingerprint cannot see a same-size rewrite inside one mtime
+    tick, and the extent's tail digest cannot see one further back than its tail. The
+    re-read costs the bytes the pass consumed, and only on a pass that writes.
 
     Never raises, and never reports a write it did not make: the bundle comes back
     unchanged unless every fold in it reached its file.
@@ -862,14 +880,18 @@ def save(
     # this pass has one to give them. Owed only with a position in hand, so a pass that
     # read nothing cannot rewrite five files for no gain.
     owed = owes_point and prefix is not None and prefix.resume is not None
-    if bundle.last_seq - bundle.saved_seq < MIN_ADVANCE_ENTRIES and not owed:
+    # *final* is :func:`~kiro_crew.crew_log.projection_session_memo.seal_session_folds`'s
+    # write on a closed unit: owed for any advance, since the unit will not be written
+    # again.
+    sealed = final and bundle.last_seq > bundle.saved_seq
+    if bundle.last_seq - bundle.saved_seq < MIN_ADVANCE_ENTRIES and not owed and not sealed:
         return bundle
     if prefix is not None and bundle.size is not None:
-        # The files must be exactly as they were BEFORE the pass (the bundle's segment
-        # set fingerprint), or the extent taken below would describe bytes the pass never
-        # read: a record rewritten between the pass and this write would be pinned as if
-        # it were the one folded. A file that moved at all -- even by an append -- costs
-        # this write, and the next pass writes instead.
+        # The files must be exactly as they were when the pass ENDED (the bundle's
+        # segment set fingerprint), or the extent taken below would describe bytes the
+        # pass never read: a record rewritten between the pass and this write would be
+        # pinned as if it were the one folded. A file that moved at all -- even by an
+        # append -- costs this write, and the next pass writes instead.
         _origin, live_size, live_mtime = _log_identity(handle)
         if (live_size, live_mtime) != (bundle.size, bundle.mtime_ns):
             return bundle
@@ -908,6 +930,13 @@ def save(
     #: leaves the counter below a value to read.
     counted: "tuple[int, int, float]" = (0, 0, 0.0)
     try:
+        if span is not None and not _span_holds(handle, span):
+            # Under the lease and after every other refusal, so only a write that is
+            # about to happen pays the re-read. A same-size rewrite between this and the
+            # write below is not seen; the window is this function's own few file writes.
+            # The bundle comes back with no identity and no custody, so no memo keeps it
+            # and no later pass persists it: the next one folds from the older savepoint.
+            return dataclasses.replace(bundle, origin=None, cuts=None)
         directory = _ensure_dir(handle)
         if directory is None:
             return bundle
@@ -977,54 +1006,38 @@ def save(
 # A slot's fold -- one cell folded across the units a slot ran under
 # --------------------------------------------------------------------------- #
 #
-# A SLOT fold concatenates several units into one stream, where a session fold reads one
-# file. Everything above still applies -- the same kernel store, the same identity
-# equality, the same witness handed to :func:`prefix_admit` -- and only two things are
-# added, both forced by the concatenation.
+# A SLOT fold concatenates several units into one stream. Everything above still applies
+# (same kernel store, identity equality and :func:`prefix_admit` witness); the
+# concatenation adds two things.
 #
-# THE IDENTITY BLOCK CARRIES THE WHOLE UNIT VECTOR. A slot fold's state was folded over
-# every unit the slot ran under, so the facts that must match verbatim are the slot key,
-# the unit list in fold order, and every EARLIER unit's whole mark -- its origin, its
-# height and its byte fingerprint, as the fold surface recorded them. That is the same
-# comparison ``projection._continuable`` makes before carrying a warm cell forward, so a
-# savepoint is admitted on exactly the shapes a warm cell is: an added or removed unit, an
-# earlier unit that grew, an earlier unit rewritten in place, and a unit recreated under
-# the same id each refuse the file. The NEWEST unit is held to its origin and its witness
-# instead, because it is the one unit a continuation exists to let grow.
+# THE IDENTITY BLOCK CARRIES THE WHOLE UNIT VECTOR: the slot key, the unit list in fold
+# order, and every EARLIER unit's whole mark (origin, height, byte fingerprint). It is the
+# comparison ``projection._continuable`` makes for a warm cell, so an added, removed,
+# grown, rewritten or recreated earlier unit refuses the file. The NEWEST unit is held to
+# its origin and witness only, since it is the one allowed to grow.
 #
-# TWO POSITIONS, NOT ONE. The kernel orders a slot stream by an ORDINAL -- a unit's base
-# plus an entry's seq -- while the checkpoint the fold surface's callers carry reports the
-# newest unit's OWN seq. So ``watermark`` is the ordinal the cell resumes at and the
-# witness's ``seq`` is the unit seq the tail stream resumes from, and the two are tied by
-# the newest unit's ordinal base. That base is reproducible on resume precisely BECAUSE
-# every earlier unit's mark is in the identity block: a vector that compares equal yields
-# the same base, so the equality is what makes the ordinal meaningful across processes.
-# The tie is checked on both sides -- nothing is written or resumed whose two numbers
-# disagree -- because an ordinal off by a unit's height would resume a cell past entries
-# the tail then folds again.
+# TWO POSITIONS, NOT ONE. The kernel orders a slot stream by ORDINAL (unit base + entry
+# seq), while callers' checkpoints report the newest unit's OWN seq. ``watermark`` is the
+# ordinal and the witness's ``seq`` the unit seq, tied by the newest unit's ordinal base,
+# which is reproducible because the earlier marks are in the identity block. The tie is
+# checked on write and resume: an ordinal off by a unit's height would resume past
+# entries the tail then folds again.
 
 
-#: Key the slot payload's ``state`` rides under, holding the fold state as a JSON STRING
-#: rather than as the object itself.
+#: Key the slot payload's ``state`` rides under, holding the fold state as a JSON STRING.
 #:
 #: THE ORDER OF A STATE'S KEYS IS PART OF THE STATE. The kernel store serializes with
-#: ``sort_keys=True``, which is right for an envelope a person greps and wrong for these
-#: folds: ``ledger``'s artifact map and ``radar``'s ``last_update`` are ordered by
-#: INSERTION and age out ``next(iter(...))``, so a state that came back alphabetical
-#: evicts whichever key sorts first instead of the oldest one. On a slot whose artifact
-#: keys are not already in alphabetical order that drops the NEWEST pointer on the first
-#: read after a restart, and the record a reader is served then disagrees with a cold
-#: fold for the life of the unit.
+#: ``sort_keys=True``, but ``ledger``'s artifact map and ``radar``'s ``last_update`` age
+#: out by INSERTION order (``next(iter(...))``); a state reloaded alphabetical would evict
+#: the wrong key, e.g. the NEWEST artifact pointer, and disagree with a cold fold for the
+#: life of the unit. A string keeps the fold's order without changing the kernel's sort
+#: for its other clients.
 #:
-#: Encoding the state here keeps the order the fold wrote it in, and keeps it without
-#: changing what the kernel does for its other clients -- whose folds would each need
-#: their own audit before that sort could be called safe to drop. The cost is the escape
-#: characters a JSON string inside JSON carries.
-#:
-#: A payload written before this wrapper decodes to a state with none of the fold's own
-#: keys, which :func:`~kiro_crew.crew_log.projection.Checkpoint.from_dict` refuses, so it
-#: is retired to a cold fold rather than misread.
-_SLOT_STATE_JSON: Final[str] = "state_json"
+#: A payload without this wrapper decodes to a state with none of the fold's keys, which
+#: :func:`~kiro_crew.crew_log.projection.Checkpoint.from_dict` refuses, so it cold-folds
+#: rather than being misread.
+#: Stored compressed when large (:mod:`~kiro_crew.crew_log.slot_state_codec`).
+_SLOT_STATE_JSON: Final[str] = slot_state_codec.STATE_JSON
 
 
 class SlotSavepoint(NamedTuple):
@@ -1191,8 +1204,8 @@ def _decoded_slot_state(payload: Any, name: str) -> "dict[str, Any] | None":
     """
     if not isinstance(payload, dict):
         return None
-    encoded = payload.get(_SLOT_STATE_JSON)
-    if not isinstance(encoded, str):
+    encoded = slot_state_codec.decode_state(payload)
+    if encoded is None:
         logger.debug("crew log slot savepoint for %s carries no encoded state", name)
         return None
     try:
@@ -1335,8 +1348,12 @@ def save_slot(
         origin=origin,
         first_seq=first_seq,
     )
-    lease = _hold(handle)
-    if lease is None:
+    # A backfill child writes to its staging directory instead, with no lease: the
+    # gateway's writers hold it, and the gateway moves the file in under it
+    # (``slot_backfill_child.admit``).
+    redirect = slot_save_dir
+    lease = None if redirect is not None else _hold(handle)
+    if lease is None and redirect is None:
         return False
     written = False
     #: Whether the store was actually asked to write. Set only around that call, so
@@ -1344,7 +1361,9 @@ def save_slot(
     offered = False
     elapsed_ms = 0.0
     try:
-        directory = _ensure_dir(handle, SLOT_CHECKPOINT_DIR)
+        directory = (
+            redirect(handle) if redirect is not None else _ensure_dir(handle, SLOT_CHECKPOINT_DIR)
+        )
         if directory is None:
             return False
         store = _UnitStore(directory)
@@ -1368,7 +1387,7 @@ def save_slot(
                     key=name,
                     state_version=fold_state_version(name),
                     watermark=watermark,
-                    state={_SLOT_STATE_JSON: encoded},
+                    state=slot_state_codec.encode_state(encoded),
                     identity=block,
                     witness=witness_mapping(prefix),
                 ),
@@ -1379,10 +1398,11 @@ def save_slot(
             # False here on that path, since the assignment never completed.
             offered = True
             elapsed_ms = (time.monotonic() - started) * 1000.0
-        if _discard_if_unit_gone(handle, directory):
+        if redirect is None and _discard_if_unit_gone(handle, directory):
             return False
     finally:
-        release_lease(lease)
+        if lease is not None:
+            release_lease(lease)
         # After the lease, for the reason :func:`_count_savepoint_write` states. Exactly
         # one point per call that reached the store, and none from a call that returned
         # before it: an unserializable state, a missing directory and a contended lease
@@ -1510,6 +1530,24 @@ def _resume_one(
 # --------------------------------------------------------------------------- #
 # The unit
 # --------------------------------------------------------------------------- #
+
+
+def _span_holds(handle: CrewLog, span: "ConsumedSpan") -> bool:
+    """Whether the records *span* framed still read the same; ``False`` when unprovable."""
+    try:
+        held = span.holds(crew_log_dir(handle.kind, handle.id), handle.id)
+    except CrewLogError:
+        log_exception_text(
+            logger, logging.DEBUG, "crew log %s: savepoint span check refused its path", handle.id
+        )
+        return False
+    if not held:
+        logger.debug(
+            "crew log %s: the records a pass folded changed before its savepoint, "
+            "so none is written",
+            handle.id,
+        )
+    return held
 
 
 def _hold(handle: CrewLog) -> str | None:

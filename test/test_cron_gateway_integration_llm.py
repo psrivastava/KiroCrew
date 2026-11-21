@@ -23,6 +23,27 @@ from cron_gateway_integration_helpers import (
 
 from kiro_crew.testing.wait import finished
 
+
+def _usage_rows(monkeypatch, tmp_path):
+    """Point the usage shards at *tmp_path*; return a reader of the rows written."""
+    import json
+
+    import kiro_crew.dashboard.handlers.usage as usage_mod
+
+    shard_dir = tmp_path / "usage" / "tokens"
+    monkeypatch.setattr(usage_mod, "_TOKEN_USAGE_DIR", shard_dir)
+
+    def rows():
+        return [
+            json.loads(line)
+            for shard in sorted(shard_dir.glob("*.jsonl"))
+            for line in shard.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    return rows
+
+
 # ── Per-job model override: _acquire_with_model_fallback / _annotate_model_downgrade ──
 
 
@@ -77,7 +98,9 @@ class TestLlmCronAdmission:
         assert job.run_never_started is True
         assert job.last_status == "error"
         assert job.last_error == "gateway admission is closed"
-        assert job.last_result == ""
+        # A message job keeps the previous result: it is the next run's
+        # "do NOT repeat" context.
+        assert job.last_result == "stale result"
         assert job.consecutive_failures == 2
         stream.assert_not_awaited()
 
@@ -88,13 +111,9 @@ class TestLlmCronAdmission:
     ):
         """The upgrade's capture and the old build's session record agree at dispatch.
 
-        0.7.0-insider.1 to .5 fired a member schedule once and left
-        ``{memory_store, agent: <member selector>}`` under ``cron:<id>``. The
-        start-of-process capture keeps the ``agent_id`` the schedule named, and
-        the single-agent fire then binds that capture under the same stable key
-        with ``replace_existing`` False -- which refused the record until the
-        capture reconciled it. Driven through the real callback: the fire runs,
-        dispatches the named agent, and the record carries the capture.
+        The stored record is ``{memory_store, agent: <member selector>}`` under ``cron:<id>``,
+        as 0.7.0-insider.1 to .5 left it. The fire binds the capture with
+        ``replace_existing`` False, so the capture must reconcile with that record.
         """
         import json
         import os
@@ -278,7 +297,7 @@ class TestModelFallback:
             return (provider_mock, True, False)
 
         result, _ = await _run_llm_callback(gw, job, get_or_create_side_effect=_side_effect)
-        assert result.startswith("⚠️")
+        assert result.startswith("Warning:")
         assert "claude-fancy-model" in result
         assert "Agent response here" in result
 
@@ -340,11 +359,14 @@ class TestThrottleFallbackCronWiring:
         assert "Agent response here" in result
 
     @pytest.mark.asyncio
-    async def test_fallback_served_run_blanks_pinned_model_in_usage_row(self):
+    async def test_fallback_served_run_blanks_pinned_model_in_usage_row(
+        self, monkeypatch, tmp_path
+    ):
         """A pinned job.model must NOT be billed while a fallback served the
         turn — the usage row blanks it so model_source reports what ran."""
         from kiro_crew.llm_helpers import TURN_FALLBACK_ATTR
 
+        rows = _usage_rows(monkeypatch, tmp_path)
         gw = _make_gw_for_llm()
         job = _make_llm_job(model="pinned-model")
         provider_mock = MagicMock()
@@ -353,25 +375,17 @@ class TestThrottleFallbackCronWiring:
         async def _side_effect(*args, **kwargs):
             return (provider_mock, True, False)
 
-        with patch(
-            "kiro_crew.slack.gateway.persist_token_record_async", new_callable=AsyncMock
-        ) as persist_mock:
-            await _run_llm_callback(gw, job, get_or_create_side_effect=_side_effect)
-        assert persist_mock.await_count >= 1
-        # Positional arg 1 is the model; blank = defer to model_source.
-        assert persist_mock.await_args.args[1] == ""
+        await _run_llm_callback(gw, job, get_or_create_side_effect=_side_effect)
+        assert [(r["surface"], r["model"]) for r in rows()] == [("cron", "")]
 
     @pytest.mark.asyncio
-    async def test_unswapped_run_still_bills_pinned_model(self):
+    async def test_unswapped_run_still_bills_pinned_model(self, monkeypatch, tmp_path):
         """No fallback marker -> the explicit pin is recorded unchanged."""
+        rows = _usage_rows(monkeypatch, tmp_path)
         gw = _make_gw_for_llm()
         job = _make_llm_job(model="pinned-model")
-        with patch(
-            "kiro_crew.slack.gateway.persist_token_record_async", new_callable=AsyncMock
-        ) as persist_mock:
-            await _run_llm_callback(gw, job)
-        assert persist_mock.await_count >= 1
-        assert persist_mock.await_args.args[1] == "pinned-model"
+        await _run_llm_callback(gw, job)
+        assert [(r["surface"], r["model"]) for r in rows()] == [("cron", "pinned-model")]
 
     def test_annotate_noop_without_marker(self):
         from types import SimpleNamespace
@@ -474,7 +488,7 @@ class TestThrottleFallbackCronWiring:
         ), f"expected the chain story in a failure alert, got {bodies!r}"
         # The delivered detail stays bounded by the cap even with the story
         # appended (the budget trims the error part). +60 absorbs the fixed
-        # "❌ Job failed:\n" / "❌ Job failed (suppressed — same error):\n"
+        # "Error: Job failed:\n" / "Error: Job failed (suppressed — same error):\n"
         # prefixes around exc_detail — the bound under test is exc_detail's.
         from kiro_crew.slack.gateway import _CRON_FAILURE_DETAIL_CAP
 
@@ -522,14 +536,13 @@ class TestCronUsageRow:
         assert kwargs["context_window"] == 200000
 
     @pytest.mark.asyncio
-    async def test_cron_row_records_resolved_agent_not_requested(self):
+    async def test_cron_row_records_resolved_agent_not_requested(self, monkeypatch, tmp_path):
         """The agent that served the turn wins over the configured alias."""
+        rows = _usage_rows(monkeypatch, tmp_path)
         gw = _make_gw_for_llm()
         job = _make_llm_job(model="claude-opus-4-8")
 
-        persist = AsyncMock()
         with (
-            patch("kiro_crew.slack.gateway.persist_token_record_async", persist),
             patch(
                 "kiro_crew.slack.gateway.read_context_tokens",
                 MagicMock(return_value=(10, 100)),
@@ -537,18 +550,19 @@ class TestCronUsageRow:
             ),
             patch(
                 "kiro_crew.slack.gateway.read_effective_agent",
-                MagicMock(return_value="kirocrew"),
+                MagicMock(return_value="served-agent"),
                 create=True,
             ),
         ):
             await _run_llm_callback(gw, job)
 
-        persist.assert_awaited_once()
-        assert persist.await_args.kwargs["agent"] == "kirocrew"
+        # The job names no agent, so the configured one is the default `kirocrew`.
+        assert [(r["surface"], r["agent"]) for r in rows()] == [("cron", "served-agent")]
 
     @pytest.mark.asyncio
-    async def test_downgraded_cron_does_not_record_rejected_model(self):
+    async def test_downgraded_cron_does_not_record_rejected_model(self, monkeypatch, tmp_path):
         """A model that was refused never ran, so it must not be attributed."""
+        rows = _usage_rows(monkeypatch, tmp_path)
         gw = _make_gw_for_llm()
         job = _make_llm_job(model="claude-nonexistent-9")
         provider_mock = MagicMock()
@@ -561,21 +575,15 @@ class TestCronUsageRow:
                 raise RuntimeError("model 'claude-nonexistent-9' not found")
             return (provider_mock, True, False)
 
-        persist = AsyncMock()
-        with (
-            patch("kiro_crew.slack.gateway.persist_token_record_async", persist),
-            patch(
-                "kiro_crew.slack.gateway.read_context_tokens",
-                MagicMock(return_value=(10, 100)),
-                create=True,
-            ),
+        with patch(
+            "kiro_crew.slack.gateway.read_context_tokens",
+            MagicMock(return_value=(10, 100)),
+            create=True,
         ):
             await _run_llm_callback(gw, job, get_or_create_side_effect=_side_effect)
 
-        persist.assert_awaited_once()
-        # Positional arg 1 is the model; blank defers to model_source, which
-        # reports the model that actually served the turn.
-        assert persist.await_args.args[1] == ""
+        # Blank defers to model_source, which names the model that served the turn.
+        assert [(r["surface"], r["model"]) for r in rows()] == [("cron", "")]
 
     @pytest.mark.asyncio
     async def test_script_cron_writes_no_usage_row(self):

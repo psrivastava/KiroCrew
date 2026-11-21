@@ -14,6 +14,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from aiohttp import web
+from app_token_records import mark_apps_live
 from multidict import CIMultiDict
 
 from kiro_crew.dashboard import tailnet
@@ -50,6 +51,7 @@ def _isolated(tmp_path, _floor_monkeypatch):
 
     monkeypatch = _floor_monkeypatch
     monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: tmp_path)
+    mark_apps_live(monkeypatch)
     monkeypatch.setattr(rg, "_gen", 0)
     monkeypatch.setattr(ta, "_revoked_store_singleton", None)
     monkeypatch.setattr(tailnet, "IS_POSIX", True)
@@ -68,6 +70,8 @@ def _isolated(tmp_path, _floor_monkeypatch):
         return {"Node": {"Name": hit[1]}, "UserProfile": {"LoginName": hit[0]}}, False
 
     monkeypatch.setattr(tailnet, "_run_json_detail", MagicMock(side_effect=whois))
+    # The loopback client stands in for the daemon behind ``tailscale serve``.
+    monkeypatch.setattr(tailnet, "loopback_client_is_daemon", lambda *_a: True)
     yield calls
     ta._state.clear_all()
     tailnet._whois_cache.clear()
@@ -221,6 +225,25 @@ async def test_tagged_nodes_are_distinct_machines():
     assert one.principal.kind is PrincipalKind.MACHINE
     assert two.principal.kind is PrincipalKind.MACHINE
     assert one.principal.id != two.principal.id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "headers",
+    [
+        [("Tailscale-User-Login", "bob@example.com"), ("X-Forwarded-For", "100.64.0.5")],
+        [("X-Forwarded-For", "100.64.0.7, 100.64.0.5")],
+        [("X-Forwarded-For", "100.64.0.7"), ("X-Forwarded-For", "100.64.0.5")],
+    ],
+    ids=["disagreeing-login-header", "comma-chain", "repeated-xff"],
+)
+async def test_unattributable_tailnet_forwarding_is_refused_never_a_person(headers, monkeypatch):
+    """Under the preview, a forwarded tailnet request that names no allowed person is refused."""
+    monkeypatch.setenv("KIROCREW_SHARED_CREW_PREVIEW", "1")
+    mw = token_auth_middleware(tailnet_trust=TRUST)
+    status, actor = await _actor_after(mw, _request(token=_token(), headers=headers))
+    assert status == 403
+    assert actor is None
 
 
 @pytest.mark.asyncio

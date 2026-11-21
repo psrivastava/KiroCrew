@@ -13,9 +13,13 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ChevronDown, ChevronLeft, ChevronRight, Info, Loader2, Search } from 'lucide-react'
 import { api } from '../../api/client'
 import Clickable from '../../components/Clickable'
+import ErrorNotice from '../../components/ErrorNotice'
+import { recordError, type ErrorReport } from '../../utils/errorReport'
+import { errMessage } from '../../utils/thunkError'
 import SimpleSelect from '../../components/SimpleSelect'
 import { Btn, ContentSkeleton } from '../../components/ui'
-import { compareText, fmtBytes, fmtNumber, fmtRelative } from '../../i18n/format'
+import { usePagerFocus } from '../../hooks/usePagerFocus'
+import { compareText, fmtBytes, fmtNumber, fmtRelative, joinSentences } from '../../i18n/format'
 import { i18nT } from '../../i18n/t'
 import type {
   SessionInventoryDetail,
@@ -62,6 +66,9 @@ export default function SessionStorageScreen({ onBack }: { onBack: () => void })
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
   const [trashOpen, setTrashOpen] = useState(true)
   const [refused, setRefused] = useState<SessionTrashRefusal[]>([])
+  // What "Ask the agent" hands over for those refusals. A 200 is never journaled,
+  // so without this the hand-off would carry only the heading.
+  const [refusedReport, setRefusedReport] = useState<ErrorReport | undefined>(undefined)
   // One page cursor per list. They are independent because the replay-only group is
   // collapsed by default: paging the main list must not move a reader's place inside
   // the group they had open, and vice versa.
@@ -131,8 +138,15 @@ export default function SessionStorageScreen({ onBack }: { onBack: () => void })
   const trashMut = useMutation({
     mutationFn: (uids: string[]) => api.sessionInventoryTrash(uids),
     onSuccess: (result) => {
-      if (result.refused.length > 0) setRefused(result.refused)
-      else setRefused([])
+      setRefused(result.refused)
+      setRefusedReport(result.refused.length > 0
+        ? recordError({
+            source: 'system',
+            message: i18nT('pages.sessionStorage.refused_heading', { count: result.refused.length, n: fmtNumber(result.refused.length) }),
+            endpoint: '/api/system/session-storage/trash',
+            detail: result.refused.map(r => `${r.uid}: ${r.reason}`).join('\n'),
+          })
+        : undefined)
       invalidate()
     },
   })
@@ -345,6 +359,16 @@ export default function SessionStorageScreen({ onBack }: { onBack: () => void })
                 reclaimable: fmtBytes(data.reclaimable_bytes),
               })}
             </p>
+            {/* Another program's store, never part of the totals above and never
+                moved from here, so it is said beside them rather than added in. */}
+            {(data.claude_code?.sessions ?? 0) > 0 && (
+              <p className="text-[12px] text-muted mt-0.5">
+                {i18nT('pages.sessionStorage.claude_code_kept', {
+                  count: data.claude_code?.sessions ?? 0,
+                  size: fmtBytes(data.claude_code?.bytes ?? 0),
+                })}
+              </p>
+            )}
           </div>
 
           {/* Blocked reason */}
@@ -409,6 +433,7 @@ export default function SessionStorageScreen({ onBack }: { onBack: () => void })
               ]}
               value={sort}
               onChange={value => setSort(value as SortKey)}
+              aria-label={i18nT('pages.sessionStorage.sort_label')}
             />
           </div>
 
@@ -435,19 +460,34 @@ export default function SessionStorageScreen({ onBack }: { onBack: () => void })
             </div>
           )}
 
-          {/* Refused notice */}
+          {/* Refused notice: the server's per-session refusals of a move to
+              Trash. The hand-off is on: the refused sessions are untouched, the
+              selection is already cleared when this shows, and the one text
+              box is a search filter, not a draft. */}
           {refused.length > 0 && (
-            <div className="bg-bg-elevated border border-border rounded-md px-3 py-2 text-[12px]">
-              <div className="font-medium text-text-strong mb-1">
-                {i18nT('pages.sessionStorage.refused_heading', { count: fmtNumber(refused.length) })}
-              </div>
-              {refused.map(r => (
-                <div key={r.uid} className="text-muted">
-                  {labelFor(r.uid)}: {refusalReason(r.reason)}
-                </div>
-              ))}
-            </div>
+            <ErrorNotice
+              askAgent
+              testId="session-storage-refused"
+              report={refusedReport}
+              message={i18nT('pages.sessionStorage.refused_heading', { count: refused.length, n: fmtNumber(refused.length) })}
+              footer={
+                <ul className="text-muted">
+                  {refused.map(r => (
+                    <li key={r.uid}>{labelFor(r.uid)}: {refusalReason(r.reason)}</li>
+                  ))}
+                </ul>
+              }
+            />
           )}
+
+          {/* The move request itself failed, so nothing was moved. The hand-off
+              is on: the sessions are untouched, and the selection and search box
+              are view state, not a draft. */}
+          <ErrorNotice
+            askAgent
+            testId="session-storage-trash-failed"
+            message={trashMut.isError ? errMessage(trashMut.error) : null}
+          />
 
           {/* Session list */}
           <div className="border-t border-border">
@@ -706,6 +746,7 @@ function Pager({
   to: number
   onPage: (page: number) => void
 }) {
+  const pager = usePagerFocus()
   if (pages <= 1) return null
   return (
     <div className="flex flex-wrap items-center justify-between gap-2 px-1.5 py-2 border-b border-border">
@@ -717,7 +758,7 @@ function Pager({
         })}
       </span>
       <div className="flex items-center gap-2">
-        <Btn disabled={page <= 1} onClick={() => onPage(page - 1)}>
+        <Btn ref={pager.prevRef} disabled={page <= 1} onClick={() => { onPage(page - 1); pager.pressedPrev() }}>
           {i18nT('pages.sessionStorage.prev_page')}
         </Btn>
         <span className="text-[12px] text-muted tabular-nums">
@@ -726,7 +767,7 @@ function Pager({
             pages: fmtNumber(pages),
           })}
         </span>
-        <Btn disabled={page >= pages} onClick={() => onPage(page + 1)}>
+        <Btn ref={pager.nextRef} disabled={page >= pages} onClick={() => { onPage(page + 1); pager.pressedNext() }}>
           {i18nT('pages.sessionStorage.next_page')}
         </Btn>
       </div>
@@ -1073,17 +1114,22 @@ function EmptyProgress({ job }: { job: SessionStorageEmptyJob }) {
     // every locale to say something the reasons already say.
     const reasons = [...new Set(job.skipped)]
     return (
-      <p className="px-1.5 py-2 text-[12px] text-warn" role="status">
-        {i18nT('pages.sessionStorage.empty_kept', { freed: fmtBytes(job.freed_bytes) })}
-        {' '}
-        {reasons.map(skipReason).join(' ')}
-        {/* Gated on the reason it actually describes. Only the unlisted-file case has
-            a file to name, so appending it to every code promised a log line that
-            says nothing for the others. */}
-        {reasons.includes('unlisted_files') && (
-          <> {i18nT('pages.sessionStorage.kept_next_step')}</>
-        )}
-      </p>
+      <div className="px-1.5 py-2">
+        {/* The hand-off is on: a kept batch is still listed above, untouched, and
+            this panel holds no draft. */}
+        <ErrorNotice
+          askAgent
+          testId="session-storage-empty-kept"
+          message={joinSentences([
+            i18nT('pages.sessionStorage.empty_kept', { freed: fmtBytes(job.freed_bytes) }),
+            ...reasons.map(skipReason),
+            // Gated on the reason it actually describes. Only the unlisted-file case has
+            // a file to name, so appending it to every code promised a log line that
+            // says nothing for the others.
+            reasons.includes('unlisted_files') && i18nT('pages.sessionStorage.kept_next_step'),
+          ])}
+        />
+      </div>
     )
   }
   return (
@@ -1122,6 +1168,19 @@ function TrashBatchRow({
   onConfirmEmpty: (id: string) => void
 }) {
   const isArmed = arming === batch.batch_id
+  // Arming and Cancel each unmount the focused button, which would drop focus
+  // to the page. Move it to the control that takes its place: Cancel on arm
+  // (the safe choice, in the slot the arm button vacated) and "Delete forever"
+  // on Cancel. Only after a press here, so nothing is stolen on render.
+  const armRef = useRef<HTMLButtonElement>(null)
+  const cancelRef = useRef<HTMLButtonElement>(null)
+  const focusNext = useRef<'arm' | 'cancel' | null>(null)
+  useEffect(() => {
+    const target = focusNext.current
+    focusNext.current = null
+    if (target === 'cancel' && isArmed) cancelRef.current?.focus()
+    else if (target === 'arm' && !isArmed) armRef.current?.focus()
+  }, [isArmed])
 
   return (
     <div className="border-b border-border px-1.5 py-2.5 flex flex-wrap items-center gap-3">
@@ -1152,7 +1211,7 @@ function TrashBatchRow({
            under the stationary pointer. The time guard below covers the same
            hazard for a keyboard repeat or a re-ordered layout. */
         <>
-          <Btn disabled={busy} onClick={() => onArm(null)}>
+          <Btn ref={cancelRef} disabled={busy} onClick={() => { focusNext.current = 'arm'; onArm(null) }}>
             {i18nT('pages.sessionStorage.cancel')}
           </Btn>
           <Btn danger disabled={busy} onClick={() => onConfirmEmpty(batch.batch_id)}>
@@ -1161,9 +1220,10 @@ function TrashBatchRow({
         </>
       ) : (
         <button
+          ref={armRef}
           type="button"
           disabled={busy}
-          onClick={() => onArm(batch.batch_id)}
+          onClick={() => { focusNext.current = 'cancel'; onArm(batch.batch_id) }}
           className="text-[12px] text-danger underline underline-offset-2 decoration-border-strong hover:decoration-danger bg-transparent border-0 cursor-pointer disabled:opacity-35"
         >
           {i18nT('pages.sessionStorage.delete_forever')}

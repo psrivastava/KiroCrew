@@ -190,29 +190,17 @@ class TestRestrictedRunStateLifetime:
 class TestSharedBindIdentityLabel:
     """The shared-bind identity write names the backend that served the session.
 
-    ``_bind_shared_handle_impl`` publishes and persists a cleanup identity before any
-    cancellable await, so the value it writes is what a run cancelled in that window
-    leaves behind. A constant here can be correct for exactly one of the backends this
-    path can serve, so it is read from the provider.
-
-    That record is not what a continuation reads: ``_run_inner_impl`` re-captures the
-    label from the same provider right after session acquisition, and that value is
-    what reaches ``state.json``, so a run that completes was always labelled
-    correctly. What the record routes is session-file CLEANUP. With kiro's label on
-    another host's session, ``_cleanup_session_files_sync`` takes the kiro branch,
-    unlinks a path that was never going to exist and returns success -- where the real
-    label returns False, "no cleanup route for this provider", and the prune keeps its
-    retry metadata instead of deleting the run folder over a cleanup that did nothing.
+    ``_bind_shared_handle_impl`` persists it before any cancellable await, and it routes
+    session-file cleanup. With kiro's label on another host's session,
+    ``_cleanup_session_files_sync`` would report a no-op as success and the prune would delete
+    the run folder; the real label returns False and keeps the retry metadata.
     """
 
     async def _bound(self, backend: str):  # type: ignore[no-untyped-def]
         """Drive the real bind against a provider whose backend is *backend*.
 
-        The provider is a REAL ``AcpSessionProvider``, built the way the bind builds
-        one, because ``provider_label`` resolves it by ``isinstance``: a bare
-        ``MagicMock`` answers the default label for every backend, which is precisely
-        the failure this test exists to catch. The backend is carried by the runtime,
-        which is where the provider reads it from in production too.
+        A real ``AcpSessionProvider``: ``provider_label`` resolves by ``isinstance``, and a bare
+        ``MagicMock`` would answer the default label for every backend.
         """
         from kiro_crew.acp.session_provider import AcpSessionProvider
         from kiro_crew.subagent_manager.run import RunEventCoordinator
@@ -283,6 +271,48 @@ class TestSuccessorClaim:
         failed = SubagentInfo(id=run_id, task="t", done=True, error="turn_limit:100")
         manager._agents[run_id] = failed
         return failed
+
+    def test_a_retry_refused_while_pending_leaves_the_run_retryable(self) -> None:
+        """Eviction during a retry's admission keeps the run, so a refused
+        admission hands it back and the next retry is granted."""
+        manager = _manager()
+        failed = self._failed(manager)
+        failed.started = 0.0
+        for i in range(50):
+            done = SubagentInfo(id=f"ok{i}", task="t", done=True)
+            done.started = float(i + 1)
+            manager._agents[done.id] = done
+        assert manager.claim_retry(failed) == ""
+        newest = SubagentInfo(id="ok50", task="t", done=True)
+        newest.started = 51.0
+        manager._agents[newest.id] = newest
+        evict_completed_agents(manager._agents)
+        manager.settle_retry(failed, None)
+        assert manager._agents.get(failed.id) is failed
+        assert manager.claim_retry(manager._agents[failed.id]) == ""
+
+    @pytest.mark.parametrize("kind", ["retry", "continuation"])
+    def test_a_claim_in_flight_survives_a_full_failed_pool(self, kind: str) -> None:
+        """Past the failed-run bound, an unclaimed failed run is dropped instead."""
+        manager = _manager()
+        failed = self._failed(manager)
+        failed.started = 0.0
+        for i in range(50):
+            other = SubagentInfo(id=f"f{i}", task="t", done=True, error="boom")
+            other.started = float(i + 1)
+            manager._agents[other.id] = other
+        if kind == "retry":
+            assert manager.claim_retry(failed) == ""
+        else:
+            assert manager._claim_continuation(failed.id, "x", "")[1] is None
+        evict_completed_agents(manager._agents)
+        if kind == "retry":
+            manager.settle_retry(failed, None)
+        else:
+            manager._settle_continuation(failed.id, failed, None)
+        assert manager._agents.get(failed.id) is failed
+        assert "f0" not in manager._agents
+        assert manager.claim_retry(failed) == ""
 
     # Every state a failed run's successor claim can be in, and whether a retry
     # and a continuation are each granted from it. The continuation column is

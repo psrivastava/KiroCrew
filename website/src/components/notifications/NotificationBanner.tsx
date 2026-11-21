@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode, type RefObject } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { AnimatePresence, motion, useReducedMotion, type TargetAndTransition } from 'framer-motion'
 import { i18nT } from '../../i18n/t'
-import { useAppDispatch, useAppSelector } from '../../store'
+import { store, useAppDispatch, useAppSelector } from '../../store'
 import { ackNotification } from '../../store/notificationsSlice'
 import { setActiveId } from '../../store/instancesSlice'
 import { useLocalCrewHidden } from '../overlayRoot'
@@ -19,7 +19,7 @@ import {
   loadBannerEnabled, shouldBannerNote,
 } from '../../hooks/notificationBanner'
 import type { Notification } from '../../types'
-import { notePriority, safeInternalUrl } from './notifMeta'
+import { noteActionLabel, notePriority, noteText, safeInternalUrl } from './notifMeta'
 import NotificationCard, { CARD_RADIUS, type NotificationCardAction } from './NotificationCard'
 import SwipeToDismiss from './SwipeToDismiss'
 import { CrewmateRosterError, noteMember } from './CrewmateNoteFace'
@@ -94,6 +94,7 @@ export default function NotificationBanner({ bellRef, popoverOpen, onOpenNote, a
   const isMobile = useIsMobile()
   const reduced = !!useReducedMotion()
   const activeSlot = useAppSelector(s => s.chat.activeSlot)
+  const notificationItems = useAppSelector(s => s.notifications.items)
 
   const [pending, setPending] = useState<Notification[]>([])
   const [expanded, setExpanded] = useState(false)
@@ -161,6 +162,13 @@ export default function NotificationBanner({ bellRef, popoverOpen, onOpenNote, a
     setPending(next)
     if (next.length <= 1) setExpanded(false)
   }, [measureExit])
+
+  useEffect(() => {
+    const held = new Set(notificationItems.filter(n => n.key).map(n => n.ts))
+    removeNotes(
+      pendingRef.current.filter(n => n.key && !held.has(n.ts)).map(n => n.ts),
+    )
+  }, [notificationItems, removeNotes])
 
   const fireAutoHide = useCallback(() => {
     timer.current = null
@@ -259,6 +267,7 @@ export default function NotificationBanner({ bellRef, popoverOpen, onOpenNote, a
         // Read at arrival, like focus: the Members page registers its thread
         // only while it is visible and focused.
         viewedThread: getViewedThreadSlot(),
+        relayCovered: store.getState().instances?.relayActive != null,
       })
       if (!ok) return
       const next = [note, ...pendingRef.current.filter(n => n.ts !== note.ts)]
@@ -298,7 +307,9 @@ export default function NotificationBanner({ bellRef, popoverOpen, onOpenNote, a
   }, [popoverOpen, onInbox, enabled, clearTimer, removeNotes])
 
   // ---- Escape dismisses the topmost card --------------------------------------
-  useEffect(() => {
+  // A layout effect, so Escape is armed in the commit that shows the card: a
+  // passive effect can run a task later and miss a press made in between.
+  useLayoutEffect(() => {
     if (pending.length === 0) return
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'Escape' || e.defaultPrevented) return
@@ -314,7 +325,10 @@ export default function NotificationBanner({ bellRef, popoverOpen, onOpenNote, a
   // The banner shows over every Crew, but its actions land in the local one (a
   // navigation, the leave-guard prompt), so over a remote Crew each brings the
   // local Crew forward first.
-  const crewHidden = useLocalCrewHidden()
+  // A relay tab covers <main> without hiding the local overlay root, so it is read on its own.
+  const localHidden = useLocalCrewHidden()
+  const relayCovered = useAppSelector(s => s.instances?.relayActive != null)
+  const crewHidden = localHidden || relayCovered
   const showLocalCrew = useCallback(() => {
     if (crewHidden) dispatch(setActiveId(null))
   }, [crewHidden, dispatch])
@@ -408,7 +422,7 @@ export default function NotificationBanner({ bellRef, popoverOpen, onOpenNote, a
             const deck = !expanded && !isMobile && idx > 0
             const urlActions = (Array.isArray(n.actions) ? n.actions : [])
               .filter(a => typeof a?.id === 'string' && typeof a?.label === 'string' && typeof a?.url === 'string')
-              .map(a => ({ ...a, safeUrl: safeInternalUrl(a.url) }))
+              .map(a => ({ ...a, label: noteActionLabel(n, a), safeUrl: safeInternalUrl(a.url) }))
               .filter(a => a.safeUrl)
               .slice(0, 2)
             const isApproval = n.kind === 'approval' && !n.acked
@@ -453,6 +467,10 @@ export default function NotificationBanner({ bellRef, popoverOpen, onOpenNote, a
                 // took its close click (the click expanded the deck instead).
                 style={{ zIndex: 10 - idx, ...(deck ? { position: 'absolute', left: 0, right: 0, top: 0, bottom: 0 } : { position: 'relative' }) }}
                 data-testid="notification-banner-card"
+                // A relay Crew pane hides under a critical card (lib/relayCrewPanes.ts).
+                // Any other card is a passing note: hiding the whole Crew for it
+                // blanked the page each time one came up, and the bell keeps it.
+                data-relay-pane-overlay={prio === 'critical' ? '' : undefined}
                 data-priority={prio}
                 data-deck={deck ? 'true' : undefined}
                 className="rounded-2xl"
@@ -481,7 +499,7 @@ export default function NotificationBanner({ bellRef, popoverOpen, onOpenNote, a
                     <NotificationCard
                       n={n}
                       onOpen={() => openNote(n)}
-                      openLabel={i18nT('components.notifications.notificationBanner.open_notification', { title: n.title })}
+                      openLabel={i18nT('components.notifications.notificationBanner.open_notification', { title: noteText(n).title })}
                       onDismiss={() => removeNotes([n.ts])}
                       dismissLabel={i18nT('components.notifications.notificationBanner.dismiss_notification')}
                       dismissTestId="notification-banner-dismiss"

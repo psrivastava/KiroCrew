@@ -46,11 +46,8 @@ class TestParsing:
     def test_non_dict_entries_are_retained_as_placeholders_not_dropped(self):
         """A non-dict entry must survive parsing so ``validate()`` can refuse it.
 
-        Parsing stays non-fatal — a hand-edited manifest must not raise — but the
-        entry is kept as an empty placeholder rather than discarded. Dropping it
-        made the manifest install clean with the control silently absent, which
-        contradicts the promise that a malformed control is refused at install
-        time instead of being discovered later as a broken chat.
+        Parsing stays non-fatal but keeps an empty placeholder; dropping it would install
+        clean with the control silently absent.
         """
         m = AppManifest.from_dict(
             {
@@ -107,11 +104,11 @@ class TestValidation:
         assert _mf([{"id": "env-picker", "entryPoint": "dist/c.mjs"}]).validate() == []
 
     def test_a_trailing_newline_is_refused_on_both_patterns(self):
-        """Regression: `$` also matches BEFORE a trailing newline.
+        """`$` also matches BEFORE a trailing newline.
 
-        These two patterns were checked with ``re.match``, so ``"a\\n"`` and
-        ``"session-status\\n"`` validated clean and the statusPath then reached
-        the URL the dashboard builds. The module docstring calls this trap out —
+        With ``re.match`` on these two patterns, ``"a\\n"`` and ``"session-status\\n"``
+        would validate clean and the statusPath would reach the URL the dashboard
+        builds. The comment above ``_ENDPOINT_ALLOWED_RE`` calls this trap out —
         both must use ``fullmatch``.
         """
         assert any(

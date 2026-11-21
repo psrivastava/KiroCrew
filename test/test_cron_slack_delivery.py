@@ -29,6 +29,7 @@ def _make_gateway():
     gw._owner_id = "U000"
     gw.subagent_mgr = None
     gw._cron_injecting = {}
+    gw._cron_runs_holding = set()
     gw._no_crons = False
     gw.sessions.get_or_create = AsyncMock(return_value=(MagicMock(), True, False))
     gw.sessions.release = MagicMock()
@@ -100,7 +101,7 @@ class TestSlackDeliveryFailureDoesNotFailJob:
         calls = gw.dashboard_state.notify.call_args_list
         # First call: success notification, second: Slack failure warning
         assert len(calls) == 2
-        assert "⚠️" in calls[1].args[2]
+        assert "Warning: " in calls[1].args[2]
         assert "channel_not_found" in calls[1].args[2]
 
     def test_job_succeeds_when_slack_is_none(self) -> None:

@@ -31,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import time
 from collections.abc import Callable
@@ -40,19 +41,25 @@ from itertools import islice
 from pathlib import Path
 from uuid import uuid4
 
-from kiro_crew import member_memory_backup, platform_compat
+from kiro_crew import member_memory_backup
+from kiro_crew import memory_record_metadata as record_meta
+from kiro_crew import platform_compat
 from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.atomic_write import atomic_write, replace_with_retry
 from kiro_crew.memory_stores import (
     DEFAULT_MEMORY_STORE,
+    MEMBER_BACKUPS_DIR_NAME,
     MEMORY_DB_FILE,
     STORE_BACKUP_DIR_NAME,
     active_store_names,
+    is_lock_write_refusal,
+    memory_stores_root,
     named_store_of_db,
     owned_store_path,
     resolve_store_path,
 )
 from kiro_crew.owner_only_files import owner_only_opener, prepare_owner_only_sqlite
+from kiro_crew.sqlite_uri import read_only_uri
 
 logger = logging.getLogger(__name__)
 
@@ -126,17 +133,26 @@ def snapshot_time(backup: Path) -> datetime:
     return datetime.strptime(stamp, pattern).replace(tzinfo=timezone.utc)
 
 
-def _read_only_uri(path: Path) -> str:
-    """A read-only SQLite URI for *path*, percent-escaped.
+def _sandboxed_backup_hint(exc: BaseException | None) -> str | None:
+    """The operator-facing reason a member backup was refused inside the agent sandbox.
 
-    ``as_uri()`` rather than interpolating the path into ``file:...``: a filename
-    containing ``?`` or ``#`` is otherwise parsed as the start of the URI's query or
-    fragment, truncating the path so the connection opens a DIFFERENT database. Store
-    names are shape-validated, but ``KIROCREW_HOME`` is operator-chosen, so the
-    truncation is reachable through the data home. One helper because two spellings of
-    one URI is how they diverge.
+    Member backups live in ``memory_stores``, which is read-only to sandboxed code
+    (``sandbox._CREW_READONLY_LEAVES``). Decided from the failure, as
+    ``cli_config._sandboxed_config_write_hint`` is: a refused write naming a path under
+    the member-backups directory. ``None`` otherwise.
     """
-    return f"{path.absolute().as_uri()}?mode=ro"
+    if not isinstance(exc, OSError) or not is_lock_write_refusal(exc):
+        return None
+    if not isinstance(exc.filename, (str, bytes, os.PathLike)):
+        return None
+    sealed = memory_stores_root().resolve() / MEMBER_BACKUPS_DIR_NAME
+    if not Path(os.path.realpath(os.fsdecode(exc.filename))).is_relative_to(sealed):
+        return None
+    return (
+        "member stores are read-only inside the agent sandbox: back up from the "
+        "dashboard or from your own terminal. Outside the sandbox, check the "
+        f"permissions of {sealed}"
+    )
 
 
 def backup_store(db_path: Path, *, now: datetime | None = None) -> Path | None:
@@ -179,7 +195,7 @@ def backup_store(db_path: Path, *, now: datetime | None = None) -> Path | None:
     dst: sqlite3.Connection | None = None
     try:
         # Read-only URI so a backup can never be the thing that writes to the store.
-        src = sqlite3.connect(_read_only_uri(db_path), uri=True)
+        src = sqlite3.connect(read_only_uri(db_path), uri=True)
         # Created 0600 before SQLite opens it, so the populated copy is never
         # readable by others, not even before the restrict_to_owner below.
         prepare_owner_only_sqlite(partial)
@@ -198,7 +214,7 @@ def backup_store(db_path: Path, *, now: datetime | None = None) -> Path | None:
         # real one is deleted to make room -- so the operator loses their last
         # restorable copy at the moment they reach for it. The restore path already
         # checks; checking only there is checking at the wrong end.
-        with closing(sqlite3.connect(_read_only_uri(partial), uri=True)) as probe:
+        with closing(sqlite3.connect(read_only_uri(partial), uri=True)) as probe:
             if probe.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                 raise MemoryBackupFailed(f"the staged copy of {db_path} failed its integrity check")
         platform_compat.restrict_to_owner(partial)
@@ -252,50 +268,64 @@ def _prune_orphaned_stages(db_path: Path, out_dir: Path, *, now: float | None = 
                 logger.debug("removing an orphaned backup sidecar failed", exc_info=True)
 
 
-def list_backups(db_path: Path) -> list[Path]:
+def list_backups(db_path: Path, *, stamped_only: bool = False) -> list[Path]:
     """*db_path*'s backups, NEWEST FIRST.
 
     Sorted by the timestamp in the NAME rather than mtime, because a copied or restored
     file carries whatever mtime the copy gave it while its name still says when its
     contents were taken.
+
+    ``stamped_only`` keeps only names whose timestamp parses. Retention, the interval
+    guard and restore's "latest" choice pass it: a file such as
+    ``memory.pre-upgrade.db`` that an operator dropped in the directory has no taken-at
+    time, so it is neither the newest backup nor one the rotation may delete.
     """
     out_dir = backup_dir_for(db_path)
     if not out_dir.is_dir():
         return []
     if member_memory_backup.is_member_store(db_path):
+        parse: Callable[[Path], datetime] = member_memory_backup.snapshot_time
+        candidates = out_dir.glob(f"{db_path.stem}.*.zip")
+        # An unfamiliar member name sorts last.
+        unparsed = 0.0
+    else:
+        parse = snapshot_time
+        candidates = out_dir.glob(f"{db_path.stem}.*.db")
+        # An unfamiliar name sorts first, so a listing shows it at the top.
+        unparsed = float("inf")
 
-        def stamp_key(path: Path) -> tuple[float, str]:
-            try:
-                return member_memory_backup.snapshot_time(path).timestamp(), path.name
-            except ValueError:
-                return 0.0, path.name
-
-        return sorted(out_dir.glob(f"{db_path.stem}.*.zip"), key=stamp_key, reverse=True)
-
-    def v1_stamp_key(path: Path) -> tuple[float, str]:
+    keyed: list[tuple[float, str, Path]] = []
+    for path in candidates:
         try:
-            return snapshot_time(path).timestamp(), path.name
+            stamp = parse(path).timestamp()
         except ValueError:
-            # An unfamiliar name sorts first, so the freshness guard takes a new
-            # backup instead of trusting it.
-            return float("inf"), path.name
+            if stamped_only:
+                continue
+            stamp = unparsed
+        keyed.append((stamp, path.name, path))
+    keyed.sort(key=lambda row: (row[0], row[1]), reverse=True)
+    return [path for _, _, path in keyed]
 
-    return sorted(out_dir.glob(f"{db_path.stem}.*.db"), key=v1_stamp_key, reverse=True)
 
-
-def prune_backups(db_path: Path, keep: int = DEFAULT_KEEP) -> int:
+def prune_backups(db_path: Path, keep: int = DEFAULT_KEEP, *, now: datetime | None = None) -> int:
     """Delete all but the *keep* newest backups of *db_path*. Returns how many went.
 
     ``keep`` below 1 is treated as 1. Retention exists to bound disk, and a policy that
     can empty the directory turns the feature into a scheduled deletion — the opposite
     of the point.
+
+    A backup stamped after *now* (taken under a wrong clock) is kept and takes no
+    ``keep`` slot. Sorting first by name, it would otherwise outrank and evict the
+    copy just taken, and the pass would count a backup that is already deleted.
     """
     keep = max(1, keep)
+    now = now or datetime.now(timezone.utc)
     out_dir = backup_dir_for(db_path)
     # Member V2 stages ZIP snapshots under their own lifecycle; only V1 stages here.
     if not member_memory_backup.is_member_store(db_path) and out_dir.is_dir():
         _prune_orphaned_stages(db_path, out_dir)
-    victims = list_backups(db_path)[keep:]
+    current = [b for b in list_backups(db_path, stamped_only=True) if not _stamped_after(b, now)]
+    victims = current[keep:]
     removed = 0
     for old in victims:
         try:
@@ -373,11 +403,11 @@ def back_up_all_stores(
             break
         try:
             require_memory_ready(named_store_of_db(path))
-            existing = list_backups(path)
+            reference = _newest_not_after(list_backups(path, stamped_only=True), stamp)
             if (
                 not force
-                and existing
-                and _age_hours(existing[0], stamp) < MIN_BACKUP_INTERVAL_HOURS
+                and reference is not None
+                and _age_hours(reference, stamp) < MIN_BACKUP_INTERVAL_HOURS
             ):
                 result["skipped"] += 1
                 continue
@@ -387,14 +417,48 @@ def back_up_all_stores(
             result["backed_up"] += 1
             if should_stop is not None and should_stop():
                 break
-            result["pruned"] += prune_backups(path, keep)
-        except MemoryBackupFailed:
+            result["pruned"] += prune_backups(path, keep, now=stamp)
+        except MemoryBackupFailed as exc:
             result["failed"] += 1
-            logger.warning("memory backup failed for %s", path, exc_info=True)
+            hint = _sandboxed_backup_hint(exc.__cause__)
+            if hint is not None:
+                # One line the operator can act on; a traceback reads like a broken install.
+                logger.warning("memory backup of %s not taken: %s (%s)", path, hint, exc.__cause__)
+            else:
+                logger.warning("memory backup failed for %s", path, exc_info=True)
         except Exception:
             result["failed"] += 1
             logger.warning("memory backup pass failed for %s", path, exc_info=True)
     return result
+
+
+def _newest_not_after(backups: list[Path], now: datetime) -> Path | None:
+    """The newest of *backups* (newest first) whose stamp is not after *now*.
+
+    A backup stamped after *now* was taken under a wrong clock. As the interval
+    guard's reference it would read as fresh on every pass until the clock caught
+    up; treated as infinitely old instead, every restart would copy and prune the
+    real history away. So it is skipped, and the guard measures from the newest
+    backup taken at or before *now*. An unparseable stamp is returned as is, so
+    :func:`_age_hours` errs toward taking a copy.
+    """
+    for backup in backups:
+        if not _stamped_after(backup, now):
+            return backup
+        logger.warning("memory backup %s is stamped after the current time", backup.name)
+    return None
+
+
+def _stamped_after(backup: Path, now: datetime) -> bool:
+    """Whether *backup*'s name stamp is later than *now* (False when it does not parse)."""
+    try:
+        if backup.suffix == ".zip":
+            from kiro_crew.member_memory_backup import snapshot_time as member_snapshot_time
+
+            return member_snapshot_time(backup) > now
+        return snapshot_time(backup) > now
+    except ValueError:
+        return False
 
 
 def _age_hours(backup: Path, now: datetime) -> float:
@@ -421,7 +485,7 @@ def newest_backup(store: str = DEFAULT_MEMORY_STORE) -> Path | None:
         db_path = resolve_store_path(store)
     except Exception:
         return None
-    backups = list_backups(db_path)
+    backups = list_backups(db_path, stamped_only=True)
     return backups[0] if backups else None
 
 
@@ -467,18 +531,32 @@ def restore_from_backup(backup: Path, store: str = DEFAULT_MEMORY_STORE) -> Path
             prepare_owner_only_sqlite(stage)  # 0600 before the copy lands in it
             try:
                 with (
-                    closing(sqlite3.connect(_read_only_uri(backup), uri=True)) as src,
+                    closing(sqlite3.connect(read_only_uri(backup), uri=True)) as src,
                     closing(sqlite3.connect(str(stage))) as dst,
                 ):
-                    if src.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                    try:
+                        verdict = src.execute("PRAGMA integrity_check").fetchone()[0]
+                    except sqlite3.DatabaseError as exc:
+                        # "file is not a database" / "malformed" is the BACKUP being
+                        # bad; an OperationalError (I/O, locking) is not, and stays one.
+                        if isinstance(exc, sqlite3.OperationalError):
+                            raise
+                        raise ValueError(
+                            "Backup is not a readable memory database; refusing to restore"
+                        ) from exc
+                    if verdict != "ok":
                         raise ValueError("Backup fails its integrity check; refusing to restore")
                     _require_v1_restore_database(src, store)
                     src.backup(dst)
+                    # The backup's reconcile marker is not trusted: the first start on
+                    # the restored file re-checks every row.
+                    record_meta.invalidate_marker(dst)
+                    dst.commit()
                     # A backup taken before rollback-journal publishing carries a WAL
                     # header; left that way, the probe below would leave
                     # `restore-*.db-wal`/`-shm` behind once activation renames the stage.
                     dst.execute("PRAGMA journal_mode=DELETE").fetchone()
-                with closing(sqlite3.connect(_read_only_uri(stage), uri=True)) as probe:
+                with closing(sqlite3.connect(read_only_uri(stage), uri=True)) as probe:
                     if probe.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                         raise ValueError("Staged backup fails its integrity check")
                     _require_v1_restore_database(probe, store)
@@ -519,7 +597,12 @@ def _v1_journal(db_path: Path) -> tuple[Path, dict | None]:
         or pending.stat().st_size > 16_384
     ):
         raise ValueError("Invalid pending memory restore journal")
-    journal = json.loads(pending.read_text(encoding="utf-8"))
+    try:
+        journal = json.loads(pending.read_text(encoding="utf-8"))
+    except RecursionError as exc:
+        # Nesting past the interpreter's limit is not a ValueError, so it would
+        # skip every caller's invalid-journal arm and end the run in a traceback.
+        raise ValueError("Invalid pending memory restore journal") from exc
     if not isinstance(journal, dict):
         raise ValueError("Invalid pending memory restore journal")
     for key, pattern in (
@@ -609,7 +692,7 @@ def _quarantine_invalid_v1_pending(db_path: Path, out: Path) -> bool:
         )
     # mode=ro refuses an absent file, rather than manufacturing empty memory.
     try:
-        with closing(sqlite3.connect(_read_only_uri(db_path), uri=True)) as db:
+        with closing(sqlite3.connect(read_only_uri(db_path), uri=True)) as db:
             _require_v1_restore_database(db, name)
             if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                 raise ValueError(
@@ -630,7 +713,7 @@ def cancel_pending_restore(db_path: Path) -> bool:
     out = backup_dir_for(db_path)
     if not (out / _V1_PENDING).exists():
         return False
-    with (out / ".restore.lock").open("a+b") as lock:
+    with open(out / ".restore.lock", "a+b", opener=owner_only_opener) as lock:
         with platform_compat.file_lock(lock.fileno(), required=True, wait=False):
             try:
                 _, journal = _v1_journal(db_path)
@@ -658,7 +741,7 @@ def _apply_pending_v1_restore(db_path: Path) -> str | None:
     out, journal = _v1_journal(db_path)
     if journal is None:
         return None
-    with (out / ".restore.lock").open("a+b") as lock:
+    with open(out / ".restore.lock", "a+b", opener=owner_only_opener) as lock:
         with platform_compat.file_lock(lock.fileno(), required=True, wait=False):
             _, journal = _v1_journal(db_path)
             if journal is None:

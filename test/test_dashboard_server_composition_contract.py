@@ -56,6 +56,7 @@ from dashboard_server_composition_contract_helpers import (
     _owner_runtime_edges,
     _owner_sources,
     _run_child,
+    _type_checking_nodes,
     _within,
 )
 
@@ -83,7 +84,7 @@ _BASE_NAMES = frozenset("""
         _MAX_HEADER_FIELD_SIZE _MIXED_INTERNAL_API_PATHS _NO_STORE_CACHE_CONTROL
         _OWN_HOST_WARM_TASKS _PERMISSIONS_POLICY _PNA_REQUEST_HEADER
         _PNA_RESPONSE_HEADER _PREVENT_SLEEP_POLL_INTERVAL_SECS
-        _PRE_AUDIT_DENY_STATUSES _SKILL_APPROVAL_SETTING_URL _STATIC_DIR
+        _PRE_AUDIT_DENY_STATUSES _STATIC_DIR
         _STRICT_INTERNAL_API_PATHS _STT_PREWARM_BOOT_DELAY_SECS
         _STT_SWEEP_BOOT_DELAY_SECS _TAILNET_AWAKE_TTL_SECS _TIME_WAIT_BUDGET_SECS
         _TUNNEL_STOP_TIMEOUT_SECS _UNATTENDED_EXPIRY_TITLE _VENDOR_CORS_HEADER_VALUE
@@ -108,8 +109,7 @@ _BASE_NAMES = frozenset("""
         _note_listener_sidecar _notify_owner_channels _notify_slack_override_expired
         _notify_unattended_expiry _override_expiry_dm_text _own_host_warm_done
         _pending_skill_notification _precompute_telemetry
-        _prune_browser_snapshots_loop _reconcile_listener_publication
-        _register_browser_install_cleanup _register_browser_view_cleanup
+        _reconcile_listener_publication _register_browser_harness_lifecycle
         _register_config_watch _register_connections_warm_lifecycle
         _register_crewmate_prune_gate _register_deploy_routes
         _register_deploy_skills _register_dist_static_routes
@@ -148,9 +148,8 @@ _BASE_NAMES = frozenset("""
         api_remote_artifact_reply_comment api_remote_artifacts_browse
         api_remote_artifacts_clone api_remote_artifacts_fork apply_config_duration
         async_safe_context_call attribute_dump audit_actor authorize_and_add_nudge
-        await_crewmate_prune_settled bind_address_for browser_cli_launch
-        browser_cli_launcher browser_cli_snapshots browser_cli_token
-        browser_cli_view build_allowed_origins build_hardened_runner
+        await_crewmate_prune_settled bind_address_for
+        build_allowed_origins build_hardened_runner
         build_host_canonical_redirect cautious_boot channel_slots chat check_host
         check_origin chmod_socket_0600 claim_dump_notification
         cleanup_migrated_builtin consume_managed_service_launch_environment
@@ -174,7 +173,7 @@ _BASE_NAMES = frozenset("""
         setup_spawn_resume_routes setup_tunnel setup_weixin_routes
         setup_whatsapp_routes should_canonicalize_host shutdown_event
         slot_ownership_middleware start_api_server start_dashboard
-        start_deferred_app_backends start_enabled_app_backends stop_hook_reconciler
+        start_enabled_app_backends stop_hook_reconciler
         subprocess_executor sweep_stale_dumps tailnet
         tailnet_effective_allowed_logins tailnet_identity_unknown tailnet_serve
         take_dropped_grant token_auth_middleware token_embed_parent_port
@@ -184,24 +183,22 @@ _BASE_NAMES = frozenset("""
 
 #: SHA-256 of the sorted ``"<name> <kind> <signature>"`` lines of every name in
 #: ``_BASE_OWNERS``, captured from the one-module file before the split: each moved
-#: name keeps the kind and signature it had there.
-_BASE_SHAPE_DIGEST = "534c66ed75e197e3cff4a5d7488aa541ca7ee0da864fa6cce3e1418926a9063c"
+#: name keeps the kind and signature it had there, except ``_apply_startup_yolo``,
+#: which also takes the gateway's ``approval_mode``.
+_BASE_SHAPE_DIGEST = "8177a15dcf3115ecb5fbe803a7f343b86cca6a8bb28555e72ed57bbe2852b33f"
 
 #: The definitions of the one-module file that ``_BASE_OWNERS`` does not name: the two
 #: entrypoints, and the helpers repository guards read by path or that own module
 #: state -- the tailnet awake cache's reader, the inherited-trust teardown pair, the
-#: browser lifecycle trio, the instances hooks with their revive policy, the pinned
+#: the instances hooks with their revive policy, the pinned
 #: order load and the healthy-boot marker. ``_FACADE_DEF_HOMES`` names the file each
 #: lives in.
 _FACADE_DEFS = (
-    "_prune_browser_snapshots_loop",
     "_tailnet_publish_keeps_awake",
     "_retake_hops_then_revive",
     "_revive_intended_instances",
     "_clear_override_derived_trust",
     "_suspend_override_derived_trust",
-    "_register_browser_install_cleanup",
-    "_register_browser_view_cleanup",
     "_register_instances_hooks",
     "_dispatch_healthy_boot_marker",
     "_kick_pinned_order_load",
@@ -219,11 +216,6 @@ _FACADE_DEFS = (
 _FACADE_DEF_HOMES: dict[str, tuple[str, ...]] = {
     "server": ("start_dashboard",),
     "api_entrypoint": ("start_api_server",),
-    "browser_lifecycle": (
-        "_prune_browser_snapshots_loop",
-        "_register_browser_install_cleanup",
-        "_register_browser_view_cleanup",
-    ),
     "heartbeat": ("_dispatch_healthy_boot_marker",),
     "inherited_trust": ("_clear_override_derived_trust", "_suspend_override_derived_trust"),
     "instances_lifecycle": (
@@ -235,6 +227,12 @@ _FACADE_DEF_HOMES: dict[str, tuple[str, ...]] = {
     "prevent_sleep": ("_tailnet_publish_keeps_awake",),
 }
 _FACADE_DEF_HOME = {name: stem for stem, names in _FACADE_DEF_HOMES.items() for name in names}
+
+#: The only imports a data module may bind beside its values: the reader of what a
+#: shipped built-in app declares (its host grants), folded into a value at import.
+_DATA_MODULE_SOURCES: dict[str, tuple[str, ...]] = {
+    "kiro_crew.dashboard.server_internal_paths": ("_builtin_strict_internal_paths",),
+}
 
 #: The pure-data modules beside the server, by dotted name, and every name each binds.
 #: The server imports all of them and nothing else imports either module, so the
@@ -301,7 +299,7 @@ def _global_names(code: types.CodeType):
 def test_every_name_the_facade_bound_at_the_base_still_resolves() -> None:
     """Tests and other modules read private names off the server as well as public
     ones, so every module-level binding survives the split."""
-    assert len(_BASE_NAMES) == 326
+    assert len(_BASE_NAMES) == 317
     assert sorted(name for name in _BASE_NAMES if not hasattr(server, name)) == []
 
 
@@ -373,102 +371,98 @@ def test_the_shared_state_keeps_its_identity() -> None:
     assert all("_tailnet_awake_cache" not in vars(owner) for owner in _owners())
 
 
-#: Names the moved code imports in its own body, by the module it imports them from. A
-#: module-level import of any of them in an owner would put that module on the
-#: gateway's boot path or close an import cycle, so each stays where the one-module
-#: file had it: inside the function that needs it.
-_LAZY_IMPORTS = {
-    "kiro_crew": "_hist_mod _rs model_registry stt",
-    "kiro_crew.agent": "rebuild_agent_config rebuild_agent_config_reporting",
-    "kiro_crew.change_card_catalog": "HOOKED_ROUTES",
-    "kiro_crew.apps.bridges": "reconcile_enabled_app_resources",
-    "kiro_crew.apps.default_installs": "reconcile_default_installs",
-    "kiro_crew.apps.dev_mode": "init_dev_mode_watcher stop_dev_mode_watcher",
-    "kiro_crew.apps.event_bus": "build_broadcast_fn",
-    "kiro_crew.apps.execution": "builtin_app_agents builtin_app_mcp_servers builtin_app_names",
-    "kiro_crew.apps.spawn_sdk": "build_spawn_impl",
-    "kiro_crew.config": "live",
-    "kiro_crew.config.live": "ConfigChange",
-    "kiro_crew.config.resolution": "DEGRADED_WHOLE_CONFIG",
-    "kiro_crew.connections.warm": "scavenge_warm_mint_artifacts shutdown_warm_mint",
-    "kiro_crew.crew_log": "crew_log_emit",
-    "kiro_crew.edition_locks": "local_enable_locked",
-    "kiro_crew.dashboard": "crew_mode_migration display_verdicts",
-    "kiro_crew.dashboard.chat": "_run_chat",
-    "kiro_crew.dashboard.enterprise_gate_middleware": (
-        "enterprise_gate_middleware_for install_enterprise_gate"
-    ),
-    "kiro_crew.enterprise_boot": "require_kiro_login",
-    "kiro_crew.dashboard.handlers": "wf_handlers work_ledger",
-    "kiro_crew.dashboard.handlers.ask_question": (
-        "api_agent_ask_open api_agent_ask_wait api_agent_ask_withdraw "
-        "api_ask_question api_ask_question_answer api_ask_question_dismiss "
-        "api_ask_question_pending"
-    ),
-    "kiro_crew.dashboard.handlers.autonudge": (
-        "api_autonudge_delete api_autonudge_fire api_autonudge_get api_autonudge_list "
-        "api_autonudge_start api_autonudge_update api_monitor_clear api_monitor_create "
-        "api_monitor_restart api_monitor_slot_get api_monitor_stop api_monitor_update "
-        "api_monitors_list api_session_monitor_get"
-    ),
-    "kiro_crew.dashboard.handlers.change_cards": "change_card_middleware",
-    "kiro_crew.dashboard.handlers.cron_board": "wire_app_cron_folder_creator",
-    "kiro_crew.dashboard.handlers.decisions": "resume_local_decision_model",
-    "kiro_crew.dashboard.handlers.sandbox_doc": "register_sandbox_doc_routes",
-    "kiro_crew.dashboard.handlers.updates": "apply_log_level_from_config",
-    "kiro_crew.dashboard.handlers.webapp_preview": "register_webapp_preview_routes",
-    "kiro_crew.dashboard.handlers.workflows": (
-        "api_workflow_author api_workflow_definition_get api_workflow_definition_run "
-        "api_workflow_definition_update api_workflow_definitions "
-        "api_workflow_definitions_create api_workflow_run api_workflow_run_cancel "
-        "api_workflow_run_get api_workflow_run_intent api_workflow_run_promote "
-        "api_workflow_run_rerun api_workflow_runs"
-    ),
-    "kiro_crew.dashboard.handlers_system": "_get_owner_hash _get_static_system_info",
-    "kiro_crew.dashboard.slot_queue_repository": "drain_restored_parked_sends",
-    "kiro_crew.dashboard.workflow_inject": "inject_bound_workflow_result",
-    "kiro_crew.dashboard.workflow_session_port": "WorkflowSessionPort",
-    "kiro_crew.decisions": "impl_jev local_runtime",
-    "kiro_crew.diag.recorder": "_DiagRecorder get_recorder",
-    "kiro_crew.memory_startup": "memory_prepared memory_startup_preparing",
-    "kiro_crew.memory_startup_prebuild": "prebuild_startup_reads",
-    "kiro_crew.history_index_worker": "SessionIndexWorkerSupervisor",
-    "kiro_crew.kiro_prerequisite": "KiroPrerequisiteService register_turn_auth_service",
-    "kiro_crew.hooks": "set_builtin_app_agents set_builtin_app_mcp_servers set_builtin_app_names",
-    "kiro_crew.memory": "MemoryStore",
-    "kiro_crew.messaging.session_trust": "clear_trusted_sessions",
-    "kiro_crew.metrics": "_gauges",
-    "kiro_crew.metrics.crew_log_export": "install_otel_crew_log_subscriber",
-    "kiro_crew.page_cache": "read_now",
-    "kiro_crew.security": "redact_credentials redact_exfiltration_urls",
-    "kiro_crew.sel": "sel",
-    "kiro_crew.slack.handler": "load_voice_reply_config",
-    "kiro_crew.stt": "engine stt_models",
-    "kiro_crew.shared_crew.wiring": "install prepare_gateway",
-    "kiro_crew.shared_crew.host_hooks": "mark_sessions_restored",
-    "kiro_crew.subagent": "_available_memory_gb",
-    "kiro_crew.transcribe": "_whisper_language",
-    "kiro_crew.workflows.service": "WorkflowService",
-}
+def _function_local_imports(tree: ast.Module) -> list[ast.Import | ast.ImportFrom]:
+    """Every import statement inside a function body of *tree*."""
+    return [
+        node
+        for function in ast.walk(tree)
+        if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
+        for node in ast.walk(function)
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+    ]
+
+
+def _bound_names(node: ast.Import | ast.ImportFrom) -> set[str]:
+    """The names an import statement binds in the scope it runs in."""
+    if isinstance(node, ast.Import):
+        return {alias.asname or alias.name.split(".", 1)[0] for alias in node.names}
+    return {alias.asname or alias.name for alias in node.names}
+
+
+def _targets(node: ast.Import | ast.ImportFrom) -> set[str]:
+    """The dotted modules one import statement in an owner loads."""
+    return {
+        target
+        for _, target in _import_targets(ast.Module(body=[node], type_ignores=[]), _OWNER_PACKAGE)
+    }
+
+
+def _lazy_import_conflicts(sources: dict[str, str]) -> list[str]:
+    """``stem:line`` of every module-level import, outside ``TYPE_CHECKING``, in an
+    owner that loads a project module or binds a name some owner function imports
+    from a project module in its body."""
+    trees = {stem: ast.parse(source) for stem, source in sources.items()}
+    lazy_nodes = [
+        node
+        for tree in trees.values()
+        for node in _function_local_imports(tree)
+        if any(_within(target, "kiro_crew") for target in _targets(node))
+    ]
+    lazy_modules = {target for node in lazy_nodes for target in _targets(node)}
+    lazy_names = {name for node in lazy_nodes for name in _bound_names(node)}
+    conflicts: list[str] = []
+    for stem, tree in trees.items():
+        guarded = _type_checking_nodes(tree)
+        in_functions = {id(node) for node in _function_local_imports(tree)}
+        for node in ast.walk(tree):
+            if (
+                not isinstance(node, (ast.Import, ast.ImportFrom))
+                or id(node) in in_functions
+                or id(node) in guarded
+            ):
+                continue
+            if _targets(node) & lazy_modules or _bound_names(node) & lazy_names:
+                conflicts.append(f"{stem}:{node.lineno}")
+    return conflicts
 
 
 def test_the_lazy_imports_stay_inside_the_functions_that_need_them() -> None:
-    expected = {name: module for module, names in _LAZY_IMPORTS.items() for name in names.split()}
+    """The owners import some modules inside the function that needs them: a
+    module-level import of one would put that module on the gateway's boot path or
+    close an import cycle. The set comes from scanning the owners' function bodies,
+    so a new function-local import needs no edit here; what fails is an owner that
+    also imports such a module, or binds such a name, at module level outside
+    ``TYPE_CHECKING``. Each lazily bound name comes from one module, so an owner
+    function reads the same object whichever function binds it."""
+    sources = _owner_sources()
     local: dict[str, set[str]] = {}
-    for source in _owner_sources().values():
-        tree = ast.parse(source)
-        for function in ast.walk(tree):
-            if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            for node in ast.walk(function):
+    for source in sources.values():
+        for node in _function_local_imports(ast.parse(source)):
+            for alias in node.names:
                 if isinstance(node, ast.ImportFrom):
-                    for alias in node.names:
-                        local.setdefault(alias.asname or alias.name, set()).add(node.module or "")
-                elif isinstance(node, ast.Import):
-                    for alias in node.names:
-                        local.setdefault(alias.asname or alias.name, set()).add(alias.name)
-    assert local == {name: {module} for name, module in expected.items()}
-    assert len(expected) == 106
+                    name, module = alias.asname or alias.name, node.module or ""
+                else:
+                    name, module = alias.asname or alias.name.split(".", 1)[0], alias.name
+                local.setdefault(name, set()).add(module)
+    assert local, "no owner function imports anything -- the scan found nothing to check"
+    assert {name: modules for name, modules in local.items() if len(modules) > 1} == {}
+    assert _lazy_import_conflicts(sources) == []
+
+
+def test_the_lazy_import_check_flags_a_hoisted_import() -> None:
+    """The check flags an owner whose module level imports what a function imports
+    lazily, in either spelling, and leaves a ``TYPE_CHECKING`` import alone."""
+    lazy = "def f():\n    from kiro_crew.workflows.service import WorkflowService\n"
+    hoisted = "from kiro_crew.workflows.service import WorkflowService\n"
+    plain = "import kiro_crew.workflows.service\n"
+    typed = (
+        "from typing import TYPE_CHECKING\n"
+        "if TYPE_CHECKING:\n    from kiro_crew.workflows.service import WorkflowService\n"
+    )
+    assert _lazy_import_conflicts({"a": lazy}) == []
+    assert _lazy_import_conflicts({"a": lazy, "b": hoisted}) == ["b:1"]
+    assert _lazy_import_conflicts({"a": plain + lazy}) == ["a:1"]
+    assert _lazy_import_conflicts({"a": typed + lazy}) == []
 
 
 def test_a_star_import_carries_the_moved_public_names(tmp_path: Path) -> None:
@@ -476,7 +470,8 @@ def test_a_star_import_carries_the_moved_public_names(tmp_path: Path) -> None:
     assert not hasattr(server, "__all__")
     probe = tmp_path / "server_star_probe.py"
     probe.write_text(
-        "from kiro_crew.dashboard.server import *  # noqa: F401,F403\n", encoding="utf-8"
+        "from kiro_crew.dashboard.server import *  # noqa: F401,F403\n",
+        encoding="utf-8",
     )
     spec = importlib.util.spec_from_file_location("server_star_probe", probe)
     assert spec is not None and spec.loader is not None
@@ -522,12 +517,12 @@ def test_every_moved_name_is_one_object_in_its_owner() -> None:
     strays = [f"{o}:{n}" for o, n in placed if getattr(server, n) is not vars(_owner(o)).get(n)]
     assert strays == []
     names = [name for _, name in placed]
-    assert len(names) == len(set(names)) == 90 + 23
+    assert len(names) == len(set(names)) == 91 + 21
 
 
 def test_the_moved_names_keep_their_base_shapes() -> None:
     lines = sorted(f"{name} {_shape(getattr(server, name))}" for name in _MOVED)
-    assert len(lines) == 90
+    assert len(lines) == 91
     digest = hashlib.sha256("\n".join(lines).encode()).hexdigest()
     assert digest == _BASE_SHAPE_DIGEST, "\n".join(lines)
 
@@ -535,13 +530,13 @@ def test_the_moved_names_keep_their_base_shapes() -> None:
 #: SHA-256 of the same ``"<name> <kind> <signature>"`` lines for the helpers of
 #: ``_FACADE_DEFS``, captured from the server module before they moved to their homes.
 #: The two entrypoints are left out: their ``port`` default reads ``KIROCREW_PORT``.
-_FACADE_HELPER_SHAPE_DIGEST = "54f69707c825bcf977e7e0ddde37d4469664ada8a855738842d4af0d75a49aee"
+_FACADE_HELPER_SHAPE_DIGEST = "0952dafb87df8d73c3c54e406f8028bf9043f91c08354f04d8a015faf2d76936"
 
 
 def test_the_moved_facade_helpers_keep_their_base_shapes() -> None:
     helpers = set(_FACADE_DEFS) - {"start_dashboard", "start_api_server"}
     lines = sorted(f"{name} {_shape(getattr(server, name))}" for name in helpers)
-    assert len(lines) == 11
+    assert len(lines) == 8
     digest = hashlib.sha256("\n".join(lines).encode()).hexdigest()
     assert digest == _FACADE_HELPER_SHAPE_DIGEST, "\n".join(lines)
 
@@ -562,7 +557,12 @@ def test_facade_state_stays_on_the_facade() -> None:
     only while no owner keeps a copy. The internal-path sets are defined in a
     pure-data module the server alone imports; their own test below pins that."""
     state = _module_assignments(_FACADE_PATH.read_text(encoding="utf-8"))
-    assert {"logger", "_tailnet_awake_cache", "_OWN_HOST_WARM_TASKS", "_BASE_CSP"} <= state
+    assert {
+        "logger",
+        "_tailnet_awake_cache",
+        "_OWN_HOST_WARM_TASKS",
+        "_BASE_CSP",
+    } <= state
     assert {"_STRICT_INTERNAL_API_PATHS", "_MIXED_INTERNAL_API_PATHS"} <= set(
         _DATA_MODULES["kiro_crew.dashboard.server_internal_paths"]
     )
@@ -596,7 +596,7 @@ def test_a_data_module_holds_only_the_values_the_facade_rebinds(module: str) -> 
     tree = ast.parse(Path(data.__file__).read_text(encoding="utf-8"))
     code = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
     assert [type(node).__name__ for node in ast.walk(tree) if isinstance(node, code)] == []
-    assert _module_bindings(tree) == names
+    assert _module_bindings(tree) == names | set(_DATA_MODULE_SOURCES.get(module, ()))
     assert {
         o.__name__: sorted(names & set(vars(o))) for o in _owners() if names & set(vars(o))
     } == {}
@@ -663,7 +663,7 @@ def test_the_data_module_importer_scan_sees_every_spelling() -> None:
 
 def test_the_facade_definitions_each_have_one_home() -> None:
     assert sorted(_FACADE_DEF_HOME) == sorted(_FACADE_DEFS)
-    assert len(_FACADE_DEF_HOME) == sum(map(len, _FACADE_DEF_HOMES.values())) == 13
+    assert len(_FACADE_DEF_HOME) == sum(map(len, _FACADE_DEF_HOMES.values())) == 10
 
 
 @pytest.mark.parametrize("name", _FACADE_DEFS)
@@ -693,7 +693,7 @@ def test_every_base_definition_is_in_exactly_one_place() -> None:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
     }
     assert defined == set(_FACADE_DEF_HOMES["server"])
-    assert len(set(_FACADE_DEFS) | _MOVED) == len(_FACADE_DEFS) + len(_MOVED) == 103
+    assert len(set(_FACADE_DEFS) | _MOVED) == len(_FACADE_DEFS) + len(_MOVED) == 101
     places: dict[str, list[str]] = {name: ["server"] for name in defined}
     for path in sorted(_OWNER_DIR.glob("[!_]*.py")):
         for top in ast.parse(path.read_text(encoding="utf-8")).body:
@@ -828,9 +828,15 @@ def test_the_facade_composes_through_the_shared_helper() -> None:
         ("from .. import server\n", True),
         ("from kiro_crew.dashboard import server\n", True),
         ("import kiro_crew.dashboard.server as srv\n", True),
-        ("import importlib\nimportlib.import_module('kiro_crew.dashboard.server')\n", True),
+        (
+            "import importlib\nimportlib.import_module('kiro_crew.dashboard.server')\n",
+            True,
+        ),
         ("__import__('kiro_crew.dashboard.server_runtime.listener')\n", True),
-        ("if TYPE_CHECKING:\n    from kiro_crew.dashboard.server import logger\n", False),
+        (
+            "if TYPE_CHECKING:\n    from kiro_crew.dashboard.server import logger\n",
+            False,
+        ),
         ("def f():\n    from kiro_crew.config import live\n", False),
         ("import asyncio\nfrom aiohttp import web\n", False),
     ],

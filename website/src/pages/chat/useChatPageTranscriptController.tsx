@@ -5,6 +5,7 @@ import { usePinnedPrompt } from './usePinnedPrompt'
 import { jumpAnchorIdx } from '../../utils/pinnedPrompt'
 import { attachUserScrollIntent, glideOnceStep, pollRowSettled } from '../../utils/searchScroll'
 import { glideDurationMs, runConvergingGlide } from '../../utils/convergingGlide'
+import { releaseReadingPosition } from '../../utils/panelSlide'
 
 export interface UseChatPageTranscriptEarlyControllerOptions {
   activeTip: unknown
@@ -226,6 +227,13 @@ export function useChatPageTranscriptEarlyController({
       onEnd: () => { detachUserScroll(); navPollCancelRef.current = null },
     })
   }, [scrollToDisplayIndex, scrollerRef, mountIndexRef])
+  // Ends the in-flight navigation's settle poll, for a scroll that takes over
+  // from it: a fold that opened under a jump target scrolls to the row itself,
+  // and the poll re-centering the whole turn would undo that.
+  const cancelNavScroll = useCallback(() => {
+    cancelAnimationFrame(navScrollRafRef.current)
+    navPollCancelRef.current?.()
+  }, [])
 
   // Stop any in-flight settle poll on unmount. Without this the loop keeps
   // ticking rAFs against a null scroller until the ~2s backstop (harmless but
@@ -304,6 +312,8 @@ export function useChatPageTranscriptEarlyController({
     const reduced = typeof window.matchMedia === 'function'
       && window.matchMedia('(prefers-reduced-motion: reduce)').matches
     let cancelled = false
+    // This jump owns the position from here (utils/panelSlide).
+    releaseReadingPosition(sc0)
     let detach = attachUserScrollIntent(sc0, () => { cancelled = true; navPollCancelRef.current?.() })
     const startGlide = () => {
       const first = goal()
@@ -361,6 +371,7 @@ export function useChatPageTranscriptEarlyController({
     handleSurveyLayoutChange,
     composerBandRef,
     navToDisplayIndex,
+    cancelNavScroll,
     displayItemsRef,
     pinFoldRef,
     pinCardRef,

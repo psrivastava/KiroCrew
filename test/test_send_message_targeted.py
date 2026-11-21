@@ -11,6 +11,8 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from kiro_crew.testing.synthetic_credentials import SAMPLE_SLACK_BOT_TOKEN
+
 # Ensure kiro_crew.slack.handler is importable for patching even when
 # heavy transitive deps (cron_descriptor, etc.) aren't installed.
 if "kiro_crew.slack.handler" not in sys.modules:
@@ -457,6 +459,116 @@ class TestUnfurlControl:
             slack.post_blocks.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_a_reserved_code_channel_button_is_refused(self, mock_sel):
+        """An agent may not post a button wearing a gateway code-channel action id."""
+        slack = MagicMock()
+        slack.open_dm = AsyncMock(return_value="D_OWNER")
+        slack.post_blocks = AsyncMock(return_value="1712793600.000001")
+        state = _mock_state(slack_client=slack, owner_id="U_OWNER")
+        app = _make_app(state)
+        blocks = [
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "action_id": "kc_code_channel_enable_handoff",
+                        "value": "C0CODECHAN1",
+                        "text": {"type": "plain_text", "text": "Acknowledge review"},
+                    }
+                ],
+            }
+        ]
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/send-message",
+                json={"text": "fallback", "blocks": blocks, "session": "slack"},
+            )
+            assert resp.status == 400
+            assert (await resp.json()).get("code") == "blocks_reserved_action"
+            slack.post_blocks.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("action_id\x1b[0m", "kc_code_channel_enable_handoff"),
+            ("\x1b[1maction_id", "kc_code_channel_enable_handoff"),
+            ("action_id", "\x1b[0mkc_code_channel_enable_handoff"),
+            ("block_id\u200b", "kc_code_channel_x"),
+        ],
+    )
+    async def test_a_reserved_button_disguised_for_the_sanitizer_is_refused(
+        self, mock_sel, key, value
+    ):
+        """The refusal holds on the sanitized tree that would be posted."""
+        slack = MagicMock()
+        slack.open_dm = AsyncMock(return_value="D_OWNER")
+        slack.post_blocks = AsyncMock(return_value="1712793600.000001")
+        state = _mock_state(slack_client=slack, owner_id="U_OWNER")
+        app = _make_app(state)
+        blocks = [
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        key: value,
+                        "text": {"type": "plain_text", "text": "Acknowledge review"},
+                    }
+                ],
+            }
+        ]
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/send-message",
+                json={"text": "fallback", "blocks": blocks, "session": "slack"},
+            )
+            assert resp.status == 400
+            assert (await resp.json()).get("code") == "blocks_reserved_action"
+            slack.post_blocks.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("published", "code"),
+        [
+            (
+                {"type": "button", "action_id": "kc_code_channel_enable_handoff"},
+                "blocks_reserved_action",
+            ),
+            (
+                {"type": "image", "image_url": "https://evil.example/p.png"},
+                "blocks_remote_media_disabled",
+            ),
+        ],
+    )
+    async def test_the_guards_hold_on_the_tree_sanitizing_produces(
+        self, mock_sel, monkeypatch, published, code
+    ):
+        """Whatever sanitizing turns the blocks into, the published tree is checked."""
+        import kiro_crew.dashboard.handlers.messaging as messaging
+
+        monkeypatch.setattr(
+            messaging,
+            "_sanitize_blocks",
+            lambda *_a, **_k: [{"type": "actions", "elements": [published]}],
+        )
+        slack = MagicMock()
+        slack.open_dm = AsyncMock(return_value="D_OWNER")
+        slack.post_blocks = AsyncMock(return_value="1712793600.000001")
+        state = _mock_state(slack_client=slack, owner_id="U_OWNER")
+        app = _make_app(state)
+        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": "ok"}}]
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/send-message",
+                json={"text": "fallback", "blocks": blocks, "session": "slack"},
+            )
+            assert resp.status == 400
+            assert (await resp.json()).get("code") == code
+            slack.post_blocks.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_plain_section_and_button_blocks_are_accepted(self, mock_sel):
         """Blocks without server-fetched media still reach Slack."""
         slack = MagicMock()
@@ -545,7 +657,6 @@ class TestSlackProfile:
 
     @pytest.mark.asyncio
     async def test_non_string_user_returns_400(self, mock_sel):
-        """Non-string user returns 400."""
         state = _mock_state(slack_client=MagicMock())
         app = _make_app(state)
 
@@ -575,7 +686,6 @@ class TestSlackProfile:
 
     @pytest.mark.asyncio
     async def test_slack_not_connected_returns_503(self, mock_sel):
-        """Slack not connected returns 503."""
         state = _mock_state(slack_client=None)
         app = _make_app(state)
 
@@ -629,10 +739,10 @@ class TestSlackProfile:
 
     @pytest.mark.asyncio
     async def test_profile_redaction(self, mock_sel):
-        """Status text with exfiltration URL gets redacted."""
+        """Status text with a credential in a URL gets the value redacted."""
         slack = MagicMock()
-        # Use a URL with a long base64-like query that triggers exfil detection
-        exfil_url = "https://evil.com/steal?d=" + "A" * 200
+        # A URL whose query carries a credential parameter: the value goes, the link stays.
+        exfil_url = "https://evil.com/steal?access_token=" + "A" * 200
         slack.get_user_profile = AsyncMock(
             return_value={
                 "id": "U0123ABC456",
@@ -649,8 +759,8 @@ class TestSlackProfile:
                 assert resp.status == 200
                 data = await resp.json()
                 status = data["profile"].get("status_text", "")
-                # The exfiltration URL payload should be redacted
-                assert "REDACTED" in status
+                # The credential value in the URL should be redacted
+                assert "https://evil.com/steal?access_token=[REDACTED: credential]" in status
                 assert "A" * 200 not in status
 
 
@@ -966,8 +1076,8 @@ class TestProactiveBodyMeetsTheDisplayFloor:
     """A proactive body is posted AS WRITTEN, so it needs the display-form floor.
 
     Every turn egress runs `redact_for_display`, which scans the form the client
-    RENDERS as well as the literal bytes: neither `AKIA**<rest>**` nor
-    `[AKIA](https://x)<rest>` matches a credential pattern as written, yet the
+    RENDERS as well as the literal bytes: neither `<head>**<rest>**` nor
+    `[<head>](https://x)<rest>` matches a credential pattern as written, yet the
     reader is shown an intact key. This path passes no renderer -- the handler
     hands `text` straight to the channel -- so a literal-only scan here is the one
     hole in that floor, and it is reachable by anything that can call the endpoint.
@@ -975,7 +1085,8 @@ class TestProactiveBodyMeetsTheDisplayFloor:
 
     #: Split by emphasis markers the client renders away. The literal string is
     #: not a credential; what the reader sees is.
-    _COLLAPSING = "AKIA**IOSFODNN7EXAMPLE**"
+    _SECRET = SAMPLE_SLACK_BOT_TOKEN
+    _COLLAPSING = f"{_SECRET[:4]}**{_SECRET[4:]}**"
 
     @pytest.mark.asyncio
     async def test_a_markdown_collapse_credential_is_not_posted(self, mock_sel):
@@ -994,7 +1105,7 @@ class TestProactiveBodyMeetsTheDisplayFloor:
 
         posted = slack.post_message.call_args.args[1]
         # Neither the literal form nor the form Slack renders may carry the key.
-        assert "AKIAIOSFODNN7EXAMPLE" not in posted.replace("*", "")
+        assert self._SECRET not in posted.replace("*", "")
         assert self._COLLAPSING not in posted
 
     @pytest.mark.asyncio
@@ -1053,6 +1164,9 @@ def _channel_transport(send_result: str = "tg-1"):
 def _channel_state(*, link=_TG_LINK, transport=None, slack_client=None, jobs=None):
     """A state whose session owns *link*, with *transport* registered for it."""
     state = _mock_state(slack_client=slack_client, owner_id="U_OWNER")
+    # No slot names an owning app, so the caller is the person: a MagicMock slot
+    # would read as an app and put its messaging grant in front of every vet.
+    state._slots = {}
     state.sessions.get_origin_link.return_value = link
     state.sessions.get_mirror_link.return_value = None
     state.get_channel_transport.return_value = transport
@@ -1310,7 +1424,7 @@ class TestChannelTypeDelivery:
                 resp = await client.post(
                     "/api/send-message",
                     json={
-                        "text": "hey @everyone key AKIAIOSFODNN7EXAMPLE",
+                        "text": "hey @everyone key " + SAMPLE_SLACK_BOT_TOKEN,
                         "channel_type": "telegram",
                     },
                     headers={"X-Session-Key": _TG_KEY},
@@ -1320,7 +1434,7 @@ class TestChannelTypeDelivery:
                 # A literal "@everyone" would mass-notify the group.
                 assert "@everyone" not in sent
                 assert "@​everyone" in sent
-                assert "AKIAIOSFODNN7EXAMPLE" not in sent
+                assert SAMPLE_SLACK_BOT_TOKEN not in sent
 
 
 class TestChannelTypeMutualExclusion:
@@ -1403,7 +1517,11 @@ class TestChannelTypeFailsClosed:
     @pytest.mark.asyncio
     async def test_governance_denial_refuses_the_send(self, mock_sel):
         """A `channels` denial for the transport refuses — it does not degrade to
-        a Slack DM or to a notification-only success."""
+        a Slack DM or to a notification-only success.
+
+        403, not 502: a denial is the caller's own permission problem and a retry
+        cannot fix it, which is the distinction `channel_not_permitted` carries.
+        """
         transport = _channel_transport()
         slack = MagicMock()
         slack.open_dm = AsyncMock(return_value="D_OWNER")
@@ -1418,10 +1536,10 @@ class TestChannelTypeFailsClosed:
                     json={"text": "denied", "channel_type": "telegram"},
                     headers={"X-Session-Key": _TG_KEY},
                 )
-                assert resp.status == 502
+                assert resp.status == 403
                 data = await resp.json()
                 assert data["ok"] is False
-                assert data["code"] == "channel_delivery_failed"
+                assert data["code"] == "channel_not_permitted"
                 transport.send_message.assert_not_called()
                 slack.post_message.assert_not_called()
 
@@ -1615,7 +1733,12 @@ class TestChannelTextIsNotTheNotificationText:
         """A dashboard-born cron's job.session_key must reach the link lookup
         whole. `_resolve_session_target` strips "dashboard:" to get a SLOT name;
         channel links are keyed by the full session key, so stripping here would
-        silently lose a dashboard session's outbound mirror."""
+        silently lose a dashboard session's outbound mirror.
+
+        Asserted over EVERY call rather than a single one: the send re-walks the
+        binding per part, so pinning the count would pin an unrelated number,
+        while checking each call catches a key stripped on any one of the walks.
+        """
         transport = _channel_transport()
         job = MagicMock()
         job.id = "job9"
@@ -1636,9 +1759,9 @@ class TestChannelTextIsNotTheNotificationText:
                     headers={"X-Session-Key": "cron:job9"},
                 )
                 assert resp.status == 200
-                state.sessions.get_origin_link.assert_called_once_with(
-                    "dashboard:chat-3-1712793600"
-                )
+                lookups = state.sessions.get_origin_link.call_args_list
+                assert lookups
+                assert {call.args for call in lookups} == {("dashboard:chat-3-1712793600",)}
 
 
 # ── the MCP tool half: which transport the governance gate names ──
@@ -1706,14 +1829,16 @@ class TestSendMessageToolChannelType:
         with _tool_mcp_core(
             strict="", lenient="cron:job1", post={"ok": True, "delivered_to": "slack"}
         ) as m:
-            _call_tool({"text": "hi"})
+            out = _call_tool({"text": "hi"})
+            assert out == "Message sent to Slack + notification."
             assert [c.args for c in m["vet_channel"].call_args_list] == [("cron:job1", "slack")]
 
     def test_bare_non_cron_send_vets_no_transport(self):
         """Unchanged: the notification-only path leaves over no transport, so the
         per-transport allowlist has nothing to rule on."""
         with _tool_mcp_core(strict="", lenient="dashboard:chat-1-1") as m:
-            _call_tool({"text": "hi"})
+            out = _call_tool({"text": "hi"})
+            assert out == "Message sent to the telegram conversation + notification."
             m["vet_channel"].assert_not_called()
 
     def test_channel_type_requires_a_strict_identity(self):
@@ -1729,7 +1854,8 @@ class TestSendMessageToolChannelType:
         """The identity that was checked is the identity the write carries —
         _post must not re-resolve leniently after a strict gate."""
         with _tool_mcp_core(lenient="dashboard:someone-else") as m:
-            _call_tool({"text": "hi", "channel_type": "telegram"})
+            out = _call_tool({"text": "hi", "channel_type": "telegram"})
+            assert out == "Message sent to telegram target ."
             assert m["post"].call_args.kwargs["session_key"] == _TG_KEY
             assert m["post"].call_args.args[1]["channel_type"] == "telegram"
 

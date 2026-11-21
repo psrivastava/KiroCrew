@@ -30,7 +30,8 @@ import unicodedata
 from collections import deque
 from typing import Any
 
-from kiro_crew.security.exfil import redact_exfiltration_urls
+from kiro_crew.security import reveal_store
+from kiro_crew.security.exfil import redact_exfiltration_urls, refuses
 from kiro_crew.security.redaction import (
     CREDENTIAL_REDACTION_TAGS,
     CredentialMatch,
@@ -64,12 +65,13 @@ SESSION_TOKEN_RULES = frozenset({"aws_session_token"})
 #: Rules the AWS credentials-file templates cover, with the key each reads.
 _AWS_TEMPLATE_KEYS = {
     "aws_secret_access_key": "aws_secret_access_key",
-    "bare_aws_secret": "aws_secret_access_key",
     "aws_session_token": "aws_session_token",
-    "aws_access_key_id": "aws_access_key_id",
 }
 
 RECORD_KEYS = frozenset({"ordinal", "rule", "label", "source", "view_command", "profile_command"})
+#: A record may also carry ``reveal_id``: the handle of the removed value in
+#: gateway memory (``security.reveal_store``), never the value itself.
+REVEAL_KEY = "reveal_id"
 
 
 def fingerprint(value: str) -> str:
@@ -120,9 +122,7 @@ def _is_clean(value: str) -> bool:
         return False
     if any(tag in value for tag in CREDENTIAL_REDACTION_TAGS) or "[REDACTED" in value:
         return False
-    if redact_credentials(value)[0] != value:
-        return False
-    return redact_exfiltration_urls(value)[0] == value
+    return not refuses(value, lambda text: redact_credentials(text)[0])
 
 
 def _tool_source(tool_input: str, *, is_shell: bool) -> dict[str, Any] | None:
@@ -227,15 +227,24 @@ def _aws_commands(rule: str, source: dict[str, Any] | None) -> tuple[str | None,
 
 
 def credential_record(
-    match: CredentialMatch, evidence: CredentialEvidence | None
+    match: CredentialMatch,
+    evidence: CredentialEvidence | None,
+    *,
+    reveal_pending: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """The persisted description of one credential placeholder."""
+    """The persisted description of one credential placeholder.
+
+    With ``reveal_pending`` the record carries a fresh ``reveal_id`` and the
+    removed value is put in that map under it, for the caller to keep in
+    gateway memory (``reveal_store.STORE.stash_as``) only if it saves this
+    record. The value is never in the record.
+    """
     source = evidence.locate(match.value) if evidence is not None else None
     view, profile = _aws_commands(match.rule, source)
     if view is None and source is not None and source.get("type") == "command":
         view = str(source["command"])
     label = match.label if _LABEL_RE.match(match.label or "") else ""
-    return {
+    record: dict[str, Any] = {
         "ordinal": match.ordinal,
         "rule": match.rule if _RULE_RE.match(match.rule) else "credential_pattern",
         "label": label,
@@ -243,12 +252,23 @@ def credential_record(
         "view_command": view,
         "profile_command": profile,
     }
+    if reveal_pending is not None:
+        handle = reveal_store.new_handle()
+        record[REVEAL_KEY] = handle
+        reveal_pending[handle] = match.value
+    return record
 
 
 def credential_records(
-    matches: list[CredentialMatch], evidence: CredentialEvidence | None
+    matches: list[CredentialMatch],
+    evidence: CredentialEvidence | None,
+    *,
+    reveal_pending: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
-    return [credential_record(m, evidence) for m in matches[:MAX_CREDENTIAL_RECORDS_PER_MESSAGE]]
+    return [
+        credential_record(m, evidence, reveal_pending=reveal_pending)
+        for m in matches[:MAX_CREDENTIAL_RECORDS_PER_MESSAGE]
+    ]
 
 
 def _valid_source(source: object) -> bool:
@@ -293,8 +313,14 @@ def revalidate_credential_record(record: object) -> dict[str, Any] | None:
     (the AWS template) or the recorded command itself, so a record edited at
     rest cannot plant a command the redactor never offered.
     """
-    if not isinstance(record, dict) or set(record) != RECORD_KEYS:
+    if not isinstance(record, dict) or set(record) - {REVEAL_KEY} != RECORD_KEYS:
         return None
+    if REVEAL_KEY in record:
+        handle = record[REVEAL_KEY]
+        if handle is not None and not (
+            isinstance(handle, str) and reveal_store.REVEAL_ID_RE.match(handle)
+        ):
+            return None
     ordinal = record["ordinal"]
     rule = record["rule"]
     label = record["label"]

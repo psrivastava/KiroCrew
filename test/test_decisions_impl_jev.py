@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import sys
 
 import pytest
 from aiohttp import web
@@ -827,7 +829,11 @@ class TestProviderDefaults:
         """Pins that nothing in ``_to_wire`` needs a custom encoder."""
         from kiro_crew.decisions.impl_jev import _to_wire
 
-        json.dumps(_to_wire("hi", "jev-latest", [CHOICE, URGENT]))
+        wire = _to_wire("hi", "jev-latest", [CHOICE, URGENT])
+        # The body survives a JSON round trip unchanged: no tuple, set or object
+        # that a plain encoder would turn into something else.
+        assert json.loads(json.dumps(wire)) == wire
+        assert set(wire["questions"]) == {CHOICE.id, URGENT.id}
 
 
 # ---------------------------------------------------------------------------
@@ -1118,7 +1124,7 @@ class TestCloudflareEnvelope:
 
 
 # ---------------------------------------------------------------------------
-# Connection reuse: one keep-alive session per loop, shared by every oracle
+# Connection reuse: one persistent client per loop, shared by every oracle
 # ---------------------------------------------------------------------------
 
 
@@ -1176,10 +1182,10 @@ class TestConnectionReuse:
             async with _Serving(rec) as serving:
                 await serving.oracle().ask("hi", [URGENT])
                 first = impl_jev._session_for_running_loop()
-                connector = first.connector
+                connector = first._transport
                 await serving.oracle().ask("hi", [URGENT])
                 second = impl_jev._session_for_running_loop()
-                same_connector = second.connector is connector
+                same_connector = second._transport is connector
                 return rec, first, second, same_connector
 
         rec, first, second, same_connector = asyncio.run(scenario())
@@ -1188,16 +1194,40 @@ class TestConnectionReuse:
         assert len(rec.peers) == 2
         assert rec.peers[0] == rec.peers[1], "both requests must ride one TCP connection"
 
+    def test_without_h2_the_client_falls_back_to_http1_and_says_so_once(self, monkeypatch, caplog):
+        # A runtime with httpx but no ``h2``: ``AsyncClient(http2=True)`` raises
+        # ImportError. Each decision still has to be sent and answered.
+        monkeypatch.setitem(sys.modules, "h2", None)
+        monkeypatch.setattr(impl_jev, "_http2_missing_warned", False, raising=False)
+
+        async def scenario():
+            rec = _ok()
+            async with _Serving(rec) as serving:
+                first = await serving.oracle().ask("hi", [URGENT])
+                await close_sessions()
+                second = await serving.oracle().ask("hi", [URGENT])
+                return first, second
+
+        with caplog.at_level(logging.WARNING, logger=impl_jev.__name__):
+            try:
+                first, second = asyncio.run(scenario())
+            except ImportError as exc:
+                pytest.fail(f"a missing h2 failed the decision: {exc}")
+        assert first["is_urgent"].p == pytest.approx(0.9)
+        assert second["is_urgent"].p == pytest.approx(0.9)
+        said = [r for r in caplog.records if "h2 package is not installed" in r.getMessage()]
+        assert len(said) == 1, "the missing h2 is logged once, not once per client"
+
     def test_a_closed_session_is_recreated_and_works(self):
         async def scenario():
             rec = _ok()
             async with _Serving(rec) as serving:
                 await serving.oracle().ask("hi", [URGENT])
                 first = impl_jev._session_for_running_loop()
-                await first.close()
+                await first.aclose()
                 answers = await serving.oracle().ask("hi", [URGENT])
                 second = impl_jev._session_for_running_loop()
-                return first, second, second.closed, answers
+                return first, second, second.is_closed, answers
 
         first, second, second_closed, answers = asyncio.run(scenario())
         assert second is not first
@@ -1237,7 +1267,7 @@ class TestConnectionReuse:
                 return session, dict(impl_jev._sessions)
 
         session, held = asyncio.run(scenario())
-        assert session.closed
+        assert session.is_closed
         assert held == {}
 
     def test_the_timeout_is_per_request_and_does_not_poison_the_session(self):
@@ -1254,7 +1284,7 @@ class TestConnectionReuse:
                 with pytest.raises((asyncio.TimeoutError, TimeoutError)):
                     await serving.oracle(timeout_ms=100).ask("hi", [URGENT])
                 after = impl_jev._session_for_running_loop()
-                return session, after, after.closed, answers
+                return session, after, after.is_closed, answers
 
         before, after, after_closed, answers = asyncio.run(scenario())
         assert before is after and not after_closed
@@ -1344,3 +1374,66 @@ class TestConnectionReuse:
             "Bearer key-one",
             "Bearer key-two",
         ]
+
+
+# ---------------------------------------------------------------------------
+# The persistent client: HTTP/2 where offered, and an early, empty warm-up
+# ---------------------------------------------------------------------------
+
+
+class _HeadRecorder(_Recorder):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.heads: list[dict] = []
+
+    def app(self) -> web.Application:
+        app = super().app()
+
+        async def _head(request: web.Request) -> web.Response:
+            self.heads.append(dict(request.headers))
+            return web.Response(status=405)
+
+        app.router.add_route("HEAD", "/v1/systemone", _head)
+        return app
+
+
+class TestPersistentClient:
+    def test_the_shared_client_offers_http2_and_reads_no_environment(self):
+        async def scenario():
+            client = impl_jev._session_for_running_loop()
+            try:
+                pool = client._transport._pool
+                return pool._http2, client._trust_env, client.follow_redirects
+            finally:
+                await close_sessions()
+
+        http2, trust_env, follows = asyncio.run(scenario())
+        assert http2 is True and trust_env is False and follows is False
+
+    def test_warm_sends_an_empty_head_with_no_credential_and_reuses_the_connection(
+        self, fake_vault
+    ):
+        async def scenario():
+            rec = _HeadRecorder(body=_ok_body({"is_urgent": _yes()}))
+            async with _Serving(rec) as serving:
+                oracle = serving.oracle()
+                await oracle.warm()
+                await oracle.ask("hi", [URGENT])
+                return rec
+
+        rec = asyncio.run(scenario())
+        assert len(rec.heads) == 1
+        assert "Authorization" not in rec.heads[0] and rec.requests
+
+    def test_a_compressed_reply_is_decoded_before_it_is_parsed(self):
+        class _Gzip(_Recorder):
+            async def handle(self, request: web.Request) -> web.Response:
+                response = web.json_response(_ok_body({"is_urgent": _yes(0.8)}))
+                response.enable_compression(web.ContentCoding.gzip)
+                return response
+
+        async def scenario():
+            async with _Serving(_Gzip()) as serving:
+                return await serving.oracle().ask("hi", [URGENT])
+
+        assert asyncio.run(scenario())["is_urgent"].p == pytest.approx(0.8)

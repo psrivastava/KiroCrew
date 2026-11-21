@@ -35,6 +35,7 @@ from typing import Any, Awaitable, Callable, Coroutine, Mapping, TypeVar
 
 from kiro_crew.config.sections_shared_crew import EffectiveLimits
 from kiro_crew.loop_lock import LoopBoundLock
+from kiro_crew.shared_crew import admission_link as _link
 from kiro_crew.shared_crew import admission_parked as _parked
 from kiro_crew.shared_crew import admission_runtime as _runtime
 from kiro_crew.shared_crew import admission_settle as _settle
@@ -75,7 +76,7 @@ from kiro_crew.shared_crew.admission_runtime import systemd_reap as _systemd_rea
 from kiro_crew.shared_crew.admission_runtime import systemd_unit_liveness as _systemd_unit_liveness
 from kiro_crew.shared_crew.codec import ContractError
 from kiro_crew.shared_crew.contracts import EnforcementLevel, Principal, Transport
-from kiro_crew.shared_crew.identity import actor_of
+from kiro_crew.shared_crew.identity import actor_of, budget_id
 from kiro_crew.shared_crew.internal_caller import (  # noqa: F401 -- public import path
     ATTESTED_SESSION_KEY,
     CALLER_SESSION_HEADER,
@@ -1193,9 +1194,8 @@ class AdmissionService:
         """Move unstarted or child work straight to a terminal *state*."""
         assert self._store is not None
         work_id = live.work.work_id
-        unattached = live.work.state in (S.QUEUED, S.ADMITTED) and not live.work.extra.get(
-            "execution_id"
-        )
+        # Linked or not, an unstarted record's start may still attach: remember it.
+        unattached = live.work.state in _link.UNSTARTED
         if live.work.state is S.QUEUED:
             self._scheduler.cancel_queued(work_id)
         try:
@@ -1499,8 +1499,8 @@ class AdmissionService:
             policy_version=self.policy_version(),
             request_digest=work.request_digest,
         )
-        if work.state in (S.QUEUED, S.ADMITTED):
-            # Proven never started: ``running`` is written before any launch.
+        if work.state in _link.UNSTARTED and not _link.linked(work, self._probes, work_class):
+            # Proven never started: ``running`` or a linked run id precedes any launch.
             work = await self._store.advance(work, S.RECONCILING)
             relaunch = self._relaunchers.get(work.operation)
             payload = await self._store.tasks.run(self._store.payload_sync, work.work_id)
@@ -1526,7 +1526,7 @@ class AdmissionService:
             )
             self._tell_reconciled(ended, payload)
             return
-        if work.state in (S.RUNNING, S.CANCELLING):
+        if work.state in _link.HELD_ON_RESTART:
             work = await self._store.advance(work, S.RECONCILING, extra=detail_started)
         # RECONCILING: holds capacity until proven stopped.
         self._scheduler.hold(ticket)
@@ -1536,6 +1536,7 @@ class AdmissionService:
         if work_class is WorkClass.CHILD or (
             work.operation in self._probes and work.extra.get("execution_id")
         ):
+            await _link.restore(self, work, work_class)
             # Its owner (the subagent queue, the task runner, the workflow
             # registry) reconciles the run; the probe settles this record.
             live.awaiting_proof = False
@@ -1724,6 +1725,8 @@ class HostHooks:
     #: after a restart settles and cancels recovered children before any spawn.
     child_probe: ChildProbe | None = None
     child_cancel: CancelHook | None = None
+    #: Background runs' probes (the task runner's), so restart holds a linked run.
+    run_probes: Mapping[OperationKind, ChildProbe] = field(default_factory=dict)
 
 
 _HOOKS = HostHooks()
@@ -1745,6 +1748,8 @@ def _apply_hooks(service: AdmissionService) -> None:
         service.set_child_probe(_HOOKS.child_probe)
     if _HOOKS.child_cancel is not None:
         service.set_child_cancel(_HOOKS.child_cancel)
+    for operation, probe in _HOOKS.run_probes.items():
+        service.register_probe(operation, probe)
 
 
 def installed_service() -> AdmissionService | None:
@@ -1929,7 +1934,7 @@ def internal_initiator(request: Any) -> str | None:
 
 
 def actor_budget(request: Any, *, automation: bool = False) -> str:
-    """The budget key for *request*: its actor's principal, its initiator's, or Unknown.
+    """The budget key for *request*: its actor's :func:`budget_id`, its initiator's, or Unknown.
 
     An internal request (work an agent starts from inside a turn) is charged
     to the person whose turn runs in its proven calling session, so automation
@@ -1941,7 +1946,7 @@ def actor_budget(request: Any, *, automation: bool = False) -> str:
     if actor is not None and not actor.principal.is_unknown:
         if automation and actor.transport is Transport.INTERNAL:
             return internal_initiator(request) or Principal.unknown().id
-        return actor.principal.id
+        return budget_id(actor.principal.id)
     if automation:
         return AUTOMATION_PRINCIPAL.id
     return Principal.unknown().id

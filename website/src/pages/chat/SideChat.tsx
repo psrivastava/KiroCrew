@@ -6,7 +6,7 @@ import { sendTurn, SEND_ABORT_MS, type SendReceipt } from '../../chat-core/trans
 import { sendFailureCopy, deliveryUnconfirmedCopy } from '../../chat-core/transport/receiptCopy'
 import { sideTurnWire } from './sideTurnWire'
 import { useAppSelector, useAppDispatch, useAppStore } from '../../store'
-import { beginSideQueueEdit, finishSideQueueEdit, forgetSideSteerSubmittedText, readSideSteerSubmittedText, recordSideSteerSubmittedText, setSideQueueEditDraft, sideClose, sideOptimisticAccepted, sideOptimisticAppend, sideOptimisticRollback, restoreSideConversation, awaitSideRestore, sseSideQueue, sideReleaseConsumed, sideSendStatus, queueEditBroadcastAt, stageToMainComposer, takeSideQueueDroppedByClose, takeSideSteerDroppedByClose, transcriptTsMs, type SideStandingNotice } from '../../store/chatSlice'
+import { beginSideQueueEdit, finishSideQueueEdit, forgetSideSteerSubmittedText, noteSideQueueCancelWaiting, readSideSteerSubmittedText, recordSideSteerSubmittedText, setSideQueueEditDraft, sideClose, sideOptimisticAccepted, sideOptimisticAppend, sideOptimisticRollback, restoreSideConversation, awaitSideRestore, sseSideQueue, sideReleaseConsumed, sideSendStatus, queueEditBroadcastAt, stageToMainComposer, takeSideQueueDroppedByClose, takeSideQueueDroppedByResyncThenClose, takeSideSteerDroppedByClose, transcriptTsMs, type SideStandingNotice } from '../../store/chatSlice'
 import QueueStack from '../../components/QueueStack'
 import ChatMessageList from '../../app-sdk/ChatMessageList'
 import FollowUpBar from '../../components/FollowUpBar'
@@ -14,9 +14,13 @@ import { deriveFollowUpOptions } from '../../app-sdk/protocol'
 import { useComposerDraft, draftByteSize } from '../../app-sdk/useComposerDraft'
 import ChatInput from '../../components/ChatInput'
 import ErrorNotice from '../../components/ErrorNotice'
+import { GUIDE_KEEP_CLEAR } from '../../guide/trustRoot'
+import StatusNotice from '../../components/StatusNotice'
+import InfoTip from '../../components/InfoTip'
 import { SlotProvider } from '../../providers/SlotContext'
 import { useConnected } from '../../hooks/useConnected'
-import { consumeSideChatSeed, readSideChatDraft, restoreSideChatDraft, writeSideChatDraft, writeSideChatPastes, useSideChatDraft } from '../../chat-core/composer/sideChatDrafts'
+import { consumeSideChatSeed, readSideChatDraft, restoreSideChatDraft, writeSideChatDraft, writeSideChatFiles, writeSideChatPastes, useSideChatDraft } from '../../chat-core/composer/sideChatDrafts'
+import { useSideChatUploads } from './useSideChatUploads'
 import type { PasteBlock } from '../../utils/pasteTokens'
 import { buildOutgoingTurn, isEmptyTurn } from '../../chat-core/composer/outgoingTurn'
 import { mergeIntoDraft as appendToDraft } from '../../utils/chatDrafts'
@@ -56,9 +60,10 @@ type SideSubmit = { q: string; steer: boolean; optimistic: boolean; slot: string
   /** True when `q` came from a follow-up chip rather than the composer, so the draft the
    *  user is still writing must survive the send. */
   override?: boolean
-  /** The composer's TOKEN text and the blocks behind it, when `q` was expanded from a
-   *  collapsed paste — what a failed submit hands back, so the pill returns as a pill. */
-  display?: string; pastes?: PasteBlock[] }
+  /** The composer's TOKEN text, the blocks behind it and the staged attachments, when
+   *  `q` was expanded from a collapsed paste or carries staged attachments — what a
+   *  failed submit hands back, so the pill returns as a pill and a file as its chip. */
+  display?: string; pastes?: PasteBlock[]; files?: string[] }
 
 /** Put `released` text back in the composer without discarding what is there.
  *
@@ -76,12 +81,12 @@ function relativeTime(iso: string): string | null {  const diff = Date.now() - n
   if (diff < 24 * 3600_000) return `${Math.floor(diff / 3600_000)}h`
   return `${Math.floor(diff / (24 * 3600_000))}d`
 }
-type SendRecovery = { text?: string; pastes?: PasteBlock[]; error?: string; notice?: SideStandingNotice }
+type SendRecovery = { text?: string; pastes?: PasteBlock[]; files?: string[]; error?: string; notice?: SideStandingNotice }
 /** What a send that was not accepted hands back to the composer: the payload as
- *  the user SAW it (collapsed paste tokens plus their blocks) when the submit
- *  carried one, else the text that went on the wire. */
-function handBack(vars: SideSubmit): Pick<SendRecovery, 'text' | 'pastes'> {
-  return vars.pastes?.length && vars.display ? { text: vars.display, pastes: vars.pastes } : { text: vars.q }
+ *  the user SAW it (collapsed paste tokens plus their blocks, and its staged
+ *  files) when the submit carried one, else the text that went on the wire. */
+function handBack(vars: SideSubmit): Pick<SendRecovery, 'text' | 'pastes' | 'files'> {
+  return vars.display !== undefined ? { text: vars.display, pastes: vars.pastes, files: vars.files } : { text: vars.q }
 }
 
 
@@ -89,7 +94,7 @@ function handBack(vars: SideSubmit): Pick<SendRecovery, 'text' | 'pastes'> {
  *  lazy-loading (the Lexical editor) before it gives up on placing the caret. */
 const SEED_FOCUS_WAIT_MS = 5000
 
-export default function SideChat({ slot, onFileOpen, onArtifactOpen }: {
+export default function SideChat({ slot, onFileOpen, onFolderOpen, onArtifactOpen }: {
   slot: string
   /** Open a path named in a side reply as a Files tab of the panel this chat
    *  sits in — the same opener the host hands the main transcript. Capability
@@ -97,6 +102,9 @@ export default function SideChat({ slot, onFileOpen, onArtifactOpen }: {
    *  OS reveal (a clipboard copy on a remote dashboard), a path link stays a
    *  plain link. */
   onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void
+  /** Open a folder named in a side reply as a folder tab of the same panel;
+   *  absent, the folder chip takes the same OS-reveal fallback. */
+  onFolderOpen?: (path: string) => void
   /** Open an artifact link as an artifact tab of the same panel; absent, the
    *  link navigates away from the chat. */
   onArtifactOpen?: (slug: string) => void
@@ -157,6 +165,16 @@ export default function SideChat({ slot, onFileOpen, onArtifactOpen }: {
   // for a user who looks back after the TTL, and the text would be resent.
   // Lives in the store, per slot, beside the text it explains (see SideState.sendStatus).
   const sendStatus = reduxSide?.sendStatus
+  // Another tab's Refresh context closed this conversation while this tab showed it.
+  // Kept outside the slot's side state, which `sideClose` dropped.
+  const closedElsewhere = useAppSelector(s => s.chat.slotSideClosedElsewhere?.[slot] === true)
+
+  // The error of a failed cancel, edit or Stop belongs to the conversation another
+  // tab closed. Left in place it outranks the status strip and would hide the
+  // closed-in-another-tab line for as long as that line lasts.
+  useEffect(() => {
+    if (closedElsewhere) setLocalError(null)
+  }, [closedElsewhere])
 
   // Retire the transient notice on its own so it cannot outlive the moment it
   // describes.
@@ -193,7 +211,10 @@ export default function SideChat({ slot, onFileOpen, onArtifactOpen }: {
     () => messages.map((m, i) => {
       const streaming = i === lastIdx && isStreamingLast
       const role = m.role === 'user' ? 'user' : m.is_error ? 'error' : streaming ? 'streaming' : 'assistant'
-      return { role, content: m.content, cls: `msg msg-${role}`, ts: m.ts }
+      // A finished answer's blocked-link records ride in `meta`, where the shared
+      // bubble reads a main chat row's, so a flagged link there draws as its chip.
+      const meta = role === 'assistant' && m.link_blocks !== undefined ? { meta: { link_blocks: m.link_blocks } } : {}
+      return { role, content: m.content, cls: `msg msg-${role}`, ts: m.ts, ...meta }
     }),
     [messages, lastIdx, isStreamingLast]
   )
@@ -256,7 +277,14 @@ export default function SideChat({ slot, onFileOpen, onArtifactOpen }: {
   // restores text into the store while the panel may be bound elsewhere, and
   // a cache then hid that restored text (and the next keystroke overwrote it)
   // when the panel came back.
-  const { text: storedDraft, seedTick, pastes: pasteBlocks } = useSideChatDraft(slot)
+  const { text: storedDraft, seedTick, pastes: pasteBlocks, files: stagedFiles } = useSideChatDraft(slot)
+  // Attachments: the main composer's upload flow under this panel's own side
+  // key, so a side upload holds only the side Send. Finished paths are staged
+  // on the slot's side draft beside the text (`stagedFiles`).
+  const {
+    uploadError, setUploadError, uploadHint, setUploadHint, sendHeld, uploadCount, uploadMutation,
+    cancelUpload, uploadFiles, dropTargetProps, uploadKey,
+  } = useSideChatUploads(slot)
   const onDraftChange = useCallback((next: string) => { writeSideChatDraft(slot, next); setLengthHint(null) }, [slot])
   // The collapsed paste blocks behind the `[ Paste #N · M lines ]` tokens in
   // the draft — the sidecar ChatInput needs before it collapses a large paste
@@ -329,7 +357,7 @@ export default function SideChat({ slot, onFileOpen, onArtifactOpen }: {
   // blocks (`restoreSideChatDraft` carries them in) -- never as the expanded
   // lines, which would lose the tokens' identity on the retry.
   const recoverFor = useCallback((forSlot: string, r: SendRecovery) => {
-    if (r.text && r.pastes?.length) restoreSideChatDraft(forSlot, r.text, r.pastes)
+    if (r.pastes?.length || r.files?.length) restoreSideChatDraft(forSlot, r.text ?? '', r.pastes, r.files)
     else if (r.text) restoreDraftTo(forSlot, r.text)
     if (r.error || r.notice) dispatch(sideSendStatus({ slot: forSlot, error: r.error, notice: r.notice }))
   }, [restoreDraftTo, dispatch])
@@ -429,7 +457,8 @@ export default function SideChat({ slot, onFileOpen, onArtifactOpen }: {
       // text, so clearing here would throw away a draft the user has not sent yet.
       // The blocks go with the text: `writeSideChatDraft('')` prunes every block
       // whose token left the text, which for an empty text is all of them.
-      if (!override) setDraft('')
+      // Staged attachments are part of that composer submit and clear with it.
+      if (!override) { setDraft(''); writeSideChatFiles(target, []) }
     },
     onSuccess: (receipt, vars) => {
       // Receipt policy for the side panel:
@@ -640,11 +669,16 @@ export default function SideChat({ slot, onFileOpen, onArtifactOpen }: {
   const cancelQueued = useMutation({
     mutationFn: ({ queueId, slot: target }: { queueId: string; slot: string }) =>
       api.sideQueueCancel(target, queueId),
-    onMutate: ({ queueId }: { queueId: string; slot: string }) => { markQueuePending(queueId, true) },
+    onMutate: ({ queueId, slot: target }: { queueId: string; slot: string }) => {
+      markQueuePending(queueId, true)
+      noteSideQueueCancelWaiting(target, queueId, true)
+    },
     onSuccess: (res, { queueId, slot: target }) => {
       // The reducer stashes the released text and the effect above drains it, so
-      // this path and the WS frame share ONE release — restoring the draft here
-      // as well would double-append it.
+      // on an open slot this path and the WS frame share ONE release — restoring
+      // the draft here as well would double-append it. A card from a closed
+      // conversation is the exception handled below: the reducer would not
+      // release it, so that branch is the only release.
       // Prefer the raw text THIS client submitted. Both the card and the frame can
       // hold a redacted rendering (broadcasts are scrubbed on the wire), and for a
       // credential-bearing question that is a permanently corrupted restore. The
@@ -655,6 +689,22 @@ export default function SideChat({ slot, onFileOpen, onArtifactOpen }: {
       const entry = reduxSide?.queue?.find(e => e.id === queueId)
       const raw = submittedRaw.current.get(queueId)
         ?? (entry?.steerId ? readSideSteerSubmittedText(target, entry.steerId) : undefined)
+      submittedRaw.current.delete(queueId)
+      if (entry?.steerId) forgetSideSteerSubmittedText(target, entry.steerId)
+      // A re-read dropped this card and the conversation then closed. The reducer
+      // ignores a closed slot, and a conversation opened since then has no card
+      // with this id, so the cancel's text goes back to the composer from the
+      // record the close kept, once, and the cancel is not applied to the newer
+      // conversation.
+      const now = chatStore.getState().chat
+      const closed = !!now.slotSideClosed[target]
+      const shown = !!now.slotSide[target]?.queue?.some(e => e.id === queueId)
+      const dropped = shown ? undefined : takeSideQueueDroppedByResyncThenClose(target, queueId)
+      if (closed || dropped) {
+        const released = dropped ? raw ?? (dropped.content || res.content || '') : ''
+        if (released) restoreDraftTo(target, released)
+        return
+      }
       dispatch(sseSideQueue({
         slot: target,
         action: 'cancel',
@@ -664,13 +714,14 @@ export default function SideChat({ slot, onFileOpen, onArtifactOpen }: {
         // server and is scrubbed, so marking that raw would defeat the preference.
         ...(raw !== undefined ? { raw: true } : {}),
       }))
-      submittedRaw.current.delete(queueId)
-      if (entry?.steerId) forgetSideSteerSubmittedText(target, entry.steerId)
     },
     onError: () => {
       setLocalError(i18nT('pages.chat.sideChat.queue_cancel_failed'))
     },
-    onSettled: (_d, _e, { queueId }) => { markQueuePending(queueId, false) },
+    onSettled: (_d, _e, { queueId, slot: target }) => {
+      markQueuePending(queueId, false)
+      noteSideQueueCancelWaiting(target, queueId, false)
+    },
   })
 
   const editQueued = useMutation({
@@ -842,14 +893,18 @@ export default function SideChat({ slot, onFileOpen, onArtifactOpen }: {
    *  arrive here as the override. */
   const send = useCallback((override?: string, steerRequested = false) => {
     const typed = (override ?? draft).trim()
-    if (isEmptyTurn({ text: typed }) || sendMutation.isPending || !slot) return
+    // Staged attachments belong to the composer submit, never to a chip's override.
+    const files = override != null ? [] : stagedFiles
+    if (isEmptyTurn({ text: typed, files }) || sendMutation.isPending || !slot) return
     // Collapsed pastes expand for the model here, on both the send and the
     // steer branch (one path): the side chat is the text-only channel of
     // `buildOutgoingTurn`. The side transcript carries no per-message meta, so
     // the bubble shows the expanded text as well — what the server stores and
     // re-serves. Only a composer submit owns the composer's blocks: an
     // override (a follow-up chip) supplies its own text and has none.
-    const { wire: q, pastes: blocks } = buildOutgoingTurn({ text: typed, pastes: override != null ? [] : pasteBlocks }, 'steer')
+    // Staged images become leading `![image](path)` lines of the question, which
+    // the side turn's prompt builder attaches as image blocks.
+    const { wire: q, pastes: blocks } = buildOutgoingTurn({ text: typed, files, pastes: override != null ? [] : pasteBlocks }, 'steer')
     if (exceedsByteLimit(q)) {
       // The limit is enforced in UTF-8 bytes (server contract), but a byte count is
       // not actionable to the user — report a character target instead, derived
@@ -878,8 +933,8 @@ export default function SideChat({ slot, onFileOpen, onArtifactOpen }: {
     // STARTS — a steer's bubble has to land above the streaming answer and a
     // queued one is a card, so the server frame places both.
     const steer = isBusy && steerRequested
-    sendMutation.mutate({ q, steer, optimistic: !isBusy, slot, override: override != null, ...(blocks.length ? { display: typed, pastes: blocks } : {}) })
-  }, [draft, pasteBlocks, slot, sendMutation, isBusy, exceedsByteLimit])
+    sendMutation.mutate({ q, steer, optimistic: !isBusy, slot, override: override != null, ...(blocks.length || files.length ? { display: typed, pastes: blocks, files } : {}) })
+  }, [draft, pasteBlocks, stagedFiles, slot, sendMutation, isBusy, exceedsByteLimit])
 
   const displayError = sendStatus?.error ?? localError
 
@@ -918,31 +973,34 @@ export default function SideChat({ slot, onFileOpen, onArtifactOpen }: {
       {showBanner && (
         <div className={`flex items-center justify-between px-3 py-1.5 text-[12px] border-b border-border shrink-0 ${isStale ? 'bg-warn/10 text-warn-text' : 'bg-bg-hover/50 text-muted'}`}>
           <span className="italic">
-            {i18nT('pages.chat.sideChat.context_from')} {i18nT('pages.chat.sideChat.turn', { count: turnsBehind })} {i18nT('pages.chat.sideChat.ago')}{age ? ` · ${age}` : ''}
+            {i18nT('pages.chat.sideChat.context_from_turns_ago', { count: turnsBehind })}{age ? ` · ${age}` : ''}
           </span>
-          <button
-            onClick={() => void handleRefresh()}
-            title={
-              queue.length > 0
-                ? i18nT('pages.chat.sideChat.refresh_blocked_queued')
-                : isBusy
-                  ? i18nT('pages.chat.sideChat.refresh_blocked_busy')
-                  : undefined
-            }
-            // Disabled WHILE a turn runs: a running turn can hold an accepted
-            // but unconsumed steer that has no queue card, so the empty-queue
-            // check cannot see it and a mid-turn Refresh would silently drop
-            // it. The hung-turn escape is the Stop control, which cancels the
-            // turn and settles the panel; once that clears (`is_complete` flips,
-            // `isBusy` falls), Refresh becomes reachable the ordinary way. So
-            // the steer-loss collateral never exists and Stop is the single
-            // in-flight escape.
-            disabled={isBusy || refreshMutation.isPending || queue.length > 0}
-            className="flex items-center gap-1 text-[11px] font-medium text-accent hover:text-accent-hover disabled:opacity-50 bg-transparent border-none cursor-pointer disabled:cursor-not-allowed"
-          >
-            <RotateCcw size={11} className={refreshMutation.isPending ? 'animate-spin' : ''} />
-            {i18nT('pages.chat.sideChat.refresh_context')}
-          </button>
+          <span className="flex items-center gap-1 shrink-0">
+            <button
+              onClick={() => void handleRefresh()}
+              title={
+                queue.length > 0
+                  ? i18nT('pages.chat.sideChat.refresh_blocked_queued')
+                  : isBusy
+                    ? i18nT('pages.chat.sideChat.refresh_blocked_busy')
+                    : undefined
+              }
+              // Disabled WHILE a turn runs: a running turn can hold an accepted
+              // but unconsumed steer that has no queue card, so the empty-queue
+              // check cannot see it and a mid-turn Refresh would silently drop
+              // it. The hung-turn escape is the Stop control, which cancels the
+              // turn and settles the panel; once that clears (`is_complete` flips,
+              // `isBusy` falls), Refresh becomes reachable the ordinary way. So
+              // the steer-loss collateral never exists and Stop is the single
+              // in-flight escape.
+              disabled={isBusy || refreshMutation.isPending || queue.length > 0}
+              className="flex items-center gap-1 text-[11px] font-medium text-accent hover:text-accent-hover disabled:opacity-50 bg-transparent border-none cursor-pointer disabled:cursor-not-allowed"
+            >
+              <RotateCcw size={11} className={refreshMutation.isPending ? 'animate-spin' : ''} />
+              {i18nT('pages.chat.sideChat.refresh_context')}
+            </button>
+            <InfoTip text={i18nT('pages.chat.sideChat.refresh_context_hint')} />
+          </span>
         </div>
       )}
       <ChatMessageList
@@ -951,6 +1009,7 @@ export default function SideChat({ slot, onFileOpen, onArtifactOpen }: {
         // The host's own openers, so a path or artifact named in a side reply
         // opens where the main transcript opens it: a tab of this panel.
         onFileOpen={onFileOpen}
+        onFolderOpen={onFolderOpen}
         onArtifactOpen={onArtifactOpen}
         transcript={{
           sessionId: `side:${slot}`,
@@ -1008,11 +1067,12 @@ export default function SideChat({ slot, onFileOpen, onArtifactOpen }: {
       {!displayError && lengthHint && (
         <div className="px-3 py-1 text-[12px] text-warn border-t border-border" role="status" data-testid="side-chat-length-hint">{lengthHint}</div>
       )}
-      {!displayError && !lengthHint && (sendStatus?.notice || localNotice) && (
+      {!displayError && !lengthHint && (sendStatus?.notice || localNotice || closedElsewhere) && (
         // The standing unconfirmed notice carries a decision ("check the
         // conversation above before sending it again"), so it reads at body
-        // weight; the transient demote notice keeps the muted strip.
-        <div className={`px-3 py-1 text-[12px] border-t border-border ${sendStatus?.notice ? 'text-text' : 'text-muted'}`} role="status">{sendStatus?.notice?.text ?? localNotice}</div>
+        // weight; the transient demote notice and the note that another tab
+        // cleared the conversation keep the muted strip.
+        <div className={`px-3 py-1 text-[12px] border-t border-border ${sendStatus?.notice ? 'text-text' : 'text-muted'}`} role="status">{sendStatus?.notice?.text ?? localNotice ?? i18nT('pages.chat.sideChat.closed_in_another_tab')}</div>
       )}
       {queueCards.length > 0 && (
         <div className="shrink-0 pt-1">
@@ -1062,8 +1122,9 @@ export default function SideChat({ slot, onFileOpen, onArtifactOpen }: {
           aria-label: the label is translated, so a selector built from its
           English text matches in one language out of twelve); the seed handler
           resolves the textarea through a wrapper query. Capability shaping is by
-          omission: no upload/voice/agent/model props, so the slim surface
-          renders none of that chrome — same component, fewer capabilities. */}
+          omission: no voice/agent/model props, so the slim surface renders none
+          of that chrome — same component, fewer capabilities. Attachments are
+          wired (`useSideChatUploads`), so a question can carry an image. */}
       {/* Tinted band: two composers can share one screen (the thread's and this
           one — on the Members page they sit side by side, same send arrow). One
           is off the record, the other steers a live run, so the off-record one
@@ -1095,7 +1156,34 @@ export default function SideChat({ slot, onFileOpen, onArtifactOpen }: {
             typedCommandMenus={false}
             slotApprovalChrome={false}
             promptOptimizer={false}
+            promptStash={false}
             connected={connected}
+            onUploadFiles={uploadFiles}
+            onCancelUpload={uploadCount > 0 ? cancelUpload : undefined}
+            uploadCount={uploadCount}
+            uploadSlot={uploadKey}
+            pendingFiles={stagedFiles}
+            onRemoveFile={path => { writeSideChatFiles(slot, stagedFiles.filter(f => f !== path)) }}
+            uploading={uploadMutation.isPending || sendHeld}
+            holdSend={sendHeld}
+            onDrop={dropTargetProps.onDrop}
+            onDragOver={dropTargetProps.onDragOver}
+            onDragLeave={dropTargetProps.onDragLeave}
+          />
+          {/* The composer's notices are kept clear like the composer itself. */}
+          <div data-testid="side-chat-composer-notices" {...GUIDE_KEEP_CLEAR}>
+          <StatusNotice
+            className="mx-1 mt-1.5 mb-0"
+            testId="side-chat-upload-hint"
+            message={uploadHint}
+            onDismiss={() => setUploadHint('')}
+          />
+          {/* No hand-off: the side question's draft in this composer is unsaved. */}
+          <ErrorNotice
+            className="mx-1 mt-1.5 mb-0"
+            testId="side-chat-upload-error"
+            message={uploadError}
+            onDismiss={() => setUploadError('')}
           />
           {postureError ? (
             // No hand-off: navigating to the main chat would unmount Side Chat and
@@ -1129,6 +1217,7 @@ export default function SideChat({ slot, onFileOpen, onArtifactOpen }: {
                   : i18nT('pages.chat.sideChat.context_only_tools_unavailable_backend')}
             </div>
           ) : null}
+          </div>
         </SlotProvider>
       </div>
     </div>

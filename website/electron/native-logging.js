@@ -148,10 +148,12 @@ const MAX_CARRY_BYTES = 1024 * 1024;
 /**
  * Query-string bearer tokens, as Chromium writes them.
  *
- * Chromium's `INFO:CONSOLE` lines append the document URL, and the desktop app
- * loads the dashboard as `?token=<jwt>` — so every renderer console message from
- * that document records the session token verbatim. The value ends at the next
- * URL/log delimiter; `&` matters because the real URL continues with `&sid=`.
+ * Chromium's `INFO:CONSOLE` lines append the document URL, so when a desktop
+ * window loads a gateway page as `?token=<jwt>`, every renderer console message
+ * from that document records the session token verbatim. Dashboard windows sign
+ * in without it (`loadDashboardWithToken`); this pass covers any other source of
+ * such a line. The value ends at the next URL/log delimiter; `&` matters because
+ * such a URL can continue with `&sid=`.
  *
  * Narrow by SHAPE, not by spelling: only a query parameter whose value is a
  * credential is matched, right after `?` or `&`. A broad "anything JWT-shaped"
@@ -449,7 +451,7 @@ function tightenLogMode(filePath, { fs, log = () => {} } = {}) {
  * was redacted the sibling is removed instead of renamed, so a clean multi-gigabyte
  * log is not rewritten for no reason.
  */
-function redactLargeLogByStreaming(filePath, sourceFd, { fs, log = () => {} } = {}) {
+function redactLargeLogByStreaming(filePath, sourceFd, { fs, log = () => {}, releaseSource = () => {} } = {}) {
   const needed = ["readSync", "writeSync", "closeSync", "renameSync", "unlinkSync"];
   if (needed.some((m) => typeof fs[m] !== "function")) {
     log(`native log streaming redaction unavailable at ${filePath}`);
@@ -521,6 +523,9 @@ function redactLargeLogByStreaming(filePath, sourceFd, { fs, log = () => {} } = 
       fs.unlinkSync(tmpPath);
       return { scanned: true, redacted: false, skipped: null };
     }
+    // Windows refuses (EPERM) to rename over a file this process still holds
+    // open, so the caller's read descriptor is released before the replace.
+    releaseSource();
     fs.renameSync(tmpPath, filePath);
     return { scanned: true, redacted: true, skipped: null };
   } catch (e) {
@@ -569,12 +574,20 @@ function redactNativeLogSecrets(filePath, { fs, log = () => {} } = {}) {
     const skipped = why.reason === "non-regular" ? "not-a-regular-file" : "unreadable";
     return { scanned: false, redacted: false, skipped };
   }
+  // Closed once: before a rename (Windows refuses EPERM to replace a file this
+  // process holds open) or in `finally`. A second close could hit a reused number.
+  let sourceOpen = true;
+  const releaseSource = () => {
+    if (!sourceOpen) return;
+    sourceOpen = false;
+    closeQuietly(source.fd, fs);
+  };
   try {
     // Over the bound the same redaction runs a chunk at a time instead of being
     // skipped: an over-cap log is the one most likely to be attached to a bug
     // report, because exceeding the bound means the console looped.
     if (Number.isFinite(source.size) && source.size > MAX_REDACT_BYTES) {
-      return redactLargeLogByStreaming(filePath, source.fd, { fs, log });
+      return redactLargeLogByStreaming(filePath, source.fd, { fs, log, releaseSource });
     }
     const raw = readAllIntoBuffer(source.fd, source.size, { fs });
     const cleaned = redactTokensInBuffer(raw);
@@ -608,6 +621,7 @@ function redactNativeLogSecrets(filePath, { fs, log = () => {} } = {}) {
         fs.unlinkSync(tmpPath);
         fs.writeFileSync(tmpPath, cleaned.out, { mode: SECRET_FILE_MODE, flag: "wx" });
       }
+      releaseSource();
       fs.renameSync(tmpPath, filePath);
     } catch (e) {
       // The original is untouched on this path — that is the whole point of the
@@ -627,8 +641,9 @@ function redactNativeLogSecrets(filePath, { fs, log = () => {} } = {}) {
     return { scanned: false, redacted: false, skipped: "error" };
   } finally {
     // Owned here for BOTH strategies: the streaming pass reads from this
-    // descriptor and deliberately does not close what it did not open.
-    closeQuietly(source.fd, fs);
+    // descriptor and deliberately does not close what it did not open; it only
+    // calls `releaseSource` right before its rename.
+    releaseSource();
   }
 }
 

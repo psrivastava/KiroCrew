@@ -17,6 +17,7 @@ from cron_script_helpers import (  # noqa: F401 -- the autouse fixtures register
     _cron_caller_is_named,
     _crons_dir_tracks_patched_home,
 )
+from redaction_structured_cases import github_classic
 
 from kiro_crew import platform_compat as pc
 from kiro_crew.cron_script import (
@@ -74,10 +75,12 @@ class TestRunScriptSandboxedErrorPaths:
         first can cut a secret mid-pattern, so redaction does not match and
         the raw head reaches the diagnostic.
         """
-        # Built at runtime so no credential-shaped literal lands in the repo.
-        fake_key = "AKIA" + "B" * 16  # matches the AWS access-key-id pattern
+        # Built at runtime so no credential-shaped literal lands in the repo. A
+        # GitHub token with a valid checksum is redacted; an AWS key ID would stay
+        # visible as an identifier.
+        fake_key = github_classic(seed=61)
         # Sized so the 200-char head window ends 10 chars into the credential:
-        # a slice-then-redact order keeps "AKIA" + 6 B's — too short for the
+        # a slice-then-redact order keeps its first 10 chars -- too short for the
         # pattern to match, so the raw head leaks into the diagnostic.
         padding = "p" * 190
         stdout_text = padding + fake_key + "e" * 50
@@ -91,7 +94,7 @@ class TestRunScriptSandboxedErrorPaths:
         ):
             result = run_script_sandboxed("/f.py:run", "j1", "")
         assert result["status"] == "error"
-        assert "AKIA" not in result["error"]
+        assert fake_key[:10] not in result["error"]
         assert fake_key not in result["error"]
         # Positive proof the payload flowed through redaction (not a vacuous
         # pass on an empty diagnostic): the 200-char head window ends 10 chars
@@ -102,18 +105,12 @@ class TestRunScriptSandboxedErrorPaths:
     def test_stderr_redaction_input_is_bounded_to_a_window(self, tmp_path, monkeypatch):
         """The stderr-tail redaction must not copy an unbounded capture.
 
-        ``proc.communicate`` caps neither stream and ``redact_credentials``
-        materialises its base64 runs into a list beside the input, so redacting
-        the WHOLE stderr costs a multiple of an unbounded string: a script
-        streaming gigabytes and then failing would OOM the gateway in redaction
-        that survived capture. Redaction reads a TAIL window of the kept 500
-        chars plus ``_REDACT_STRADDLE_MARGIN``, which keeps the footprint fixed.
+        ``redact_credentials`` copies its input several times, so redacting a
+        gigabyte stderr could OOM the gateway. It reads only the kept 500 chars plus
+        ``_REDACT_STRADDLE_MARGIN``.
 
-        Asserted on redact's INPUT rather than on the output, because the output
-        cannot tell the two apart -- a credential far before the window is
-        truncated away whether or not it was ever scanned. A credential
-        straddling the -500 boundary proves the window overshoot still lets the
-        pattern see it whole.
+        Asserted on redact's INPUT: the output cannot show whether truncated text
+        was scanned. A credential straddling -500 proves the overshoot still works.
         """
         from kiro_crew import cron_script
 
@@ -125,14 +122,14 @@ class TestRunScriptSandboxedErrorPaths:
             return real_redact(text)
 
         monkeypatch.setattr(cron_script, "redact", _spy)
-        fake_key = "AKIA" + "B" * 16  # matches the AWS access-key-id pattern
+        fake_key = github_classic(seed=62)  # 40 chars, redacted by the plan
         # The -500 cut lands ONE character into the key: slice-then-redact
-        # would leak the 19-char fragment, and a window that failed to reach
+        # would leak the 39-char fragment, and a window that failed to reach
         # back past the cut would leak it the same way.
         # Newline-separated filler: the window then starts inside an ordinary
         # short line, so only that line's severed remainder is masked and the
         # straddling credential is still exercised against the pattern pass.
-        stderr_text = ("n" * 100 + "\n") * 200 + "W" * 300 + fake_key + "X" * 481
+        stderr_text = ("n" * 100 + "\n") * 200 + "W" * 300 + fake_key + "X" * 461
         mock_proc = MagicMock()
         mock_proc.returncode = 1
         mock_proc.communicate.return_value = ("", stderr_text)
@@ -170,7 +167,7 @@ class TestRunScriptSandboxedErrorPaths:
             return real_redact(text)
 
         monkeypatch.setattr(cron_script, "redact", _spy)
-        fake_key = "AKIA" + "B" * 16  # matches the AWS access-key-id pattern
+        fake_key = github_classic(seed=63)  # 40 chars, redacted by the plan
         # The 200-char head cut lands 10 chars into the key; the trailing run
         # pushes the capture far past the window so the bound is discriminating.
         stdout_text = "p" * 190 + fake_key + "e" * 30000
@@ -194,14 +191,10 @@ class TestRunScriptSandboxedErrorPaths:
     def test_grant_value_longer_than_the_margin_is_still_scrubbed(self, tmp_path):
         """The grant scrub must read the WHOLE capture, not the redact window.
 
-        A vault value has no shape, so ``_scrub_grant_values`` matches it only
-        whole (``value in text``): if the scrub ran on the bounded window, a
-        granted value LONGER than ``_REDACT_STRADDLE_MARGIN`` straddling the
-        window's far edge would lose its head, stop matching, and its tail --
-        which no pattern recognises either -- would reach the persisted
-        ``last_error`` verbatim. The scrub is exact-substring replacement, so
-        whole-capture input carries none of the memory amplification the
-        redact window exists to bound.
+        ``_scrub_grant_values`` matches a vault value only whole, so on the window a
+        value longer than ``_REDACT_STRADDLE_MARGIN`` straddling its edge would leak
+        its tail into ``last_error``. Exact-substring replacement does not amplify
+        memory, so the whole capture is safe to scan.
         """
         # Longer than the margin, and shaped like nothing redact recognises,
         # so only the scrub stands between it and the diagnostic.
@@ -244,13 +237,9 @@ class TestRunScriptSandboxedErrorPaths:
     def test_pem_opened_before_the_tail_window_is_still_masked(self, tmp_path):
         """A PEM block spanning the whole tail window must not leak body lines.
 
-        A PEM block has no length ceiling, so the straddle margin cannot cover
-        it: a block whose ``-----BEGIN `` line falls before the window start
-        loses the anchor the pattern needs, and its body lines inside the
-        window -- shaped like nothing else redact recognises -- would reach
-        the persisted ``last_error`` verbatim. ``_pem_safe_tail_window``
-        tracks open-block state across the discarded prefix and masks the
-        retained bytes through the END line.
+        A PEM block has no length ceiling, so its ``-----BEGIN `` anchor can fall
+        before the window. ``_pem_safe_tail_window`` tracks open-block state across
+        the discarded prefix and masks the retained bytes through the END line.
         """
         label = "OPENSSH PRIVATE" + " KEY"
         # Body lines deliberately lowercase-only: they trip neither the
@@ -348,12 +337,8 @@ class TestRunScriptSandboxedErrorPaths:
     def test_severed_single_line_run_is_masked_not_reported(self, tmp_path):
         """A single-line token severed by the window start leaks no suffix.
 
-        Every single-line credential shape is whitespace-free, so when the
-        window boundary lands mid-line the possible credential tail is the
-        window's leading non-whitespace run. All-same-letter content is the
-        discriminator: it trips no pattern (no mixed case, no digits, no
-        anchor), so only the severed-run rule stands between it and the
-        persisted ``last_error``.
+        All-same-letter content trips no pattern, so only the severed-run rule
+        keeps it out of the persisted ``last_error``.
         """
         stderr_text = "warmup line\n" + "Z" * 6000 + "\n" + ("post-token diagnostic\n" * 10)
         mock_proc = MagicMock()
@@ -373,11 +358,9 @@ class TestRunScriptSandboxedErrorPaths:
     def test_whitespace_after_the_cut_does_not_unmask_the_severed_line(self, tmp_path):
         """A severed line is masked whole, wherever the credential sits on it.
 
-        The cut can land inside whitespace that PRECEDES the credential (an
-        indented value, a wrapped ``Authorization:`` header), so a rule that
-        masked only a leading non-whitespace run would see whitespace at the
-        window start, match nothing, and hand the raw token through. The
-        whole in-window remainder of the severed line is masked instead.
+        The cut can land in whitespace before the credential (an indented value, a
+        wrapped ``Authorization:`` header), so masking only a leading non-whitespace
+        run would pass the token through.
         """
         stderr_text = (
             ("n" * 100 + "\n") * 2
@@ -446,13 +429,9 @@ class TestRunScriptSandboxedErrorPaths:
     def test_begin_marker_after_the_cut_on_the_severed_line_keeps_its_block_masked(self, tmp_path):
         """Masking the severed line must not delete a BEGIN anchor it carries.
 
-        A key printed inline in an error string (``Error: ... -----BEGIN
-        ...``) puts the BEGIN marker AFTER the cut on the severed line. A rule
-        that masked the severed line as an opaque unit would delete the anchor
-        with the line while the key body survives in the remainder, unmatched
-        by the pattern pass. The marker walk continues through the severed
-        segment, so the block is masked through its labelled END like any
-        other open block.
+        An inline key (``Error: ... -----BEGIN ...``) puts BEGIN after the cut on
+        the severed line; deleting that line whole would leave the key body
+        unmatched. The marker walk continues through it and masks through END.
         """
         label = "RSA PRIVATE" + " KEY"
         key_open = f"-----BEGIN {label}-----"
@@ -486,12 +465,9 @@ class TestRunScriptSandboxedErrorPaths:
     def test_inline_prefixed_begin_marker_split_by_the_cut_fails_closed(self, tmp_path):
         """Inline prose before a marker must not defeat the severed-BEGIN rule.
 
-        A key printed mid-sentence (``Error: dumping key -----BEGIN ...``)
-        with the cut landing INSIDE the marker leaves an inline prefix before
-        the partial marker on the pre-cut line, so a check that requires the
-        LINE to start with the marker never fires while the marker walk sees
-        no complete marker on either side. The rule inspects the pre-cut
-        line's SUFFIX instead, so this shape fails closed to the tag.
+        With the cut inside the marker and prose before it, neither side holds a
+        complete marker, so the rule checks the pre-cut line's suffix and fails
+        closed to the tag.
         """
         label = "RSA PRIVATE" + " KEY"
         key_open = f"-----BEGIN {label}-----"
@@ -543,16 +519,9 @@ class TestRunScriptSandboxedTimeout:
             patch("kiro_crew.cron_script.wrap_argv", return_value=(["true"], None)),
             patch("subprocess.Popen", return_value=mock_proc),
             patch(
-                # Stub the reap at the shim, NOT via the global subprocess.Popen
-                # patch above. On Windows _kill_proc_group reaps through
-                # platform_compat.kill_process_tree, which shells out to `taskkill
-                # /T /F` with subprocess.run — and subprocess.run builds its child
-                # from subprocess.Popen, so the patch aimed at the launcher spawn
-                # also hijacks taskkill's, handing subprocess.run a MagicMock whose
-                # communicate() returns a mock instead of a 2-tuple (ValueError:
-                # not enough values to unpack). The timeout HANDLER is what is under
-                # test; the kill mechanism has its own coverage in
-                # TestKillBroadcastGuard.
+                # Stub the reap at the shim: on Windows it runs `taskkill` through
+                # subprocess.run, which the Popen patch above would hijack. The kill
+                # itself is covered in TestKillBroadcastGuard.
                 "kiro_crew.platform_compat.kill_process_tree",
                 return_value=True,
             ) as mock_tree,
@@ -785,20 +754,10 @@ class TestResolveInternalSecret:
 class TestPostKillDrainTimeoutHardening:
     """The post-kill drain must not leak pipes or mislabel the kill-path result.
 
-    ``Popen.communicate`` does not kill the child on timeout, so both spawners
-    SIGKILL the process group and then reap it with a bounded
-    ``communicate(timeout=5)``. That second drain can ITSELF raise
-    ``TimeoutExpired`` when the pipes never reach EOF — the child outlived the
-    group kill, or another process still holds the write end open. Two
-    invariants have to survive that:
-
-    - the ``PIPE`` fds get closed rather than left open for the life of the
-      gateway. ``Popen._communicate`` closes them as a side effect of reaching
-      EOF, which is exactly the path it does not reach here.
-    - the kill path still reports a *timeout*. In ``run_command_sandboxed`` a
-      ``TimeoutExpired`` raised inside the ``except`` block bypasses that
-      block's own handler list, so the timed-out ``return`` is skipped and the
-      broad ``except Exception`` reports "Command failed" instead.
+    The bounded ``communicate(timeout=5)`` after the group SIGKILL can itself raise
+    ``TimeoutExpired`` when the pipes never reach EOF. The ``PIPE`` fds must still
+    close (``Popen._communicate`` closes them only at EOF), and
+    ``run_command_sandboxed`` must still report a timeout, not "Command failed".
     """
 
     def test_script_drain_timeout_closes_pipes_and_keeps_contract(self):
@@ -848,7 +807,7 @@ class TestPostKillDrainTimeoutHardening:
         # A timed-out command must report the timeout, not "Command failed".
         assert result == {
             "status": "error",
-            "output": "❌ Command timed out after 30s",
+            "output": "Error: Command timed out after 30s",
             "exit_code": -1,
         }
         mock_proc.stdout.close.assert_called_once()
@@ -858,14 +817,9 @@ class TestPostKillDrainTimeoutHardening:
 class TestCronSpawnTiersAreAligned:
     """The two cron spawn paths must ask for the SAME sandbox tier.
 
-    A script body is agent-written and a command body is a fixed string the vet
-    already narrowed, so the script path is the HIGHER-capability surface of the
-    two. It nonetheless ran ``standard`` while the command path ran ``cc``,
-    leaving ``~/.aws/credentials``, the SSO cache, ``~/.kube``, ``~/.netrc``,
-    ``~/.git-credentials``, ``~/.npmrc`` and ``~/.pypirc`` readable by the more
-    capable child. These tests pin the alignment rather than the literal, so a
-    later change that moves ONE path re-fails here instead of silently
-    re-opening the gap.
+    A weaker script tier would leave ``~/.aws/credentials``, ``~/.kube``,
+    ``~/.netrc`` and similar files readable by agent-written code. The tests pin
+    the alignment, not the literal, so moving ONE path fails here.
     """
 
     def _capture_mode(self, monkeypatch):
@@ -921,9 +875,9 @@ class TestCronSpawnTiersAreAligned:
     def test_a_secret_granted_script_still_takes_the_narrowest_tier(self, tmp_path, monkeypatch):
         """A grant is the operator-approved route, and it tightens rather than widens.
 
-        This is the escape hatch a script needing a host credential uses, so it
-        must keep running ``strict`` — the alignment above must not have widened
-        the granted branch to ``cc``.
+        A grant puts the approved secrets in the child's environment, so it
+        must keep running ``strict`` — the alignment above must not have
+        widened the granted branch to ``cc``.
         """
         monkeypatch.setattr("kiro_crew.cron_script.Path.home", lambda: tmp_path)
         crons_dir = tmp_path / ".kirocrew" / "crons"

@@ -13,10 +13,10 @@ the only auth owner this route has.
 
 What is on disk, under ``<data home>/engines/kas/``::
 
-    0.66.33/
+    0.66.117/
       install.json                what was installed, and where its two entry points are
       bundle/node_modules/@kiro/agent/dist/server/acp-server.js
-      node/node-v22.20.0-linux-x64/bin/node
+      node/node-v22.23.3-linux-x64/bin/node
 
 The desktop app stages the same layout into its resources. A universal Mac app
 stages it once, with a Node binary holding both architectures
@@ -40,16 +40,16 @@ The manifest's own sha256 is pinned beside the version, which makes the
 manifest the trust root for everything else. Its shape::
 
     {
-      "version": "0.66.33",
+      "version": "0.66.117",
       "package": "@kiro/agent",
       "platforms": {
-        "linux-x64": {"file": "kas-linux-x64.tar.xz", "sha256": "...", "size": 25630996},
+        "linux-x64": {"file": "kas-linux-x64.tar.xz", "sha256": "...", "size": 21280012},
         ...
       },
       "node": {
-        "version": "22.20.0",
+        "version": "22.23.3",
         "builds": {
-          "linux-x64": {"file": "node-v22.20.0-linux-x64.tar.xz", "sha256": "...", "size": ...},
+          "linux-x64": {"file": "node-v22.23.3-linux-x64.tar.xz", "sha256": "...", "size": ...},
           ...
         }
       }
@@ -80,6 +80,7 @@ import stat
 import subprocess
 import tarfile
 import tempfile
+import time
 import urllib.parse
 import zipfile
 from collections.abc import Callable, Iterator, Mapping
@@ -102,6 +103,7 @@ __all__ = [
     "InstalledKasBundle",
     "KasBundleError",
     "KasBundleManifest",
+    "KasHostUnsupported",
     "fetch_manifest",
     "host_node_key",
     "host_platform_key",
@@ -114,6 +116,7 @@ __all__ = [
     "make_universal_node",
     "manifest_url_for",
     "parse_manifest",
+    "sweep_stale_staging",
     "trim_for_shipping",
 ]
 
@@ -156,10 +159,26 @@ _FILE_NAME_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._+-]{0,127}$")
 #: (the engine's ACP server and the Node binary) are; ``kirocrew doctor`` prints its path.
 KAS_BUNDLE_INSTALL_RECORD_NAME = "install.json"
 _STAGING_PREFIX = ".staging-"
+#: Staging trees that are not an install's, so the stale sweep never takes them: a
+#: retired tree can hold the only copy of the working engine, and lipo's is the
+#: universal-Node merge's work tree.
+_RETIRED_STAGING_PREFIX = f"{_STAGING_PREFIX}retired-"
+_LIPO_STAGING_PREFIX = f"{_STAGING_PREFIX}lipo-"
+#: An install's staging tree with nothing written for this long is taken as no live
+#: install's: above ``release_apply.ENGINE_INSTALL_TIMEOUT_SECS`` (the update's kill)
+#: and ``asset_downloader.DEFAULT_TIMEOUT_SECS`` (a download's socket timeout).
+_STALE_STAGING_SECS = 3600.0
 
 
 class KasBundleError(Exception):
     """A manifest, transfer, extraction or layout problem. ``str(exc)`` is the remedy."""
+
+
+class KasHostUnsupported(KasBundleError):
+    """This host cannot run the engine at all (OS, architecture, glibc, no build).
+
+    Retrying the download cannot help, so callers must not suggest it.
+    """
 
 
 @dataclass(frozen=True)
@@ -185,7 +204,7 @@ class KasBundleManifest:
         try:
             return self.platforms[platform_key]
         except KeyError:
-            raise KasBundleError(
+            raise KasHostUnsupported(
                 f"KAS {self.version} publishes no engine build for {platform_key} "
                 f"(has: {', '.join(sorted(self.platforms)) or 'none'})"
             ) from None
@@ -194,7 +213,7 @@ class KasBundleManifest:
         try:
             return self.node_builds[node_key]
         except KeyError:
-            raise KasBundleError(
+            raise KasHostUnsupported(
                 f"KAS {self.version} publishes no Node runtime for {node_key} "
                 f"(has: {', '.join(sorted(self.node_builds)) or 'none'})"
             ) from None
@@ -225,7 +244,7 @@ def _host_os(system: str) -> str:
         return "darwin"
     if system == "windows":
         return "win32"
-    raise KasBundleError(f"KAS bundles are not published for this operating system ({system})")
+    raise KasHostUnsupported(f"KAS bundles are not published for this operating system ({system})")
 
 
 def _host_arch(machine: str) -> str:
@@ -234,7 +253,7 @@ def _host_arch(machine: str) -> str:
         return "x64"
     if machine in ("arm64", "aarch64"):
         return "arm64"
-    raise KasBundleError(f"KAS bundles are not published for this architecture ({machine})")
+    raise KasHostUnsupported(f"KAS bundles are not published for this architecture ({machine})")
 
 
 def host_node_key(system: str | None = None, machine: str | None = None) -> str:
@@ -267,7 +286,7 @@ def _require_loadable_glibc(system: str | None, machine: str | None) -> None:
     floor = constants._OFFICIAL_NODE_GLIBC_FLOOR
     if glibc is None or glibc >= floor:
         return
-    raise KasBundleError(
+    raise KasHostUnsupported(
         f"this host's glibc ({glibc[0]}.{glibc[1]}) is older than KAS requires "
         f"(glibc {floor[0]}.{floor[1]}+): the bundled Node build needs glibc "
         f"{floor[0]}.{floor[1]}, and Amazon Linux 2-era hosts (glibc below 2.27) "
@@ -372,7 +391,10 @@ def _read_json_url(url: str, opener: Any, *, sha256: str | None = None) -> Any:
     except (OSError, ValueError) as exc:
         # ValueError is urllib's answer to a url it cannot parse (an unclosed
         # IPv6 bracket in a hand-typed --url), the same refusal as an unreachable one.
-        raise KasBundleError(f"could not fetch {asset_downloader.redact_url(url)}: {exc}") from exc
+        why = asset_downloader.network_failure_cause(exc) or exc
+        raise KasBundleError(
+            f"could not download the KAS engine from {asset_downloader.redact_url(url)}: {why}"
+        ) from exc
     if len(body) > _MANIFEST_MAX_BYTES:
         raise KasBundleError(f"{asset_downloader.redact_url(url)} is too large to be a manifest")
     if sha256 is not None and hashlib.sha256(body).hexdigest() != sha256:
@@ -605,7 +627,13 @@ def _locate_node(node_dir: Path) -> Path:
 _NODE_PROBE_TIMEOUT_SECS = 30
 
 
-def _probe_node(node_bin: Path, expected_version: str, *, launcher: tuple[str, ...] = ()) -> None:
+def _probe_node(
+    node_bin: Path,
+    expected_version: str,
+    *,
+    launcher: tuple[str, ...] = (),
+    timeout_retries: int = 0,
+) -> None:
     """Run the extracted Node once, the way the harness will, and check its version.
 
     One probe covers every way an archive can be dead on this host: the wrong
@@ -613,20 +641,32 @@ def _probe_node(node_bin: Path, expected_version: str, *, launcher: tuple[str, .
     Failing here keeps a broken runtime from being published at its version's name instead of
     surfacing as a handshake timeout on the first session. *launcher* is prepended
     to the argv (``arch -x86_64``, to run one slice of a universal binary).
+    *timeout_retries* reruns the probe that many more times when it times out;
+    any other failure is raised at once.
     """
-    try:
-        proc = subprocess.run(
-            [*launcher, str(node_bin), "--version"],
-            capture_output=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=_NODE_PROBE_TIMEOUT_SECS,
-            cwd=str(node_bin.parent),
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise KasBundleError(
-            f"the extracted Node runtime does not run on this host: {exc}"
-        ) from exc
+    attempt = 0
+    while True:
+        try:
+            proc = subprocess.run(
+                [*launcher, str(node_bin), "--version"],
+                capture_output=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=_NODE_PROBE_TIMEOUT_SECS,
+                cwd=str(node_bin.parent),
+            )
+            break
+        except subprocess.TimeoutExpired as exc:
+            if attempt < timeout_retries:
+                attempt += 1
+                continue
+            raise KasBundleError(
+                f"the extracted Node runtime does not run on this host: {exc}"
+            ) from exc
+        except OSError as exc:
+            raise KasBundleError(
+                f"the extracted Node runtime does not run on this host: {exc}"
+            ) from exc
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout).strip().splitlines()
         raise KasBundleError(
@@ -644,6 +684,59 @@ def _write_json(path: Path, data: Mapping[str, Any]) -> None:
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     os.replace(tmp, path)
+
+
+def sweep_stale_staging(root: Path) -> None:
+    """Remove the ``.staging-<version>-*`` trees installs ended from outside left.
+
+    An install removes its own staging tree in its ``except``, but the refresh's
+    hard stop (``os._exit``) and the update's kill run no handler. A tree with an
+    entry newer than :data:`_STALE_STAGING_SECS` may be a running install's and
+    stays; a link or junction at a listed name is never followed or removed.
+    Never raises.
+    """
+    cutoff = time.time() - _STALE_STAGING_SECS
+    try:
+        candidates = [
+            p
+            for p in root.iterdir()
+            if p.name.startswith(_STAGING_PREFIX)
+            and not p.name.startswith((_RETIRED_STAGING_PREFIX, _LIPO_STAGING_PREFIX))
+        ]
+    except OSError as exc:
+        logger.warning("could not list %s for stale KAS staging trees: %s", root, exc)
+        return
+    for tree in candidates:
+        try:
+            if platform_compat.is_link_or_junction(tree):
+                continue
+            newest, size = tree.lstat().st_mtime, 0
+            for dirpath, dirnames, filenames in os.walk(tree):
+                for name in dirnames + filenames:
+                    st = os.lstat(os.path.join(dirpath, name))
+                    newest = max(newest, st.st_mtime)
+                    if stat.S_ISREG(st.st_mode):
+                        size += st.st_size
+            if newest > cutoff:
+                continue
+            shutil.rmtree(tree)
+        except OSError as exc:
+            logger.warning("could not sweep the KAS staging tree %s: %s", tree, exc)
+            continue
+        logger.info("removed the stale KAS staging tree %s (%d bytes)", tree, size)
+
+
+def _move_aside(path: Path) -> Path:
+    """Rename *path* to a hidden ``.staging-retired-*`` sibling and return that name.
+
+    Windows refuses the rename while a process holds a file inside *path* open
+    without delete sharing (a running session's ``node.exe``); the :class:`OSError`
+    then leaves *path* untouched.
+    """
+    retired = Path(tempfile.mkdtemp(prefix=_RETIRED_STAGING_PREFIX, dir=path.parent))
+    retired.rmdir()
+    os.rename(path, retired)
+    return retired
 
 
 def install_bundle(
@@ -678,6 +771,7 @@ def install_bundle(
         )
 
     root.mkdir(parents=True, exist_ok=True)
+    sweep_stale_staging(root)
     staging = Path(tempfile.mkdtemp(prefix=f"{_STAGING_PREFIX}{manifest.version}-", dir=root))
     try:
         downloads = staging / "downloads"
@@ -732,9 +826,17 @@ def install_bundle(
         # and the no-replace publish turns that into a refusal, never a swap.
         retired: Path | None = None
         if force and final.exists():
-            retired = Path(tempfile.mkdtemp(prefix=f"{_STAGING_PREFIX}retired-", dir=root))
-            retired.rmdir()
-            os.rename(final, retired)
+            try:
+                retired = _move_aside(final)
+            except OSError as exc:
+                # Windows refuses to rename a directory while a process holds a file
+                # in it open, as a running session's node.exe does; the installed
+                # engine stays where it is.
+                raise KasBundleError(
+                    f"KAS {manifest.version} at {final} could not be replaced "
+                    f"({exc.strerror or exc}); if a KAS session is running it, "
+                    "stop that session and retry"
+                ) from exc
         try:
             platform_compat.publish_dir_noreplace(staging, final)
         except FileExistsError as exc:
@@ -769,6 +871,35 @@ def installed_versions(*, root: Path | None = None) -> list[str]:
     return sorted(n for n in names if _VERSION_RE.match(n) and not n.startswith("."))
 
 
+def remove_version(version: str, *, root: Path | None = None) -> None:
+    """Remove the installed engine *version* from *root* whole, or leave it whole.
+
+    *version* is a name :func:`installed_versions` listed. The folder is renamed to
+    a hidden ``.staging-retired-*`` sibling first, as ``install_bundle(force=True)``
+    does: Windows refuses that rename while a process holds a file inside open
+    without delete sharing (a running session's ``node.exe``), so a held engine
+    fails before anything is deleted and stays installed. Once renamed, the version
+    is out of :func:`installed_versions`; a failed delete of the renamed tree leaves
+    a hidden folder that costs disk space, never a half-engine at the version's
+    name. Raises :class:`KasBundleError`.
+    """
+    home = (root or kas_engines_root()) / version
+    try:
+        retired = _move_aside(home)
+    except OSError as exc:
+        raise KasBundleError(
+            f"KAS {version} at {home} could not be removed ({exc.strerror or exc}); "
+            "if a KAS session is running it, stop that session and retry"
+        ) from exc
+    try:
+        shutil.rmtree(retired)
+    except OSError as exc:
+        raise KasBundleError(
+            f"KAS {version} is removed, but its files at {retired} could not be deleted "
+            f"({exc.strerror or exc}); delete that folder once nothing holds it"
+        ) from exc
+
+
 def install_pinned(
     base_url: str,
     *,
@@ -777,14 +908,21 @@ def install_pinned(
 ) -> InstalledKasBundle:
     """Install this release's pinned engine if it is not already there; return it.
 
-    The digest check runs on the manifest's bytes before anything is parsed or
-    fetched, so a host serving a different manifest under the pinned version's
-    name installs nothing.
+    A host that cannot run the engine (:class:`KasHostUnsupported`: no build for
+    its OS or architecture, or glibc below the floor) is refused before the
+    manifest is fetched, so the refusal names that cause even offline and a caller
+    that asks again costs no network round trip. The digest check runs on the
+    manifest's bytes before anything is parsed or fetched, so a host serving a
+    different manifest under the pinned version's name installs nothing.
     """
     root = root or kas_engines_root()
     present = installed_bundle(root=root, version=KAS_PIN_VERSION)
     if present is not None:
         return present
+    # The local host checks install_bundle repeats; none of them reads the network.
+    _require_loadable_glibc(None, None)
+    host_platform_key()
+    host_node_key()
     manifest, url = fetch_manifest(
         base_url, version=KAS_PIN_VERSION, sha256=KAS_PIN_MANIFEST_SHA256
     )
@@ -875,7 +1013,7 @@ def make_universal_node(
     other_ref = manifest.node_for(other)
     node_bin = installed.node_bin
 
-    work = Path(tempfile.mkdtemp(prefix=f"{_STAGING_PREFIX}lipo-", dir=home.parent))
+    work = Path(tempfile.mkdtemp(prefix=_LIPO_STAGING_PREFIX, dir=home.parent))
     try:
         archive = work / other_ref.file
         _fetch_artifact(
@@ -907,8 +1045,19 @@ def make_universal_node(
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
+    # The slice that is not the host's runs under Rosetta. Its first launch of
+    # this freshly written binary waits for Rosetta to translate the whole
+    # Node (about 100 MB) ahead of time, which on a loaded macOS runner can
+    # take longer than the probe's timeout. Rosetta's translation daemon
+    # caches what it translated, so one rerun after a timeout usually starts
+    # fast. Only a timeout is rerun, once; any other probe failure fails at once.
     for slice_name in sorted(want):
-        _probe_node(node_bin, manifest.node_version, launcher=(arch, f"-{slice_name}"))
+        _probe_node(
+            node_bin,
+            manifest.node_version,
+            launcher=(arch, f"-{slice_name}"),
+            timeout_retries=1,
+        )
     again = _read_installed(home.parent, installed.version, bundled=installed.bundled)
     if again is None or again.node_bin != node_bin:
         raise KasBundleError(f"{home} does not read back after the universal Node was written")

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { fireEvent, render, screen } from '@testing-library/react'
 import { FileCard } from '../components/FileCard'
 
 describe('FileCard', () => {
@@ -20,6 +20,38 @@ describe('FileCard', () => {
     expect(video?.src).toContain('/api/outbox/clip.mp4')
   })
 
+  it('holds a 16:9 box for a video it has not seen, then the clip\'s own ratio on every later mount', () => {
+    const file = { filename: 'reserve-me.mp4', content_type: 'video/mp4' }
+    const first = render(<FileCard file={file} />)
+    const video = first.container.querySelector('video')!
+    // Before the metadata arrives a <video> is 150px tall whatever the clip.
+    expect(video.className).toContain('aspect-video')
+    expect(video.style.aspectRatio).toBe('')
+
+    Object.defineProperty(video, 'videoWidth', { configurable: true, value: 720 })
+    Object.defineProperty(video, 'videoHeight', { configurable: true, value: 1280 })
+    fireEvent.loadedMetadata(video)
+    expect(video.className).not.toContain('aspect-video')
+    expect(Number.parseFloat(video.style.aspectRatio)).toBeCloseTo(720 / 1280)
+    first.unmount()
+
+    // A virtualized row mounts its card again each time it scrolls back in.
+    const again = render(<FileCard file={file} />).container.querySelector('video')!
+    expect(again.className).not.toContain('aspect-video')
+    expect(Number.parseFloat(again.style.aspectRatio)).toBeCloseTo(720 / 1280)
+  })
+
+  it('takes the player\'s natural size when the metadata reports no picture size', () => {
+    const { container } = render(<FileCard file={{ filename: 'audio-only.mp4', content_type: 'video/mp4' }} />)
+    const video = container.querySelector('video')!
+    expect(video.className).toContain('aspect-video')
+    // A `video/*` file with no picture: an empty 16:9 box would be taller than
+    // the player the card shows for it without one.
+    fireEvent.loadedMetadata(video)
+    expect(video.className).not.toContain('aspect-video')
+    expect(video.style.aspectRatio).toBe('')
+  })
+
   it('keeps long descriptions on their own wrapping line', () => {
     const description = 'A long description that should remain readable instead of disappearing behind the metadata row'
     render(<FileCard file={{ filename: 'report.pdf', content_type: 'application/pdf', size: 2048, description }} />)
@@ -28,7 +60,7 @@ describe('FileCard', () => {
     expect(line).not.toHaveClass('truncate')
   })
 
-  it('keeps the whole non-media card as the download link', () => {
+  it('keeps the whole PDF card as a Save link that asks for an attachment', () => {
     render(<FileCard file={{ filename: 'report.pdf', content_type: 'application/pdf', size: 2048 }} />)
     expect(screen.getByText('report.pdf')).toBeInTheDocument()
     // `fmtBytes` is SI (1000-based) and locale-formatted, so 2048 B is 2 kB and not
@@ -41,12 +73,29 @@ describe('FileCard', () => {
     // line rather than as the whole element text.
     expect(screen.getByText((content) => /^PDF\s*·\s*2\s*kB$/.test(content.replace(/\u00a0/g, ' ')))).toBeInTheDocument()
     expect(screen.getByTestId('file-card-glyph').dataset.family).toBe('document')
-    const link = document.querySelector('a[download]')
-    expect(link).toBeInTheDocument()
-    expect(link?.getAttribute('href')).toContain('/api/outbox/report.pdf')
-    expect(screen.getByText('report.pdf').closest('a[download]')).toBe(link)
-    expect(link).toHaveAccessibleName(/Save/)
+    const save = document.querySelector('a[download]')
+    expect(save).toBeInTheDocument()
+    // The server only answers `attachment` for an inline type when asked, and a
+    // browser that drops the `download` attribute follows that header.
+    expect(save?.getAttribute('href')).toBe('/api/outbox/report.pdf?download=1')
+    expect(save?.getAttribute('download')).toBe('report.pdf')
+    expect(save).toHaveAccessibleName(/Save/)
     expect(document.querySelectorAll('a[download]')).toHaveLength(1)
+    expect(screen.getByText('report.pdf').closest('a[download]')).toBe(save)
+  })
+
+  it('keeps the whole card of any other non-media file as the download link', () => {
+    render(<FileCard file={{ filename: 'notes.zip', content_type: 'application/zip' }} />)
+    const link = document.querySelector('a[download]')
+    expect(link?.getAttribute('href')).toBe('/api/outbox/notes.zip?download=1')
+    expect(screen.getByText('notes.zip').closest('a[download]')).toBe(link)
+    expect(link).toHaveAccessibleName(/Save/)
+  })
+
+  it('points the Save of a media card at the attachment URL and the player at the inline one', () => {
+    render(<FileCard file={{ filename: 'clip.mp4', content_type: 'video/mp4' }} />)
+    expect(document.querySelector('a[download]')?.getAttribute('href')).toBe('/api/outbox/clip.mp4?download=1')
+    expect(document.querySelector('video')?.getAttribute('src')).toBe('/api/outbox/clip.mp4')
   })
 
   it('renders download link when no content_type', () => {

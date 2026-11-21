@@ -10,10 +10,13 @@ text without rendering it; both producers must apply it.
 
 from __future__ import annotations
 
-import time
+from redaction_structured_cases import github_classic
 
+from conftest import assert_rejected_without_backtracking
 from kiro_crew.dashboard.state import _ChatSlot
 from kiro_crew.preview_text import strip_markdown_preview
+
+TOKEN = github_classic(seed=148)
 
 
 class TestStripMarkdownPreview:
@@ -93,6 +96,9 @@ class TestStripMarkdownPreview:
         # as deliver: routing tags; covered by the shared constant.
         assert strip_markdown_preview("plan ready\n<!-- plan_task_id:abc123 -->") == "plan ready"
 
+    def test_option_action_tag_is_stripped(self):
+        assert strip_markdown_preview("all done\n<!-- option-action:close=Done -->") == "all done"
+
     def test_link_keeps_label(self):
         assert strip_markdown_preview("see [the docs](https://x.y/z)") == "see the docs"
 
@@ -120,6 +126,19 @@ class TestStripMarkdownPreview:
 
     def test_options_block_removed(self):
         assert strip_markdown_preview("pick one [OPTIONS: A | B]") == "pick one"
+
+    def test_steer_ack_marker_removed(self):
+        # The chat bubble draws kiro-cli's steer ack as a "Steered" chip, so the
+        # sidebar preview must not print the raw marker; prose naming it stays.
+        reply = "Done with the notes. [STEERING steer-1aa87cfb-9b1c: I re-read the file]"
+        assert strip_markdown_preview(reply) == "Done with the notes."
+        prose = "Read the [STEERING] section first"
+        assert strip_markdown_preview(prose) == prose
+
+        def reject(text: str) -> None:
+            assert "STEERING" in strip_markdown_preview(text)
+
+        assert_rejected_without_backtracking(reject, lambda n: "[STEERING steer-a: " * n)
 
     def test_snake_case_survives(self):
         # Single underscores are NOT emphasis in intra-word positions; the
@@ -160,18 +179,67 @@ class TestStripMarkdownPreview:
         src = "  > quoted\n\t- item\n   2. two\n  ---  \nend"
         assert strip_markdown_preview(src) == "quoted item two end"
 
+    def test_cron_row_identity_marker_is_stripped(self):
+        # The invisible run marker under a scheduled run's header printed
+        # as raw "<!-- cron-run:<id>:<ts> -->" text in the sidebar preview.
+        row = (
+            "# Cron Job Result: smoke | 2026-11-05 05:52:37 UTC\n\n"
+            "<!-- cron-run:d50d65be:1793836357.123456 -->\n\nPONG"
+        )
+        assert (
+            strip_markdown_preview(row) == "Cron Job Result: smoke | 2026-11-05 05:52:37 UTC PONG"
+        )
+
+    def test_cron_row_marker_written_by_run_marker_is_stripped(self):
+        # Built by the writer itself, so a respelled marker cannot drift
+        # from what the preview strips.
+        from types import SimpleNamespace
+
+        from kiro_crew.dashboard.cron_inject import run_marker
+
+        job = SimpleNamespace(id="d50d65be", last_result_ts=1793836357.123456)
+        marker = run_marker(job)
+        assert "cron-run:" in marker
+        for head in ("# Cron Job Result", "# Cron Run"):
+            row = f"{head}: smoke | stamp{marker}\n\nPONG"
+            preview = strip_markdown_preview(row)
+            assert "<!--" not in preview
+            assert "cron-run" not in preview
+            assert preview.endswith("PONG")
+
+    def test_cron_reference_marker_is_stripped_with_the_run_marker(self):
+        row = (
+            "# Cron Run: smoke | stamp\n\n<!-- cron-run:abc:1.000000 --><!-- cron-ref -->\n\n"
+            "Same instruction as the previous run"
+        )
+        assert (
+            strip_markdown_preview(row)
+            == "Cron Run: smoke | stamp Same instruction as the previous run"
+        )
+
+    def test_cron_marker_quoted_in_an_ordinary_message_is_left_alone(self):
+        # Only the marker under a cron row's own header is internal.
+        text = "The row looks like <!-- cron-run:abc:1.000000 --> in the file"
+        assert strip_markdown_preview(text) == text
+
     def test_blank_line_runs_do_not_backtrack(self):
         # CWE-1333 / py/polynomial-redos regression: with MULTILINE ^\s*,
         # every line-start anchor in a run of blank lines rescanned the
         # run's remainder — O(n^2). A ~100k-char whitespace-heavy preview
         # wedged the gateway event loop past the 25s watchdog window at
         # dashboard boot, and the same persisted slot re-triggered it on
-        # every restart (dump-then-exit crash loop). Linear now.
-        evil = "x" + "\n" * 100_000 + " " * 100_000 + "tail"
-        start = time.perf_counter()
-        assert strip_markdown_preview(evil) == "x tail"
-        elapsed = time.perf_counter() - start
-        assert elapsed < 1.0, f"preview strip too slow ({elapsed:.2f}s) — may backtrack"
+        # every restart (dump-then-exit crash loop). Linear now, asserted with
+        # the shared ramped CPU guard rather than one wall-clock reading.
+        def reject(text: str) -> None:
+            assert strip_markdown_preview(text) == "x tail"
+
+        # The thread-CPU constant the wall-clock bound carried: a kept complexity
+        # budget stays at its original value (testing-conventions D7).
+        assert_rejected_without_backtracking(
+            reject,
+            lambda n: "x" + "\n" * n + " " * n + "tail",
+            budget_seconds=1.0,  # flake-ok: the original 1.0 s thread-CPU budget, kept per D7
+        )
 
 
 class TestSlotLastMessageStripsMarkdown:
@@ -188,6 +256,18 @@ class TestSlotLastMessageStripsMarkdown:
         )
         assert s.to_dict()["last_message"] == "Compacted the GitHub Triage rail header"
 
+    def test_sidebar_preview_of_a_cron_result_has_no_identity_marker(self):
+        s = self._slot_with(
+            (
+                "assistant",
+                "# Cron Job Result: smoke | 2026-11-05 05:52:37 UTC\n\n"
+                "<!-- cron-run:d50d65be:1793836357.123456 -->\n\nPONG",
+            ),
+        )
+        assert (
+            s.to_dict()["last_message"] == "Cron Job Result: smoke | 2026-11-05 05:52:37 UTC PONG"
+        )
+
     def test_sidebar_preview_replaces_diff_fence(self):
         s = self._slot_with(
             ("assistant", "```diff\n--- /Users/user/.kirocrew/workspace/H.tsx\n+++ b\n```"),
@@ -202,7 +282,7 @@ class TestSlotLastMessageStripsMarkdown:
         assert d["last_message"] == "pick one"
 
     def test_syntax_only_message_falls_back_to_older_preview(self):
-        # Codex PR-243 finding: a latest message that is ONLY stripped syntax
+        # A latest message that is ONLY stripped syntax
         # must not blank the preview — fall back to the previous visible
         # message (mirrors history.last_message_preview's skip-empty scan).
         s = self._slot_with(
@@ -230,13 +310,13 @@ class TestSlotLastMessageStripsMarkdown:
         assert s.to_dict()["last_message"] == "here is the real answer"
 
     def test_credential_split_by_markdown_is_still_redacted(self):
-        # Codex PR-243 HIGH finding: stripping must run BEFORE redaction.
+        # Stripping must run BEFORE redaction.
         # Markdown markers inside a secret split the credential signature past
         # the scanner; stripping afterwards would rejoin the fragments into a
         # valid credential in the broadcast preview.
-        s = self._slot_with(("assistant", "key is AKIA**IOSFODNN7EXAMPLE** ok"))
+        s = self._slot_with(("assistant", f"key is {TOKEN[:4]}**{TOKEN[4:]}** ok"))
         msg = s.to_dict()["last_message"]
-        assert "AKIAIOSFODNN7EXAMPLE" not in msg
+        assert TOKEN not in msg and TOKEN[4:] not in msg
         assert msg.startswith("key is ")
 
     def test_credential_split_by_zwsp_is_still_redacted(self):
@@ -244,9 +324,9 @@ class TestSlotLastMessageStripsMarkdown:
         # characters had split, so strip-before-redact is load-bearing for
         # this class too: stripping after redaction would rejoin the halves
         # into a live key in the broadcast preview.
-        s = self._slot_with(("assistant", "key is AKIA\u200bIOSFODNN7EXAMPLE ok"))
+        s = self._slot_with(("assistant", f"key is {TOKEN[:4]}\u200b{TOKEN[4:]} ok"))
         msg = s.to_dict()["last_message"]
-        assert "AKIAIOSFODNN7EXAMPLE" not in msg
+        assert TOKEN not in msg and TOKEN[4:] not in msg
         assert msg.startswith("key is ")
 
 
@@ -265,6 +345,27 @@ class TestHistoryLastMessagePreviewStripsMarkdown:
         ]
         log._path(key).write_text("\n".join(lines) + "\n")
         assert log.last_message_preview(key) == "Compacted the GitHub Triage rail"
+
+    def test_cron_result_session_preview_has_no_identity_marker(self, tmp_path):
+        import json
+
+        from kiro_crew.history import ConversationLog
+
+        log = ConversationLog(base_dir=tmp_path)
+        log.init()
+        key = "cron-test"
+        content = (
+            "# Cron Job Result: smoke | 2026-11-05 05:52:37 UTC\n\n"
+            "<!-- cron-run:d50d65be:1793836357.123456 -->\n\nPONG"
+        )
+        lines = [
+            json.dumps({"_type": "metadata", "title": "Cron: smoke"}),
+            json.dumps({"role": "assistant", "content": content}),
+        ]
+        log._path(key).write_text("\n".join(lines) + "\n")
+        assert (
+            log.last_message_preview(key) == "Cron Job Result: smoke | 2026-11-05 05:52:37 UTC PONG"
+        )
 
     def test_last_message_info_falls_back_past_zwsp_only_row(self, tmp_path):
         import json

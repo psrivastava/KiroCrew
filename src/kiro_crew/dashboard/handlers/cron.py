@@ -45,13 +45,16 @@ __all__ = sorted(n for n in set(globals()) | set(_EXPORTS) if not n.startswith("
 if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and IDEs
     from kiro_crew.dashboard.handlers.cron_board import (  # noqa: F401
         _FOLDER_ID_SHAPE,
+        _LIST_TEXT_PREVIEW,
         _cron_folders_lock,
         _get_cron_folders_lock,
         _job_snapshot,
+        _jobs_response,
         api_cron_folders,
         api_cron_folders_create,
         api_cron_folders_delete,
         api_cron_folders_update,
+        api_cron_get,
         api_crons,
         create_or_adopt_cron_folder,
         logger,
@@ -63,15 +66,26 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _recognize_session,
     )
     from kiro_crew.dashboard.handlers.cron_jobs import (  # noqa: F401
+        _APP_AUTO_RESETTING_FIELDS,
+        _COERCED_BOOL_FLAGS,
+        _ENABLED_IGNORED_WARNING,
         _MAX_BATCH_DELETE,
         _MAX_CRON_BODY_BYTES,
         _T,
         _ChatFolderGone,
+        _coerce_bool_flag,
+        _invalid_new_chat_per_run,
+        _member_store,
         _persist_holding_folder,
+        _refuse_app_auto_approval,
+        _refuse_mate_home_chat_folder,
+        _removal_actor,
         _resolve_chat_folder_id,
         _resolve_one_shot_at,
         _schema_field,
         _unknown_chat_folder_response,
+        _warn_only_bool_flag,
+        _with_schedule_warnings,
         api_cron_batch_delete,
         api_cron_delete,
         api_cron_enable,
@@ -91,19 +105,26 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _LESSON_EMBED_DEADLINE_SECS,
         _candidate_applies,
         _embed_lesson_bounded,
+        _is_operator_browser,
         _lesson_jsonl_store,
         _lesson_list_page,
+        _lesson_replace_refusal,
         _lesson_scope_selector,
         _load_workspace_lessons,
+        _parse_lesson_replaces,
         _prepare_member_lesson_store,
         _surface_lesson_saved,
+        _vector_tier_populated,
         api_lessons,
         api_lessons_create,
         api_lessons_delete,
+        api_lessons_update,
     )
     from kiro_crew.dashboard.handlers.cron_runs import (  # noqa: F401
         _HISTORY_PAGE_MAX,
+        _ack_job,
         _history_page,
+        _run_target_missing,
         api_cron_ack,
         api_cron_cancel,
         api_cron_history,
@@ -120,8 +141,10 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     )
     from kiro_crew.dashboard.handlers.cron_secret_grants import (  # noqa: F401
         _SHA256_HEX_RE,
+        _expected_ts_value,
         _is_str_mapping,
         _promote_pending_grant,
+        _unrepresentable_ts_response,
         api_cron_secret_grant,
     )
     from kiro_crew.dashboard.handlers.cron_shared import (  # noqa: F401
@@ -140,6 +163,7 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     from kiro_crew import (  # noqa: F401
         model_registry,
     )
+    from kiro_crew.config.fields import _coerce_bool  # noqa: F401
     from kiro_crew.config.loader import (  # noqa: F401
         KiroCrewConfig,
         config_dir,
@@ -156,6 +180,7 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
         CronStoreBusy,
         CronStoreUnreadable,
         is_valid_timezone,
+        never_fires_warning,
         parse_time_string,
     )
     from kiro_crew.cron_script import (  # noqa: F401
@@ -169,6 +194,7 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
         validate_secret_env_grant,
     )
     from kiro_crew.cron_service.model import (  # noqa: F401
+        validate_alert_after_failures,
         validate_auto_pause_after_failures,
     )
     from kiro_crew.dashboard.chat_persistence import (  # noqa: F401
@@ -177,11 +203,21 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     from kiro_crew.dashboard.cron_inject import (  # noqa: F401
         apply_cron_turn_timeout,
         chat_folder_exists,
+        chat_folder_move_refuses_store,
+        chat_folder_refuses_store,
         hydrate_slot_from_history,
         inject_cron_result_to_dashboard,
         move_cron_job_tab,
         prefetch_cron_dismissed,
+        read_cron_tab_rows,
         restore_cron_turn_timeout,
+        stored_cron_folder,
+    )
+    from kiro_crew.dashboard.cron_note_ack import (  # noqa: F401
+        cron_item_already_recorded,
+        cron_note_transition,
+        mark_cron_item_recorded,
+        new_ack_id,
     )
     from kiro_crew.dashboard.cron_timeout_field import (  # noqa: F401
         timeout_secs_from_body,
@@ -221,6 +257,13 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
         FileTooLargeError,
         safe_read_file_bytes_nolink,
     )
+    from kiro_crew.lesson_events import (  # noqa: F401
+        LESSON_REMOVED,
+        LESSON_SOURCE_USER,
+        LESSON_UPDATED,
+        emit_lessons_changed,
+        lesson_write_action,
+    )
     from kiro_crew.lesson_validation import (  # noqa: F401
         LESSON_APPLIES_ON_TOPIC,
         LESSON_APPLIES_UNSTATED,
@@ -253,6 +296,7 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     from kiro_crew.security import (  # noqa: F401
         redact_credentials,
         redact_exfiltration_urls,
+        refuses,
     )
     from kiro_crew.validation import (  # noqa: F401
         _MODEL_NAME_RE,
@@ -261,6 +305,7 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
         CHANNEL_MAX_LEN,
         CRON_ADD_SCHEMA,
         LEARN_ADD_SCHEMA,
+        LEARN_UPDATE_SCHEMA,
         LESSON_LIST_LIMIT,
         LESSON_LIST_LIMIT_MAX,
         MAX_CRON_MESSAGE,

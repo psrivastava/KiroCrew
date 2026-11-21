@@ -116,9 +116,9 @@ function mount(items: unknown[]) {
   }
 }
 
-/** A host push: the page's own message listener re-renders on the next tick. */
+/** A host push: the page's `kirocrew-dashboard` listener re-renders on the next tick. */
 function push() {
-  window.dispatchEvent(new MessageEvent('message', { data: { type: 'kirocrew:fields' } }))
+  window.dispatchEvent(new Event('kirocrew-dashboard'))
   vi.advanceTimersByTime(1)
 }
 
@@ -214,5 +214,27 @@ describe('org-chart: the fold toggles', () => {
     for (const btn of buttons()) {
       expect(btn.title).toBe('Collapses this group in the graph only. The cards below stay.')
     }
+  })
+})
+
+describe('org-chart: needs you follows the fold', () => {
+  /** The chip text of the worker whose task is *id*. */
+  function chipOf(id: string): string {
+    const chips = Array.from(document.querySelectorAll('.oc-chip'))
+    return chips.find((c) => c.textContent?.includes(`task ${id}`))?.textContent ?? ''
+  }
+
+  it("calls a worker's question needs-you only while the fold's awaits_person says so", () => {
+    mount([
+      board('lead', [
+        { ...task('a'), status: 'question', awaits_person: false },
+        { ...task('b'), status: 'blocked', reason: 'needs_human', awaits_person: true },
+        { ...task('c'), status: 'question' },
+      ]),
+    ])
+    expect(chipOf('a')).not.toContain('needs you')
+    expect(chipOf('b')).toContain('needs you')
+    // A value without `awaits_person` keeps the old status rule.
+    expect(chipOf('c')).toContain('needs you')
   })
 })

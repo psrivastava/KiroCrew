@@ -1,12 +1,14 @@
 import { useState, useRef, useCallback, useEffect, useMemo } from 'react'
-import { crewApprovalDecidableHere, runsCrewMode } from '../lib/crewMode'
-import CrewApprovalCards from './crew/CrewApprovalCards'
-import { CrewWorkerComposerGate } from './crew/CrewWorkerComposerGate'
+import { crewApprovalDecidableHere, crewModeRoot, crewRootOf, showsAsCrewMode } from '../lib/crewMode'
+import CrewApprovalCards, { MateApprovalCards } from './crew/CrewApprovalCards'
+import MateWorkerQuestions from './crew/MateWorkerQuestions'
+import { CrewSteerUnrecordedNotice, CrewWorkerComposerGate } from './crew/CrewWorkerComposerGate'
 import { useCrewRoot } from './crew/useCrewRoot'
 import { X } from 'lucide-react'
 import { SplitGlyph } from './SplitGlyph'
 import { useQuery } from '@tanstack/react-query'
 import ChatMessageList from '../app-sdk/ChatMessageList'
+import { RunInTerminalOriginSlot } from './runInTerminalScope'
 import type { VirtualTranscriptHandle } from '../app-sdk/ChatMessageList'
 import { EdgeFade, JumpToBottomButton } from '../app-sdk/ChatScrollChrome'
 import { createTranscriptVersioner } from '../chat-core/transcript/transcriptVersion'
@@ -16,24 +18,35 @@ import { DeliveryWarningStrip } from './DeliveryWarningStrip'
 import { useDeliveryWarningStrip } from './useDeliveryWarningStrip'
 import { mergePaneSends, type PaneSentRestore } from './useChatPaneSend'
 import { busySteerFlag } from './chat-input/busySend'
-import { filterCrewmateChat, withQueuedAsBubbles } from './chat/crewmateBubbles'
+import { stagedProjectTurnKey } from './chat-input/stagedProject'
+import { withQueuedAsBubbles } from './chat/crewmateBubbles'
+import { filterCrewmateChatWithBrowser } from './chat/crewmateBrowserLive'
+import { crewmateFollowUps } from './chat/crewmateChips'
 import { AWAITING_REPLY_ACTIVITY, useCrewmateAwaitingReply } from './chat/useCrewmateAwaitingReply'
+import { preparingCaption as preparingCaptionFor } from './chat/preparingCaption'
 import CrewmateLiveActivity from './chat/CrewmateLiveActivity'
+import PreparingReplyBubble from './chat/PreparingReplyBubble'
 import { useUnreadLanding } from './chat/useUnreadLanding'
+import { useRedactionHostsReload } from './chat/useRedactionHostsReload'
 import ErrorNotice from './ErrorNotice'
+import { GUIDE_KEEP_CLEAR } from '../guide/trustRoot'
+import VoicePlaybackNotice from './VoicePlaybackNotice'
 import StatusNotice from './StatusNotice'
 import { Btn } from './ui'
 import ChatDropOverlay from './ChatDropOverlay'
 import PaneDim from './PaneDim'
 import PendingQuestionCard from './PendingQuestionCard'
 import QueueStack, { SubagentDeliveryProgress, splitPaneMessages } from './QueueStack'
+import McpLoadingBar from '../pages/chat/McpLoadingBar'
 import SubagentProgressBar from '../pages/chat/SubagentProgressBar'
-import ChatFooter from '../pages/chat/ChatFooter'
-import { useEnvironmentStartLabel, useSlotRunsHere } from './sessionEnvironmentHooks'
+import ChatFooter, { allToolCallsReturned, transcriptActivityKey, turnSentHere } from '../pages/chat/ChatFooter'
+import { useChatProjectDir, useEnvironmentStartLabel, useSlotRunsHere } from './sessionEnvironmentHooks'
+import { ChatProjectDirCtx } from './markdown/contexts'
 import PinnedPrompt from '../pages/chat/PinnedPrompt'
 import SessionTitleControl from '../pages/chat/SessionTitleControl'
 import { pinCandidateKey, usePinnedPrompt } from '../pages/chat/usePinnedPrompt'
 import { useJevAutoSend } from '../pages/chat/useJevAutoSend'
+import { useConnected } from '../hooks/useConnected'
 import type { DisplayItem } from '../pages/chat/types'
 import { viewSubagentSlots } from '../lib/subagentReplayScope'
 import { useSlotActivity } from '../pages/members/useSlotActivity'
@@ -42,24 +55,30 @@ import { sessionMemoryTag } from '../lib/agentMemorySource'
 import { SlotProvider } from '../providers/SlotContext'
 import { useProvider } from '../providers'
 import { useConnectionsUiEnabled } from '../hooks/useConnectionsUi'
+import { useSessionPalette } from '../hooks/useSessionPalette'
+import { resolveSessionColor, headerBandStyle } from '../utils/sessionColors'
 import { legacyCodexEffort } from '../hooks/useInteractiveModels'
 import { selectionCapabilitiesFailed } from '../lib/effort'
 import { isUnpinnedModel } from '../lib/jevRoute'
 import { useQueuedMessageActions } from '../hooks/useQueuedMessageActions'
+import { usePinnedScrollOrigin } from '../hooks/usePinnedScrollOrigin'
 import { useAppSelector, useAppDispatch, store } from '../store'
-import { PANE_HYDRATE_LIMIT, selectSlotMessages, selectSlotStreamState, selectComposerBusy, hydrateSlotMessages, appendSlotMessage, loadOlderMessages, loadOlderSlotMessages, stageToMainComposer, pendingQuestionFor } from '../store/chatSlice'
+import { PANE_HYDRATE_LIMIT, selectSlotMessages, selectSlotStreamState, selectSlotToolLog, selectComposerBusy, hydrateSlotMessages, clearSlotHydrated, holdHydratedSlotPane, appendSlotMessage, loadOlderMessages, loadOlderSlotMessages, stageToMainComposer, pendingQuestionFor } from '../store/chatSlice'
 import { deriveFollowUpOptions } from '../app-sdk/protocol'
 import { appendFollowUpOption, removeFollowUpOption, selectSingleFollowUpOption, type OwnedSuffix } from '../lib/followUpToggle'
 import { CONTENT_WIDTH, loadChatConfig, type ChatConfig } from '../pages/chat/ChatSettings'
 import { scaleContentWidth } from '../pages/chat/contentWidth'
 import { tryQuickSend } from '../lib/quickSend'
+import { mergeReplyIntoDraft } from '../utils/chatDrafts'
+import { COMPOSE_SEND_EVENT, type ComposeSendDetail } from './chat/GrillCard'
 import { mergeCarriedDraft } from '../utils/pasteTokens'
 import { useSelectionQuoteAsk } from '../chat-core/composer/selectionActions'
 import FlyingQuote from './FlyingQuote'
 import { revealComposer } from '../pages/chat/composerFocus'
 import { api } from '../api/client'
-import { slotMessagesQueryKey } from '../api/slotMessagesQuery'
+import { releaseUnobservedPaneSlot, slotMessagesQueryKey } from '../api/slotMessagesQuery'
 import { Composer, type ComposerHandle, type ComposerVoiceOptions } from '../chat-core/composer/Composer'
+import { PANE_DICTATION_SCOPE, markDictated, noteComposerEdit } from '../chat-core/composer/dictationProvenance'
 import { slotApprovalMode } from '../utils/slotApprovalMode'
 import { isUntitledSession, sessionDisplayTitle } from '../utils/sessionDisplayTitle'
 import { isComposerSendHeld } from '../utils/composerSendHolds'
@@ -68,6 +87,7 @@ import { answerRejectedMessage } from '../utils/questionAnswers'
 import { fetchDashboardConfig } from '../api/dashboardConfigQuery'
 import type { ChatPaneProps } from './ChatPaneProps'
 import { useChatPaneDraft } from './useChatPaneDraft'
+import { useSentPromptHistory } from './useSentPromptHistory'
 import { useChatPaneUploads } from './useChatPaneUploads'
 import { useChatPanePickerModels, useChatPanePickerActions } from './useChatPanePickers'
 import { ChatPaneAgentMenu, ChatPaneModelMenu } from './ChatPanePickerMenus'
@@ -79,6 +99,8 @@ import { slotRowByKey } from '../store/slotIndex'
 import { useMarkTranscriptShown } from '../hooks/useAckCronNotesInView'
 
 export type { PaneLeading } from './ChatPaneProps'
+// Side Chat runs the same upload flow under a key of its own.
+export { useChatPaneUploads } from './useChatPaneUploads'
 
 /**
  * ChatPane — one live chat session in the native session grid.
@@ -111,6 +133,8 @@ export default function ChatPane({
   openSideChat,
   leading,
   onFileOpen,
+  onFolderOpen,
+  onOpenCrewTab,
   onArtifactOpen,
   busyMode = 'split',
   crewmate,
@@ -140,6 +164,8 @@ export default function ChatPane({
   // keeps the element ref for the pinned-prompt hook, a handle for the jump
   // pill, and the rendered at-bottom state that shows it.
   const scrollerRef = useRef<HTMLDivElement | null>(null)
+  const paneRootRef = useRef<HTMLDivElement | null>(null)
+  usePinnedScrollOrigin(paneRootRef)
   const listRef = useRef<VirtualTranscriptHandle | null>(null)
   const [isAtBottom, setIsAtBottom] = useState(true)
   const scrollToBottom = useCallback(() => { listRef.current?.scrollToBottom() }, [])
@@ -171,6 +197,8 @@ export default function ChatPane({
   const transcriptRestoreOwned = useCallback(() => listRef.current?.restoreGate ?? false, [])
 
   const allMessages = useAppSelector((s) => selectSlotMessages(s, slotKey))
+  // ↑/↓ prompt history for this pane's composer, on the same terms as ChatPage.
+  const sentMessages = useSentPromptHistory(allMessages, slotKey)
   const activeSlot = useAppSelector((s) => s.chat.activeSlot)
   // Consume a Side Chat → composer hand-off staged for THIS pane's slot. Keyed
   // by slot so a member's hand-off merges into that member's own composer and
@@ -186,11 +214,12 @@ export default function ChatPane({
     setInput((cur) => mergeCarriedDraft(cur, carried))
   }, [mainComposerAppend, slotKey, dispatch, carryIntoComposer, setInput])
   const streamState = useAppSelector((s) => selectSlotStreamState(s, slotKey))
+  const toolsReturned = useAppSelector((s) => allToolCallsReturned(selectSlotToolLog(s, slotKey)))
   const running = streamState !== 'idle'
   // Per-slot context-window usage for the input-bar ring (mirrors ChatPage; the
-  // store keys these by slot). Default 0 so the ring always renders, exactly
-  // like single chat.
-  const contextPct = useAppSelector((s) => s.chat.slotContextPct[slotKey] ?? 0)
+  // store keys these by slot). Undefined until the slot has a reading: the ring
+  // still renders, as unknown rather than a measured 0%.
+  const contextPct = useAppSelector((s) => s.chat.slotContextPct[slotKey])
   const contextTokens = useAppSelector((s) => s.chat.slotContextTokens?.[slotKey])
   // Prefer the warm's value: this pane's own query is staleTime:Infinity, so its
   // has_more freezes at mount while a later bounded warm can truncate the cache.
@@ -204,11 +233,12 @@ export default function ChatPane({
   // queued, is the header pill's and the roster's to show.
   const paneQueued = useAppSelector((s) => (s.chat.subagentQueued?.[slotKey] ?? 0) > 0)
   const paneRunsHere = useSlotRunsHere(paneSlot && paneSlot.executor !== 'remote' ? paneSlot.key : null)
+  const paneProjectDir = useChatProjectDir(paneSlot)
   // A Split View pane holding a Crew Mode worker follows the main pane's rule:
   // its approval is decided only on the conductor's card (no band here), and a
   // closed conductor turns its composer off. A pane holding the conductor keeps
   // its approval cards (edge review R3 G3, Z1).
-  const paneCrewRoot = paneSlot?.crew_root || ''
+  const paneCrewRoot = crewRootOf(paneSlot)
   const { rootClosed: paneCrewRootClosedRaw } = useCrewRoot(paneCrewRoot)
   const paneCrewRootClosed = !!paneCrewRoot && paneCrewRootClosedRaw
   const noSend = useCallback(() => {}, [])
@@ -265,6 +295,9 @@ export default function ChatPane({
   const composerVoiceOptions = useMemo<ComposerVoiceOptions>(() => ({
     onAutoSubmit: () => { autoSubmitRef.current?.() },
     pushToTalk,
+    // The pane's draft is its own, apart from the main chat's for the same
+    // session, so its dictation record is too.
+    dictationScope: PANE_DICTATION_SCOPE,
   }), [pushToTalk])
   // Shared composer-busy rule (chatSlice.selectComposerBusy): main turn
   // streaming OR sub-agents running (dual signal). Drives the queue affordance
@@ -302,6 +335,9 @@ export default function ChatPane({
     () => splitPaneMessages(allMessages),
     [allMessages],
   )
+  // Whether the person has sent this chat a message: the gateway refuses to move
+  // a Crew Mode chat off its conductor from then on.
+  const paneHasUserMessage = useMemo(() => paneMessages.some(m => m.role === 'user'), [paneMessages])
   // A crewmate's chat draws only what the crewmate says (see the `crewmate`
   // prop). Filtered HERE, above the list, so the run positions the assistant
   // rows compute from their neighbours see the drawn list, and so the pinned
@@ -315,21 +351,34 @@ export default function ChatPane({
   // that answers is live (useCrewmateAwaitingReply).
   const { awaitingReply, markSent: markCrewmateSent } = useCrewmateAwaitingReply(!!crewmate, slotKey, allMessages, crewmateLive, paneSlot)
   // The gateway is preparing a message for this slot outside any turn (a
-  // background reply such as the warm task brief). It shows the same working
-  // indicator a turn shows, but is not a turn: the composer stays idle.
+  // background reply such as the warm task brief). It shows a pending reply
+  // bubble holding the caption, but is not a turn: the composer stays idle.
   const preparing = !!paneSlot?.preparing
-  const crewmateTyping = crewmateLive || awaitingReply || preparing
+  const crewmateTyping = crewmateLive || awaitingReply
+  // The only background message today is the warm catch-up (warm_task_brief.py).
+  // Resolved per render, not as a module constant, so the caption follows a
+  // language switch; the held caption compares by content, not identity.
+  // The gateway's own caption, when it sent one, names what is being checked.
+  const preparingCaption = preparingCaptionFor(paneSlot)
   // The composer agrees with the typing bubble: from the person's Send it is
   // busy (Stop while empty), not idle, though the answering turn's first frame
   // can be seconds away. `busy` alone is the store's word, and the store has
   // no pending-turn mark for a slot that is not the active one.
   const composerBusy = busy || awaitingReply
+  // A crewmate's chat draws a queued message as the person's own bubble, which
+  // the next drain sends. A held entry (the server's `meta.held`) is the
+  // exception: no drain sends it, so it keeps the queue card and its send, edit
+  // and cancel controls.
+  const crewmateHeldQueue = useMemo(() => (crewmate ? queuedMessages.filter(m => m.meta?.held === true) : []), [crewmate, queuedMessages])
+  const crewmateBubbleQueue = useMemo(() => queuedMessages.filter(m => !crewmateHeldQueue.includes(m)), [queuedMessages, crewmateHeldQueue])
   // Queued rows are drawn in place from the slot's full row list, so a parked
   // message sits where it was sent (`withQueuedAsBubbles`).
   const messages = useMemo(
-    () => (crewmate ? filterCrewmateChat(withQueuedAsBubbles(allMessages, queuedMessages)) : paneMessages),
-    [crewmate, allMessages, paneMessages, queuedMessages],
+    () => (crewmate ? filterCrewmateChatWithBrowser(withQueuedAsBubbles(allMessages, crewmateBubbleQueue)) : paneMessages),
+    [crewmate, allMessages, paneMessages, crewmateBubbleQueue],
   )
+  // A queued turn opens without the composer going idle (#20350).
+  const projectTurnKey = useMemo(() => stagedProjectTurnKey(messages), [messages])
   // This pane shows the chat's transcript once it has rows; a bell note for a
   // cron run is read against that, and a closed pane drops out (#23564).
   // The scroller is what the on-screen backstop probes.
@@ -409,6 +458,16 @@ export default function ChatPane({
     () => allMessages.filter(m => m.role === 'queued'),
     [allMessages],
   )
+  // The same rows for the transcript's discussion cards (`ctx.queued`), kept at
+  // one reference while the queue's rows are unchanged. A streaming flush
+  // replaces `allMessages` but not its queued rows, and a new array here would
+  // redraw every mounted row, since the list's row renderer depends on it.
+  const cardQueuedRef = useRef<typeof allQueuedMessages>([])
+  const cardQueued = useMemo(() => {
+    const prev = cardQueuedRef.current
+    if (prev.length !== allQueuedMessages.length || prev.some((m, i) => m !== allQueuedMessages[i])) cardQueuedRef.current = allQueuedMessages
+    return cardQueuedRef.current
+  }, [allQueuedMessages])
 
   // Follow-up [OPTIONS:] pills for this pane's composer — the same
   // derive-and-pass wiring ChatPage uses, adapted to the pane's own signals.
@@ -424,10 +483,11 @@ export default function ChatPane({
   // for the same reason as ChatPage: both would offer the same choices, and
   // only the card can answer the blocked tool call.
   const pendingQuestion = useAppSelector((s) => pendingQuestionFor(s.chat.pendingQuestions, slotKey))
-  const { followUpOptions, followUpSourceKey, followUpMulti } = useMemo(
-    () => deriveFollowUpOptions(allMessages, busy, !!pendingQuestion),
-    [allMessages, busy, pendingQuestion],
-  )
+  // A crewmate chat never offers a chip that asks it for a card (crewmateChips).
+  const { followUpOptions, followUpSourceKey, followUpMulti } = useMemo(() => {
+    const derived = deriveFollowUpOptions(allMessages, busy, !!pendingQuestion)
+    return crewmate ? crewmateFollowUps(derived) : derived
+  }, [allMessages, busy, pendingQuestion, crewmate])
   // Visual-only highlight state; the composer text is the source of truth for
   // what gets sent. Cleared whenever the options list changes (new assistant
   // message) or the pane is re-bound to another slot — both signal a fresh turn.
@@ -451,8 +511,11 @@ export default function ChatPane({
   // setInput directly, not this handler, so they are unaffected.
   const handleUserInput = useCallback((next: string | ((prev: string) => string)) => {
     followUpInsertedRef.current = null
+    // An emptied composer holds no dictated words, so this slot's next message
+    // starts unmarked (`dictationProvenance`).
+    if (typeof next === 'string') noteComposerEdit(slotKey, next, PANE_DICTATION_SCOPE)
     setInput(next)
-  }, [setInput])
+  }, [setInput, slotKey])
   const followUpOptionsKey = followUpOptions.join('\x00')
   // A single-select offer is keyed on its source row too: a newer reply can repeat
   // the same labels, and a single-select pick must not replace text the user picked
@@ -461,10 +524,11 @@ export default function ChatPane({
   useEffect(() => { setFollowUpPicked(new Set()); followUpInsertedRef.current = null }, [followUpOptionsKey, singleSourceKey, followUpMulti, slotKey])
   // Quick Send parity with ChatPage: same query key, so the cache is shared
   // with the page and no extra request is made for a pane.
-  const { data: dashCfg, error: dashCfgError } = useQuery<{ quick_send?: boolean; decisions_enabled?: boolean; upload_max_mb?: number }>({ queryKey: ['dashboardConfig'], queryFn: fetchDashboardConfig, staleTime: 30_000 })
-  // Whether the split send button may offer `Auto (Jev)`: the fleet ceiling and
+  const { data: dashCfg, error: dashCfgError } = useQuery<{ quick_send?: boolean; decisions_enabled?: boolean; upload_max_mb?: number; link_previews?: boolean }>({ queryKey: ['dashboardConfig'], queryFn: fetchDashboardConfig, staleTime: 30_000 })
+  // Whether the split send button may offer `Auto (decision model)`: the fleet ceiling and
   // the owner's consent, both the gateway's answers (see useJevAutoSend).
   const jevAutoConsented = useJevAutoSend()
+  const connected = useConnected()
   // Follow-up bar layout: the same persisted setting ChatPage reads, kept live
   // the same way (ChatPage.tsx's reload listener) — a pane is long-lived, so a
   // one-shot read would leave it on the old layout after the user changes the
@@ -507,10 +571,19 @@ export default function ChatPane({
 
   const pickerModels = useChatPanePickerModels({ slotKey, paneSlot, provider, dispatch, dashCfg })
   const {
-    installedAgents, agentChoices, defaultAgent, paneAgentName, queryClient, navigate, agentDD, selectionCapabilitiesQ, codexPairModels,
+    installedAgents, displayAgents, agentChoices, defaultAgent, paneAgentName, queryClient, navigate, agentDD, selectionCapabilitiesQ, codexPairModels,
     jevRouteOn, modelDD, anchorAgentBtn, anchorModelBtn, shownModel, effortSupported, defaultEffort, effectiveEffort,
     chipDefault, modelMarker,
   } = pickerModels
+  // The pane header carries the same session colour as the sidebar row, read
+  // from the display roster so a scope switch does not blank it.
+  const headerPalette = useSessionPalette()
+  const headerColor = resolveSessionColor(
+    paneSlot,
+    headerPalette.paletteColors,
+    paneSlot?.agent ? displayAgents.find(a => a.name === paneSlot.agent)?.session_color : null,
+  )
+  const headerColorStyle = headerColor ? headerBandStyle(headerColor, headerPalette.boost, headerPalette.boostFor) : undefined
 
   // One-time hydrate of this slot's message history via React Query + the api
   // client (caching + cross-pane dedup; staleTime Infinity keeps it one-shot —
@@ -551,12 +624,55 @@ export default function ChatPane({
     queryFn: () => api.chatSlotDetail(slotKey, hydrateLimit),
     staleTime: Infinity,
   })
+  // The hydrate is refused while this pane's slot is the active one, so it runs
+  // again when the slot stops being active: a split pane left on an empty or
+  // still-loading active slot has no page marker for the hold below to read,
+  // and this re-run is what places its page and flags it.
+  const paneIsActive = slotKey === activeSlot
   useEffect(() => {
     if (slotDetail?.messages) {
       dispatch(hydrateSlotMessages({ slot: slotKey, messages: slotDetail.messages, queue: slotDetail.queue, hasMore: slotDetail.has_more, bounded: hydrateLimit !== undefined, total: slotDetail.total, running: slotDetail.running, nextBefore: slotDetail.next_before }))
       setHydratedSlot(slotKey)
     }
-  }, [slotDetail, slotKey, dispatch, hydrateLimit])
+  }, [slotDetail, slotKey, dispatch, hydrateLimit, paneIsActive])
+  // A Blocked link card's Allow / Undo on this slot: re-read it so the link
+  // shows in place of the chip.
+  useRedactionHostsReload(slotKey)
+  // Whether this pane's transcript is its loaded page, for the footer's stall
+  // watch: the active slot's page comes from the slot switch; a background
+  // slot's is any page the store has described (its `slotPaneHasMore` marker),
+  // written by the hydrate above, a warm, or the park of a once-active
+  // transcript, so the watch does not drop when the active slot moves away.
+  const activePageLoaded = useAppSelector((s) => !s.chat.slotLoading && s.chat.slotSwitchTarget !== slotKey)
+  const transcriptLoaded = paneIsActive ? activePageLoaded : warmHasMore !== undefined
+  // A turn this pane sent is watched without a loaded page. Kept after the
+  // send is confirmed, which clears the row's `optimistic` mark.
+  // Dropped when the pane moves to another slot, as the footer resets per session.
+  const sentSlotRef = useRef<string | null>(null)
+  if (sentSlotRef.current !== slotKey) sentSlotRef.current = null
+  if (turnSentHere(messages)) sentSlotRef.current = slotKey
+  const paneSentTurn = sentSlotRef.current === slotKey
+  // `slotHydrated` means "a pane shows this slot NOW": set at mount (or by the
+  // hydrate above), cleared once the last pane showing the slot is gone, so
+  // `boundSlotWindow` reaches a monitor pane that was opened and then left in
+  // the background. The release is deferred one microtask so the observer
+  // counts it reads are settled: a pane mounting the same slot in this commit
+  // (a layout change, StrictMode's re-run) still holds it, and the slot stays
+  // flagged. The cleanup releases the slot this effect ran for, not a later one.
+  // The hold is refused for the active slot, so the effect re-runs when this
+  // pane's slot stops being active: a split pane left on screen after the
+  // reader switches to another chat is flagged the moment its slot is parked.
+  // That re-run's cleanup releases nothing, because this pane still observes
+  // the slot.
+  useEffect(() => {
+    const slot = slotKey
+    dispatch(holdHydratedSlotPane(slot))
+    return () => {
+      queueMicrotask(() => {
+        if (releaseUnobservedPaneSlot(queryClient, slot)) dispatch(clearSlotHydrated(slot))
+      })
+    }
+  }, [slotKey, paneIsActive, dispatch, queryClient])
 
   // Scroll follow (auto-pin, release, jump pill) is owned by the virtualizer
   // inside ChatMessageList — growth on EARLIER rows (a tool result updating, a
@@ -569,13 +685,14 @@ export default function ChatPane({
   const {
     uploadError, setUploadError, uploadHint, setUploadHint, sendHeld, uploadCount, uploadMutation,
     cancelUpload, uploadFiles, dragOver, dropTargetProps,
-  } = useChatPaneUploads({ slotKey, dispatch, slotKeyRef, mountedRef, setInput, dashCfg, dashCfgError })
+  } = useChatPaneUploads({ slotKey, slotKeyRef, mountedRef, setInput, dashCfg, dashCfgError })
 
 
   const { messageQuote, paneHiddenCommands, slashError, setSlashError, doSend, doSteer, onDirectQuestionSend } = useChatPaneSend({
     slotKey, crewmate, dispatch, draft, composerRef, busy, running, paneSlot, scrollToBottom, openSideChat, agentLocked, paneAgentName, pendingQuestion, markCrewmateSent,
   })
   const { recoverInto: recoverQuoteInto } = messageQuote
+
 
   const { stopError, stopErrorDetail, dismissStopError, paneStopState, onStop } = useChatPaneStop({ slotKey, busy: composerBusy, paneSlot, dispatch })
   // The endpointer auto-submit (handed to the Voice atom above) is an Enter
@@ -592,6 +709,32 @@ export default function ChatPane({
     if (flag) doSteer(flag === 'auto' ? { auto: true } : undefined)
     else doSend()
   }
+  // A reply card's Start / No thanks (GrillCard) in this pane: a deliberate
+  // press, so it sends whatever Quick Send says. While busy it takes this pane's
+  // default busy decision (steer, or queue behind the turn). Offline, or during
+  // a force stop (which clears the queue), the text goes into this pane's box.
+  // A send reports what it came to through the card's `onOutcome`. A card for
+  // another chat is left alone.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const d = (e as CustomEvent<ComposeSendDetail>).detail
+      if (!d || d.result || d.slot !== slotKey || typeof d.text !== 'string' || !d.text || typeof d.onOutcome !== 'function' || paneCrewRootClosed) return
+      const text = d.text
+      const files = Array.isArray(d.files) ? d.files.filter((f): f is string => typeof f === 'string' && !!f) : []
+      if (!connected || paneStopState === 'killing') {
+        setInput(cur => mergeReplyIntoDraft(cur, text))
+        // The card's own uploaded files join this pane's box (it is the card's chat).
+        if (files.length) setPendingFiles(cur => [...cur, ...files.filter(f => !cur.includes(f))])
+        d.result = 'staged'
+        return
+      }
+      const flag = busySteerFlag({ slotKey, busy, turnRunning: running, stopState: paneStopState, jevAutoConsented, busyMode: composerBusyMode })
+      d.result = 'pending'
+      doSend(text, flag, d.onOutcome, files)
+    }
+    window.addEventListener(COMPOSE_SEND_EVENT, handler)
+    return () => window.removeEventListener(COMPOSE_SEND_EVENT, handler)
+  }, [slotKey, paneCrewRootClosed, connected, paneStopState, busy, running, jevAutoConsented, composerBusyMode, doSend, setInput, setPendingFiles])
   useChatPaneRunSync({ slotKey, paneSlot, dispatch })
   // Resume for a turn that ended on an error or never answered, as the main chat
   // offers it: in the composer and on the newest error row. This pane's slot is
@@ -611,12 +754,15 @@ export default function ChatPane({
     onCancel: onCancelQueued,
     onInterrupt: onInterruptQueued,
     onEdit: onEditQueued,
+    onEditOpen: onEditOpenQueued,
     onReorder: onReorderQueued,
     pendingIds: queuePendingIds,
   } = useQueuedMessageActions({
     slot: slotKey,
     allQueued: allQueuedMessages,
-    visibleQueued: queuedMessages,
+    // The cards the stack draws, so a reorder moves among the cards on screen.
+    visibleQueued: crewmate ? crewmateHeldQueue : queuedMessages,
+    dictationScope: PANE_DICTATION_SCOPE,
     // Adapter: the hook's third argument is the queued send's mention-alias
     // snapshot, which only ChatPage's composer can re-adopt (pendingFileTokens
     // and the reconciliation effect live there). This pane's composer has no
@@ -631,7 +777,15 @@ export default function ChatPane({
     // picker inserts it, relative to that project.
     project: () => paneSlot?.project,
   })
-  const { listMessages, renderers } = useChatPaneRenderers({ slotKey, busyMode, onFileOpen, crewmate, crewmateTranscript, onSessionOpen, sessions, activeSession, messages, foldBefore, resume })
+  // The Crew Mode dispatch-notice reveal is the host's single `onOpenCrewTab`
+  // (one reveal path: switch to the card's slot so the panel it opens is that
+  // chat's, select Workers, open the dock, close Find). It is threaded down from
+  // ChatPage so a split pane uses the SAME reveal as the single-chat surface,
+  // with no second copy here.
+  // The slot whose playback the browser blocked, as the crewmate's
+  // VoicePlaybackNotice reports it; its replies reveal their action rows.
+  const [voiceRecoverySlot, setVoiceRecoverySlot] = useState<string | null>(null)
+  const { listMessages, renderers } = useChatPaneRenderers({ slotKey, busyMode, onFileOpen, onFolderOpen, onOpenCrewTab, crewmate, crewmateTranscript, onSessionOpen, sessions, activeSession, messages, foldBefore, resume, revealActions: voiceRecoverySlot === slotKey, linkPreviews: dashCfg?.link_previews === true })
 
   // The composer dock floats over the bottom of the scroller (ChatPage's
   // layout, shared measurement): `dockH` is what the scroller pays below its
@@ -646,6 +800,7 @@ export default function ChatPane({
 
   const currentPaneSlot = useCallback(() => slotKeyRef.current, [slotKeyRef])
   const restorePaneSend = useCallback((forSlot: string, sent: PaneSentRestore) => {
+    if (sent.dictated) markDictated(forSlot, PANE_DICTATION_SCOPE)
     restoreIntoComposer(recoverQuoteInto(sent.text, sent.quote, mountedRef.current && forSlot === slotKeyRef.current), sent.files, sent.pastes, forSlot)
   }, [restoreIntoComposer, recoverQuoteInto, mountedRef, slotKeyRef])
   const deliveryStrip = useDeliveryWarningStrip<PaneSentRestore>({
@@ -655,6 +810,7 @@ export default function ChatPane({
   return (
     <SlotProvider slotId={slotKey}>
       <div
+        ref={paneRootRef}
         onMouseDownCapture={onFocus}
         /* Focus capture keeps the grid's focused-pane state true under
            KEYBOARD navigation: tabbing into a pane (or into its portaled
@@ -680,6 +836,7 @@ export default function ChatPane({
            `activeSlot`, so without this nothing in the DOM could say which
            pane renders the session the user just opened. */
         data-pane-slot={slotKey}
+        data-chat-scope=""
         {...dropTargetProps}
         className={`relative flex flex-col h-full min-h-0 overflow-hidden bg-bg ${
           frameless
@@ -697,7 +854,7 @@ export default function ChatPane({
         } as React.CSSProperties}
       >
         {!frameless && (
-        <div data-pane-title-row className={`@container/panehead group/header relative z-50 flex items-center gap-2 pr-3 py-2 border-b border-border bg-card shrink-0 transition-[padding-left] duration-[240ms] [transition-timing-function:cubic-bezier(.32,.72,0,1)] ${leading?.inset ? 'pl-[49px]' : 'pl-3'}`}>
+        <div data-pane-title-row style={headerColorStyle} className={`@container/panehead group/header relative z-50 flex items-center gap-2 pr-3 py-2 border-b border-border bg-card shrink-0 ${headerColor ? 'chat-header-colored' : ''} transition-[padding-left] duration-[240ms] [transition-timing-function:cubic-bezier(.32,.72,0,1)] ${leading?.inset ? 'pl-[49px]' : 'pl-3'}`}>
           {/* Leading edge (#10585): in split view this pane may stand in for
               the single-chat title row at the surface's top-left. `inset`
               clears the shell's stationary sidebar toggle: the pane starts at
@@ -714,6 +871,8 @@ export default function ChatPane({
               footer's "Stopping…" caption and the composer instead of staying
               green as if the turn were working normally (#20397). */}
           <span data-testid="chat-pane-status-dot" className={`w-2 h-2 rounded-full shrink-0 ${headerStopUnderWay ? 'bg-danger animate-pulse' : running ? 'bg-ok animate-pulse' : 'bg-accent'}`} />
+          {/* A separate dot: a red session colour must never read as the stopping dot. */}
+          {headerColor && <span data-testid="chat-pane-session-dot" className="chat-header-dot" aria-hidden="true" />}
           {/* Same rename / regenerate control as the single-session header
               (#9727): the title row is the `group/header` hover target that
               reveals the Pen and the Sparkles button. */}
@@ -818,104 +977,132 @@ export default function ChatPane({
         {/* The scroller (theming hook 'chat-container', overflow contract,
             sentinels/spacers) is ChatMessageList's virtualized mount — see
             TranscriptScrollShell for the style contract it enforces. */}
-        <ChatMessageList
-          ref={listRef}
-          messages={listMessages}
-          // The slot's own liveness too, not only this session's stream: a
-          // DM/member pane observing a turn driven elsewhere still follows.
-          running={running || !!paneSlot?.running}
-          renderers={renderers}
-          hideCardOwnedOAuth={connectionsUiOn}
-          // No "Ask the agent" on this list's notices: the hand-off navigates
-          // away and unmounts the pane. Its composer text, files and pastes are
-          // parked per slot (useChatPaneDraft), but a staged message quote
-          // (useMessageQuote) lives only in this pane's state and would be lost.
-          handOff={false}
-          onDisplayItems={onDisplayItems}
-          hiddenRow={pinHiddenRow}
-          unreadRun={unreadRun}
-          onQuote={onQuote}
-          onQuoteMessage={messageQuote.quoteMessage}
-          onAsk={onAsk}
-          threads={threads}
-          onFileOpen={onFileOpen}
-          onArtifactOpen={onArtifactOpen}
-          transcript={{
-            sessionId: `pane:${slotKey}`,
-            scrollerRef,
-            onScroll: onScrollPin,
-            onAtBottomChange: setIsAtBottom,
-            // `topInset`: a host band floating over the pane's top (the
-            // Members DM header) is paid for here, so the first rows clear it
-            // at scroll top and pass under it once the reader scrolls. The
-            // dock floats over the scroller's bottom edge, so the scroller
-            // pays for that strip too, plus the same clearance ChatPage keeps
-            // between its last line and the glass.
-            scrollerStyle: { paddingTop: 12 + topInset, paddingBottom: dockH + DOCK_CLEARANCE_PX, minHeight: 0 },
-            // handOff off, like the list's own notices (see `handOff` above).
-            earlier: pagesActiveSlot
-              ? { hasMore: activeHasMore, loading: loadingOlder, failed: olderFailed, onLoad: loadOlder, handOff: false }
-              : pagesPane
-                ? { hasMore: true, loading: paneLoadingOlder, failed: paneOlderFailed, onLoad: loadOlderPane, handOff: false }
-                : undefined,
-            aboveRows: (
-              <ChatPaneAboveRows slotKey={slotKey} activeSlot={activeSlot} messages={messages} paneMessages={paneMessages} crewmate={crewmate} crewmateLive={crewmateLive} running={running} slotDetailFailed={slotDetailFailed} refetchSlotDetail={refetchSlotDetail} hideEmptyHint={hideEmptyHint} crewmateQuietUnproven={crewmateQuietUnproven} onOpenCrewWorkLog={onOpenCrewWorkLog} warmHasMore={warmHasMore} pagesPane={pagesPane} onOpenFull={onOpenFull} />
-            ),
-            belowRows: (
-              /* The working indicator. Inside the scroll container, after the
-                 last message, so it reads as "the reply is coming" exactly where
-                 the reply will land. Stop/regenerate chrome stays page-level: the
-                 pane derives the indicator's inputs from its own per-slot stream
-                 state.
-                 A crewmate's chat draws a typing bubble (three dots in the
-                 crewmate's own bubble) with its current step as the one-line
-                 caption under it, mounted for the whole live turn so nothing
-                 moves while steps come and go (#18238, #19997); the chat page's
-                 ghost-pose carousel is NOT mounted beside it, or two things
-                 would move at once. Keyed by the slot: the caption holds each
-                 step briefly (useHeldActivity), and the Members page rebinds
-                 this one pane to another crewmate without remounting it, so
-                 without the key B's chat would open on A's held step. A new key
-                 is a fresh mount: B's reading at once.
-                 Every other pane — a split pane of an ordinary chat — shows the
-                 same indicator the full chat page shows (the ghost-pose
-                 carousel, theme-swappable via themeBranding): a running turn
-                 was otherwise invisible between tool steps. */
-              <>
-              {crewmate
-                ? crewmateTyping && (
-                  <CrewmateLiveActivity
-                    key={slotKey}
-                    // Before the answering turn runs there is no live reading
-                    // to name (the slot's status record is the last turn's),
-                    // so the caption says it is working on it.
-                    activity={crewmateLive ? liveActivity : AWAITING_REPLY_ACTIVITY}
-                    streamingText={messages[messages.length - 1]?.role === 'streaming' && streamState === 'streaming'}
-                    streamTick={
-                      messages[messages.length - 1]?.role === 'streaming'
-                        ? (messages[messages.length - 1]?.content.length ?? 0)
-                        : 0
-                    }
-                  />
-                )
-                : (
-                  <ChatFooter
-                    statusLabel={paneEnvironmentStart}
-                    running={running || !!paneSlot?.running || preparing}
-                    stopping={stopUnderWay}
-                    state={streamState}
-                    lastRole={messages[messages.length - 1]?.role ?? ''}
-                    streamTick={
-                      messages[messages.length - 1]?.role === 'streaming'
-                        ? (messages[messages.length - 1]?.content.length ?? 0)
-                        : 0
-                    }
-                  />
-                )}
-              </>
-            ),
-          }}
-        />
+        <ChatProjectDirCtx.Provider value={paneProjectDir}>
+          <RunInTerminalOriginSlot.Provider value={crewmate ? slotKey : null}>
+          <ChatMessageList
+            ref={listRef}
+            messages={listMessages}
+            queued={cardQueued}
+            // The slot's own liveness too, not only this session's stream: a
+            // DM/member pane observing a turn driven elsewhere still follows.
+            running={running || !!paneSlot?.running}
+            renderers={renderers}
+            hideCardOwnedOAuth={connectionsUiOn}
+            // No "Ask the agent" on this list's notices: the hand-off navigates
+            // away and unmounts the pane. Its composer text, files and pastes are
+            // parked per slot (useChatPaneDraft), but a staged message quote
+            // (useMessageQuote) lives only in this pane's state and would be lost.
+            handOff={false}
+            onDisplayItems={onDisplayItems}
+            hiddenRow={pinHiddenRow}
+            unreadRun={unreadRun}
+            // Show Thinking Inline, as the Sessions chat reads it. Not in a Bot's
+            // chat: it draws messages only (docs/decisions/2026-10-09), so it
+            // has no working steps, and folding would hide the Bot's own words.
+            collapseAllSteps={!crewmate && chatConfig.collapseAllSteps}
+            onQuote={onQuote}
+            onQuoteMessage={messageQuote.quoteMessage}
+            onAsk={onAsk}
+            threads={threads}
+            onFileOpen={onFileOpen}
+            onFolderOpen={onFolderOpen}
+            onArtifactOpen={onArtifactOpen}
+            transcript={{
+              sessionId: `pane:${slotKey}`,
+              scrollerRef,
+              onScroll: onScrollPin,
+              onAtBottomChange: setIsAtBottom,
+              // `topInset`: a host band floating over the pane's top (the
+              // Members DM header) is paid for here, so the first rows clear it
+              // at scroll top and pass under it once the reader scrolls. The
+              // dock floats over the scroller's bottom edge, so the scroller
+              // pays for that strip too, plus the same clearance ChatPage keeps
+              // between its last line and the glass. The same two strips are the
+              // scroller's scroll padding, so a control the keyboard or a
+              // `scrollIntoView` brings into view (a card's buttons) lands clear
+              // of both bands instead of under the glass.
+              scrollerStyle: { paddingTop: 12 + topInset, paddingBottom: dockH + DOCK_CLEARANCE_PX, minHeight: 0, scrollPaddingTop: 12 + topInset, scrollPaddingBottom: dockH + DOCK_CLEARANCE_PX },
+              // handOff off, like the list's own notices (see `handOff` above).
+              earlier: pagesActiveSlot
+                ? { hasMore: activeHasMore, loading: loadingOlder, failed: olderFailed, onLoad: loadOlder, handOff: false }
+                : pagesPane
+                  ? { hasMore: true, loading: paneLoadingOlder, failed: paneOlderFailed, onLoad: loadOlderPane, handOff: false }
+                  : undefined,
+              aboveRows: (
+                <ChatPaneAboveRows slotKey={slotKey} activeSlot={activeSlot} messages={messages} paneMessages={paneMessages} crewmate={crewmate} crewmateLive={crewmateLive} running={running} slotDetailFailed={slotDetailFailed} refetchSlotDetail={refetchSlotDetail} hideEmptyHint={hideEmptyHint} crewmateQuietUnproven={crewmateQuietUnproven} onOpenCrewWorkLog={onOpenCrewWorkLog} warmHasMore={warmHasMore} pagesPane={pagesPane} onOpenFull={onOpenFull} />
+              ),
+              belowRows: (
+                /* The working indicator. Inside the scroll container, after the
+                   last message, so it reads as "the reply is coming" exactly where
+                   the reply will land. Stop/regenerate chrome stays page-level: the
+                   pane derives the indicator's inputs from its own per-slot stream
+                   state.
+                   A crewmate's chat draws a typing bubble (three dots in the
+                   crewmate's own bubble) with its current step as the one-line
+                   caption under it, mounted for the whole live turn so nothing
+                   moves while steps come and go (#18238, #19997); the chat page's
+                   ghost-pose carousel is NOT mounted beside it, or two things
+                   would move at once. Keyed by the slot: the caption holds each
+                   step briefly (useHeldActivity), and the Members page rebinds
+                   this one pane to another crewmate without remounting it, so
+                   without the key B's chat would open on A's held step. A new key
+                   is a fresh mount: B's reading at once.
+                   Every other pane — a split pane of an ordinary chat — shows the
+                   same indicator the full chat page shows (the ghost-pose
+                   carousel, theme-swappable via themeBranding): a running turn
+                   was otherwise invisible between tool steps. */
+                <>
+                {crewmate
+                  ? (
+                    <>
+                    {/* Kept mounted so it folds out in place as the welcome lands. */}
+                    <PreparingReplyBubble caption={preparingCaption} shown={preparing && !crewmateLive && !awaitingReply} testId="chat-pane-preparing-catch-up" />
+                    {crewmateTyping && (
+                    <CrewmateLiveActivity
+                      key={slotKey}
+                      // Before the answering turn runs there is no live reading
+                      // to name (the slot's status record is the last turn's),
+                      // so the caption says it is working on it.
+                      activity={crewmateLive ? liveActivity : AWAITING_REPLY_ACTIVITY}
+                      streamingText={messages[messages.length - 1]?.role === 'streaming' && streamState === 'streaming'}
+                      streamTick={
+                        messages[messages.length - 1]?.role === 'streaming'
+                          ? (messages[messages.length - 1]?.content.length ?? 0)
+                          : 0
+                      }
+                    />
+                    )}
+                    </>
+                  )
+                  : (
+                    <>
+                    <ChatFooter
+                      statusLabel={paneEnvironmentStart}
+                      running={running || !!paneSlot?.running}
+                      stopping={stopUnderWay}
+                      state={streamState}
+                      lastRole={messages[messages.length - 1]?.role ?? ''}
+                      streamTick={
+                        messages[messages.length - 1]?.role === 'streaming'
+                          ? (messages[messages.length - 1]?.content.length ?? 0)
+                          : 0
+                      }
+                      // Not while only preparing a catch-up: that is no turn to stop.
+                      activityKey={(running || paneSlot?.running) && (transcriptLoaded || paneSentTurn) ? transcriptActivityKey(messages) : undefined}
+                      sentHere={turnSentHere(messages)}
+                      browserSessionKey={slotKey}
+                      waitingOnUser={!!paneSlot?.pending_approval || !!paneSlot?.needs_input}
+                      toolsReturned={toolsReturned}
+                    />
+                    <PreparingReplyBubble caption={preparingCaption} shown={preparing && !crewmateLive} testId="chat-pane-preparing-catch-up" />
+                    </>
+                  )}
+                </>
+              ),
+            }}
+          />
+          </RunInTerminalOriginSlot.Provider>
+        </ChatProjectDirCtx.Provider>
         {/* Composer dock. Floats over the bottom of the transcript scroller
             instead of sitting under it in the flex column (ChatPage's iOS
             toolbar layout, decided in
@@ -940,6 +1127,10 @@ export default function ChatPane({
         <JumpToBottomButton visible={!isAtBottom && messages.length > 0} onClick={scrollToBottom} unreadCount={unreadCount} />
 
         <div className="dock-inert" data-testid="composer-status-stack">
+        {/* Never in a Bot's chat: that surface draws messages only
+            (docs/decisions/2026-10-09-crewmate-chat-draws-messages-only.md),
+            and the Bot says in its own words when a server it needs is not up. */}
+        {!crewmate && <McpLoadingBar slot={slotKey} />}
         {!crewmate && <SubagentProgressBar slot={slotKey} />}
 
         {!crewmate && <SubagentDeliveryProgress count={systemDeliveryCount} />}
@@ -950,9 +1141,10 @@ export default function ChatPane({
             cancellable — hiding real state is worse than showing a card the
             surface did not intend. */}
         {/* A crewmate's chat draws a queued message as the person's own
-            bubble in the thread instead (`withQueuedAsBubbles`). */}
-        {!crewmate && queuedMessages.length > 0 && (
-          <QueueStack messages={queuedMessages} onCancel={onCancelQueued} onInterrupt={crewmate ? undefined : onInterruptQueued} onEdit={onEditQueued} onReorder={onReorderQueued} pendingIds={queuePendingIds} />
+            bubble in the thread instead (`withQueuedAsBubbles`), all but a
+            held entry, which waits here for the person to act on it. */}
+        {(crewmate ? crewmateHeldQueue : queuedMessages).length > 0 && (
+          <QueueStack key={slotKey} messages={crewmate ? crewmateHeldQueue : queuedMessages} onCancel={onCancelQueued} onInterrupt={onInterruptQueued} onEdit={onEditQueued} onEditOpen={onEditOpenQueued} onReorder={onReorderQueued} pendingIds={queuePendingIds} />
         )}
 
         {/* The pending ask_question card shares the message column's gutter and
@@ -967,6 +1159,8 @@ export default function ChatPane({
               agent that asked may not be the pane the user is looking at, and
               without this its card never appears anywhere, so it waits out its
               full window. */}
+          {/* `data-question-slot`: the Crew tab's "Answer in chat" scrolls here. */}
+          <div data-question-slot={slotKey}>
           <PendingQuestionCard
             slotKey={slotKey}
             onFallbackSend={(text, questions) => {
@@ -980,8 +1174,11 @@ export default function ChatPane({
             }}
             onDirectSend={onDirectQuestionSend}
           />
+          </div>
         </div>
 
+        {/* The composer's notices are kept clear like the composer itself. */}
+        <div data-testid="chat-pane-composer-notices" {...GUIDE_KEEP_CLEAR}>
         <StatusNotice
           className="mx-4 mt-2 mb-0 animate-rise"
           testId="chat-pane-upload-hint"
@@ -1003,6 +1200,7 @@ export default function ChatPane({
           className="mx-4 mt-2"
           testId="chat-pane-switch-error"
           message={switchError}
+          announce={false}
           onDismiss={() => setSwitchError('')}
         />
         {/* No hand-off: this pane holds an unsent draft. A failed ACP capability
@@ -1054,6 +1252,12 @@ export default function ChatPane({
           message={resume.continueError}
           onDismiss={() => resume.setContinueError('')}
         />
+        {/* A crewmate's reply offers Read aloud, so its playback failures are
+            reported here, for this pane's slot. While the browser blocks
+            playback, the reply rows reveal their actions so the More menu the
+            notice points to is reachable without hover. No hand-off: the
+            composer draft below is unsaved. */}
+        {crewmate && <VoicePlaybackNotice slot={slotKey} askAgent={false} onBlockedSlotChange={setVoiceRecoverySlot} />}
         {/* No hand-off: the composer draft is untouched by a failed rename; the
             title in the bar is the one the store still holds, so the user can
             simply try again. */}
@@ -1065,6 +1269,7 @@ export default function ChatPane({
           message={titleError?.message}
           onDismiss={() => setTitleError(null)}
         />
+        </div>
 
         </div>
         {/* Quote transit: the selection flies from where it was taken into this
@@ -1072,10 +1277,24 @@ export default function ChatPane({
             shape as ChatPage's inputAreaRef). */}
         {quoteFlight && <FlyingQuote text={quoteFlight.text} from={quoteFlight.from} targetRef={inputAreaRef} onComplete={endQuoteFlight} />}
         <div ref={inputAreaRef} className="relative z-10 dock-inert">
-        {paneSlot?.crew_mode_root && <CrewApprovalCards root={slotKey} />}
-        {paneCrewRoot && (
+        {crewModeRoot(paneSlot) && <CrewApprovalCards root={slotKey} />}
+        {/* A crewmate thread: the approvals and question cards of the sessions it
+            dispatched (their `mate_root`), so none waits unseen. */}
+        {/* One height budget for both stacks, so together they never push the
+            composer or each other's top out of the pane. */}
+        {paneSlot?.mode === 'member' && (
+          <div className="mx-2 mb-2 max-h-[45vh] overflow-y-auto empty:hidden" data-testid="mate-worker-prompts">
+            <MateApprovalCards root={slotKey} />
+            <MateWorkerQuestions key={slotKey} root={slotKey} />
+          </div>
+        )}
+        {paneCrewRoot ? (
           <CrewWorkerComposerGate root={paneCrewRoot} worker={slotKey} workerTitle={title}
             waitingForApproval={!!paneSlot?.pending_approval} />
+        ) : (
+          // Without the gate (a build without conductor mode, LTS) a send the server still
+          // took as a steer can come back unrecorded: say so here.
+          <CrewSteerUnrecordedNotice worker={slotKey} workerTitle={title} />
         )}
         <Composer
           ref={composerRef}
@@ -1084,6 +1303,9 @@ export default function ChatPane({
           onChange={handleUserInput}
           voice={composerVoiceOptions}
           pastes={composerPastes}
+          // The Mention atom: the `@` picker stages into this list, and a file
+          // chip's remove takes the token its pick wrote out of the text.
+          setPendingFiles={setPendingFiles}
         >
         <ComposerInput
           value={input}
@@ -1098,6 +1320,7 @@ export default function ChatPane({
           slotApprovalChrome={crewApprovalDecidableHere(paneSlot, 'worker_split_pane')}
           disabled={paneCrewRootClosed}
           lockedPlaceholder={paneCrewRootClosed ? '' : undefined}
+          sentMessages={sentMessages}
           // A chat bound to a Session Environment runs in its workspace, so a `!`
           // command would land on this machine instead: refused like a remote
           // crew's, and held while that placement is still unread.
@@ -1105,6 +1328,7 @@ export default function ChatPane({
             : paneRunsHere === undefined ? 'pending' : 'local'}
           hiddenCommands={paneHiddenCommands}
           isRunning={composerBusy}
+          projectTurnKey={projectTurnKey}
           onStop={onStop}
           isQueued={stopUnderWay}
           stopState={paneStopState}
@@ -1113,6 +1337,8 @@ export default function ChatPane({
           // cases the newest error card handles with a remedy of its own.
           continuable={resume.composerResume}
           continueIsRecovery={resume.interrupted}
+          resumeAfterSignIn={resume.resumeAfterSignIn}
+          restoredQueueCount={crewmate ? crewmateHeldQueue.length : queuedMessages.filter(m => m.meta?.restored === true).length}
           onContinue={resume.onContinue}
           continuing={resume.continuing}
           // Steer path on the pane too (it was queue-only before): busy panes
@@ -1153,11 +1379,16 @@ export default function ChatPane({
           // See ComposerDockView: the slot's RAW model, because `shownModel` substitutes
           // the served id and would hide every routed turn.
           modelIsJevRouted={jevRouteOn && isUnpinnedModel(paneSlot?.model)}
-          contextPct={contextPct}
+          harnessBackend={selectionCapabilitiesQ.data?.models_backend}
+          contextPct={contextPct ?? 0}
+          contextUnknown={contextPct === undefined && contextTokens?.used == null}
           contextUsedTokens={contextTokens?.used}
           contextWindowTokens={contextTokens?.window || provider.getContextWindow(shownModel)}
           derivePctFromUsed={contextTokens?.used != null && contextTokens.window == null}
-          onAgentClick={!agentLocked && !runsCrewMode(paneSlot?.agent, paneSlot?.agent_kind, paneSlot?.crew_mode_agent) && provider.capabilities.agentTemplates ? (rect, trigger) => { anchorAgentBtn(rect, trigger); agentDD.setOpen(!agentDD.open) } : undefined}
+          // A Crew Mode root with a message offers no switch, preview on or off: the raw
+          // `crew_mode_root` stamp is the gateway's own lock (`crew_mode_locked`).
+          onAgentClick={!agentLocked && !showsAsCrewMode(paneSlot)
+            && !(paneHasUserMessage && !!paneSlot?.crew_mode_root) && provider.capabilities.agentTemplates ? (rect, trigger) => { anchorAgentBtn(rect, trigger); agentDD.setOpen(!agentDD.open) } : undefined}
           onModelClick={(rect, trigger) => { anchorModelBtn(rect, trigger); modelDD.setOpen(!modelDD.open) }}
           approvalMode={displayMode}
           followUpOptions={followUpOptions}
@@ -1205,6 +1436,8 @@ export default function ChatPane({
           }}
           onFollowUpSend={(text?: string) => { if (!paneCrewRootClosed) doSend(text) }}
           project={paneSlot?.project ?? ''}
+          turnProject={paneSlot?.turn_project}
+          turnProjectFallback={paneSlot?.turn_project_fallback}
           // A crewmate's chat is a DM with one named crewmate, so the composer
           // addresses it by name rather than the product ("Message Kiro Crew…")
           // and carries no sigil hint: next to a person's name the shortcut list
@@ -1214,11 +1447,11 @@ export default function ChatPane({
           onUploadFiles={uploadFiles}
           onCancelUpload={uploadCount > 0 ? cancelUpload : undefined}
           uploadCount={uploadCount}
+          uploadSlot={slotKey}
           pendingFiles={pendingFiles}
           pendingDirs={pendingDirs}
           pendingQuote={messageQuote.pendingQuote}
           onRemoveQuote={messageQuote.clearQuote}
-          onRemoveFile={(p) => setPendingFiles((prev) => prev.filter((x) => x !== p))}
           onRemoveDir={rel => {
             const esc = `@${rel}`.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
             setInput(prev => prev.replace(new RegExp(`(^|\\s)${esc}(?: |(?=\\s)|$)`, 'g'), '$1'))

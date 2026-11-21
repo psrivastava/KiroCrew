@@ -21,14 +21,13 @@ sweeps" or "never called with preserve_existing=False".
 from __future__ import annotations
 
 import os
-import shutil
-import tempfile
 import time
 import unittest
 from collections.abc import Callable
-from pathlib import Path
 from typing import Any
 from unittest import mock
+
+import pytest
 
 from kiro_crew.apps.builtins.ops_mission_control.backend import ledger, ledger_index
 from kiro_crew.apps.builtins.ops_mission_control.backend.models import LedgerEntry
@@ -68,8 +67,13 @@ class _FakeStore:
 class _Env(unittest.TestCase):
     """Isolated data home: the cursor and ledger are real files."""
 
+    @pytest.fixture(autouse=True)
+    def _per_test_dirs(self, tmp_path):
+        """Hand ``setUp`` pytest's per-test directory for the data home."""
+        self._tmp_path = tmp_path
+
     def setUp(self) -> None:
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = self._tmp_path
         self._prev = os.environ.get("KIROCREW_HOME")
         os.environ["KIROCREW_HOME"] = str(self.tmp)
 
@@ -78,7 +82,6 @@ class _Env(unittest.TestCase):
             os.environ.pop("KIROCREW_HOME", None)
         else:
             os.environ["KIROCREW_HOME"] = self._prev
-        shutil.rmtree(self.tmp, ignore_errors=True)
 
     @staticmethod
     def _seed(n: int, *, prefix: str = "lesson") -> None:
@@ -158,6 +161,23 @@ class TestIncrementalImport(_Env):
 
         store = _FakeStore()
         self.assertEqual(ledger_index.import_pending(store)["written"], 3)
+
+    def test_non_utf8_cursor_degrades_to_rescanning(self) -> None:
+        """A cursor holding bytes that are not UTF-8 is corrupt like bad JSON: the
+        import re-checks every entry instead of raising out of the dispatch cycle."""
+        self._seed(3)
+        (self.tmp / "apps/ops-mission-control/data").mkdir(parents=True, exist_ok=True)
+        cursor = ledger_index._cursor_path()
+        cursor.write_bytes(b'{"imported": ["\xff\xfe"]}')
+        try:
+            ids = ledger_index._read_cursor()
+        except UnicodeDecodeError as exc:
+            self.fail(f"a non-UTF-8 cursor must read as empty, not raise: {exc}")
+        self.assertEqual(ids, set())
+
+        store = _FakeStore()
+        self.assertEqual(ledger_index.import_pending(store)["written"], 3)
+        self.assertEqual(len(ledger_index._read_cursor()), 3, "the cursor is rewritten whole")
 
 
 class _CappedStore(_FakeStore):
@@ -451,8 +471,8 @@ class TestSemanticRecallWiring(_Env):
         store = VectorMemoryStore(db_path=self.tmp / "memory.db", embedding_dim=2)
         store.init()
         # A failed write raises before the store is returned, so dispatch never runs its
-        # own close(); on Windows the still-open memory.db then makes tearDown's rmtree
-        # leak self.tmp.
+        # own close(); on Windows the still-open memory.db then cannot be removed with
+        # self.tmp.
         try:
             self.assertTrue(
                 store.write_episodic(

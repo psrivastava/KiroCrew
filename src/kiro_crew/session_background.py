@@ -40,6 +40,7 @@ from kiro_crew.metrics.sessions import (
     record_session_ended,
     record_session_started,
 )
+from kiro_crew.session_allocation_parts.companions import sandbox_tier_tightened
 from kiro_crew.start_priority import PrioritySemaphore, StartPriority
 
 if TYPE_CHECKING:
@@ -52,6 +53,24 @@ if TYPE_CHECKING:
 #: prompt criteria fire; observed at 1.9 GB. Recycling it spawns the replacement
 #: first, so no user sees it.
 BACKGROUND_RSS_FALLBACK_MB = 1536
+#: Seconds a parked ``_bg`` runtime may stay parked. Past it the drain reap kills
+#: it even while it still reports a session: a probe that keeps answering busy
+#: would otherwise keep a multi-GB process alive until the gateway restarts.
+#: The kill ends any turn still running there, such as a history consolidation
+#: (it has no timeout) past 15 minutes; bounding the process is worth that.
+BG_PARK_MAX_SECS = 900.0
+#: Most parked ``_bg`` runtimes kept at once; the drain reap kills the oldest
+#: beyond it, busy or not, so displacement outpacing the drain stays bounded.
+#: Three quick displacements therefore end the oldest runtime's turns.
+BG_PARKED_MAX = 2
+#: ``_is_stale`` reasons that kill a busy runtime instead of parking it: past the
+#: handle ceiling the process itself is the danger. ``"rss"`` is not one:
+#: a healthy kiro-cli runs at 0.6-0.8 GB, above the 500 MiB recycle threshold, so
+#: an RSS kill would end live background turns every few minutes. A busy runtime
+#: stale by RSS parks, bounded by ``BG_PARK_MAX_SECS`` and ``BG_PARKED_MAX``.
+_BG_KILL_NOW_STALE_REASONS = frozenset({"handles"})
+#: When a runtime was parked on the drain list, for ``BG_PARK_MAX_SECS``.
+_BG_PARKED_AT_ATTR = "_kc_bg_parked_at"
 
 
 class _BackgroundSessionEntry(Protocol):
@@ -73,6 +92,7 @@ class _BackgroundRuntime(Protocol):
     acp_backend: str
     #: The session tree's ``$KIROCREW_SCRATCH`` directory; a replacement inherits it.
     work_scratch_dir: Path | None
+    sandbox_mode: str
 
     def is_alive(self) -> bool: ...
 
@@ -118,6 +138,10 @@ class _BackgroundOwner(Protocol):
 
     def _advance_session_generation(self, key: str) -> int: ...
 
+    def session_generation(self, key: str) -> int: ...
+
+    def absorb_orphaned_release(self, key: str) -> bool: ...
+
     def _dispatch_hard_kill(self, provider: LLMProvider) -> None: ...
 
     def _configured_bg_backend_raw(self) -> str | None: ...
@@ -143,10 +167,14 @@ class _BackgroundOwner(Protocol):
 
     def get_pid(self, key: str) -> int | None: ...  # pid-owner-ok: _bg runtime owner
 
+    async def _evict_stale_session(self, key: str, session: _BackgroundSessionEntry) -> None: ...
+
     async def _reacquire_and_validate(
         self,
         key: str,
         session: _BackgroundSessionEntry,
+        *,
+        refuse_looser_tier: bool = True,
     ) -> bool: ...
 
 
@@ -201,8 +229,38 @@ class BackgroundRuntimeDeps:
     ]
     session_factory: Callable[..., _BackgroundSessionEntry]
     first_turn_nothing_armed: object
-    provider_bg_session_factory: Callable[[_BackgroundSessionEntry], object]
+    provider_bg_session_factory: Callable[[_BackgroundSessionEntry], _ProviderBgSession]
     session_closing_error: Callable[[str], BaseException]
+
+
+def _mark_parked(runtime: object) -> None:
+    """Stamp when *runtime* went onto the drain list; a re-park keeps the first stamp."""
+    if isinstance(getattr(runtime, _BG_PARKED_AT_ATTR, None), (int, float)):
+        return
+    try:
+        setattr(runtime, _BG_PARKED_AT_ATTR, time.monotonic())
+    except Exception:
+        # A runtime that refuses the stamp is reaped on the busy probe alone.
+        pass
+
+
+def _session_count(runtime: object) -> int | str:
+    """Sessions registered or initializing on *runtime*, for a kill log line.
+
+    Read before the kill, which clears them; ``"unknown"`` when the runtime does
+    not expose the counts.
+    """
+    queues = getattr(runtime, "_session_queues", None)
+    inits = getattr(runtime, "_session_inits_in_flight", 0)
+    if not isinstance(queues, dict) or type(inits) is not int:
+        return "unknown"
+    return len(queues) + inits
+
+
+def _park_expired(runtime: object, now: float) -> bool:
+    """Whether *runtime* has been parked longer than ``BG_PARK_MAX_SECS``."""
+    parked_at = getattr(runtime, _BG_PARKED_AT_ATTR, None)
+    return isinstance(parked_at, (int, float)) and now - parked_at > BG_PARK_MAX_SECS
 
 
 #: Attribute ``mark_context_overflowed`` leaves on a provider; read only by
@@ -240,6 +298,9 @@ class _ProviderBgSession:
     def __init__(self, sess: _BackgroundSessionEntry) -> None:
         self._sess = sess
         self._sem_held = False
+        #: Whether ``sess`` was spawned under a looser ``agent.sandbox`` than is now
+        #: configured; ``_provider_backed_bg_session`` supplies the real check.
+        self.looser_than_configured: Callable[[], bool] = lambda: False
 
     @property
     def provider(self) -> LLMProvider:
@@ -275,6 +336,12 @@ class _ProviderBgSession:
         await self._sess.semaphore.acquire()
         self._sem_held = True
         try:
+            # A handle can outlive a tightening, so each turn checks once it holds the permit.
+            if self.looser_than_configured():
+                raise RuntimeError(
+                    "background session unavailable: spawned under a looser "
+                    "agent.sandbox than is now configured"
+                )
             async for event in self._sess.provider.stream(message, allow_image=allow_image):
                 yield event
         finally:
@@ -373,33 +440,23 @@ class BackgroundSessionRuntime:
         # Before the permit: a defaulted KAS waits (bounded) for the kiro-cli
         # floor, so this session starts on the backend the verdict chose.
         await await_kas_floor_verdict()
-        # The factory resolves the background agent's model pin SYNCHRONOUSLY
-        # on the loop from the agent-spec snapshot, which at gateway start has
-        # not been published yet (the first ``mc-discovery`` refresh is still
-        # in flight): a cold snapshot answers "no pin", the session would be
-        # created on the chat model, and it is persistent, so it would stay
-        # there for the gateway's lifetime. This is the one caller that reaches
-        # the lookup cold AND is async, so warm the snapshot here, off the loop,
-        # and the factory's unchanged lookup finds the rows. Once, awaited, no
-        # retry: a failed warm-up costs this session the cold answer only.
-        # Before the permit, so the identity-sweep barrier below covers the
-        # spawn alone, not a directory parse.
+        # Warm the agent-spec snapshot off the loop: the factory reads the model
+        # pin from it synchronously, and at gateway start it is still cold (first
+        # ``mc-discovery`` refresh in flight), which would put this persistent
+        # session on the chat model for the gateway's lifetime. Once, no retry.
+        # Before the permit, so the identity-sweep barrier covers only the spawn.
         await warm_agent_specs(operation="ensure_background", source="unknown")
-        # The permit is retained through stamping AND registration, not just
-        # the process start: the identity sweep drains every cold-start permit
-        # as its quiescence barrier, so releasing the permit while this
-        # provider is started-but-unregistered would let a concurrent sweep
-        # reconcile the store change this spawn straddled while the (possibly
-        # wrong-account) provider is invisible to it -- it would then register,
-        # unstamped by the sweep's epoch handling, after the sweep completed.
-        # Holding the permit keeps this spawn inside the barrier until the
-        # registry can see the result. Explicit acquire/release rather than
-        # ``async with`` so the start-failure return keeps its original
-        # exception semantics while the registration section (whose failures
-        # must PROPAGATE, per the rollback handler below) also stays under the
-        # permit. Lock order matches the sweep's own (permit -> owner._lock).
+        # Hold the permit through stamping AND registration: the identity sweep
+        # drains cold-start permits as its barrier, and a started-but-unregistered
+        # (possibly wrong-account) provider would otherwise register unstamped
+        # after the sweep. Explicit acquire/release, not ``async with``, so the
+        # start-failure return keeps its exception semantics while registration
+        # failures still PROPAGATE (see the rollback handler). Lock order matches
+        # the sweep's (permit -> owner._lock).
         await self._owner._start_sem.acquire(start_priority)
         try:
+            # A reset of the key after this read makes the start below stale.
+            generation = self._owner.session_generation(background_key)
             try:
                 provider = self._owner._provider_factory(background_key, agent=background_agent)
                 provider.start_priority = start_priority
@@ -440,7 +497,11 @@ class BackgroundSessionRuntime:
                     # _closing is rechecked because the start above spans the window
                     # in which close_all takes its session snapshot: registering now
                     # would leak this provider past graceful shutdown.
-                    if not self._owner._closing and background_key not in self._owner._sessions:
+                    if (
+                        not self._owner._closing
+                        and background_key not in self._owner._sessions
+                        and self._owner.session_generation(background_key) == generation
+                    ):
                         sess = self._deps.session_factory(
                             provider=provider,
                             first_turn=self._deps.first_turn_nothing_armed,
@@ -467,15 +528,30 @@ class BackgroundSessionRuntime:
                     self._owner._starting_pids.discard(starting_pid)
         finally:
             self._owner._start_sem.release(start_priority)
-        # Racing registration lost, or shutdown began while we were starting:
+        # Racing registration lost, a reset of the key overtook this start, or
+        # shutdown began while we were starting:
         # tear the fresh provider down instead of registering it.
         await provider.shutdown()
+
+    def _unreadable_backend(self) -> str:
+        """The backend a background runtime takes when ``agent.acp_backend`` is unreadable.
+
+        ``acp_backend_kiro`` in an ``oss`` build, as before. In an LTS build the
+        build's floor, KAS (RFC D6), because Kiro CLI there needs a remote rule.
+        """
+        from kiro_crew import edition
+
+        if edition.is_lts():
+            from kiro_crew.agent_sdk.backends import governance_floor_backend
+
+            return governance_floor_backend()
+        return self._deps.acp_backend_kiro
 
     def _configured_bg_backend_raw(self) -> str | None:
         """Return the configured background backend, or ``None`` if unreadable."""
         logger = self._deps.logger
         try:
-            backend = getattr(self._owner._cfg.agent, "acp_backend", self._deps.acp_backend_kiro)
+            backend = getattr(self._owner._cfg.agent, "acp_backend", self._unreadable_backend())
         except Exception:
             logger.warning(
                 "agent.acp_backend is unreadable; treating the _bg backend as unknown",
@@ -487,7 +563,7 @@ class BackgroundSessionRuntime:
     def _configured_bg_backend(self) -> str:
         """Return the backend background runtimes must spawn under."""
         backend = self._owner._configured_bg_backend_raw()
-        return backend if backend is not None else self._deps.acp_backend_kiro
+        return backend if backend is not None else self._unreadable_backend()
 
     def _bg_backend_supports_runtime(self) -> bool:
         """Whether the configured backend can use the multiplexed runtime."""
@@ -497,7 +573,11 @@ class BackgroundSessionRuntime:
         """Kill and drop parked runtimes whose last live handle has drained.
 
         Caller MUST hold ``_bg_runtime_lock``. A runtime that is still busy
-        stays parked for the next pass; a failed kill also stays parked so the
+        stays parked for the next pass until it has been parked
+        ``BG_PARK_MAX_SECS``, then it is killed anyway; past ``BG_PARKED_MAX``
+        parked, the oldest out of their identity grace are killed, and one
+        still inside it is kept for a later pass. Both kills end any turn still
+        running on that runtime and log how many sessions it had. A failed kill stays parked so the
         process is retried rather than orphaned. ``kill()`` is called even on an
         already-dead runtime so it can release PID bookkeeping. A runtime the
         spawn-identity gate or an ``agent.env`` change parked additionally keeps
@@ -518,18 +598,63 @@ class BackgroundSessionRuntime:
                 # Fail toward preserving work, not toward recycling — a probe
                 # that cannot answer must not kill a runtime whose handles may
                 # be live. The runtime stays parked and is probed again next
-                # pass.
+                # pass, until BG_PARK_MAX_SECS.
                 busy = True
-            if busy:
+            if busy and not _park_expired(runtime, now):
                 remaining.append(runtime)
                 continue
+            if busy:
+                logger.warning(
+                    "Killing a parked _bg runtime (PID %s) still busy after %.0fs parked;"
+                    " ending its %s session(s)",
+                    runtime.pid,
+                    BG_PARK_MAX_SECS,
+                    _session_count(runtime),
+                )
             try:
                 await runtime.kill(expected=True, reason="drained displacement teardown")
                 logger.info("Reaped a drained displaced _bg runtime (PID %s)", runtime.pid)
             except Exception:
                 logger.warning("Failed to reap a drained _bg runtime; will retry", exc_info=True)
                 remaining.append(runtime)
-        self._draining_bg_runtimes = remaining
+        self._draining_bg_runtimes = await self._cap_parked_bg_runtimes(remaining, now)
+
+    async def _cap_parked_bg_runtimes(
+        self, parked: list[_BackgroundRuntime], now: float
+    ) -> list[_BackgroundRuntime]:
+        """Kill the oldest of *parked* beyond ``BG_PARKED_MAX``; return the survivors.
+
+        A runtime inside its identity grace is never a candidate, and a failed
+        kill keeps that runtime and moves on to the next one, so one stuck
+        process cannot hold the cap open. Survivors keep their order. A capped
+        runtime is killed busy or not, ending any turn still running on it.
+        """
+        logger = self._deps.logger
+        excess = len(parked) - BG_PARKED_MAX
+        killed: set[int] = set()
+        for runtime in parked:
+            if excess <= 0:
+                break
+            if identity_park_grace_remaining(runtime, now) > 0.0:
+                continue
+            sessions = _session_count(runtime)
+            try:
+                await runtime.kill(expected=True, reason="parked _bg runtime cap")
+            except Exception:
+                logger.warning(
+                    "Failed to kill a parked _bg runtime over the cap; will retry",
+                    exc_info=True,
+                )
+                continue
+            logger.warning(
+                "Killed a parked _bg runtime (PID %s): more than %d parked; ended its %s session(s)",
+                runtime.pid,
+                BG_PARKED_MAX,
+                sessions,
+            )
+            killed.add(id(runtime))
+            excess -= 1
+        return [runtime for runtime in parked if id(runtime) not in killed]
 
     async def _displace_bg_runtime_locked(
         self,
@@ -555,35 +680,36 @@ class BackgroundSessionRuntime:
         cause: str,
         *,
         park_only: bool = False,
+        kill_now: bool = False,
     ) -> None:
         """Free the ``_bg`` slot, killing or parking ``runtime`` per its load.
 
         Caller MUST hold ``_bg_runtime_lock``. An idle runtime is killed; a busy
         one, or one whose kill failed, is parked on ``_draining_bg_runtimes``
-        until its handles drain. ``cause`` is the operator-facing attribution and
-        is logged with every outcome: a staleness recycle and a backend flap have
-        different remedies, so the two must never read alike.
+        until its handles drain. ``kill_now`` kills a busy runtime too, for a
+        cause where the process itself is the danger
+        (``_BG_KILL_NOW_STALE_REASONS``). ``cause`` is the operator-facing
+        attribution and is logged with every outcome: a staleness recycle and a
+        backend flap have different remedies, so the two must never read alike.
 
-        ``park_only`` parks even an idle runtime instead of killing it here. The
-        periodic sweep uses it, because that caller's idle reading can be one
-        statement stale: ``get_bg_session`` pins the runtime under this lock,
-        RELEASES the lock, and only then calls ``create_session`` -- which is
-        where ``_session_inits_in_flight`` is raised. Killing inside that window
-        would surface as ``AcpRuntimeDead`` on a caller that did nothing wrong.
-        Parking cannot: the reaper re-probes on a later tick, by which time the
-        pinned start has either registered (busy -- it stays parked) or failed.
+        ``park_only`` parks even an idle runtime; the periodic sweep needs it
+        because ``get_bg_session`` pins the runtime, RELEASES this lock, and only
+        then raises ``_session_inits_in_flight`` in ``create_session``. Killing in
+        that window raises ``AcpRuntimeDead`` on an innocent caller; the reaper
+        re-probes a parked runtime on a later tick.
         """
         logger = self._deps.logger
         try:
             busy = runtime.has_active_or_initializing_sessions()
         except Exception:
             busy = True
-        if busy or park_only:
+        if (busy and not kill_now) or park_only:
             logger.info(
                 "Parking the _bg runtime (PID %s) to drain — %s",
                 runtime.pid,
                 cause,
             )
+            _mark_parked(runtime)
             self._draining_bg_runtimes.append(runtime)
             if len(self._draining_bg_runtimes) > 1:
                 # Each entry is a live agent process shielded from the orphan
@@ -596,7 +722,8 @@ class BackgroundSessionRuntime:
                 )
         else:
             logger.info(
-                "Recycling the idle _bg runtime (PID %s) — %s",
+                "Recycling the %s _bg runtime (PID %s) — %s",
+                "busy" if busy else "idle",
                 runtime.pid,
                 cause,
             )
@@ -607,6 +734,7 @@ class BackgroundSessionRuntime:
                     "Displacement kill failed; parking the runtime for the reaper",
                     exc_info=True,
                 )
+                _mark_parked(runtime)
                 self._draining_bg_runtimes.append(runtime)
         self._bg_runtime = None
 
@@ -635,20 +763,12 @@ class BackgroundSessionRuntime:
         """Retire the shared background runtime once it is idle AND stale.
 
         The staleness ceilings (``_DEFAULT_MAX_AGE_SECS`` 6 h,
-        ``_DEFAULT_MAX_RSS_MB`` 500 MiB) were only ever evaluated on the REUSE
-        path in :meth:`get_bg_session`, and the shared runtime's pid is shielded
-        from the orphan sweep for its whole life. A runtime that stops being
-        reused is therefore never asked the question again and never reaped by
-        anything else: it lives until the gateway restarts. Observed on an
-        operator host: 11 agent runtimes holding 6.0 GB, six of them 14.5 h old
-        and five of those over the 500 MiB ceiling, against 4 live slots.
-
-        This is the periodic caller that asks the question off the reuse path, so
-        a runtime nobody is calling is still bounded. It only ever retires a
-        runtime with NO active or initializing session, and it PARKS rather than
-        kills (see ``park_only`` on :meth:`_detach_bg_runtime_locked`), so a
-        co-tenant session can never be dropped by it. Returns True when the slot
-        was freed.
+        ``_DEFAULT_MAX_RSS_MB`` 500 MiB) are otherwise checked only on the REUSE
+        path in :meth:`get_bg_session`, and the orphan sweep shields this pid, so
+        an unused runtime would live until gateway restart. Only a runtime with NO
+        active or initializing session is retired, and it is PARKED, not killed
+        (``park_only`` on :meth:`_detach_bg_runtime_locked`). Returns True when the
+        slot was freed.
         """
         logger = self._deps.logger
         async with self._bg_runtime_lock:
@@ -721,7 +841,14 @@ class BackgroundSessionRuntime:
     async def _provider_backed_bg_session(
         self, start_priority: StartPriority = StartPriority.BACKGROUND
     ) -> object:
-        """Return the shared provider-backed background-session adapter."""
+        """Return the shared provider-backed background-session adapter.
+
+        An entry spawned under a looser ``agent.sandbox`` than is now configured is
+        replaced first, so no turn streams on it. One the recycle cannot replace (a dead
+        process no claim validates, or a failed start) is ended and started afresh; a
+        turn through the handle refuses once it holds the permit while the entry is
+        still looser (``prompt``).
+        """
         if self._owner._closing:
             # Typed for the same reason as get_bg_session's gates: a shutdown
             # racing this path must classify as shutdown, not as the missing-
@@ -730,10 +857,28 @@ class BackgroundSessionRuntime:
                 "session manager is closing; no background session"
             )
         await self._owner._ensure_background(start_priority=start_priority)
+
+        def spawned_looser() -> bool:
+            entry = self._owner._sessions.get(self._deps.background_key)
+            return entry is not None and sandbox_tier_tightened(
+                entry.provider.sandbox_mode, self._owner._cfg.agent.sandbox
+            )
+
+        if spawned_looser():
+            # The recycle takes the turn permit, so a running turn finishes first.
+            await self.recycle_background()
+            entry = self._owner._sessions.get(self._deps.background_key)
+            if entry is not None and spawned_looser():
+                await self._owner._evict_stale_session(self._deps.background_key, entry)
+                await self._owner._ensure_background(start_priority=start_priority)
         sess = self._owner._sessions.get(self._deps.background_key)
         if sess is None:
             raise RuntimeError("background session unavailable for non-kiro _bg provider")
-        return self._deps.provider_bg_session_factory(sess)
+        handle = self._deps.provider_bg_session_factory(sess)
+        handle.looser_than_configured = lambda: sandbox_tier_tightened(
+            sess.provider.sandbox_mode, self._owner._cfg.agent.sandbox
+        )
+        return handle
 
     async def get_bg_session(
         self, start_priority: StartPriority = StartPriority.BACKGROUND
@@ -797,7 +942,7 @@ class BackgroundSessionRuntime:
                 configured_backend = (
                     configured_backend_raw
                     if configured_backend_raw is not None
-                    else self._deps.acp_backend_kiro
+                    else self._unreadable_backend()
                 )
                 runtime_capable = configured_backend in self._deps.runtime_backends()
                 if runtime_capable and runtime is not None and runtime.is_alive():
@@ -812,6 +957,14 @@ class BackgroundSessionRuntime:
                             cached_backend,
                             configured_backend_raw,
                         )
+                    elif sandbox_tier_tightened(
+                        runtime.sandbox_mode, self._owner._cfg.agent.sandbox
+                    ):
+                        # Parked, busy or idle: its in-flight sessions finish on it.
+                        mark_identity_parked(runtime, time.monotonic())
+                        await self._detach_bg_runtime_locked(
+                            runtime, "agent.sandbox is stricter than its spawn tier", park_only=True
+                        )
                     else:
                         # Age AND RSS are probed whether or not co-tenant
                         # handles are live: a multiplexed runtime that never
@@ -819,13 +972,15 @@ class BackgroundSessionRuntime:
                         # be bounded at all, which is how this process was
                         # observed growing to multi-GB RSS over a day of
                         # uptime. Displacing a busy runtime does not interrupt
-                        # it — it is parked to drain, and only new callers are
-                        # moved to the replacement.
+                        # it — it is parked to drain (bounded by BG_PARK_MAX_SECS
+                        # and BG_PARKED_MAX), and only new callers are moved to
+                        # the replacement. Only "handles" kills it at once.
                         stale_reason = await runtime._is_stale()
                         if stale_reason:
                             await self._detach_bg_runtime_locked(
                                 runtime,
                                 f"stale by {stale_reason}",
+                                kill_now=stale_reason in _BG_KILL_NOW_STALE_REASONS,
                             )
 
                 if runtime_capable and (
@@ -873,6 +1028,14 @@ class BackgroundSessionRuntime:
                             ),
                         )
 
+                    # LTS (RFC D6): a background runtime on a KAS that boot
+                    # proved cannot start is refused before any process, as every
+                    # factory-built session is. A no-op in an oss build.
+                    from kiro_crew.agent_sdk.backends import ACP_BACKEND_KAS
+                    from kiro_crew.lts_boot import refuse_unstartable_kas
+
+                    if configured_backend == ACP_BACKEND_KAS:
+                        refuse_unstartable_kas()
                     replacement = build_runtime(self.state.inherited_scratch)
                     # Bracket the spawn with identity reads so the runtime
                     # carries a spawn stamp: sessions demuxed onto it inherit
@@ -998,19 +1161,14 @@ class BackgroundSessionRuntime:
     async def _rss_recycle_reason(self, background_key: str) -> str | None:
         """The recycle reason when the background tree is at or over its ceiling.
 
-        The ceiling is ``session.watchdog_rss_max_mb`` when it is positive and
-        below ``BACKGROUND_RSS_FALLBACK_MB``, else that fallback: the per-session
-        knob is sized for chat sessions with many MCP servers, while this
-        internal runtime is the one tree a transcript of oversized records grows
-        without bound, so it keeps its own lower ceiling either way.
-        The RSS sweep in ``session_cleanup`` skips persistent keys and the
-        background key is one, so this is the only path that compares this
-        runtime's tree against that number. It belongs here rather than there
-        because the sweep resets a session in place, while ``recycle_background``
-        spawns the replacement before retiring the old provider.
+        The ceiling is ``session.watchdog_rss_max_mb`` when positive and below
+        ``BACKGROUND_RSS_FALLBACK_MB``, else that fallback: oversized transcript
+        records grow this tree without bound, so it keeps a lower ceiling than
+        chat sessions. The ``session_cleanup`` RSS sweep skips persistent keys
+        (this is one), and ``recycle_background`` spawns the replacement before
+        retiring the old provider, so the check lives here.
 
-        A pid with no reading, or a reading that raises, yields ``None`` so the
-        context and prompt criteria decide the turn on their own.
+        No reading, or one that raises, yields ``None``.
         """
         ceiling = self._deps.rss_max_mb()
         if ceiling <= 0 or ceiling > BACKGROUND_RSS_FALLBACK_MB:
@@ -1062,8 +1220,10 @@ class BackgroundSessionRuntime:
 
         # Take the same semaphore a turn takes, then re-validate identity and
         # liveness under the owner lock. False means the helper already released
-        # the semaphore.
-        if not await self._owner._reacquire_and_validate(background_key, session):
+        # the semaphore. A looser sandbox tier is not refused: it is a reason below.
+        if not await self._owner._reacquire_and_validate(
+            background_key, session, refuse_looser_tier=False
+        ):
             return
         try:
             provider = session.provider
@@ -1079,7 +1239,9 @@ class BackgroundSessionRuntime:
             ) and not self._owner._bg_backend_supports_runtime()
             pct = provider.context_usage_pct()
             post_compaction = pct == 0.0 and self._deps.context_pct_is_unknown(provider)
-            if overflowed:
+            if sandbox_tier_tightened(provider.sandbox_mode, self._owner._cfg.agent.sandbox):
+                reason = "agent.sandbox is stricter than its spawn tier"
+            elif overflowed:
                 reason = f"prompt too long for the model window (context reported at {pct:.0f}%)"
             elif pct >= self._deps.bg_recycle_pct:
                 reason = f"context at {pct:.0f}%"
@@ -1170,7 +1332,12 @@ class BackgroundSessionRuntime:
                     exc_info=True,
                 )
         finally:
-            session.semaphore.release()
+            # Release ONLY a permit this task still owns: a teardown that popped
+            # the session during the recycle recorded this task as the holder and
+            # handed the permit to a woken claimant, so a second release here
+            # would over-release it (``retire_turn_permit``).
+            if not self._owner.absorb_orphaned_release(background_key):
+                session.semaphore.release()
             # ``_reacquire_and_validate`` named this task the holder; the
             # holding ends with this release.
             session.turn_owner = None

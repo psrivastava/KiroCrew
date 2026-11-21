@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -110,10 +111,20 @@ def _enter(repo: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return repo
 
 
+@pytest.fixture(scope="module")
+def _repo_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """:func:`_make_repo` built once per module; each test gets its own copy."""
+    return _make_repo(tmp_path_factory.mktemp("pre-push-gate-template"), "repo")
+
+
+def _copy_repo(template: Path, parent: Path, name: str) -> Path:
+    return Path(shutil.copytree(template, parent / name, symlinks=True))
+
+
 @pytest.fixture
-def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _repo_template: Path) -> Path:
     """A branch one commit past a synthetic ``origin/main``, with the cwd set to it."""
-    return _enter(_make_repo(tmp_path, "repo"), monkeypatch)
+    return _enter(_copy_repo(_repo_template, tmp_path, "repo"), monkeypatch)
 
 
 @pytest.fixture
@@ -463,11 +474,11 @@ def test_a_git_that_fails_is_an_error_not_a_clean_tree(repo, use_gates, capsys) 
 
 
 def test_a_repository_directory_with_spaces_and_non_ascii_gets_its_proof(
-    tmp_path, monkeypatch, use_gates
+    tmp_path, monkeypatch, use_gates, _repo_template
 ) -> None:
     # Windows drops a trailing space from a directory name, so the space is only added elsewhere.
     name = "r\u00e9po with spaces" + ("" if sys.platform == "win32" else " ")
-    odd = _enter(_make_repo(tmp_path, name), monkeypatch)
+    odd = _enter(_copy_repo(_repo_template, tmp_path, name), monkeypatch)
     use_gates(OK_GATE)
     assert gate.main(["pre_push_gate.py"]) == 0
     assert (odd / ".git" / gate.PROOF_FILENAME).is_file()
@@ -759,11 +770,44 @@ def _hostile(repo: Path, tmp_path: Path, only: str | None = None) -> None:
             _git(repo, "config", key, value)
 
 
+@pytest.fixture(scope="module")
+def _branch_repo_template(
+    tmp_path_factory: pytest.TempPathFactory, _repo_template: Path
+) -> tuple[Path, str]:
+    """``branch_repo``'s commit made once per module, with its merge base.
+
+    Each test copies it; the base sha is the same object in every copy.
+    """
+    template = _copy_repo(_repo_template, tmp_path_factory.mktemp("pre-push-gate-branch"), "repo")
+    _commit_files(template, ["src/kiro_crew/x.py", "website/y.ts", "docs/guide.md"])
+    return template, _git(template, "merge-base", "HEAD", "origin/main")
+
+
 @pytest.fixture
-def branch_repo(repo: Path) -> Path:
+def branch_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _branch_repo_template: tuple[Path, str]
+) -> Path:
     """Root, ``src/`` and ``website/`` files changed past ``origin/main``, one commit."""
-    _commit_files(repo, ["src/kiro_crew/x.py", "website/y.ts", "docs/guide.md"])
-    return repo
+    return _enter(_copy_repo(_branch_repo_template[0], tmp_path, "repo"), monkeypatch)
+
+
+@pytest.fixture
+def branch_base(_branch_repo_template: tuple[Path, str]) -> str:
+    """``git merge-base HEAD origin/main`` of ``branch_repo``."""
+    return _branch_repo_template[1]
+
+
+@pytest.fixture(scope="module")
+def branch_expected_gates(_branch_repo_template: tuple[Path, str]) -> list[str]:
+    """The gates the real runner selects for ``branch_repo`` under clean config.
+
+    Asked once per module from the template (the same commit every copy holds),
+    the way ``_enter`` sets up a test: cwd in the repo, host config off.
+    """
+    template, base = _branch_repo_template
+    with pytest.MonkeyPatch.context() as mp:
+        _enter(template, mp)
+        return _selected_ids(base)
 
 
 EXPECTED_CHANGED = sorted(["mine.py", "src/kiro_crew/x.py", "website/y.ts", "docs/guide.md"])
@@ -776,10 +820,9 @@ def _selected_ids(base: str) -> list[str]:
 
 @pytest.mark.parametrize("key", [*HOSTILE_GIT_CONFIG, "core.excludesFile"])
 def test_one_hostile_config_key_changes_nothing_from_a_subdirectory(
-    branch_repo, tmp_path, monkeypatch, key
+    branch_repo, branch_base, branch_expected_gates, tmp_path, monkeypatch, key
 ) -> None:
-    base = _git(branch_repo, "merge-base", "HEAD", "origin/main")
-    expected_gates = _selected_ids(base)
+    base, expected_gates = branch_base, branch_expected_gates
     _hostile(branch_repo, tmp_path, only=key)
     for where in (branch_repo, branch_repo / "website", branch_repo / "src" / "kiro_crew"):
         monkeypatch.chdir(where)
@@ -790,10 +833,9 @@ def test_one_hostile_config_key_changes_nothing_from_a_subdirectory(
 
 
 def test_every_hostile_key_at_once_changes_nothing_from_a_subdirectory(
-    branch_repo, tmp_path, monkeypatch
+    branch_repo, branch_base, branch_expected_gates, tmp_path, monkeypatch
 ) -> None:
-    base = _git(branch_repo, "merge-base", "HEAD", "origin/main")
-    expected_gates = _selected_ids(base)
+    base, expected_gates = branch_base, branch_expected_gates
     assert {"mypy", "flake8", "isort", "agent-sdk-boundary", "sync-io-in-async"} <= set(
         expected_gates
     )
@@ -838,3 +880,24 @@ def test_a_clean_run_from_a_subdirectory_under_hostile_config_writes_the_proof(
     assert json.loads(_proof(branch_repo).read_text(encoding="utf-8"))["tree"] == _git(
         branch_repo, "rev-parse", "HEAD^{tree}"
     )
+
+
+def test_the_excludes_override_names_no_device_file() -> None:
+    """On Windows (``sys.platform == "win32"``) ``os.devnull`` is ``nul``, a device git
+    refuses as an exclude file, which makes every ``git status`` exit 128 before any gate
+    runs. The override is the empty value git skips on every OS."""
+    neutral = gate._GIT_NEUTRAL
+    values = [neutral[i + 1] for i, arg in enumerate(neutral) if arg == "-c"]
+    assert len(values) * 2 == len(neutral), "every override is one -c pair"
+    assert "core.excludesFile=" in values
+    assert "core.excludesFile=" + os.devnull not in values
+
+
+def test_status_with_the_overrides_exits_zero_and_still_sees_an_untracked_file(
+    repo, tmp_path
+) -> None:
+    ignore_all = tmp_path / "ignore-everything"
+    ignore_all.write_text("*\n", encoding="utf-8")
+    _git(repo, "config", "core.excludesFile", str(ignore_all))
+    (repo / "new.py").write_text("y = 1\n", encoding="utf-8")
+    assert gate._worktree_state()[2] == ["?? new.py"]

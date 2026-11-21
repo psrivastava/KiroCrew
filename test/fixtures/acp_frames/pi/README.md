@@ -14,12 +14,17 @@ the corpus does and does not prove.
 | `zero-tools-refused-live.jsonl` | live | four turns on an agent spec declaring `"tools": []`: a `write`, a `bash` and an `mcp__probe_server__echo` call, each with the `session/request_permission` the gate extension raised and the `tool_call_update` that ended it `failed`, and a `frobnicate` call pi failed itself with no permission frame |
 | `effort-live.jsonl` | live | the initialize and `session/new` responses on pi's own catalog model `claude-opus-4-8` (a `thought_level` select offering `max`), a `thought_level=max` write reading back `max`, a model write to `claude-sonnet-4-5` (select now off through `high`, current `high`), a `max` write there answered with success and read back `high`, and the `current_mode_update` / `config_option_update` after each write |
 | `steering-live.jsonl` | live | the initialize, `session/new` and set-model responses, a `tool_call` for a `bash` sleep, the `session/request_permission` forwarded from Kiro Crew's gate extension, the updates through `completed`, the extension's consumed-steer notification (an `agent_message_chunk` carrying `_meta.piAcp.notify`), the model's answer to the steer, `usage_update`, and the `end_turn` result |
+| `model-error-live.jsonl` | live | the initialize, `session/new` and set-model responses, the gate extension's failed-model-call envelope (an `agent_message_chunk` carrying `_meta.piAcp.notify` level `error`), `usage_update`, the `session_info_update` pair around the turn, and the `end_turn` result |
 | `saved-spec-projection-live.jsonl` | live | the initialize and `session/new` responses of a crew member session on a saved spec the client confirmed, then one turn: a `tool_call` for the spec's own `mcp__probe_server__echo`, the `session/request_permission` forwarded from the gate extension, the update through `completed` carrying the server's answer, and the result |
+| `write-edit-live.jsonl` | live | a slice: the initialize response, then the `tool_call` and updates of a `write` call (`rawInput` `{path, content}`) and an `edit` call (`{path, edits}`), each naming the file relative to the working directory, and the completed updates' diff blocks; the shapes `dashboard/chat_turn/file_change_shapes.py` reads for the file-change chip |
+| `worker-kit-live.jsonl` | live | the initialize and `session/new` responses of a Bot's worker session, then one turn: a `tool_call` for the Bot's own `mcp__pixel_probe__probe_codeword`, the `session/request_permission` forwarded from the gate extension, the update through `completed` carrying the server's answer, the reply, `usage_update` and `session_info_update` frames, and the result |
 
-Every file is captured off `pi-acp` 0.0.34 spawning `pi` 1.3.0, the pair the Real
+Every file is captured off `pi-acp` 0.0.34 spawning `pi` 1.4.0, the pair the Real
 Adapter lane pins in `test/real_adapters/package.json` (installed with `npm ci`
 there), driving a scripted OpenAI-compatible endpoint on the loopback interface
-named in pi's own `models.json`. `test/test_real_adapter_fixture_pins.py` reds when
+named in pi's own `models.json`; `model-error-live.jsonl` instead names pi's built-in
+`amazon-bedrock` provider, whose call fails before any request leaves the host.
+`test/test_real_adapter_fixture_pins.py` reds when
 either pin moves past a header. Agent-to-client lines are verbatim apart from the
 reductions each `_meta.note` names (synthetic session and dialog ids, `<cwd>`, the
 command inventory dropped). The working directory in the frames is a scratch
@@ -30,13 +35,13 @@ Crew's own `PiLaunch` with the gate extension loaded.
 ## What the compaction capture establishes
 
 `compact-live.jsonl` was taken with `scripts/capture_acp_compaction.py` off `pi-acp`
-0.0.34 spawning `pi` 1.3.0, against a scripted OpenAI-compatible endpoint on the
+0.0.34 spawning `pi` 1.4.0, against a scripted OpenAI-compatible endpoint on the
 loopback interface named in pi's own `models.json`. That endpoint reports `prompt_tokens`
 as the character count of the messages pi sent, divided by four, so the `used` series
 measures what pi itself put on the wire. Over four ordinary turns `used` climbed
-13483 -> 25572 -> 37610 -> 49648. The `/compact` turn ended `end_turn` inside the same
+13484 -> 25572 -> 37611 -> 49649. The `/compact` turn ended `end_turn` inside the same
 `session/prompt` request with pi's own `Compaction completed` chunk and nothing after
-it. The next ordinary turn added another ~12k-token prompt and read 13596, below the
+it. The next ordinary turn added another ~12k-token prompt and read 13597, below the
 pre-compact peak. That is the bar `ACP_BACKENDS_COMPACT` holds its members to, and the
 absence of a status frame is what puts pi in `ACP_BACKENDS_INLINE_COMPACTION` too.
 
@@ -45,7 +50,7 @@ absence of a status frame is what puts pi in `ACP_BACKENDS_INLINE_COMPACTION` to
 pi-acp accepts the `session/new` `mcpServers` array and never hands it to pi, so
 `mcp-stdio-mount-live.jsonl` was driven with the array AND the per-session handoff
 file the launch writes (`acp.harness.pi.pi_mcp_handoff_payload`), named in
-`KIROCREW_PI_MCP_HANDOFF`. Taken off `pi-acp` 0.0.34 spawning `pi` 1.3.0 through
+`KIROCREW_PI_MCP_HANDOFF`. Taken off `pi-acp` 0.0.34 spawning `pi` 1.4.0 through
 the gate launcher, against a scripted model on the loopback
 interface that called `mcp__probe_server__echo`. The gate extension registered the
 one stdio server with pi's built-in MCP support; the server's own log recorded
@@ -54,12 +59,12 @@ raised `session/request_permission` through the gate first; and the server's res
 (`ECHO:ping`) reached the turn. On the earlier pi 1.2.0 drive, the same drive with a
 same-named server in pi's own `mcp.json` ended the call `failed` with the gate's
 refusal, and the file-configured server was never asked `tools/call`; an array-only
-drive spawned no server at all. Those two controls were not re-run on 1.3.0.
+drive spawned no server at all. Those two controls were not re-run on 1.3.0 or 1.4.0.
 
 ## What the member panel capture establishes
 
 `member-panel-mount-live.jsonl` is the evidence `ACP_BACKENDS_MEMBER_PANEL` holds pi
-to. Taken off `pi-acp` 0.0.34 spawning `pi` 1.3.0 through the gate launcher, for a
+to. Taken off `pi-acp` 0.0.34 spawning `pi` 1.4.0 through the gate launcher, for a
 crew member session key. The array was not written by hand: `AcpClient`'s own resolver
 composed it for that key on pi (`kirocrew-dashboard`, then `kirocrew-panel`, each with
 the signed per-session token, `KIROCREW_SESSION_KEY` and the bound port of a
@@ -84,7 +89,7 @@ backend.
 
 `zero-tools-refused-live.jsonl` was recorded by the in-product recorder
 (`KIROCREW_ACP_RECORD_FRAMES`) while an `AcpClient(acp_backend="pi")` session ran an
-agent spec declaring `"tools": []`, off `pi-acp` 0.0.34 spawning `pi` 1.3.0 through the
+agent spec declaring `"tools": []`, off `pi-acp` 0.0.34 spawning `pi` 1.4.0 through the
 gate launcher, against a scripted model on the loopback interface named in pi's own
 `models.json`, with one stdio MCP server handed over through the per-session handoff.
 The consumer driving it approved every permission event it was handed, the way a user
@@ -109,7 +114,7 @@ shipped. The refusal is after the spawn and does not read the sandbox.
 `saved-spec-projection-live.jsonl` is the evidence `ACP_BACKENDS_MEMBER_CAPABILITIES`
 holds pi to. It was recorded by the in-product recorder while an
 `AcpClient(acp_backend="pi")` session ran as a crew member on a saved spec, off
-`pi-acp` 0.0.34 spawning `pi` 1.3.0 from a scratch npm prefix, through the gate
+`pi-acp` 0.0.34 spawning `pi` 1.4.0 (installed by `npm ci` in `test/real_adapters`), through the gate
 launcher, against a scripted model on the loopback interface. The saved intent was
 stamped with the digest a save stamps over the spec. After `session/new` the client
 confirmed the spec it consumed, which is the parse `_mirrorless_member_mounts`
@@ -130,6 +135,38 @@ The recording host refuses user namespaces, so as for the zero-tool capture the
 routing's sandbox preflight was replaced with "no mask"; the gatewayd pooling was
 replaced by the spec's own entry, so the call is observable at the server. The seal,
 read-back, envelope nonce, permission path and member confirmation ran as shipped.
+
+## What the worker-kit capture establishes
+
+`worker-kit-live.jsonl` is the evidence `ACP_BACKENDS_MATE_WORKER_KIT` and
+`ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT` hold pi to. Taken off `pi-acp` 0.0.34
+spawning `pi` 1.4.0, both installed by `npm ci` in `test/real_adapters`, through Kiro
+Crew's own `PiLaunch` (the gate extension sealed and read back, the launcher, the
+per-session MCP handoff), against a scripted model named `scripted` on the loopback
+interface in pi's own `models.json`. The session was a Bot's WORKER: its key was
+recorded as Bot `pixel`'s worker, and its spec was `mate_worker.worker_session_spec`, a
+worker base (prompt `You are the worker.`, tools `[read]`, no servers) merged with
+`pixel`'s file (tools `[@pixel-probe]`, one stdio server whose one tool returns a
+codeword, and a prompt telling the worker to call it when asked for the codeword).
+
+The array was not written by hand: `AcpClient(acp_backend="pi")`'s own resolver
+composed `pixel-probe` for the worker's key, and the gate extension's registration
+receipt named it; the same resolve with no key, or for a key not recorded as a
+worker, composed nothing. The prompt was the `[AGENT SYSTEM PROMPT]` block
+`context_assembly.agent_spec._crewmate_worker_prompt` built for that worker, then the
+question. The scripted model calls the Bot's tool only when the Bot's sentence is in
+the request it was sent and the tool is in that request's own tool list; both held.
+The call raised `session/request_permission` through the gate first, the server
+logged `initialize`, `notifications/initialized`, `tools/list` and `tools/call`, and
+the reply was the server's codeword.
+
+This recording host has a working namespace sandbox, so the routing's preflight, the
+read-back's wrap and the Node probe's wrap ran as shipped; the driver spawned the
+adapter from the launch plan's argv, as `test/test_pi_real_adapter.py` does. The
+Bot's file and the worker's execution record were supplied in-process, the seams the
+worker spec reads. The capture proves no single-tool limit: pi has no per-tool deny
+channel, so pi stays out of `ACP_BACKENDS_MATE_WORKER_TOOL_LIMITS` and a worker whose
+Bot switches single tools off is refused before spawn.
 
 ## What the permission capture establishes
 
@@ -155,7 +192,7 @@ way `AcpClient` does — and the `.expected.json` beside the fixture shows the e
 that results, with the real tool name as its title and the arguments as its trusted
 params. Replayed WITHOUT the nonce, the same frame is read as the dialog it is.
 
-Two things it does *not* pin. It was observed on pi-acp 0.0.34 over pi 1.3.0, and
+Two things it does *not* pin. It was observed on pi-acp 0.0.34 over pi 1.4.0, and
 only the Real Adapter lane re-measures per-call forwarding on an adapter upgrade; the
 read-back pins only that the extension loaded. And the ORDER of the permission frame
 against the adapter's own `tool_call` / `tool_call_update` frames is not fixed. This
@@ -173,21 +210,39 @@ code and nothing else -- the output is meant to be read through the ACP
 `terminal/*` methods, which Kiro Crew does not implement. The model saw the output
 (its reply reports it); the transcript's tool pill does not.
 
+## What the model-error capture establishes
+
+`model-error-live.jsonl` was recorded by the in-product recorder while the real
+`kirocrew chat -m` CLI ran one turn on pi's built-in `amazon-bedrock` provider with no
+AWS credential reachable, off `pi-acp` 0.0.34 spawning `pi` 1.4.0 through the gate
+launcher, inside the namespace sandbox backend the recording host provides. pi's
+assistant message ended `stopReason: "error"` with `Could not load credentials from
+any providers`. Before the extension reported it, the same drive carried no chunk at
+all between the turn's two `session_info_update` frames and the prompt answered
+`end_turn`: an empty reply. Now the extension records the failure at `turn_end` and,
+at `agent_settled`, notifies one envelope (the `kiro-crew-model-error` marker, the
+gate nonce in `_meta.gate_envelope_nonce`, provider, model, error), which pi-acp
+forwards before it answers `end_turn`: pi runs its extensions' `agent_settled`
+handlers before it tells its RPC listeners, and pi-acp's `settleTurn` flushes the
+updates it queued before it answers the prompt. `AcpClient` never shows the envelope as text
+and fails the turn with `pi's model call failed (<provider>/<model>): <error>`;
+`test_pi_steer.py` replays the turn through the client's real read loop.
+
 ## What the steering capture establishes
 
 `steering-live.jsonl` is the evidence `ACP_BACKENDS_STEERING_REQUEST` holds pi to.
-Taken off `pi-acp` 0.0.34 spawning `pi` 1.3.0, both installed into a scratch npm
-prefix, through Kiro Crew's own `AcpClient` and `PiLaunch`: the gate extension sealed
+Taken off `pi-acp` 0.0.34 spawning `pi` 1.4.0, both installed by `npm ci` in
+`test/real_adapters`, through Kiro Crew's own `AcpClient` and `PiLaunch`: the gate extension sealed
 and read back, the launcher, and this launch's steer channel
 (`acp.harness.pi_steer`). The recording host has no sandbox backend (no user
-namespaces), so the capture driver ran the session with the sandbox off and the
-floor that refuses an unsandboxed pi neutered, in the driver only. The scripted model
+namespaces), so the client ran with `sandbox_mode` off and the routing's sandbox
+preflight and the pi Node probe's sandbox wrap were stood in for, in the driver only. The scripted model
 on the loopback interface called `bash` with a four-second sleep; one second into it
 the client steered, which writes a sealed file rather than a frame, so the steer
 itself is not on the wire. After the tool result the extension queued the steer with
 `pi.sendMessage(message, {deliverAs: "steer"})` at `turn_end`; when pi started that
 message it notified the consumed envelope (the `kiro-crew-steer` marker, the gate
-nonce in `_meta.gate_envelope_nonce`, sequence 1), which `AcpClient` reports as
+nonce in `_meta.gate_envelope_nonce`), which `AcpClient` reports as
 `EVENT_STEER_CONSUMED` and never shows as text. The model's next request carried the
 steer as its latest user message, its answer named the steered word, and the same
 `session/prompt` ended `end_turn`. The client removed the steer file at that

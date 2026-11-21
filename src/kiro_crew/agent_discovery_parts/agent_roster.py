@@ -34,6 +34,7 @@ from kiro_crew.agent_discovery_parts.spec_reads import (
     _kiro_agents_dir,
     _read_agent_spec,
     _warn_on_systematic_scan_failure,
+    declared_spec_claim,
 )
 from kiro_crew.agent_discovery_parts.spec_snapshot import (
     _LIST_AGENTS_CACHE,
@@ -129,18 +130,18 @@ def agent_welcome_message(
     duplicate name, and last-seen winning among duplicate project specs. Reading
     the winner instead of reproducing the rules is what keeps the two from
     drifting; a second copy of the precedence, however well tested, is a copy
-    that can disagree.
+    that can disagree. The one exception is a user-level row: several files may
+    declare that name, and the session runs the one ``agent.spec_pins`` chose, so
+    the user-level greeting comes from :func:`declared_spec_claim`, the resolver
+    the session starts from.
 
-    Only the winning file is then parsed, through the same hardened reader under
-    this function's own *operation* label, so a denial is attributed to the hint
-    rather than to a listing. That read applies the full guard set again (size
-    cap, sidecars, sensitive symlink targets, non-object JSON), so reopening by
-    name is not an unguarded second read.
+    Only the winning file is parsed, through the same hardened reader under this
+    function's own *operation* label, so a denial is attributed to the hint. That
+    read reapplies the full guard set (size cap, sidecars, sensitive symlink
+    targets, non-object JSON).
 
-    Best-effort and never raises: an unknown agent, an unreadable or oversized
-    spec, or a roster row whose file is gone all yield ``""``. A missing hint and
-    an unreadable one are deliberately the same answer — the field is decoration,
-    and no chat turn should fail over it.
+    Never raises: an unknown agent, an unreadable or oversized spec, or a vanished
+    file all yield ``""``. The field is decoration; no chat turn should fail over it.
     """
     if not agent:
         return ""
@@ -159,10 +160,19 @@ def agent_welcome_message(
         if not project_dir:
             return ""
         directory = project_agents_dir(project_dir)
-    elif agents_dir is not None:
-        directory = agents_dir
     else:
-        directory = _kiro_agents_dir()
+        directory = agents_dir if agents_dir is not None else _kiro_agents_dir()
+        # Several user-level files may declare the name: the session runs the one
+        # ``agent.spec_pins`` chose, so the greeting is read from that file through
+        # the same resolver. A refusal (no pin, broken pin) starts no session.
+        try:
+            claim = declared_spec_claim(
+                directory, agent, operation="agent_welcome_message", source="unknown"
+            )
+        except Exception:  # noqa: BLE001 - decoration must never fail a turn
+            return ""
+        if claim is not None:
+            return spec_welcome_message(claim.spec)
     data = _read_agent_spec(
         directory / winner.filename,
         operation="agent_welcome_message",
@@ -229,7 +239,7 @@ def _with_edition_agents(disk_agents: list[AgentInfo]) -> list[AgentInfo]:
 def _global_agent_info(f: Path, data: dict[str, Any]) -> AgentInfo:
     """Build an :class:`AgentInfo` for a user-level (``~/.kiro/agents``) config."""
     # Coerced BEFORE the package-detection below, which does
-    # ``stem.endswith(agent_name)``: a non-string name raised TypeError there, and
+    # ``stem.endswith(...)``: a non-string name raised TypeError there, and
     # the broad ``except`` around the caller's loop turned that into a silently
     # DROPPED agent rather than a degraded one. Falling back to the filename stem
     # keeps the row selectable under the name its file already implies.
@@ -239,8 +249,11 @@ def _global_agent_info(f: Path, data: dict[str, Any]) -> AgentInfo:
     package = ""
     # Package-installed agents follow the "{package}-{name}.json" filename
     # convention (a generic package-manager convention, not tied to any specific
-    # tool). A plain "{name}.json" is built-in.
-    is_package_filename = agent_name and stem.endswith(agent_name) and stem != agent_name
+    # tool). A plain "{name}.json" is built-in, and so is a stem that merely
+    # ends with the name ("my_atlas", "myreviewer"): only a non-empty package
+    # followed by "-" and the name counts.
+    suffix = f"-{agent_name}"
+    is_package_filename = bool(agent_name) and stem.endswith(suffix) and len(stem) > len(suffix)
     if is_package_filename:
         pkg_stem = f.stem
         if pkg_stem.startswith("local-"):
@@ -301,28 +314,23 @@ def list_agents(
 ) -> list[AgentInfo]:
     """Scan the agent directories for all installed agents.
 
-    Returns a list of ``AgentInfo`` objects. Each agent corresponds to a kiro-cli
-    agent config file that can be selected via ``session/set_mode`` in the ACP
-    protocol.
+    Each ``AgentInfo`` is a kiro-cli agent config selectable via ACP
+    ``session/set_mode``.
 
-    Two scopes are searched when *project_dir* is given: the user-level directory
-    (``~/.kiro/agents``, or *agents_dir*) and the project's own
-    (``<project>/.kiro/agents`` plus ``<project>/.kiro/*.agent-spec.json``). A
-    project agent SHADOWS a user-level agent of the same name and the shadowing is
-    logged, mirroring kiro-cli — which resolves ``--agent`` against its cwd first,
-    and is spawned by Kiro Crew with the session's project dir as that cwd. The
-    losing entry is not returned: it is unreachable for this session, so listing it
-    would offer an agent that cannot run.
+    With *project_dir*, both the user directory (``~/.kiro/agents``, or
+    *agents_dir*) and the project's (``<project>/.kiro/agents`` plus
+    ``<project>/.kiro/*.agent-spec.json``) are searched. A project agent SHADOWS
+    a same-named user agent (logged), mirroring kiro-cli, which resolves
+    ``--agent`` against its cwd first and is spawned with the project dir as cwd.
+    The loser is unreachable, so it is not returned.
 
-    Omitting *project_dir* preserves the user-level-only behavior, which is what
-    callers with no session context (and therefore no project) want. A
-    *project_dir* under a protected tree is refused whole and answered the same
-    way: the value arrives from a caller-supplied session field, so nothing --
-    not the spec scan, not the cache signature's stats -- reads under it.
+    Without *project_dir*, only the user directory is listed. A *project_dir*
+    under a protected tree is refused whole and answered the same way: the value
+    arrives from a caller-supplied session field, so nothing -- not the spec scan,
+    not the cache signature's stats -- reads under it.
 
-    Results are cached per scope pair and reused while both directory signatures
-    are unchanged, so repeated calls avoid re-reading and re-parsing every agent
-    JSON on the event loop.
+    Results are cached per scope pair while both directory signatures hold, so
+    repeated calls skip re-parsing every spec on the event loop.
     """
     d = agents_dir or _kiro_agents_dir()
     # The project scope's sensitivity is decided BEFORE anything reads under it.
@@ -417,18 +425,25 @@ def list_agents(
             seen[a.name] = a
         elif a.package and not existing.package:
             seen[a.name] = a
+        elif not a.package and not existing.package:
+            # Two plain files declaring one name, such as a copy whose name was
+            # never edited: no package explains the second, and it still takes
+            # its own stem, so the drop is said where an operator sees it. The
+            # name and filenames are rendered with ``%r``: a newline in a
+            # declared name is escaped instead of starting a forged log record.
+            logger.warning(
+                "Duplicate agent name %r in %r and %r; keeping %r",
+                a.name,
+                existing.filename,
+                a.filename,
+                existing.filename,
+            )
         elif a.package and existing.package:
             if a.package == existing.package:
-                # Package managers publish a locally-built package as BOTH
-                # "{package}-{name}.json" AND "local-{package}-{name}.json";
-                # stripping the "local-" prefix above makes the twin files
-                # collide on the same (name, package). That is the EXPECTED
-                # on-disk shape for every locally published package — warning
-                # on it produced a self-contradictory "from packages 'X' and
-                # 'X'" line per agent per scan (dozens per startup), drowning
-                # real signals. Keep the first-seen file (unchanged first-wins
-                # policy; sort order decides which twin that is) and note the
-                # twin at debug.
+                # A locally published package ships both "{package}-{name}.json"
+                # and "local-{package}-{name}.json", which collide once "local-"
+                # is stripped. That is expected, so it is not a warning: keep the
+                # first-seen file (sort order picks it) and log the twin at debug.
                 logger.debug(
                     "Agent '%s': keeping '%s' over same-package twin '%s'",
                     a.name,
@@ -437,7 +452,7 @@ def list_agents(
                 )
             else:
                 logger.warning(
-                    "Duplicate agent name '%s' from packages '%s' and '%s'; keeping '%s'",
+                    "Duplicate agent name %r from packages %r and %r; keeping %r",
                     a.name,
                     existing.package,
                     a.package,

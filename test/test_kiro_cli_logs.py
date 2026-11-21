@@ -5,11 +5,11 @@ is attributable to the code rather than to the fixture:
 
 1. SCOPE. The tool reads kiro-cli's mcp/lsp PROTOCOL logs only. The two
    conversation-bearing sources kiro-cli also writes — ``kiro-chat.log`` and the
-   ``sessions/cli/<sid>.jsonl`` transcripts — are single shared host files per
-   gateway, so returning either would disclose another session's private
+   ``sessions/cli/<sid>.jsonl`` transcripts — are not scoped to the calling
+   session, so returning either would disclose another session's private
    conversation to the calling session; the credential-oriented redaction stack
    does not narrow prose. ``test_chat_log_is_not_a_source`` plants a populated
-   chat log and asserts none of it comes back.
+   shared and per-process chat log and asserts none of either comes back.
 2. REDACTION. Every live-secret shape kiro-cli writes into its logs — a bearer
    token, a mid-line ``Authorization: Basic <b64>`` header, an ``mc_token`` auth
    cookie, and the serialized ``"authorization": ...`` JSON form — must be gone
@@ -28,6 +28,7 @@ import pytest
 from conftest import requires_symlinks
 from kiro_crew import diagnostics
 from kiro_crew.mcp_tools import logs as logs_tool
+from kiro_crew.testing.synthetic_credentials import SAMPLE_SLACK_BOT_TOKEN
 
 # All four secret shapes the issue names, in one log body.
 _LOG = (
@@ -80,24 +81,20 @@ def test_reads_and_redacts_every_secret_shape(tmp_path, monkeypatch):
 
 
 def test_redaction_is_load_bearing(tmp_path, monkeypatch):
-    """Mutation guard: disable the extra-redaction stack and the secrets leak.
+    """The core credential plan reads every shape here without the extra stack.
 
-    A redaction test that still passes with redaction disabled proves nothing.
-    Here we empty ``_EXTRA_REDACTIONS`` (the stack that covers the bearer /
-    Authorization / mc_token shapes) and assert the SAME secrets now appear —
-    so the green assertion in ``test_reads_and_redacts_every_secret_shape`` is
-    attributable to that stack, not to the secrets never being there.
+    ``_EXTRA_REDACTIONS`` once was the only cover for the bearer, Basic and
+    cookie headers; the rule table now reads them itself. Empty the extra stack
+    and the SAME secrets must still be gone, so the green assertion in
+    ``test_reads_and_redacts_every_secret_shape`` does not rest on it alone.
     """
     _source(monkeypatch, tmp_path, _LOG)
     monkeypatch.setattr(diagnostics, "_EXTRA_REDACTIONS", ())
 
     out = diagnostics.read_kiro_cli_logs()
 
-    # With the extra stack gone, the header/bearer/cookie shapes leak verbatim
-    # (redact_credentials / redact_exfiltration_urls do not cover them — that is
-    # exactly why _EXTRA_REDACTIONS exists).
     leaked = [s for s in _SECRETS if s in out]
-    assert leaked, "no secret leaked with _EXTRA_REDACTIONS disabled — the test is vacuous"
+    assert not leaked, f"the core plan left these shapes visible: {leaked}"
 
 
 def test_chat_log_is_not_a_source(tmp_path, monkeypatch):
@@ -110,14 +107,21 @@ def test_chat_log_is_not_a_source(tmp_path, monkeypatch):
     not narrow conversation prose, and there is no per-session delimiter to filter
     on — so an agent-callable read of it would hand session A's private
     conversation to session B. The bundle collector still includes it (that path
-    is user-to-user); this tool must not.
+    is user-to-user); this tool must not. The per-process chat logs the bundle
+    finds in agent scratch (``_scratch_kiro_chat_logs``) are no narrower: one
+    kiro-cli process can serve several sessions, so they stay out too.
 
-    The guard is mutation-shaped: the chat log EXISTS and is discoverable here,
-    so an implementation that appended it as a source would fail this test.
+    The guard is mutation-shaped: both chat logs EXIST and are discoverable here,
+    so an implementation that appended either as a source would fail this test.
     """
     chat = tmp_path / "kiro-chat.log"
     chat.write_text("2026-09-06T16:00:00 SESSION-B-PRIVATE-CONVERSATION-PROSE\n")
     monkeypatch.setattr(diagnostics, "_kiro_cli_chat_log", lambda: chat)
+    scratch_chat = tmp_path / "runtime-00000001" / "kiro-log" / "kiro-chat.log"
+    scratch_chat.parent.mkdir(parents=True)
+    scratch_chat.write_text("2026-09-06T16:00:00 SESSION-C-PER-PROCESS-PROSE\n")
+    monkeypatch.setattr(diagnostics.agent_scratch, "scratch_root", lambda: tmp_path)
+    assert diagnostics._scratch_kiro_chat_logs() == [scratch_chat]
     # A protocol log is present too, so the tool has something to return and the
     # assertion below cannot pass merely because the reader found nothing at all.
     _source(monkeypatch, tmp_path, "2026-09-06T16:00:00 mcp handshake ok\n")
@@ -126,7 +130,8 @@ def test_chat_log_is_not_a_source(tmp_path, monkeypatch):
 
     assert "mcp handshake ok" in out, "the protocol log should still be read"
     assert "SESSION-B-PRIVATE-CONVERSATION-PROSE" not in out
-    assert "=== kiro-chat.log" not in out, "the chat log must not appear as a section"
+    assert "SESSION-C-PER-PROCESS-PROSE" not in out
+    assert "=== kiro-chat" not in out, "no chat log may appear as a section"
 
 
 def test_oversized_single_line_returns_only_the_marker(tmp_path, monkeypatch):
@@ -573,7 +578,7 @@ def test_hidden_character_split_credential_does_not_survive_the_transport(tmp_pa
     """A credential split by an invisible must not be rejoined downstream.
 
     ``redact_credentials`` matches the literal shape of a secret, so an invisible
-    planted inside one defeats it: ``AKIA<ZWSP>IOSFODNN7EXAMPLE`` matches no
+    planted inside one defeats it: ``xoxb-1234567<ZWSP>890-...`` matches no
     pattern. The danger is what happens NEXT. Every MCP response leaves through
     ``validation.build_tool_response`` -> ``sanitize_response`` ->
     ``sanitize_string`` -> ``strip_hidden_unicode``, which removes the invisible
@@ -587,8 +592,8 @@ def test_hidden_character_split_credential_does_not_survive_the_transport(tmp_pa
     """
     from kiro_crew import validation
 
-    secret = "AKIAIOSFODNN7EXAMPLE"
-    split = "AKIA\u200bIOSFODNN7EXAMPLE"
+    secret = SAMPLE_SLACK_BOT_TOKEN
+    split = secret[:12] + "\u200b" + secret[12:]
     _source(monkeypatch, tmp_path, f"2026-09-06T16:00:00 request key={split}\n")
 
     out = diagnostics.read_kiro_cli_logs()
@@ -607,12 +612,12 @@ def test_scrub_strips_hidden_characters_before_redacting(tmp_path):
     """
     from kiro_crew import validation
 
-    secret = "AKIAIOSFODNN7EXAMPLE"
+    secret = SAMPLE_SLACK_BOT_TOKEN
 
     intact, n_intact = diagnostics._scrub(f"key={secret}\n")
     assert n_intact >= 1 and secret not in intact, "control: the intact form must be redacted"
 
-    split, n_split = diagnostics._scrub("key=AKIA\u200bIOSFODNN7EXAMPLE\n")
+    split, n_split = diagnostics._scrub("key=" + secret[:12] + "\u200b" + secret[12:] + "\n")
     assert secret not in split, "the split form must not survive _scrub"
     assert secret not in validation.sanitize_response(split), "and must not be rejoinable"
 

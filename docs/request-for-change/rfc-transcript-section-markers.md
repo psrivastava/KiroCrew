@@ -3,8 +3,8 @@ title: Transcript Section Markers — chapter breaks for one-at-a-time work
 status: draft
 author: rnoack
 created: 2026-08-29
-last-audited: 2026-10-06
-audited-at: 9348a25a34
+last-audited: 2026-11-19
+audited-at: fc89562d69
 doc-pr: 7033
 implementation-prs: []
 tracking-issues: []
@@ -70,7 +70,7 @@ is to scroll past everything or open a new session.
 
 `POST /api/chat/slots/{slot}/reset-conversation` (route
 `dashboard/routes/chat.py`, handler `api_chat_slot_reset_conversation` in
-`dashboard/chat_api/slot_lifecycle.py`) gives
+`dashboard/chat_api/slot_repair.py`) gives
 the slot a fresh *model* conversation while keeping the slot open. With
 `{"replay": false}` it also suppresses the `[CONVERSATION HISTORY]` re-injection
 that would otherwise rebuild what was just discarded

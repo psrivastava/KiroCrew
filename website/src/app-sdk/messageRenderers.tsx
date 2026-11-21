@@ -13,7 +13,7 @@
  * (this module already imports several); anything that genuinely needs live app
  * state is supplied BY the host as a registry entry instead.
  */
-import React, { memo } from 'react'
+import React, { lazy, memo, Suspense } from 'react'
 import { Clock, AppWindow, LoaderCircle, CircleSlash, CircleAlert, CircleDot, Lock, PanelRight, Copy, Check, ChevronDown, ChevronUp } from 'lucide-react'
 import { i18nT } from '../i18n/t'
 import { isNoteRow } from '../lib/noteContract'
@@ -23,24 +23,34 @@ import { copyToClipboard } from '../utils/clipboard'
 import { extractToolFilePath } from '../utils/toolFilePath'
 import { deriveToolCallTitle } from '../utils/toolCallTitle'
 import { isSafePath } from '../utils/safePath'
+import { pathBasename } from '../utils/pathBasename'
 import { isHiddenInvisibleAssistantRow } from '../utils/invisibleText'
 import AssistantMessage, { type TurnStats } from '../pages/chat/AssistantMessage'
 import { type FileChangeEntry } from '../components/FileChangeChips'
 import { FileCard } from '../components/FileCard'
 import { parseFileRecord } from '../lib/fileRecord'
 import UserMessage from '../pages/chat/UserMessage'
+import { continuesAuthorRun } from '../api/sharedCrewUi'
 import { renderMcpOAuthMessage } from '../pages/chat/McpOAuthBanner'
 import SubagentCompletionCard from '../pages/chat/SubagentCompletionCard'
 import NudgeCard from '../pages/chat/NudgeCard'
 import ElicitationCard from '../pages/chat/ElicitationCard'
 import NoticeCard from '../pages/chat/NoticeCard'
+import { isProjectHooksNotice } from '../pages/chat/projectHooksNoticeMatch'
+import SpecHooksRunNowhereNotice, { isSpecHooksRunNowhereNotice, specHooksRunNowhereDismissed } from '../pages/chat/SpecHooksNotice'
 import { SystemNoticeRow, isSystemNoticeRow } from '../pages/chat/CompactionCard'
+import { replyShowsFooter } from '../pages/chat/replyFooter'
+import { toolRailColor } from '../utils/toolRailColor'
 import SkillLoadCard, { isSkillLoadRow } from '../pages/chat/SkillLoadCard'
 import { ErrorCard } from '../pages/chat/ErrorCard'
 import { decisionStripFieldOf } from '../pages/chat/decisionRecord'
-import { resolveTransientNotice } from '../pages/chat/transientNotice'
+import { agentNoToolsAgent, resolveGatewayNotice } from '../pages/chat/gatewayNotice'
+import AgentNoToolsNotice from '../pages/chat/AgentNoToolsNotice'
 import StopEventCard from '../pages/chat/StopEventCard'
+import RecoveryCard, { resolveInjectCard } from '../pages/chat/RecoveryCard'
 import { warmBriefBodyOf } from '../components/chat/WarmBriefCard'
+import { grillRowId } from '../components/chat/GrillCard'
+import { grillKeysSentAfter } from './protocol/grillMarker'
 import { ToolDetails } from '../pages/chat/ToolDetails'
 import { isSubagentCompletionMessage } from '../pages/chat/subagentCompletion'
 import { REASONING_ROLES, stripAppEnvelope } from '../pages/chat/groupDisplayItems'
@@ -55,6 +65,11 @@ import { turnHadPolicyBlock } from './turnPolicyBlock'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 import { isRejectedDecision } from '../utils/approvalDecision'
 import { useReportRowActive } from '../pages/chat/rowActivity'
+import { isToolCallRow, stripToolCallLead } from '../lib/toolRowContract'
+
+// Lazy: only a KAS session with a folder agent's hooks ever draws this row, so it
+// stays out of the App chunk (Bundle Size Gate).
+const ProjectHooksNotice = lazy(() => import('../pages/chat/ProjectHooksNotice'))
 
 /** Everything a renderer may read. Passed per row so entries stay pure functions. */
 /** What a host that offers reply threads hands the rows: the footer data per
@@ -75,11 +90,20 @@ export interface MessageRenderContext {
    *  redraws a row when any other row changes EXCEPT a streaming row's text
    *  growing (chat-core/transcript/transcriptVersion). */
   messages: ChatMessage[]
+  /** The session's queued entries, for a host whose `messages` leaves them
+   *  out (a split pane draws them in its queue stack). A reply's discussion
+   *  card reads them: a queued Start already answered it. */
+  queued?: readonly ChatMessage[]
   /** Whether the session is currently producing output. */
   running: boolean
   /** Stable React key the list computed for this row. */
   key: string
   onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void
+  /** Open a directory a reply names in the host's side panel. Absent = a
+   *  folder chip falls back to the OS file manager, which a remote or
+   *  headless host can only answer by copying the path. Capability by
+   *  omission, like `onFileOpen`. */
+  onFolderOpen?: (path: string) => void
   /** Open an artifact (`/artifacts/<slug>` link in a reply) in the host's side
    *  panel, the way the main chat does. Absent = the link stays a plain
    *  `target="_blank"` anchor to the standalone artifact view, which a
@@ -215,8 +239,8 @@ export const ToolCallPill = memo(function ToolCallPill({ message, running, onFil
   const [copyOutcome, setCopyOutcome] = React.useState<CopyOutcome>('idle')
   const copyResetTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null)
   React.useEffect(() => () => { if (copyResetTimer.current) clearTimeout(copyResetTimer.current) }, [])
-  // A finished call is NOT re-roled: the backend writes the result onto the 🔧
-  // row's own `meta.output` (chat_runner's EVENT_TOOL_RESULT handler; '' for a
+  // A finished call is NOT re-roled: the backend writes the result onto the Tool:
+  // row's own `meta.output` (`_on_tool_result` in dashboard/chat_turn/tool_results.py; '' for a
   // terminal frame with no renderable output), so the role alone left every
   // completed call in a polled transcript on the loader. Same rule as the
   // store-connected ToolCallLine: a result arrived, or the session is idle and
@@ -231,7 +255,7 @@ export const ToolCallPill = memo(function ToolCallPill({ message, running, onFil
   // raw command, matching the main chat. The raw label is the fallback, and is
   // not hard-truncated — CSS truncation keeps one line without destroying the
   // text for the expanded panel or the file probe.
-  const rawLabel = (message.content || '').replace(/^🔧\s*/, '').split('\n')[0]
+  const rawLabel = stripToolCallLead(message.content).split('\n')[0]
   const purpose = typeof message.meta?.purpose === 'string' ? message.meta.purpose : ''
   // Without a purpose, the title the main chat shows by default (simplified
   // tool names): the transport title `Running: <cmd>` is a LIVE verb, so on a
@@ -253,11 +277,11 @@ export const ToolCallPill = memo(function ToolCallPill({ message, running, onFil
   // Status icon + colour mirror the store-connected tool row so an embedded
   // transcript reads with the same visual grammar as a main session: spinner
   // while running, green dot when done, amber alert for auto-denied (a policy or
-  // hook block, detected by the HOST from the hidden 🚫 sibling message and
-  // passed in, since this pill only ever renders the visible 🔧 message), red
+  // hook block, detected by the HOST from the hidden Refused: sibling message and
+  // passed in, since this pill only ever renders the visible Tool: message), red
   // slash when user-rejected, amber lock when awaiting approval.
   const isAutoDenied = !isRejected && !!autoDenied
-  // Auto-denied is TERMINAL even though the 🔧 message never becomes a
+  // Auto-denied is TERMINAL even though the Tool: message never becomes a
   // tool_result (isDone) — the gate blocked the call, nothing further runs —
   // so it must escape both the loader icon and the spin animation.
   const Icon = isRejected ? CircleSlash : isAutoDenied ? CircleAlert : isDone ? CircleDot : hasPendingPerm ? Lock : LoaderCircle
@@ -286,9 +310,10 @@ export const ToolCallPill = memo(function ToolCallPill({ message, running, onFil
   // gets copied is exactly what the panel shows, not the portion the 160px box
   // happens to have scrolled into view.
   // The backend persists the call's `input` and its `output` on the tool row's
-  // meta (`_tool_meta` / the tool-result handler in chat_runner.py), and the
+  // meta (`_tool_meta` in chat_turn/tool_rows.py / `_on_tool_result` in
+  // chat_turn/tool_results.py), and the
   // embed's transcript response carries them. `message.content` is only the
-  // "🔧 title" line, so when either payload is present the expanded row renders
+  // "Tool: title" line, so when either payload is present the expanded row renders
   // the main chat's own `ToolDetails` (Input/Output tabs) instead of repeating
   // the title. The content panel below stays as the fallback for rows that
   // predate the persisted payloads.
@@ -304,9 +329,10 @@ export const ToolCallPill = memo(function ToolCallPill({ message, running, onFil
       ? rawLabel + '\n\n' + (message.content || '')
       : (message.content || '')
   const detailsId = React.useId()
-  // Rail colour mirrors the pill's status tone, at the main chat's 70% mix.
+  // Rail colour mirrors the pill's status tone, through the mapping the main
+  // chat's tool row uses too.
   const detailsRail = {
-    color: `color-mix(in srgb, ${isRejected ? 'var(--danger)' : isAutoDenied ? 'var(--warn)' : isDone ? 'var(--ok)' : hasPendingPerm ? 'var(--warn)' : 'var(--accent)'} 70%, transparent)`,
+    color: toolRailColor({ isRejected: !!isRejected, isAutoDenied, isDone: !!isDone, hasPendingPerm: !!hasPendingPerm }),
   }
   // The two budgets above are width-blind, so the collapsed box is also measured
   // once it is on screen: a real browser then detects the wrap case exactly,
@@ -386,7 +412,7 @@ export const ToolCallPill = memo(function ToolCallPill({ message, running, onFil
           aria-label={i18nT('appSdk.chatMessageList.open_path', { path: filePath })}
           className="inline-flex items-center gap-1 text-[12px] leading-5 font-mono px-1.5 py-0.5 rounded-md border border-border text-muted cursor-pointer hover:text-text hover:border-border-strong transition-all"
         >
-          {filePath.split('/').pop()}
+          {pathBasename(filePath)}
           <PanelRight size={11} />
         </button>
       )}
@@ -506,6 +532,11 @@ export interface AssistantBubbleOptions {
    *  system policy notice rather than the user's (`turnHadPolicyBlock`). The
    *  raw marker is stripped from the prose either way. */
   suppressSteerAck?: boolean
+  /** Never draw the "N files changed" chips, whatever `meta.file_changes`
+   *  holds. A host whose replies are not file work the reader reviews (a
+   *  crewmate's chat: its notes, scripts and page writes) sets it. Off
+   *  (default) the chips draw as on every other surface. */
+  hideFileChanges?: boolean
   /** Session routing for the reply's markdown: open a session chip, plus the
    *  roster and the active key the chip resolver needs. All three or none — the
    *  renderer gates on (`onSessionOpen` AND `sessions`), so a half-wired host
@@ -525,15 +556,33 @@ export interface AssistantBubbleOptions {
   /** The bubble's own Regenerate action (its hover row), for the host that
    *  can regenerate this reply. Absent: no Regenerate. */
   onRegenerate?: () => void
+  /** The LOCAL slot these rows belong to. Set, the reply draws its lock tags
+   *  from `meta.redactions` and their card offers the owner's reveal of the
+   *  removed value, and its Blocked link card can allow the host for this
+   *  slot. A host drawing another gateway's rows leaves it unset; its links
+   *  still draw as Blocked link chips from `meta.link_blocks`, with no Allow. */
+  redactionSlot?: string
+  /** The reply menu's Read aloud, for a host that can read this reply aloud
+   *  (a crewmate's chat). Absent: no Read aloud item. */
+  onSpeak?: (content: string) => void
+  /** Show the reply's action row without hover, for a host whose playback the
+   *  browser blocked (the recovery notice points at More → Read aloud). */
+  revealActions?: boolean
+  /** Copy a mouse selection in the reply as the drag ends (Settings -> Chat ->
+   *  Copy on Select). Absent: off. */
+  copyOnSelect?: boolean
+  /** Draw link previews under the reply's links (Settings -> Chat -> Link
+   *  Previews). Absent: off. */
+  linkPreviews?: boolean
 }
 
 /**
  * The assistant reply as the SDK draws it, minus the row layout: the footer
- * rule (a finished reply shows its footer once the turn is over — another user
- * or assistant row follows, or nothing follows and the session is idle) and
- * every prop the bubble takes off the message. Exported so a host that places
- * the reply differently (a crewmate's chat draws it as a bordered bubble in a
- * run) renders the SAME bubble rather than a second copy of this logic.
+ * rule (`replyShowsFooter`: a finished reply shows its footer once its turn is
+ * over) and every prop the bubble takes off the message. Exported so a host
+ * that places the reply differently (a crewmate's chat draws it as a bordered
+ * bubble in a run) renders the SAME bubble rather than a second copy of this
+ * logic.
  * Returns null for a say-nothing row (bare U+200B): invisible-only content
  * would draw as an empty bubble.
  */
@@ -565,25 +614,10 @@ export function renderAssistantBubble(
   // Same skip as ChatPage's inline chain — see utils/invisibleText.
   if (isHiddenInvisibleAssistantRow(m)) return null
   const isStreaming = m.role === 'streaming'
-  // The footer belongs to a FINISHED reply. It shows once the turn is over,
-  // which is either because another user or assistant row follows, or
-  // because nothing follows and the session has gone idle.
-  let showFooter = false
-  if (!isStreaming) {
-    let nextRelevant = false
-    for (let j = ctx.index + 1; j < ctx.messages.length; j++) {
-      if (ctx.messages[j].role === 'user') { showFooter = true; nextRelevant = true; break }
-      // A hidden invisible-only row draws nothing, so it cannot host the
-      // footer; pass over it to the row that renders.
-      if (isHiddenInvisibleAssistantRow(ctx.messages[j])) continue
-      // A system-notice row (compaction / session reload) draws a system
-      // card, not a reply, so it cannot end the turn either.
-      if (isSystemNoticeRow(ctx.messages[j])) continue
-      if (ctx.messages[j].role === 'assistant' || ctx.messages[j].role === 'streaming') { nextRelevant = true; break }
-    }
-    if (!nextRelevant) showFooter = !ctx.running
-    if (opts.forceFooter) showFooter = true
-  }
+  // The footer belongs to a FINISHED reply, by the rule every surface shares
+  // (`replyShowsFooter`); a host that groups rows into runs claims it at the
+  // run's end (`forceFooter`).
+  const showFooter = !isStreaming && (opts.forceFooter === true || replyShowsFooter(m, ctx.messages, ctx.index, ctx.running))
   const bubble = (
     <AssistantMessage
       content={m.content}
@@ -593,6 +627,7 @@ export function renderAssistantBubble(
       showFooter={showFooter}
       slotRunning={ctx.running}
       onFileOpen={ctx.onFileOpen}
+      onFolderOpen={ctx.onFolderOpen}
       onArtifactOpen={ctx.onArtifactOpen}
       onQuote={ctx.onQuote}
       onAsk={ctx.onAsk}
@@ -607,9 +642,19 @@ export function renderAssistantBubble(
       variantIdx={m.variant_idx}
       turnStats={(m.meta as Record<string, unknown> | undefined)?.turn_stats as TurnStats | undefined}
       decisionsStrip={decisionStripFieldOf(m)}
-      fileChanges={(m.meta as Record<string, unknown> | undefined)?.file_changes as FileChangeEntry[] | undefined}
-      fileChangesOmittedFiles={(m.meta as Record<string, unknown> | undefined)?.file_changes_omitted_files}
+      fileChanges={opts.hideFileChanges ? undefined : (m.meta as Record<string, unknown> | undefined)?.file_changes as FileChangeEntry[] | undefined}
+      fileChangesOmittedFiles={opts.hideFileChanges ? undefined : (m.meta as Record<string, unknown> | undefined)?.file_changes_omitted_files}
       onRegenerate={opts.onRegenerate}
+      onSpeak={opts.onSpeak}
+      revealActions={opts.revealActions}
+      copyOnSelect={opts.copyOnSelect}
+      linkPreviews={opts.linkPreviews}
+      redactions={opts.redactionSlot ? (m.meta as Record<string, unknown> | undefined)?.redactions : undefined}
+      // The Blocked link chip and its card on every host: whether a link
+      // renders live is the server's decision about the text, whoever draws
+      // it. Only the card's Allow needs a local slot (`redactionSlot`).
+      blockedLinks={(m.meta as Record<string, unknown> | undefined)?.link_blocks}
+      redactionSlot={opts.redactionSlot}
       suppressSteerAck={opts.suppressSteerAck || turnHadPolicyBlock(ctx.messages, ctx.index)}
       bubbleClassName={bubbleClassName}
       onReplyInThread={isStreaming ? undefined : replyInThreadFor(m, ctx)}
@@ -617,6 +662,9 @@ export function renderAssistantBubble(
       // A structured warm brief draws as a fixed card in place of the markdown,
       // inside this same bubble, so it keeps the timestamp and row actions.
       body={warmBriefBodyOf(m)}
+      grillRowId={grillRowId(m)}
+      grillMid={threadMidOf(m)}
+      grillSent={grillKeysSentAfter(ctx.messages, ctx.index, ctx.queued)}
     />
   )
   // The column's child is the bubble itself unless this message has a thread
@@ -636,7 +684,7 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
     roles: ['system'],
     match: isSkillLoadRow,
     render: (m, ctx) => ctx.row(
-      <SkillLoadCard message={m} disclosureKey={ctx.key} />,
+      <SkillLoadCard message={m} disclosureKey={ctx.key} onArtifactOpen={ctx.onArtifactOpen} />,
     ),
   },
   {
@@ -662,6 +710,8 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
         key={ctx.key}
         message={m}
         onFileOpen={ctx.onFileOpen}
+        onFolderOpen={ctx.onFolderOpen}
+        onArtifactOpen={ctx.onArtifactOpen}
         disclosureKey={ctx.key}
       />,
       true,
@@ -686,7 +736,8 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
           meta={m.meta}
           timestamp={formatTs(m.ts)}
           timestampTitle={fmtMessageTimeFull(m.ts)}
-          renderContent={(c, mt) => renderUserContent({ content: c, meta: mt, onFileOpen: ctx.onFileOpen })}
+          renderContent={(c, mt) => renderUserContent({ content: c, meta: mt, onFileOpen: ctx.onFileOpen, onFolderOpen: ctx.onFolderOpen, onArtifactOpen: ctx.onArtifactOpen })}
+          continuesRun={continuesAuthorRun(ctx.messages, ctx.index)}
           onReplyInThread={replyInThreadFor(m, ctx)}
           onQuoteMessage={quoteMessageFor(m, ctx, 'user')}
         />
@@ -722,9 +773,9 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
   {
     id: 'tool',
     roles: ['tool'],
-    // A tool role also carries the hidden 🚫 deny sibling, which is read for the
+    // A tool role also carries the hidden Refused: deny sibling, which is read for the
     // auto-denied flag and never drawn.
-    match: m => !!m.content?.startsWith('🔧'),
+    match: m => isToolCallRow(m.content),
     render: (m, ctx) => {
       const tcid = m.meta?.tool_call_id as string | undefined
       return toolRow(m, ctx, !!tcid && ctx.autoDeniedIds.has(tcid))
@@ -734,6 +785,26 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
     id: 'tool_lifecycle',
     roles: ['tool_call', 'tool_result'],
     render: (m, ctx) => toolRow(m, ctx),
+  },
+  {
+    // Shape-matched (`'*'` plus a role check) so a host's role-keyed `inject`
+    // row, such as ChatPage's bubble, cannot outrank the card.
+    id: 'recovery_inject',
+    roles: ['*'],
+    match: m => m.role === 'inject' && resolveInjectCard(m) !== null,
+    render: (m, ctx) => {
+      const parsed = resolveInjectCard(m)
+      if (!parsed) return null
+      return ctx.row(<RecoveryCard parsed={parsed} disclosureKey={ctx.key} />)
+    },
+  },
+  {
+    // Model-only: the refusal's own `notice` row already shows the person.
+    // Shape-matched for the same reason as `recovery_inject`.
+    id: 'automation_notice_inject',
+    roles: ['*'],
+    match: m => m.role === 'inject' && (m.meta as { injectKind?: unknown } | undefined)?.injectKind === 'automation_notice',
+    render: () => null,
   },
   {
     id: 'inject',
@@ -754,7 +825,7 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
           {cronLabel && <span className="text-muted text-[11px] leading-4 font-medium px-1 mb-1"><Clock size={11} className="inline mr-0.5" />{cronLabel}</span>}
           {!cronLabel && appLabel && <span className="text-muted text-[11px] leading-4 font-medium px-1 mb-1 cursor-help" title={i18nT('components.mcpApp.from_app_tooltip')}><AppWindow size={11} className="inline mr-0.5" />{i18nT('components.mcpApp.from_app', { app: appLabel.split('/')[0] })}</span>}
           <div className="mc-message-font-scope msg-content px-4 py-3 leading-relaxed rounded-lg bg-warn-subtle text-text ring-1 ring-inset forced-colors:border ring-warn/30 rounded-bl-[4px] overflow-hidden min-w-0" style={{ overflowWrap: 'anywhere', wordBreak: 'break-word', fontSize: 'var(--mc-message-font-size, 14px)' }}>
-            <MessageErrorBoundary rawContent={cleanContent}><MarkdownRenderer content={cleanContent} softBreaks /></MessageErrorBoundary>
+            <MessageErrorBoundary rawContent={cleanContent}><MarkdownRenderer content={cleanContent} onArtifactOpen={ctx.onArtifactOpen} softBreaks /></MessageErrorBoundary>
           </div>
         </>,
       )
@@ -766,10 +837,10 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
     // The shared ErrorCard, deliberately without `onContinue`: omitting the
     // handler selects its settled (non-continuable) shape, and the app-sdk
     // surface has no turn to resume, so it must never grow the affordance.
-    // Same transient-notice split as transcriptRenderers: a pending gateway
+    // Same gateway-notice split as transcriptRenderers: a pending gateway
     // retry is a soft localized NoticeCard, not a red error.
     render: (m, ctx) => {
-      const transient = resolveTransientNotice(m, ctx.messages, ctx.index)
+      const transient = resolveGatewayNotice(m, ctx.messages, ctx.index)
       if (transient?.card === 'notice') {
         return ctx.row(<NoticeCard content={transient.text} tone={transient.tone} />)
       }
@@ -783,9 +854,51 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
     render: () => null,
   },
   {
+    // The notice that a backend runs none of the agent spec's hooks, with its
+    // Dismiss link. Shape-matched, so a host claiming the notice role does not
+    // take the link away; once dismissed, the row draws nothing anywhere.
+    id: 'spec_hooks_run_nowhere',
+    roles: ['*'],
+    match: isSpecHooksRunNowhereNotice,
+    render: (m, ctx) => specHooksRunNowhereDismissed()
+      ? null
+      : ctx.row(<SpecHooksRunNowhereNotice content={m.content} askAgent={ctx.handOff !== false} />),
+  },
+  {
+    // A KAS session's notice about a folder agent's own hooks, with its Turn on
+    // or Turn off link. Shape-matched, like the row above.
+    id: 'project_hooks',
+    roles: ['*'],
+    match: isProjectHooksNotice,
+    render: (m, ctx) => ctx.row(
+      <Suspense fallback={null}>
+        <ProjectHooksNotice message={m} askAgent={ctx.handOff !== false} />
+      </Suspense>,
+    ),
+  },
+  {
+    // A new chat's notice that its agent lists no tools, with a link to that
+    // agent's page under Customize. Matched on its token, like the rows above.
+    id: 'agent_no_tools',
+    roles: ['*'],
+    match: m => agentNoToolsAgent(m) !== null,
+    render: (m, ctx) => {
+      const notice = resolveGatewayNotice(m, ctx.messages, ctx.index)
+      return ctx.row(
+        <AgentNoToolsNotice content={notice?.text ?? m.content} agent={agentNoToolsAgent(m) ?? ''} />,
+      )
+    },
+  },
+  {
     id: 'notice',
     roles: ['notice'],
-    render: (m, ctx) => ctx.row(<NoticeCard content={m.content} />),
+    // A gateway notice row (empty response, model fallback) draws localized
+    // copy keyed on its token; any other notice keeps its own text.
+    render: (m, ctx) => {
+      const notice = resolveGatewayNotice(m, ctx.messages, ctx.index)
+      if (notice?.card === 'notice') return ctx.row(<NoticeCard content={notice.text} tone={notice.tone} />)
+      return ctx.row(<NoticeCard content={m.content} />)
+    },
   },
   {
     // Grouped and lifecycle-only roles have no row of their own: a thinking or

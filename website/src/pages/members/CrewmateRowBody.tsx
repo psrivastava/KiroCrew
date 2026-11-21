@@ -8,16 +8,18 @@
  * Everything here reads ONE `MemberSignals` record (`signalsOf`, in
  * useMembersPageRoster.ts), the same reading the status filters count, so a
  * marker can never disagree with the filter that lists it. The host owns the
- * row's chrome -- the button, its active state, the roster's star and team
- * indent, the switcher's check mark -- and hands this component the row's
+ * row's chrome -- the button, its active state, the star (`CrewmateStarButton`,
+ * a sibling of the button) and the roster's team indent -- and hands this component the row's
  * identity, its signals and the automation record for the avatar ring.
  *
  * Markers, left to right:
  *  - the face: `CrewMonitoredAvatar` (working face, on-watch ring) with the
  *    `ok` presence dot on its corner while the member works -- an idle member
  *    shows nothing rather than a grey dot, which read as disabled;
- *  - the name line: the display name, and at its right end the goal mark (a
- *    named `Goal` glyph) while the member holds a goal;
+ *  - the name line: the display name, then on a team Crew the initials of the
+ *    people who have written in its DM thread (`TeamParticipantChips`),
+ *    and at its right end the goal mark (a named `Goal` glyph) while the
+ *    member holds a goal;
  *  - the status line under the name: a `Stopped` chip when the thread's newest
  *    event is a Stop press, then the last-message preview, which is what
  *    truncates. On watch (an active monitor loop or the heartbeat) is the ring
@@ -33,6 +35,7 @@ import { crewDisplayName } from '../../components/AgentSelector'
 import CrewMonitoredAvatar from '../../components/crew/CrewMonitoredAvatar'
 import { ROW_STATUS_CLS, ROW_TITLE_CLS } from '../../components/listShell'
 import { cn } from '../../lib/utils'
+import { TeamParticipantChips } from '../chat/shared-crew/ParticipantChips'
 import type { AutomationRecord } from '../../monitoring/automation'
 import type { MemberSignals } from './rosterFilter'
 
@@ -109,6 +112,7 @@ export default function CrewmateRowBody({
             the mark does not. */}
         <span className="flex items-center gap-1.5 min-w-0">
           <span className={`block ${ROW_TITLE_CLS} font-semibold text-text truncate min-w-0`}>{crewDisplayName(m)}</span>
+          <TeamParticipantChips participants={m.participants} dropped={m.participants_dropped} testId={`${testIdPrefix}-participants`} />
           {signals.goal && (
             <span
               className="ml-auto shrink-0 inline-flex text-muted"

@@ -120,12 +120,12 @@ def admission_source() -> CapabilityContribution:
 def admission_usage() -> Mapping[str, Mapping[str, int]]:
     """``principal id -> {"active", "queued"}`` from the fair scheduler.
 
-    Raises when admission is off, so the People page reports usage as
-    unavailable rather than as zero.
+    Raises ``people.UsageOff`` when admission is off, so the People page reports
+    usage as not counted rather than as zero or as a failure.
     """
     service = admission_gate.installed_service()
     if service is None or not service.enabled:
-        raise LookupError("fair admission is off")
+        raise people.UsageOff("fair admission is off")
     snap = service.scheduler.snapshot()
     principals = snap.get("principals")
     out: dict[str, dict[str, int]] = {}
@@ -195,6 +195,10 @@ def install(state: Any = None) -> None:
                 capabilities.register_capability_source(name, fields, source)
         people.register_usage_source(admission_usage)
         if state is not None:
+            from kiro_crew.shared_crew import owner
+
+            owner.set_owner_subject(str(getattr(state, "owner_id", "") or ""))
+            owner.warm_machine_name()
             work_store.set_change_listener(work_broadcaster(state))
             trigger.set_scheduled_namer(cron_job_namer(state))
             from kiro_crew.shared_crew import host_hooks

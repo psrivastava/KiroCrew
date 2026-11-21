@@ -460,17 +460,34 @@ async def test_dashboard_enrolled_member_controls_through_real_manager(
             ]
             assert refusals and all(r.levelname == "WARNING" for r in refusals)
             assert not [r for r in caplog.records if "Dashboard chat error" in r.getMessage()]
-            # The row names the setting that decides, and the saved spec.
+            # A chat that is not a Bot's DM runs on Settings -> Agent Harness, so
+            # the row names that, and the saved spec, never the member setting.
             row = next(m for m in slot.messages if m.get("role") == "error")
-            assert "agent.member_acp_backend" in row["content"]
+            assert "in Settings → Agent Harness pick a harness that can (" in row["content"]
+            assert "agent.member_acp_backend" not in row["content"]
             assert "saved capabilities" in row["content"]
-            # The remedy names every backend that can load the spec, not a fixed
-            # pair; kiro-cli is left out, since a member set to kiro runs on KAS.
-            for backend in ACP_BACKENDS_MEMBER_CAPABILITIES - {ACP_BACKEND_KIRO}:
-                assert backend in row["content"]
-            assert " kiro" not in row["content"]
+            # The remedy names every selectable backend that can load the spec.
+            from kiro_crew.acp_backends import backend_to_stored, selectable_backends
+            from kiro_crew.crewmate_harness import harness_label
+
+            for backend in ACP_BACKENDS_MEMBER_CAPABILITIES & selectable_backends():
+                assert harness_label(backend_to_stored(backend)) in row["content"]
     finally:
         await _close_capability_dashboards(world)
+
+
+@pytest.mark.asyncio
+async def test_an_enrolled_member_given_no_cwd_starts_in_its_workspace_default(world):
+    """What a member chat whose project was cleared passes, so the clear lands where a fresh chat does."""
+    service, cfg, factory, made, project, stores, log = world
+    await asyncio.to_thread(save, service, enroll=True)
+    manager = SessionManager(cfg, provider_factory=factory)
+    try:
+        await manager.get_or_create("dashboard:A", agent="A", cwd=None)
+        assert made[-1]._cwd == config_loader.default_project_dir(cfg.agents["A"].workspace)
+        assert Path(made[-1]._cwd).resolve() == project.resolve()
+    finally:
+        await manager.close_all(drain_timeout=0)
 
 
 @pytest.mark.asyncio
@@ -1390,14 +1407,16 @@ def test_the_kiro_construction_path_carries_no_member_confirmation():
     assert "await asyncio.to_thread(require_unchanged_derived_spec, sent_snapshot)" in init
 
     # The confirmation sits on ONE arm of the provider's existing backend split: the
-    # legacy AcpClient path. The Kiro/KAS arm above it reaches none of it.
+    # legacy AcpClient path. The Kiro/KAS arm above it reaches none of it. The split
+    # may widen the runtime arm with an ``or`` (a harness shared only for chats).
+    def _runtime_split(test: ast.expr) -> bool:
+        if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.Or):
+            test = test.values[0]
+        return isinstance(test, ast.Attribute) and test.attr == "is_acp_runtime_backend"
+
     tree = ast.parse(textwrap.dedent(inspect.getsource(AcpProvider.start)))
     split = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.If)
-        and isinstance(node.test, ast.Attribute)
-        and node.test.attr == "is_acp_runtime_backend"
+        node for node in ast.walk(tree) if isinstance(node, ast.If) and _runtime_split(node.test)
     ]
     assert len(split) == 1, "the provider's backend split is the arm this rides"
     client_arm = split[0].orelse
@@ -1479,6 +1498,7 @@ async def test_the_member_confirmation_covers_only_a_live_member_session(
     client._confirm_member_projection = MagicMock()
     await client.confirm_member_projection()
     assert client._confirm_member_projection.called is confirms
+    assert client._confirmed_capability_session == (session_id if confirms else "")
 
 
 @pytest.mark.asyncio
@@ -1499,21 +1519,22 @@ async def test_the_provider_confirms_from_its_client_arm_only(
     never reaches the call at all."""
     from kiro_crew.providers.acp import AcpProvider
 
-    provider = AcpProvider(work_dir=tmp_path, agent="saved-member", acp_backend=backend)
+    provider = AcpProvider(
+        work_dir=tmp_path, agent="saved-member", acp_backend=backend, member_context=True
+    )
     provider.memory_mode = "persistent"
     monkeypatch.setattr(provider, "_apply_effort_overlay", lambda: None)
     monkeypatch.setattr(provider, "_apply_tool_search_overlay", lambda: None)
     monkeypatch.setattr(provider, "_start_kiro_runtime", AsyncMock())
     monkeypatch.setattr(provider, "_apply_initial_effort", AsyncMock())
     provider._client.ensure_ready = AsyncMock()
-    provider._client.confirm_member_projection = AsyncMock()
+    provider._client._session_id = "live-session"
+    provider._client._confirm_member_projection = lambda _spec: None
 
     await provider.start()
 
-    if client_arm:
-        provider._client.confirm_member_projection.assert_awaited_once_with()
-    else:
-        provider._client.confirm_member_projection.assert_not_awaited()
+    # The real confirmation stamps the session it judged; the runtime arm never stamps.
+    assert provider._client._confirmed_capability_session == ("live-session" if client_arm else "")
 
 
 @pytest.mark.asyncio
@@ -1532,10 +1553,12 @@ async def test_a_confirmed_session_is_not_judged_again(tmp_path):
     await client.confirm_member_projection()
 
     assert client._confirm_member_projection.call_count == 1
+    assert client._confirmed_capability_session == "claude-live"
     # A new session is judged afresh.
     client._session_id = "claude-next"
     await client.confirm_member_projection()
     assert client._confirm_member_projection.call_count == 2
+    assert client._confirmed_capability_session == "claude-next"
 
 
 @pytest.mark.asyncio
@@ -1545,25 +1568,24 @@ async def test_a_confirmed_session_is_not_judged_again(tmp_path):
 async def test_member_confirmation_uses_adapter_routing_seam(
     monkeypatch, backend, mirror_used, member_context
 ):
-    from kiro_crew import acp_tool_gate
+    from kiro_crew import acp_tool_gate, agent_capabilities_consumed
     from kiro_crew.acp.session_handle import AcpSessionHandle
 
     runtime = _codex_runtime()
     runtime._acp_backend = backend
     runtime._member_context = member_context
-    runtime._confirm_member_projection = AsyncMock()
     handle = _codex_handle(None)
     handle._runtime = runtime
     handle.mirror_used = mirror_used
     handle.set_config_option = AsyncMock()
     monkeypatch.setattr(acp_tool_gate, "session_config_issue", lambda *_: None)
+    monkeypatch.setattr(agent_capabilities_consumed, "confirm_consumed_projection", lambda *_: ())
 
     await AcpSessionHandle.apply_session_permission_routing(handle)
 
-    if backend == ACP_BACKEND_CODEX and mirror_used and member_context:
-        runtime._confirm_member_projection.assert_awaited_once_with(handle)
-    else:
-        runtime._confirm_member_projection.assert_not_awaited()
+    # The real runtime confirmation records the saved template on the handle.
+    confirmed = backend == ACP_BACKEND_CODEX and mirror_used and member_context
+    assert handle.confirmed_projection_template == ("saved-member" if confirmed else "")
 
 
 def test_member_confirmation_gate_follows_the_mirrored_array():

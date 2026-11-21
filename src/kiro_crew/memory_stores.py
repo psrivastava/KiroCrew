@@ -32,6 +32,7 @@ from functools import wraps
 from pathlib import Path
 
 from kiro_crew import crew_teams
+from kiro_crew.constants import WINDOWS_DEVICE_STEMS
 
 logger = logging.getLogger(__name__)
 
@@ -738,7 +739,7 @@ def require_member_memory_store(config, member: str, *, require_directory: bool 
         return DEFAULT_MEMORY_STORE
     agent = config.agents.get(member)
     if agent is None:
-        raise UnknownMemoryStore(f"Unknown Crew Member {member!r}; Global was not used")
+        raise UnknownMemoryStore(f"Unknown Bot {member!r}; Global was not used")
     store = require_memory_store(
         agent.memory_store, config=config, require_directory=require_directory
     )
@@ -768,8 +769,9 @@ def unusable_legacy_binding(config, member: str) -> str | None:
     binding and stays refused by the callers: ownership cannot be verified for a
     store that has no path, and a refusal is the only answer that adopts nothing.
 
-    Pure -- no filesystem call and no config load -- so the dashboard handler and
-    the CLI can both ask with the config they already hold.
+    Pure -- no filesystem call and no config load. Neither update surface moves
+    such a binding: the dashboard PUT and ``kirocrew agent update`` refuse every
+    changed ``memory_store``.
     """
     agent = config.agents.get(member)
     if agent is None:
@@ -964,7 +966,9 @@ def _allocate_member_id(config, member: str, *, refuse_damaged: bool = True) -> 
     members retain their stores and DM bindings, so those identities reserve the
     slug too. A live legacy agent with no ``member_id`` reserves its name-derived
     slug until it is provisioned. Captured work and an existing legacy member must
-    never resolve to a newly created member that happens to share the name.
+    never resolve to a newly created member that happens to share the name. A create
+    also never takes a ``constants.WINDOWS_DEVICE_STEMS`` stem, which is no directory
+    on Windows; the upgrade keeps one, since its live member's records are already keyed by it.
 
     ``refuse_damaged`` decides what a non-string identity elsewhere in the config
     means. Creating a member refuses outright, because a config that cannot be
@@ -1018,6 +1022,8 @@ def _allocate_member_id(config, member: str, *, refuse_damaged: bool = True) -> 
     if refuse_damaged and any(not isinstance(identity, str) for identity in identities):
         raise UnknownMemoryStore("Configured member identity must be a string; allocation refused")
     existing = {identity for identity in identities if isinstance(identity, str)}
+    if refuse_damaged:
+        existing |= WINDOWS_DEVICE_STEMS
     member_id = base
     while member_id in existing or dm_slug_is_reserved(member_id):
         member_id = f"{base[:48]}-{uuid.uuid4().hex[:12]}"
@@ -1038,7 +1044,7 @@ LEGACY_OWNER_MEMBER_META_KEY = "owner_member"
 #: What an operator does about a V2 store the upgrade refuses to touch. One
 #: string so the boot log and ``kirocrew doctor`` say the same thing.
 LEGACY_MEMBER_STORE_REMEDY = (
-    "edit config.json so exactly one Crew Member has memory_store set to this store "
+    "edit config.json so exactly one Bot has memory_store set to this store "
     "and an empty member_id, and make the store's owner_member name that member"
 )
 
@@ -1056,9 +1062,14 @@ def _legacy_member_manifest_owner(directory: Path) -> tuple[bool, str]:
         return False, ""
     except OSError as exc:
         raise UnknownMemoryStore(f"{LEGACY_MEMBER_MANIFEST} is unreadable: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        # A ValueError, not an OSError: without this arm it escapes the
+        # per-store refusal and ends the upgrade scan for every other store.
+        raise UnknownMemoryStore(f"{LEGACY_MEMBER_MANIFEST} is not UTF-8") from exc
     try:
         value = json.loads(raw)
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
+        # RecursionError: nesting past the interpreter's limit, a hand-edited file.
         raise UnknownMemoryStore(f"{LEGACY_MEMBER_MANIFEST} is not valid JSON") from exc
     owner = value.get("owner_member") if isinstance(value, dict) else None
     if not isinstance(owner, str) or not owner:
@@ -1233,14 +1244,14 @@ def _legacy_member_store_candidates(config) -> dict[str, tuple[str, str, str]]:
                 raise UnknownMemoryStore("the default store cannot be a member store")
             if len(bound) != 1:
                 raise UnknownMemoryStore(
-                    "no Crew Member is bound to it"
+                    "no Bot is bound to it"
                     if not bound
-                    else f"{len(bound)} Crew Members are bound to it: {', '.join(sorted(bound))}"
+                    else f"{len(bound)} Bots are bound to it: {', '.join(sorted(bound))}"
                 )
             alias = bound[0]
             agent = config.agents[alias]
             if not isinstance(agent.member_id, str):
-                raise UnknownMemoryStore("its Crew Member's member_id is not a string")
+                raise UnknownMemoryStore("its Bot's member_id is not a string")
             directory = _named_store_dir(name)
             # Every owner label the old build left behind must name the member
             # bound today. Accepting a manifest that merely agrees with the
@@ -1268,7 +1279,7 @@ def _legacy_member_store_candidates(config) -> dict[str, tuple[str, str, str]]:
             resuming = bool(member_id) and agent.member_id == member_id
             if agent.member_id and not resuming:
                 raise UnknownMemoryStore(
-                    f"its Crew Member {alias!r} already carries member_id {agent.member_id!r}"
+                    f"its Bot {alias!r} already carries member_id {agent.member_id!r}"
                 )
             if member_id:
                 claimed = any(
@@ -1751,7 +1762,7 @@ class MemberFieldConflict(Exception):
     """A stored field is not the value the writer expected to find (compare-and-set)."""
 
     def __init__(self, field: str) -> None:
-        super().__init__(f"the crewmate's {field} changed since it was read")
+        super().__init__(f"the Bot's {field} changed since it was read")
         self.field = field
 
 
@@ -1836,7 +1847,7 @@ def persist_member_config(
         config.agents[member].workspace != new_workspace or new_workspace not in config.workspaces
     ):
         raise UnknownMemoryStore(
-            f"workspace {new_workspace!r} is not the binding of Crew Member {member!r}"
+            f"workspace {new_workspace!r} is not the binding of Bot {member!r}"
         )
     workspace_entry = config.workspaces[new_workspace] if new_workspace else None
 
@@ -1849,20 +1860,16 @@ def persist_member_config(
             agents[DEFAULT_MEMORY_STORE] = asdict(config.agents[DEFAULT_MEMORY_STORE])
         current = agents.get(member)
         if create and member in agents:
-            raise MemberAlreadyExists(
-                f"Crew Member {member!r} was created concurrently; reload the roster"
-            )
+            raise MemberAlreadyExists(f"Bot {member!r} was created concurrently; reload the roster")
         if not create and current is None:
-            raise UnknownMemoryStore(
-                f"Crew Member {member!r} was removed concurrently; reload the roster"
-            )
+            raise UnknownMemoryStore(f"Bot {member!r} was removed concurrently; reload the roster")
         if not create and current is not None:
             if (
                 not isinstance(current, dict)
                 or current.get("memory_store", DEFAULT_MEMORY_STORE) != expected_store
             ):
                 raise UnknownMemoryStore(
-                    f"Crew Member {member!r} memory changed concurrently; reload the roster"
+                    f"Bot {member!r} memory changed concurrently; reload the roster"
                 )
         if expected_approval_mode is not None and not create:
             # Compare-and-set against the record on disk, inside the
@@ -1901,6 +1908,25 @@ def persist_member_config(
                         f"memory store {store!r} is already bound to another member"
                     )
             existing = stores.get(store)
+            if create and existing is not None:
+                # An adopt takes the id its kept store records. A crewmate with no
+                # member id derives its slug from its name; one written by another
+                # process since the snapshot would share that id, which the
+                # snapshot's checks could not see.
+                from kiro_crew.members import MemberSlugError, slug_for_name
+
+                for name, entry in agents.items():
+                    if name == member or not isinstance(entry, dict) or entry.get("member_id"):
+                        continue
+                    try:
+                        legacy_slug = slug_for_name(name)
+                    except MemberSlugError:
+                        continue
+                    if legacy_slug == config.agents[member].member_id:
+                        raise UnknownMemoryStore(
+                            f"Bot {name!r} was added concurrently with the same identity; "
+                            "reload the roster"
+                        )
             if existing is not None and (
                 not isinstance(existing, dict)
                 or existing.get("owner_member_id") != config.agents[member].member_id

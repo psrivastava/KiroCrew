@@ -12,6 +12,7 @@ import contextlib
 import errno
 import json
 import re
+import signal
 import threading
 import time
 from pathlib import Path
@@ -236,6 +237,7 @@ class TestCronServiceCancel:
         assert (
             audit["outcome"] == "failed"
         ), "the SEL audit says the run was cancelled while its process group is still alive"
+        assert "kill_process_group: refusing" in audit["metadata"]["kill_failed"]
 
     @pytest.mark.asyncio
     async def test_cancel_kills_the_process_a_hung_reset_had_already_unmapped(
@@ -337,11 +339,8 @@ class TestCronServiceCancel:
     ) -> None:
         """The run's own finally reset popped the session BEFORE cancel looked; the kill still lands.
 
-        Same lookup as ``_force_reap``: the live map misses, the session manager
-        still holds the popped session for the life of its (hung) teardown, and
-        the handle read from there names the process. Without it cancel's own
-        reset answered False for the gone key, nothing was verified, and the run
-        was recorded ``cancelled`` with its process untouched.
+        Same lookup as ``_force_reap``: the live map misses, and the handle comes from
+        the popped session the manager holds during its hung teardown.
         """
         svc = CronService(base_dir=None, on_job=AsyncMock())
         svc._history = CronHistoryStore(base_dir=tmp_path)
@@ -399,12 +398,9 @@ class TestCronServiceCancel:
     ) -> None:
         """Same fence as ``_force_reap``: up before the first read, lifted only after the record and the audit, a start past its spawn door named.
 
-        A cold start caught inside ``provider.start()`` when cancel runs has
-        published nothing a pass could see; the fence invalidates it (refused at
-        registration, its provider hard-killed there) and cancel reports it
-        instead of recording ``cancelled`` over it. And the fence outlives the
-        passes: a caller held at the door wakes to a key whose run is RECORDED,
-        never to one that is neither being ended nor recorded.
+        A cold start inside ``provider.start()`` is invisible to the passes; the fence
+        refuses it at registration and cancel names it. A caller held at the door wakes
+        only once the run is recorded.
         """
         from collections.abc import Iterator
         from contextlib import contextmanager
@@ -840,11 +836,9 @@ class TestSubprocessRegistry:
     def test_run_command_sandboxed_can_be_cancelled_mid_run(self, tmp_path, monkeypatch) -> None:
         """Real end-to-end: a sleeping command is SIGTERMed mid-run.
 
-        Sandbox wrapping is patched to identity: builder-fleet hosts don't
-        reliably support the namespace/cgroup sandbox (the wrapped child can
-        fail instantly or spawn slowly, racing the registry check — this
-        flaked the Dry Run Build on Py3.10). The registry/kill mechanics are
-        what's under test here; the real sandboxed path is covered by pod e2e.
+        Sandbox wrapping is patched to identity: on hosts without reliable namespace or
+        cgroup support the wrapped child races the registry check. Pod e2e covers the
+        real sandboxed path.
         """
         # ``run_command_sandboxed`` has no cwd parameter -- the command runs
         # where the gateway runs -- so the child inherits this process's CWD.
@@ -878,28 +872,24 @@ class TestSubprocessRegistry:
         ):
             t = threading.Thread(target=_run)
             t.start()
-            # Wait for the subprocess to register.
+            # Wait for the subprocess to register, or for the run to end without
+            # one: a spawn that failed fast must fail here, not after the wait's bound.
             wait_until(
-                lambda: "cancelme" in _RUNNING_PROCS,
+                lambda: "cancelme" in _RUNNING_PROCS or not t.is_alive(),
                 describe=lambda: f"running={list(_RUNNING_PROCS)}",
             )
-            assert "cancelme" in _RUNNING_PROCS
-            started = time.time()
+            assert "cancelme" in _RUNNING_PROCS, f"the command never registered: {result}"
             assert kill_running_process("cancelme") is True
-            # Poll for thread death (same pattern as the registration wait
-            # above) instead of one fixed-budget join: an instantaneous
-            # is_alive() read behind a single join can report a still-dying
-            # thread on a loaded runner even when SIGTERM worked. The 20s
-            # deadline stays comfortably below the child's 30s sleep, so
-            # passing still proves death-by-cancellation, not natural expiry.
-            deadline = started + 20
-            while time.time() < deadline and t.is_alive():
-                t.join(timeout=0.1)
-        assert not t.is_alive(), "thread still alive 20s after SIGTERM"
-        # 25, not 20: the final join may return ~0.1s past the poll deadline
-        # with the thread already dead; the headroom keeps that success from
-        # failing here while staying well below the 30s natural expiry.
-        assert time.time() - started < 25  # died well before the 30s sleep
+            # Lost-run bound only: what proves the cancellation is the exit code below.
+            wait_until(
+                lambda: not t.is_alive(),
+                describe=lambda: "the cancelled command's thread is still running",
+            )
+        # The child died of the SIGTERM the cancel sent: a natural expiry of the
+        # 30 s sleep exits 0, and a SIGTERM that did not land is escalated to SIGKILL.
+        assert (
+            result["exit_code"] == -signal.SIGTERM
+        ), f"cancelled command exited {result['exit_code']}, not by the cancel's SIGTERM"
         assert result["status"] == "cancelled"
         assert "cancelme" not in _RUNNING_PROCS
         assert "cancelme" not in _CANCELLED_PROC_JOBS  # flag consumed
@@ -1139,14 +1129,17 @@ _CANCEL_REPORTS: dict[str | None, tuple[str, str | None, tuple[str, bool, bool] 
     # A pause saved before the cancel is in the frozen record and on disk: the saved
     # store shows the job paused, so the busy store is not a pause left unsaved.
     "paused_before_cancel_then_busy": _paused(_BUSY, "at"),
-    "pause_unsaved_then_busy": (_held(_BUSY)[0], _HELD_MESSAGE, ("at", False, True)),
+    # The pause whose save failed is rolled back with a reload, which re-applies
+    # the cancel's held settlement, so the job stays held for a later write.
+    "pause_unsaved_then_busy": _held_for_retry(_BUSY),
     "newer_run_here_then_busy": _on_schedule(_BUSY),
     # The settlement is held before the merge, so the tick in the gap keeps the
     # job off the schedule through its reload and its save lands the park.
     "reloaded_then_busy": _paused(_BUSY, "at"),
     # A failed park answers success only when the saved store shows the job cannot
-    # run again: a pause or a removal this process could not save is not proof.
-    "pause_unsaved_then_write_error": (_held(_ENOSPC)[0], _HELD_MESSAGE, ("at", False, True)),
+    # run again: a pause this process could not save is rolled back, so the job is
+    # held by the cancel's own settlement until a later write saves it.
+    "pause_unsaved_then_write_error": _held_for_retry(_ENOSPC),
     "paused_here_then_write_error": _paused(_ENOSPC, "at"),
     "removed_unsaved_then_busy": (_held(_BUSY)[0], _HELD_MESSAGE, None),
     "paused_here_then_unreadable": (_UNREAD_NOTE, _HELD_MESSAGE, ("at", False, True)),

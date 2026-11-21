@@ -334,11 +334,12 @@ class TestAdmissionAndSkills:
     def test_native_mapped_skills_receive_only_scoped_discovery(self, rig, monkeypatch):
         builder, _, skills, _, _ = rig
         mapped = seed_skill(skills._dir, "mapped")
-        seed_skill(skills._dir, "outside")
+        # Named so no fixed prompt text contains it: "outside" is in a critical rule.
+        seed_skill(skills._dir, "unscoped-zebra")
         monkeypatch.setattr(ctx, "agent_skill_globs", lambda agent, **kwargs: [str(mapped)])
         text = builder.build_session_context(agent="kirocrew", provider_type="acp")
         assert "skill_search" in text and "mapped" in text
-        assert "outside" not in text
+        assert "unscoped-zebra" not in text
         assert "Synthetic procedure" not in text
 
     def test_lazy_setting_does_not_expand_admission(self, rig):
@@ -588,7 +589,7 @@ class TestBackgroundBudget:
         # this test. With a rule set far larger than the startup allowance, the
         # rendered ``[Learned corrections]`` block must be bound at
         # ``caps.lessons_startup`` (~37,000): greater than the ordinary
-        # ``caps.lessons`` (~7,458, the pre-fix regression this PR undoes) and no
+        # ``caps.lessons`` (~7,458, the cap that must not apply here) and no
         # larger than ``caps.lessons_startup`` plus header/footer framing (so not
         # the ceiling). At the 200K window used here the ceiling is 100,000, well
         # above 37,000, so only the startup allowance can bind.

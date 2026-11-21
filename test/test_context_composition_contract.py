@@ -104,12 +104,12 @@ _STABLE_TEXT = {
 
 _STABLE_TEXT_SHA256 = {
     "context_scope_all_withheld": "98ed04f8fca6f805d76f7fd3f518c63f221d5af6da6636fd30b28dc217207a0a",
-    "critical_rules": "16827ce030089653769a3f16a6fb96e6c9fcda799ef4750630080011b5ac1647",
-    "critical_rules_channel": "7b7ea4db70ccbc233959938b561281591e3b3c26544b383046942ce229eacf7e",
-    "critical_rules_subagent": "9eaa81827b3b0cb392286aa21837b6c17014e0abce484d2013150535102104c9",
+    "critical_rules": "7589a55a642c92f893a87f499fa91d7d6fcae3d424283dfbbe11979c8bcb2e2e",
+    "critical_rules_channel": "a55668069ebcf5a45055d59028c2b57f39e86546b2639fe88385f765e7ef6257",
+    "critical_rules_subagent": "89db6c776715d0b6358e140b8b13afba64bfe287e6e862e57b978baa09844d1b",
     "docs_section": "971b6008afbd9ff048c498c06cffecc6dafc7a58b0df75ff9db0b15cf9e26c09",
-    "member_how_you_work": "fa3af62a3def3ac93a7041874f9679b8e3b0afb2d1a8d0fd62427a17975e68d4",
-    "member_how_you_work_unavailable": "7694aedaa66ea0a9e59a3a29cfa7bd1cb74357aaa673f8186e466b506adfab24",
+    "member_how_you_work": "427b44b5d3ac54397f08af76f0d8bcfe88e7ce0c79da95509d0d2eada745478b",
+    "member_how_you_work_unavailable": "8c15a19edb76ec927f189ac37771d2d3a5007a03028f5d2c21ec4184f2797ea3",
     "reply_answer_only": "f0bd694165ff81cdbe123048042070588b846bd43a224b31adc79d9f8768bfce",
     "reply_concise": "5d3e25d89e682469332237e46373f0e9aac8516eefd63047134d1ec0575aac2a",
     "response_preferences_frame": "08ee149ae459c828213d47643f1cdbd6661d8a77a2223b8be5d0aa6fbb6cdc18",
@@ -152,6 +152,9 @@ def _mask_stable_text(text: str) -> str:
 
 
 def _turn(rig: _Rig, text: str, is_new: bool, **kwargs) -> str:
+    # The matrix pins the bytes of a turn a person sent. An automation turn's
+    # guidance is covered in test_followup_guidance_origin_gate.py.
+    kwargs.setdefault("directive_user_origin", True)
     message, _hook = rig.builder.build_message(text, is_new, **kwargs)
     return message
 
@@ -519,7 +522,7 @@ _SCENARIOS = {
 #: recorded before the assembly moved into owners.
 _GOLDEN: dict[str, tuple[str, list[tuple[str, int]]]] = {
     "background_overflow": (
-        "0ee1905bca3a3c831714e7ea6ff1b63c37f739d96b2d1c3846286110510837ef",
+        "991d511142f47fc4baaf03e87ab5d7dadbcfcb51d3108a9a4b1a51e3898707a5",
         [
             ("unclassified", 64),
             ("agent_identity", 25),
@@ -528,7 +531,7 @@ _GOLDEN: dict[str, tuple[str, list[tuple[str, int]]]] = {
             ("docs_pointer", 235),
             ("memory", 31813),
             ("memory_tools", 425),
-            ("lessons", 179),
+            ("lessons", 177),
         ],
     ),
     "cancelled_turn_preamble": (
@@ -538,9 +541,9 @@ _GOLDEN: dict[str, tuple[str, list[tuple[str, int]]]] = {
         ],
     ),
     "compressed_history_replay": (
-        "52ced419172acdf39e95df4137373db1a00ec3e6e0d52a05d91172444ee64b98",
+        "c3046bd62c6541906c1b2ef53b8d14b2e8409d071c9a9ae2a8d62d07375eb7f2",
         [
-            ("agent_instructions", 1479),
+            ("agent_instructions", 1675),
             ("session_wrapper", 288),
             ("agent_identity", 25),
             ("surface", 197),
@@ -548,50 +551,50 @@ _GOLDEN: dict[str, tuple[str, list[tuple[str, int]]]] = {
             ("docs_pointer", 235),
             ("memory_tools", 425),
             ("unclassified", 26),
-            ("conversation_replay", 170),
-            ("reply_format_rules", 1347),
+            ("conversation_replay", 415),
+            ("reply_format_rules", 1282),
             ("request_header", 53),
         ],
     ),
     "dynamic_cards": (
-        "4cfa0e05e27a1356f29e7c2828069d72d0ddaee232c63304fa29cb7beee9b2fb",
+        "15ab144ee4d73133319e24a223afe7c0010d757f4c1ed210b0ab2f1557da1dfd",
         [
-            ("reply_format_rules", 1604),
+            ("reply_format_rules", 1539),
             ("request_header", 51),
         ],
     ),
     "folder_breadcrumb_injection": (
-        "c77b058158d0efa58737a5b3e12e81cdebd5ee4a5591f1d221a984e40f786d4c",
+        "4137ea5d3f8a447a2fef170522b22ce6b8725fcc320bc3a2ef538e2ded867728",
         [
-            ("reply_format_rules", 1347),
+            ("reply_format_rules", 1282),
             ("request_header", 44),
         ],
     ),
     "follow_up_from_telegram": (
-        "72914af14df3e819a04fc7a0c583e448f667e82d135d8368563ed16474241a27",
+        "2e3ec94b8f18028e46355f46ceee423632ca557e59027f97ad4338d04c410b0a",
         [
             ("surface", 356),
-            ("reply_format_rules", 1347),
+            ("reply_format_rules", 1282),
             ("request_header", 50),
         ],
     ),
     "follow_up_reinjection": (
-        "9d6892ea04a2776f416e8d4659d2b464d06809487f328eedcd501dd0c3320901",
+        "68cf43320da49ab32b5df8116a792b14d6ba8e490439c3a849eee9369c94b3af",
         [
-            ("agent_instructions", 1479),
+            ("agent_instructions", 1675),
             ("memory", 183),
             ("memory_tools", 84),
             ("recovery", 167),
             ("skill_index", 439),
             ("unclassified", 36),
-            ("lessons", 181),
+            ("lessons", 179),
             ("response_preferences", 402),
-            ("reply_format_rules", 1347),
+            ("reply_format_rules", 1282),
             ("request_header", 46),
         ],
     ),
     "fresh_channel_noninteractive": (
-        "ef87f9d8c7ed1fdea98b99a827e5e02f2994f8fcba92b7ab2a3a9fe10e5d3d6e",
+        "21109e887cdcd6f8a1d01901ffb7d621a7b1a1f252dd64c7adc6c0244d0ef6fb",
         [
             ("agent_instructions", 145),
             ("session_wrapper", 296),
@@ -601,13 +604,13 @@ _GOLDEN: dict[str, tuple[str, list[tuple[str, int]]]] = {
             ("docs_pointer", 235),
             ("memory", 864),
             ("memory_tools", 425),
-            ("lessons", 180),
+            ("lessons", 178),
             ("unclassified", 26),
             ("request_header", 49),
         ],
     ),
     "fresh_custom_agent": (
-        "171cc02465cbe9fdf48c6302d458e8089426359eef2b0cb9bb77771dc4319172",
+        "aa014b08e62d2dda135d67e7496c3407ee4d8bd043ac281e16ffa034630b8c55",
         [
             ("agent_instructions", 74),
             ("session_wrapper", 288),
@@ -615,9 +618,9 @@ _GOLDEN: dict[str, tuple[str, list[tuple[str, int]]]] = {
             ("surface", 197),
             ("memory", 864),
             ("memory_tools", 425),
-            ("lessons", 180),
+            ("lessons", 178),
             ("unclassified", 26),
-            ("reply_format_rules", 1347),
+            ("reply_format_rules", 1282),
             ("request_header", 50),
         ],
     ),
@@ -636,9 +639,9 @@ _GOLDEN: dict[str, tuple[str, list[tuple[str, int]]]] = {
         ],
     ),
     "fresh_dashboard": (
-        "b2097c54e3c19b2c35f83afe4578a236eaa380dc373313db699bff7667750807",
+        "ba8d01b7fb4d0d3e9d9f1f6898430ae437f03fbeb5a9e37f880c7f2b9e067571",
         [
-            ("agent_instructions", 1479),
+            ("agent_instructions", 1675),
             ("session_wrapper", 288),
             ("agent_identity", 25),
             ("surface", 197),
@@ -646,16 +649,16 @@ _GOLDEN: dict[str, tuple[str, list[tuple[str, int]]]] = {
             ("docs_pointer", 235),
             ("memory", 864),
             ("memory_tools", 425),
-            ("lessons", 180),
+            ("lessons", 178),
             ("unclassified", 26),
-            ("reply_format_rules", 1347),
+            ("reply_format_rules", 1282),
             ("request_header", 58),
         ],
     ),
     "fresh_dashboard_from_discord": (
-        "c7c456fb50d09c9af712dbef693e250ef93d3eae9e7b88a6b928638410f682c0",
+        "897487d1f1b2172b936a870fd09c15574108063e3bd323c1a1095c238b6d601c",
         [
-            ("agent_instructions", 1479),
+            ("agent_instructions", 1675),
             ("session_wrapper", 296),
             ("agent_identity", 25),
             ("surface", 175),
@@ -663,7 +666,7 @@ _GOLDEN: dict[str, tuple[str, list[tuple[str, int]]]] = {
             ("docs_pointer", 235),
             ("memory_tools", 425),
             ("unclassified", 26),
-            ("reply_format_rules", 1347),
+            ("reply_format_rules", 1282),
             ("request_header", 44),
         ],
     ),
@@ -679,17 +682,17 @@ _GOLDEN: dict[str, tuple[str, list[tuple[str, int]]]] = {
         ],
     ),
     "hook_inject_context": (
-        "0c9c8c56ff2dff139ab90a11187470611183364f4ec8e5236c3b02c7e1706a6b",
+        "f7782f843fbd92ac0fe69840559d56da1ff2a8693a9055855179486104235fd1",
         [
             ("hook_context", 65),
-            ("reply_format_rules", 1347),
+            ("reply_format_rules", 1282),
             ("request_header", 49),
         ],
     ),
     "hook_modify_with_quick_prompt": (
-        "42b38cb94a9e98b301e36fd1236be380a6fd7befb3bc9e7a175b3fce66627ec1",
+        "90c97bf46fe15833506f6e1904ede1d4d78db192c759aa6eaf88d208e5c772bb",
         [
-            ("reply_format_rules", 1347),
+            ("reply_format_rules", 1282),
             ("request_header", 83),
         ],
     ),
@@ -700,19 +703,19 @@ _GOLDEN: dict[str, tuple[str, list[tuple[str, int]]]] = {
         ],
     ),
     "per_turn_rails": (
-        "fb04860277fbfe363d19f97b8f69ffcdecb97f157dd200f5d7360dca2701b253",
+        "fd7c13c9302ec85ffaf7a7860c8dde859e14f8ddfbb1f9405d4b792aff27a908",
         [
             ("working_folder", 308),
             ("folder_path", 311),
             ("theme_persona", 162),
-            ("reply_format_rules", 1347),
+            ("reply_format_rules", 1282),
             ("request_header", 50),
         ],
     ),
     "profile_language_preferences": (
-        "5523005de0c44a3dd08872cfff06692a84c3ecc9275c0ee6186c0006244b9a41",
+        "0e21ab9af19005b631e03685690af485061632b1de692a7bf09a791190330b8f",
         [
-            ("agent_instructions", 1479),
+            ("agent_instructions", 1675),
             ("session_wrapper", 288),
             ("agent_identity", 25),
             ("surface", 698),
@@ -721,33 +724,35 @@ _GOLDEN: dict[str, tuple[str, list[tuple[str, int]]]] = {
             ("memory_tools", 425),
             ("unclassified", 26),
             ("response_preferences", 406),
-            ("reply_format_rules", 1347),
+            ("reply_format_rules", 1282),
             ("request_header", 47),
         ],
     ),
     "resumed": (
-        "717f7958bafc0fed04fc72a2f398c037418309d20e31260a130eebe687135629",
+        "dc5948d4637d5b9d8139c2347928058b4ed7b144ac43d0aa731a85e582666935",
         [
-            ("recovery", 303),
+            ("recovery", 442),
             ("agent_identity", 25),
             ("surface", 30),
-            ("reply_format_rules", 1347),
+            ("lessons", 179),
+            ("unclassified", 18),
+            ("reply_format_rules", 1282),
             ("request_header", 50),
         ],
     ),
     "session_context_member_mode": (
-        "758327f19b09f64d46dd8e137d69303353c0cb0645fb7b81f578f65b2200d16b",
+        "248922f057696c224054b43166e066739ca28b0bf6c38fbcd904fa230d140720",
         [
             ("unclassified", 64),
             ("agent_identity", 25),
-            ("surface", 1360),
+            ("surface", 1819),
             ("workspace_identity", 371),
             ("docs_pointer", 235),
             ("memory_tools", 425),
         ],
     ),
     "session_context_small_window": (
-        "8c31431aac6e64cfce18de592e62e3f9e25de84ed6893bf1380fd433e804eaf5",
+        "6c62e5fc6af6abfd6d0cd088a5a92aa0914278dbeacdde657e65a9fa1c16faf0",
         [
             ("unclassified", 64),
             ("agent_identity", 25),
@@ -756,7 +761,7 @@ _GOLDEN: dict[str, tuple[str, list[tuple[str, int]]]] = {
             ("docs_pointer", 235),
             ("memory", 869),
             ("memory_tools", 425),
-            ("lessons", 179),
+            ("lessons", 177),
         ],
     ),
     "session_replay_live_window": (
@@ -778,9 +783,9 @@ _GOLDEN: dict[str, tuple[str, list[tuple[str, int]]]] = {
         ],
     ),
     "skills_discovery": (
-        "49adefe0518a63058e79669270f83428ab9223b46e113e16023ee62726e31e69",
+        "91e9e15ae45569dcb0d1cf2c20ffde7542187007066ca474cb622e698a256179",
         [
-            ("agent_instructions", 1479),
+            ("agent_instructions", 1675),
             ("session_wrapper", 288),
             ("agent_identity", 25),
             ("surface", 197),
@@ -789,7 +794,7 @@ _GOLDEN: dict[str, tuple[str, list[tuple[str, int]]]] = {
             ("memory_tools", 425),
             ("skill_index", 416),
             ("unclassified", 26),
-            ("reply_format_rules", 1347),
+            ("reply_format_rules", 1282),
             ("request_header", 50),
         ],
     ),
@@ -833,16 +838,16 @@ _GOLDEN: dict[str, tuple[str, list[tuple[str, int]]]] = {
         ],
     ),
     "temporary_session": (
-        "13d7a7013b1c28a6898a4b13098b94f2b3b354a906b9a348cbd8905ef4b1a8a1",
+        "02dd836401893c1f0d4251994d4bd1067f0006fb5fb1154ce6877b60275013b1",
         [
-            ("agent_instructions", 1479),
+            ("agent_instructions", 1675),
             ("session_wrapper", 288),
             ("agent_identity", 25),
             ("surface", 197),
             ("workspace_identity", 371),
             ("docs_pointer", 235),
             ("unclassified", 26),
-            ("reply_format_rules", 1347),
+            ("reply_format_rules", 1282),
             ("request_header", 49),
         ],
     ),
@@ -871,22 +876,22 @@ _GOLDEN: dict[str, tuple[str, list[tuple[str, int]]]] = {
         ],
     ),
     "triggered_skills": (
-        "941c751292f9b5e75a7a34fbef21ab3082d4c4a1cd2317dc493a3e55e59a069d",
+        "c9a3511716a06c370d44ec828494fd769b78d730363b45fec52c66ca02270805",
         [
             ("loaded_skill", 62),
-            ("reply_format_rules", 1347),
+            ("reply_format_rules", 1282),
             ("request_header", 58),
         ],
     ),
     "user_range_with_prefix": (
-        "0904815c9ea1f87a6a68bae3708f3991780191b8e872232538547fc87dc51bc3",
+        "67d972be0955650c43f68d0b9ff95a30887ebcf8d1bc54459dc828ba2e3e351b",
         [
-            ("reply_format_rules", 1347),
+            ("reply_format_rules", 1282),
             ("request_header", 124),
         ],
     ),
     "widget_density_less": (
-        "9a80fa651ad6740b13b0b0556ca3b2be4772a717370622db68cd9e92c509dc59",
+        "0139b20fd801807a285e13a55b26d326f7ee7fc745b48b4ed447cb838e03ea7a",
         [
             ("agent_instructions", 792),
             ("session_wrapper", 288),
@@ -896,7 +901,7 @@ _GOLDEN: dict[str, tuple[str, list[tuple[str, int]]]] = {
             ("docs_pointer", 235),
             ("memory_tools", 425),
             ("unclassified", 26),
-            ("reply_format_rules", 1347),
+            ("reply_format_rules", 1282),
             ("request_header", 44),
         ],
     ),
@@ -913,6 +918,15 @@ def test_assembled_prompt_is_byte_identical(rig: _Rig, scenario: str) -> None:
     rendered = _mask_stable_text(rig.normalize(_SCENARIOS[scenario](rig)))
     observed = (_sha(rendered), _outline(rendered))
     assert observed == _GOLDEN.get(scenario), f"{scenario}: {observed!r}"
+
+
+def test_the_replay_header_names_what_a_text_replay_does_not_carry(rig: _Rig) -> None:
+    """A replay is rebuilt from chat text alone, so its header tells the model
+    that tool calls, their results and unwritten work did not come with it."""
+    message = _compressed_history_replay(rig)
+    header = next(line for line in message.splitlines() if line.startswith("[CONVERSATION HISTORY"))
+    assert "not your earlier tool calls or their results" in header
+    assert "nothing you worked out without writing it in a reply" in header
 
 
 # ── Budget boundaries ─────────────────────────────────────────────────────────
@@ -932,7 +946,7 @@ _CAPS_BY_WINDOW = {
         2541,
         2541,
         4950,
-        3300,
+        16500,
         34650,
         8000,
         44550,
@@ -951,7 +965,7 @@ _CAPS_BY_WINDOW = {
         2541,
         2541,
         4950,
-        3300,
+        16500,
         34650,
         8000,
         44550,
@@ -970,7 +984,7 @@ _CAPS_BY_WINDOW = {
         2541,
         2541,
         4950,
-        3300,
+        16500,
         6930,
         1600,
         8910,
@@ -989,7 +1003,7 @@ _CAPS_BY_WINDOW = {
         2541,
         2541,
         4950,
-        3300,
+        16500,
         6930,
         1600,
         8910,
@@ -1008,7 +1022,7 @@ _CAPS_BY_WINDOW = {
         2541,
         2541,
         4950,
-        3300,
+        16500,
         69300,
         16000,
         89100,

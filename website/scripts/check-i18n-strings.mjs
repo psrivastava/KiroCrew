@@ -17,12 +17,14 @@
  * so whoever fixed a string had to commit the smaller number and the gain could not be
  * given back. Two problems, in increasing order of seriousness.
  *
- * The first is contention. This baseline is one generated artifact holding a `_total`
- * plus 269 per-file entries, regenerated from a whole-tree scan. Forcing every improving
- * change to re-snapshot it means two branches that fix strings in *different* files
- * still conflict textually, in `_total` if nowhere else, and every merge to `main`
- * invalidates the number in every other open branch — serialisation imposed by the
- * ledger, not by the code being changed.
+ * The first is contention. This baseline is one generated artifact regenerated from a
+ * whole-tree scan. Forcing every improving change to re-snapshot it meant two branches
+ * that fixed strings in *different* files still conflicted textually, and every merge to
+ * `main` invalidated the number in every other open branch — serialisation imposed by
+ * the ledger, not by the code being changed. It stores per-file entries only: a stored
+ * grand total is one line every re-snapshot rewrites, and two branches that land the
+ * same new total merge into a number neither measured, so the total is computed from
+ * `files` wherever it is shown.
  *
  * The second is that the downward guard did not actually prevent regressions. It
  * required an *edit*, and the edit is one command. `195904c` shipped a new app with 113
@@ -356,15 +358,28 @@ function diffScope() {
   const untracked = git(['ls-files', '--others', '--exclude-standard', '--', 'website/src'])
   for (const rel of untracked.split('\n').filter(Boolean)) added[rel] = ALL_LINES
 
+  // A file this branch MOVED is measured against its base-side source, not as new: a
+  // pure move adds no debt, and git's own rename detection is what says it is one.
+  const renamedFrom = renameSources(git(['diff', '--name-status', '-M', '--diff-filter=R', from, '--', 'website/src']))
   const readBase = (repoRel) => {
     try {
-      return git(['show', `${from}:${repoRel}`])
+      return git(['show', `${from}:${renamedFrom.get(repoRel) ?? repoRel}`])
     } catch {
       // Absent at the base: the file is new on this branch, so its base count is zero.
       return null
     }
   }
   return { from, added, readBase }
+}
+
+/** `new path -> base path` for every rename in a `git diff --name-status -M` listing. */
+export function renameSources(nameStatus) {
+  const out = new Map()
+  for (const line of nameStatus.split('\n')) {
+    const [status, source, target] = line.split('\t')
+    if (status && status.startsWith('R') && source && target) out.set(target, source)
+  }
+  return out
 }
 
 /**
@@ -445,7 +460,6 @@ async function main() {
   if (update) {
     const current = {
       _comment: BASELINE_COMMENT,
-      _total: total,
       files: Object.fromEntries(Object.entries(byFile).sort(([a], [b]) => a.localeCompare(b))),
     }
     fs.writeFileSync(BASELINE, `${JSON.stringify(current, null, 2)}\n`)
@@ -632,7 +646,7 @@ async function main() {
   if (grew.length === 0) {
     console.log(
       `OK: ${total} untranslated strings across ${Object.keys(byFile).length} files, `
-      + `at or below the baseline of ${base._total ?? 'unknown'}.`,
+      + `at or below the baseline of ${Object.values(base.files).reduce((a, f) => a + f.total, 0)}.`,
     )
   }
 }

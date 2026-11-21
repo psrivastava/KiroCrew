@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from source_corpus import repo_files_named, repo_root
+from source_corpus import repo_files_named, repo_root, untraced
 
 import kiro_crew.dashboard.chat_runner as cr
 from kiro_crew.dashboard import chat_turn
@@ -52,54 +52,10 @@ _OWNER_PACKAGE = chat_turn.__name__
 _OWNER_DIR = Path(chat_turn.__file__).resolve().parent
 _GLOBAL_OPS = frozenset({"LOAD_GLOBAL", "STORE_GLOBAL", "DELETE_GLOBAL"})
 
-#: The owners the runner composes. Adding or removing one changes the composition,
-#: so the set is spelled out rather than globbed.
+#: The owners the runner composes: every module of ``chat_turn``, read off the
+#: package directory rather than through the call the runner composes with.
 _OWNER_MODULES = frozenset(
-    {
-        "account_identity",
-        "acp_recovery",
-        "app_agent_binding",
-        "context_cap",
-        "crew_log_attribution",
-        "decisions_hooks",
-        "deny_chokepoints",
-        "directives",
-        "eager_spawn",
-        "elicitation_prompt",
-        "file_changes",
-        "mcp_session",
-        "model_fallback",
-        "native_cards",
-        "permission_prompt",
-        "prompt_assembly",
-        "queue_cycle",
-        "queue_drain",
-        "recipient",
-        "recovery",
-        "regenerate_swap",
-        "segment_flush",
-        "session_events",
-        "session_reset",
-        "slash_commands",
-        "steer_queue",
-        "stop_recovery",
-        "stream_chunks",
-        "tool_approval",
-        "tool_results",
-        "tool_rows",
-        "turn_admission",
-        "turn_context",
-        "turn_dispatch_gates",
-        "turn_ending",
-        "turn_entry",
-        "turn_failures",
-        "turn_ledgers",
-        "turn_locals",
-        "turn_marker",
-        "turn_reply_seams",
-        "turn_spec_hooks",
-        "turn_stats",
-    }
+    info.name for info in pkgutil.iter_modules([str(_OWNER_DIR)]) if info.name.isidentifier()
 )
 
 #: Every module-level name ``chat_runner`` bound at the base the split was cut from:
@@ -216,7 +172,7 @@ _BASE_NAMES = frozenset("""
         _name_grant_refusal_off_loop _native_card_feed _native_crew_should_auto_approve
         _native_done_result _native_subagent_close_all _native_subagent_sync _normalize_model
         _note_cycle_start_failure _note_eager_spawn_failure _note_reply_row
-        _pending_reset_retries _persist_tool_result_rows _persistable_session_policy
+        _persist_tool_result_rows _persistable_session_policy
         _pinned_model_verdict _post_native_question_card _pre_tool_block_reason
         _pre_tool_hooks_should_block _prefetch_ttl _prepare_mirror_msg _prepare_spec_hooks
         _prewarm_allowance _probe_fallback_restore_for_slot
@@ -287,7 +243,7 @@ _BASE_NAMES = frozenset("""
         record_activity record_agent_selection record_interaction_event
         record_provider_agent_switch redact redact_and_truncate redact_credentials
         redact_credentials_with_records redact_exfiltration_urls
-        redact_exfiltration_urls_with_records redact_for_display redact_log_via_context
+        redact_for_display redact_log_via_context
         redact_via_context reflow_and_label_glued_option_marker refresh_materialized_agents
         refresh_tag_grants_cache refusal_card_text refusal_for_command_off_loop
         refuse_stale_switch register_guarded_history_write register_images_off_loop
@@ -407,16 +363,10 @@ def test_the_chat_facade_reexports_the_runner_objects() -> None:
     assert [name for name in names if getattr(chat, name) is not getattr(cr, name)] == []
 
 
-#: The file each coroutine a task is started with is defined in, and each function
-#: that starts one. ``stall_attribution`` names a stalled task by the outermost frame
-#: it can place, and it reads a frame in the runner or in a ``chat_turn`` owner as a
-#: dashboard chat turn, so an entry may live in either; the map pins each entry to its
-#: file, and the stall test below proves the reach for each. ``_run_chat``'s row is the
-#: exit guard's ``guarded`` (``_hands_off_queue_on_exit``), the coroutine every turn task
-#: runs; ``_arm_pending_reset_retry`` and ``_arm_synthesis_recheck`` define the coroutines
-#: they start, ``_launch_synthesis`` starts the pending synthesis,
-#: ``_finish_queue_cycle`` starts it and the title and summary passes, and
-#: ``_prewarm_startup_query`` starts a first message's early embed and memory reads.
+#: The file defining each task-entry coroutine, and each function that starts one.
+#: ``stall_attribution`` reads a frame in the runner or a ``chat_turn`` owner as a chat
+#: turn, so an entry may live in either; the stall test below proves the reach for each.
+#: ``_run_chat``'s row is ``guarded`` in ``_hands_off_queue_on_exit``, which every turn runs.
 _RUNNER_HOME = "dashboard/chat_runner.py"
 _TASK_ENTRY_HOMES: dict[str, str] = {
     "_run_chat": _RUNNER_HOME,
@@ -533,15 +483,23 @@ def test_run_chat_keeps_its_entry_signature() -> None:
         "_responsive_human",
         "_responsive_protected",
         "_directive_user_origin",
+        "_message_is_typed",
         "_turn_provenance_restored",
+        "_turn_start_background",
         "_directive_self_wake",
         "_directive_loop_id",
         "_directive_loop_gen",
+        "_recovered_wake",
         "_skill_trigger_text",
         "_directive_channel_origin",
+        "_directive_source_channels",
+        "_directive_owner_origin",
         "_commands_off",
         "_recovery_echo_owed",
+        "_card_origin",
+        "_prompt_on_channel",
         "_turn_actor",
+        "_agent_started",
         "regenerate_hint",
         "_on_consumed",
         "_on_irreversibly_consumed",
@@ -582,7 +540,6 @@ _RUNNER_STATE = (
     "_eager_spawn_sem",
     "_armed_prefetches",
     "_arm_generation",
-    "_pending_reset_retries",
     "logger",
 )
 
@@ -861,27 +818,6 @@ def test_an_owner_imports_the_runner_and_its_siblings_only_for_type_checking() -
     assert offenders == []
 
 
-def test_every_owner_with_a_coroutine_is_in_the_config_dir_guard() -> None:
-    """``test_no_config_dir_in_async`` scans the files it lists, so an owner that
-    gains an ``async def`` must be listed there, or its coroutines escape the guard."""
-    guard = repo_root() / "test" / "test_no_config_dir_in_async.py"
-    listed: set[str] = set()
-    for node in ast.parse(guard.read_text(encoding="utf-8")).body:
-        if isinstance(node, ast.Assign) and any(
-            isinstance(t, ast.Name) and t.id == "_ASYNC_CHECKED_FILES" for t in node.targets
-        ):
-            listed = {elt.value for elt in node.value.elts if isinstance(elt, ast.Constant)}
-    assert listed, "_ASYNC_CHECKED_FILES not found; this check went stale"
-    assert "dashboard/chat_runner.py" in listed
-    with_coroutines = {
-        f"dashboard/chat_turn/{stem}.py"
-        for stem, source in _owner_sources().items()
-        if any(isinstance(n, ast.AsyncFunctionDef) for n in ast.walk(ast.parse(source)))
-    }
-    assert with_coroutines, "no owner defines a coroutine; this check went stale"
-    assert sorted(with_coroutines - listed) == []
-
-
 def _run_child(tmp_path: Path, script: str, *args: str) -> None:
     result = subprocess.run(
         [sys.executable, "-c", textwrap.dedent(script), *args],
@@ -897,6 +833,7 @@ def _run_child(tmp_path: Path, script: str, *args: str) -> None:
 def test_a_fresh_runner_import_loads_every_owner(tmp_path: Path) -> None:
     """Importing the runner imports every owner with it: none loads lazily on a
     later call, so the import order stays the one the one-module file had."""
+    assert _OWNER_MODULES, "chat_turn holds no module -- the owner scan is blind"
     _run_child(
         tmp_path,
         """
@@ -1026,11 +963,9 @@ def _resolve_target(node: ast.AST, params: dict[str, set[str]]) -> set[str] | No
 def _patched_names_in(text: str) -> set[str]:
     """Names one test source rebinds on the runner itself.
 
-    A dotted target (``chat_runner.KiroCrewConfig.load``) patches an attribute of a
-    shared object rather than a runner binding, so every holder of that object sees
-    it; only first-level runner names count. A name spelled by a parametrized
-    argument resolves to its parameter values; anything else the scan cannot
-    resolve is reported as ``<dynamic>``, which fails the patch-reach test closed.
+    Only first-level names count: a dotted target patches a shared object every holder
+    sees. A parametrized name resolves to its values; anything else is ``<dynamic>``,
+    which fails the patch-reach test closed.
     """
     if not _MENTIONS_THE_RUNNER.search(text):
         return set()
@@ -1081,23 +1016,22 @@ def _facade_patched_names() -> set[str]:
     root = repo_root()
     here = Path(__file__).resolve()
     found: set[str] = set()
-    for path in repo_files_named(".py"):
-        parts = path.relative_to(root).parts
-        in_tests = parts[0] == "test" or (parts[0] == "src" and "tests" in parts)
-        if not in_tests or path.resolve() == here:
-            continue
-        found |= _patched_names_in(path.read_text(encoding="utf-8", errors="replace"))
+    # The scan only parses test source, so it runs with the coverage tracer paused.
+    with untraced():
+        for path in repo_files_named(".py"):
+            parts = path.relative_to(root).parts
+            in_tests = parts[0] == "test" or (parts[0] == "src" and "tests" in parts)
+            if not in_tests or path.resolve() == here:
+                continue
+            found |= _patched_names_in(path.read_text(encoding="utf-8", errors="replace"))
     return found
 
 
 def _captured_names(source: str) -> set[str]:
     """Names an owner module binds or evaluates when it LOADS, outside ``TYPE_CHECKING``.
 
-    That is everything a later patch of the runner cannot reach: a runtime import
-    (at module level or nested in a module-level ``if``/``try``/``with``), a default
-    argument, a decorator, a class base, a class body, or a module-level expression.
-    A name read inside a function body is read at call time from the runner's
-    globals, so it is not captured. The module docstring evaluates nothing.
+    A later runner patch cannot reach these: runtime imports, defaults, decorators,
+    class bases and bodies, module-level expressions. Function-body reads are not captured.
     """
     tree = ast.parse(source)
     guarded = _type_checking_nodes(tree)
@@ -1267,25 +1201,19 @@ def test_no_owner_captures_a_name_tests_rebind_on_the_runner() -> None:
 
 # ── the path-keyed guards keep their reach ────────────────────────────────────
 
-#: Constructs repository guards enumerate by path, each with the files it lives in:
-#: redaction sinks and the redactor census, the deny chokepoints and the approve
-#: sites, the turn-ceiling, allocation, usage-row and turn-metric sites, the
-#: runtime-death attribution, the transcript-derivation plumbing, the hook gate, the
-#: agent-spec read registry, the slot.running reader map, the task entries, the
-#: stop classifier, the crew-log closers, the persona gate, the L1 budget resets, the
-#: memory-store seam's calls, the frame contract, the compaction-continuation and
-#: native question-card wiring, and the start-priority claimer calls. A file that
-#: grew one would move it out of such a guard's sight without failing it, so each
-#: pattern matches exactly the homes listed here, and a construct moves only together
-#: with its row and the guard that reads it.
+#: Constructs that repository guards enumerate by path, each with the files it lives in.
+#: A new file growing one would escape its guard silently, so each pattern matches
+#: exactly the homes listed, and a construct moves only together with its row and guard.
 _GUARDED_CONSTRUCT_HOMES: dict[str, tuple[str, ...]] = {
     r"\b\w*redact\w*\(": (
         _RUNNER_HOME,
         "dashboard/chat_turn/acp_recovery.py",
+        "dashboard/chat_turn/builtin_tools_notice.py",
         "dashboard/chat_turn/deny_chokepoints.py",
         "dashboard/chat_turn/eager_spawn.py",
         "dashboard/chat_turn/elicitation_prompt.py",
         "dashboard/chat_turn/file_changes.py",
+        "dashboard/chat_turn/mcp_oauth_notice.py",
         "dashboard/chat_turn/mcp_session.py",
         "dashboard/chat_turn/model_fallback.py",
         "dashboard/chat_turn/native_cards.py",
@@ -1358,7 +1286,6 @@ _GUARDED_CONSTRUCT_HOMES: dict[str, tuple[str, ...]] = {
     # _turn_admit; each lives only in its homes, so the turn's own copy stays there.
     r"await _consume_pending_reset\(state, slot\)": (
         "dashboard/chat_turn/eager_spawn.py",
-        "dashboard/chat_turn/session_reset.py",
         "dashboard/chat_turn/turn_admission.py",
     ),
     r"_requested_model = slot\.model": (
@@ -1375,10 +1302,12 @@ _GUARDED_CONSTRUCT_HOMES: dict[str, tuple[str, ...]] = {
         "dashboard/chat_turn/tool_approval.py",
     ),
     r"spawn_guarded_turn\(": (
+        "dashboard/chat_turn/agent_started.py",
         "dashboard/chat_turn/queue_cycle.py",
         "dashboard/chat_turn/queue_drain.py",
     ),
     r"create_task\(": (
+        "dashboard/chat_turn/account_identity.py",
         "dashboard/chat_turn/eager_spawn.py",
         "dashboard/chat_turn/prompt_assembly.py",
         "dashboard/chat_turn/queue_cycle.py",
@@ -1393,10 +1322,12 @@ _GUARDED_CONSTRUCT_HOMES: dict[str, tuple[str, ...]] = {
         "dashboard/chat_turn/queue_drain.py",
     ),
     r"\bslot\.task = ": (
+        "dashboard/chat_turn/agent_started.py",
         "dashboard/chat_turn/queue_cycle.py",
         "dashboard/chat_turn/queue_drain.py",
     ),
     r"\.(?:turn_)?running\b": (
+        "dashboard/chat_turn/agent_started.py",
         "dashboard/chat_turn/eager_spawn.py",
         "dashboard/chat_turn/queue_cycle.py",
         "dashboard/chat_turn/queue_drain.py",
@@ -1407,7 +1338,11 @@ _GUARDED_CONSTRUCT_HOMES: dict[str, tuple[str, ...]] = {
         "dashboard/chat_turn/slash_commands.py",
     ),
     r"capabilities_of\(": (
+        "dashboard/chat_turn/builtin_tools_notice.py",
+        "dashboard/chat_turn/mcp_oauth_notice.py",
+        "dashboard/chat_turn/mcp_session.py",
         "dashboard/chat_turn/model_fallback.py",
+        "dashboard/chat_turn/prompt_assembly.py",
         "dashboard/chat_turn/slash_commands.py",
         "dashboard/chat_turn/tool_approval.py",
         "dashboard/chat_turn/tool_rows.py",

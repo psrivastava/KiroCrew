@@ -9,6 +9,7 @@
  * built-ins), or an Installed check. The row opens the detail page, honoring
  * Cmd/Ctrl-click for a new tab.
  */
+import { useId } from 'react'
 import { ArrowUp, BadgeCheck, Check, Monitor, Power, Star } from 'lucide-react'
 import { Btn } from '../ui'
 import Clickable from '../Clickable'
@@ -19,19 +20,23 @@ import AppSource, { type SourceName } from './AppSource'
 import { appDisplayName, appDescription } from './appManifest'
 import { needsDesktopApp } from '../../lib/electron'
 import { fmtCompact } from '../../i18n/format'
+import { offlineProps } from '../../utils/offline'
 
 import { i18nT } from '../../i18n/t'
 import { guidePick } from '../../uiLocations/targetRegistry'
-export default function AppListRow({ app, sources, busy, onOpen, onGet, onUpdate, onEnable }: {
+export default function AppListRow({ app, sources, busy, connected, onOpen, onGet, onUpdate, onEnable }: {
   app: RegistryApp
   sources?: SourceName[]
   busy?: boolean
+  /** The gateway connection flag: offline, Enable is refused. */
+  connected: boolean
   onOpen: (e?: React.MouseEvent | React.KeyboardEvent) => void
   onGet: () => void
   onUpdate: () => void
   onEnable: () => void
 }) {
   const isBuiltin = app.origin === 'builtin' && !!app.installed
+  const desktopHintId = useId()
 
   return (
     <Clickable
@@ -92,27 +97,33 @@ export default function AppListRow({ app, sources, busy, onOpen, onGet, onUpdate
                gateway); only its UI needs the desktop shell. Offer the action and
                say what it needs — a static tag would strand a remote user with no
                way to turn it on. The Monitor badge's hint lives in a hover title,
-               so carry the same hint as the button's accessible name for keyboard
-               / screen-reader users (same reason AppDetailPage shows it in text). */
+               so carry the same hint as the button's accessible description for
+               keyboard / screen-reader users (same reason AppDetailPage shows it in
+               text). The name stays the visible label, so a voice-control user can
+               say the word printed on the button. */
             <span className="inline-flex items-center gap-2">
               <Btn
-                disabled={busy}
+                disabled={busy || !connected}
                 onClick={onEnable}
-                aria-label={needsDesktopApp(app)
-                  ? `${i18nT('components.appstore.appListRow.enable')}. ${i18nT('components.appstore.appListRow.desktop_app_hint')}`
-                  : undefined}
+                aria-describedby={needsDesktopApp(app) ? desktopHintId : undefined}
+                {...offlineProps(connected, i18nT('utils.offline.manage_apps'), i18nT('components.appstore.appListRow.enable'))}
               ><Power size={14} /> {i18nT('components.appstore.appListRow.enable')}</Btn>
               {needsDesktopApp(app) && (
                 <span className="inline-flex items-center gap-1 text-[12px] text-muted" title={i18nT('components.appstore.appListRow.desktop_app_hint')}>
                   <Monitor size={12} /> {i18nT('components.appstore.appListRow.desktop_app')}
+                  <span id={desktopHintId} className="sr-only">{i18nT('components.appstore.appListRow.desktop_app_hint')}</span>
                 </span>
               )}
             </span>
           )
-        ) : app.installed && app.updateAvailable ? (
+        ) : app.installed && app.updateAvailable && app.installedFrom !== 'market' ? (
           <Btn disabled={busy} className="border-[var(--info)] text-[var(--info)] hover:text-[var(--info)] hover:border-[var(--info)]" onClick={onUpdate}>
             <ArrowUp size={14} /> {i18nT('components.appstore.appListRow.update')}
           </Btn>
+        ) : app.installed && app.installedFrom === 'market' ? (
+          /* Installed from a Kiro Space store under this name: this git row
+             neither updates nor reinstalls it. */
+          <span className="inline-flex items-center gap-1 text-[12px] text-muted" data-testid="installed-from-market"><Check size={12} /> {i18nT('components.appstore.marketStore.installed_from_market')}</span>
         ) : app.installed ? (
           <span className="inline-flex items-center gap-1 text-[12px] text-muted"><Check size={12} /> {i18nT('components.appstore.appListRow.installed')}</span>
         ) : (

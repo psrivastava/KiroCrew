@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from kiro_crew import env
+from kiro_crew import env, kiro_cli
 from kiro_crew.doctor_checks import services
 
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX launcher/delegate pair")
@@ -39,7 +39,7 @@ def install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     (home / ".local" / "bin").mkdir(parents=True)
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    _script(bin_dir / "kiro-cli", "echo 'kiro-cli 9.9.9'")
+    _script(bin_dir / "kiro-cli", "echo 'kiro-cli 2.33.0'")
     augmented = tmp_path / "augmented"
     augmented.mkdir()
     monkeypatch.setenv("HOME", str(home))
@@ -47,6 +47,9 @@ def install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(
         env, "augmented_path", lambda base, **_: os.pathsep.join([base, str(augmented)])
     )
+    # The tmp ``kiro-cli`` is the pinned install, so its version is the pin's own
+    # read and no host install is asked.
+    monkeypatch.setattr(kiro_cli, "pin_kiro_cli", lambda: (str(bin_dir / "kiro-cli"), False))
     return bin_dir
 
 
@@ -138,6 +141,39 @@ def test_launcher_with_no_delegate_anywhere_is_broken(
     out, issues = _run(str(install / "kiro-cli"), capsys)
     assert "no kiro-cli-chat" in out
     assert issues
+
+
+def test_standalone_kiro_cli_without_a_chat_binary_passes(
+    install: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # From 3.0.0 the installer ships kiro-cli alone: it is the chat binary.
+    _script(install / "kiro-cli", "echo 'kiro-cli 3.0.0'")
+    out, issues = _run(str(install / "kiro-cli"), capsys)
+    assert issues == []
+    assert "✅ kiro-cli 3.0.0" in out
+    assert "broken" not in out
+
+
+def test_standalone_kiro_cli_ignores_a_leftover_dangling_chat_link(
+    install: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A 2.x upgrade can leave ~/.local/bin/kiro-cli-chat behind; 3.0.0 never execs it.
+    _script(install / "kiro-cli", "echo 'kiro-cli 3.0.0'")
+    os.symlink(tmp_path / "gone", _local_bin() / "kiro-cli-chat")
+    out, issues = _run(str(install / "kiro-cli"), capsys)
+    assert issues == []
+    assert "✅ kiro-cli 3.0.0" in out
+    assert "broken" not in out
+
+
+def test_kiro_cli_that_cannot_report_a_version_is_still_broken(
+    install: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _script(install / "kiro-cli", "echo 'error: failed to start' >&2; exit 1")
+    out, issues = _run(str(install / "kiro-cli"), capsys)
+    assert "❌ Kiro CLI is broken" in out
+    assert services.CHAT_DELEGATE_BROKEN_FIX in out
+    assert len(issues) == 1
 
 
 def test_delegate_found_on_path(
@@ -319,6 +355,65 @@ def test_relay_entry_is_the_launcher_sibling_when_the_vault_signs_in(
     monkeypatch.delenv("KIROCREW_KIRO_BIN", raising=False)
     _vault(monkeypatch, True)
     assert services.kas_relay_entry(str(install / "kiro-cli")) == str(sibling)
+
+
+def test_relay_entry_keeps_a_standalone_kiro_cli_past_a_stale_sibling(
+    install: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """From 3.0.0 ``kiro-cli`` is the chat binary; the spawn never swaps in an older one."""
+    _script(install / "kiro-cli", "echo 'kiro-cli 3.0.0'")
+    _script(install / "kiro-cli-chat", "echo ok")
+    monkeypatch.delenv("KIROCREW_KIRO_BIN", raising=False)
+    _vault(monkeypatch, True)
+    assert services.kas_relay_entry(str(install / "kiro-cli")) is None
+
+
+@pytest.fixture
+def path_only_3x(install: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A ``PATH``-only ``kiro-cli`` 3.0.0 (no pin) whose version is not cached yet.
+
+    A fresh ``kirocrew doctor`` process never warms the probe's cache, so doctor
+    must read the file itself, still only inside the sandbox: the sandboxed read
+    answers 3.0.0 and the pin's own read must never run. No real spawn.
+    """
+    kiro = install / "kiro-cli"
+    _script(kiro, "echo 'kiro-cli 3.0.0'")
+    monkeypatch.setattr(kiro_cli, "pin_kiro_cli", lambda: (None, True))
+    monkeypatch.setattr(
+        kiro_cli, "kiro_cli_version_at", lambda b: pytest.fail("not the pin: sandboxed read only")
+    )
+    monkeypatch.setattr(
+        "kiro_crew.kiro_cli_path_probe._sandboxed_version",
+        lambda binary: (3, 0, 0) if binary == str(kiro) else None,
+    )
+    return kiro
+
+
+def test_relay_entry_keeps_a_path_only_standalone_kiro_cli_past_a_stale_sibling(
+    path_only_3x: Path, install: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cold cache: doctor reads the ``PATH`` ``kiro-cli`` inside the sandbox and names
+    the entry a warmed gateway's spawn uses, not the stale sibling."""
+    _script(install / "kiro-cli-chat", "echo ok")
+    monkeypatch.delenv("KIROCREW_KIRO_BIN", raising=False)
+    _vault(monkeypatch, True)
+    assert services.kas_relay_entry(str(path_only_3x)) is None
+
+
+def test_chat_delegate_target_reads_a_path_only_kiro_cli_inside_the_sandbox(
+    path_only_3x: Path,
+) -> None:
+    assert services._chat_delegate_target(str(path_only_3x)) == str(path_only_3x)
+
+
+def test_path_only_standalone_kiro_cli_on_a_cold_cache_passes(
+    path_only_3x: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No ``kiro-cli-chat`` anywhere: a fresh doctor must not call a 3.x install broken."""
+    out, issues = _run(str(path_only_3x), capsys)
+    assert issues == []
+    assert "✅ kiro-cli 3.0.0" in out
+    assert "broken" not in out
 
 
 def test_relay_entry_keeps_the_launcher_without_a_vault_identity(

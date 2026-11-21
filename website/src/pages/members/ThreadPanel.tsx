@@ -30,6 +30,7 @@ import MarkdownRenderer from '../../components/MarkdownRenderer'
 import MessageErrorBoundary from '../../components/MessageErrorBoundary'
 import { Btn, SendBtn } from '../../components/ui'
 import { useImeGuard } from '../../hooks/useImeGuard'
+import { useReturnInsertsNewline } from '../../hooks/useComposerSendMode'
 import { ApiError } from '../../api/apiError'
 import { threadQueryKey, threadsApi, threadsQueryKey, type ThreadReply } from '../../api/threads'
 import { fmtMessageTime } from '../chat/messageTime'
@@ -92,7 +93,7 @@ function ReplyRow({ reply, pos, crewmateName, crewmateLabel, youLabel }: { reply
       <div className="min-w-0 flex-1 flex flex-col items-start">
         {opens && <AuthorLine name={crewmateLabel || crewmateName} ts={reply.ts} align="left" />}
         <Bubble pos={pos} side="left">
-          <MessageErrorBoundary rawContent={reply.content}><MarkdownRenderer content={reply.content} softBreaks /></MessageErrorBoundary>
+          <MessageErrorBoundary rawContent={reply.content}><MarkdownRenderer content={reply.content} softBreaks blockedLinks={reply.link_blocks} /></MessageErrorBoundary>
         </Bubble>
       </div>
     </li>
@@ -126,6 +127,7 @@ export default function ThreadPanel({ slot, mid, crewmateName, crewmateLabel, on
     threadDrafts.set(slot, mid, text)
   }, [slot, mid])
   const ime = useImeGuard()
+  const returnInsertsNewline = useReturnInsertsNewline()
   const rootRef = useRef<HTMLDivElement>(null)
   const scrollerRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
@@ -307,7 +309,7 @@ export default function ThreadPanel({ slot, mid, crewmateName, crewmateLabel, on
               <div className="min-w-0 flex-1 flex flex-col items-start">
                 <AuthorLine name={crewmateLabel || crewmateName} ts={parent.ts} align="left" />
                 <Bubble side="left" testId="thread-parent-bubble">
-                  <MessageErrorBoundary rawContent={parent.content}><MarkdownRenderer content={parent.content} softBreaks /></MessageErrorBoundary>
+                  <MessageErrorBoundary rawContent={parent.content}><MarkdownRenderer content={parent.content} softBreaks blockedLinks={parent.link_blocks} /></MessageErrorBoundary>
                 </Bubble>
               </div>
             </div>
@@ -353,7 +355,7 @@ export default function ThreadPanel({ slot, mid, crewmateName, crewmateLabel, on
         </ul>
       </div>
       {tooLong && (
-        <p className="px-3 pt-1 text-[12px] text-muted" data-testid="thread-too-long" role="status">
+        <p id="thread-too-long" className="px-3 pt-1 text-[12px] text-muted" data-testid="thread-too-long" role="status">
           {t('pages.chat.thread.err_too_long')}
         </p>
       )}
@@ -380,11 +382,13 @@ export default function ThreadPanel({ slot, mid, crewmateName, crewmateLabel, on
             onChange={(e) => setDraft(e.target.value)}
             {...ime.bindComposition()}
             onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey) { if (ime.claimEnter(e)) submit() }
+              if (e.key === 'Enter' && !e.shiftKey && !returnInsertsNewline) { if (ime.claimEnter(e)) submit() }
             }}
             className={/* focus-cue-ok: the cue is the composer card's focus-within border-accent, the same cue the main composer shell paints; a second ring on the textarea would double-paint one control. */ 'flex-1 min-w-0 resize-none bg-transparent text-[13px] leading-6 text-card-fg outline-hidden placeholder:text-muted'}
             placeholder={t(unreadable ? 'pages.chat.thread.reply_after_retry' : 'pages.chat.thread.reply_placeholder')}
             aria-label={t('pages.chat.thread.reply_in_thread')}
+            aria-invalid={tooLong ? true : undefined}
+            aria-describedby={tooLong ? 'thread-too-long' : undefined}
             data-testid="thread-composer"
             disabled={unreadable}
           />

@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef, type HTMLAttributes } from 'react'
+import { useEffect, useState, useCallback, useMemo, useRef, type HTMLAttributes } from 'react'
 import { createPortal } from 'react-dom'
 import { OverlayPortal, useCloseWhenCrewHidden, useLocalCrewHidden } from '../../components/overlayRoot'
 import { useLocation, useNavigate } from 'react-router-dom'
@@ -8,6 +8,7 @@ import { useAppSelector, useAppDispatch } from '../../store'
 import { ackNotification } from '../../store/notificationsSlice'
 import { setActiveId } from '../../store/instancesSlice'
 import { useIsMobile } from '../../hooks/useIsMobile'
+import { useExplorePreview } from '../../hooks/usePreviewFlag'
 import { useAckCronNotesInView } from '../../hooks/useAckCronNotesInView'
 import { useCrewWindow } from '../../pages/chat/crew-window/crewWindowStore'
 import { animateDrawer, registerDrawerTargets, takeOverDrawer } from '../../hooks/useDrawerSwipe'
@@ -15,9 +16,11 @@ import { useGuardedLeave } from '../../components/NavigationLeaveGuard'
 import ErrorBoundary from '../../components/ErrorBoundary'
 import AskAgentButton from '../../components/AskAgentButton'
 import NotificationDetailPanel from '../../components/notifications/NotificationDetailPanel'
+import { useFeedFocusOnDetailClose } from '../../components/notifications/feedFocus'
 import NotificationFeed from '../../components/notifications/NotificationFeed'
 import NotificationBanner from '../../components/notifications/NotificationBanner'
 import FileMenuResultToast from '../../components/notifications/FileMenuResultToast'
+import MilestoneNoticeToast from '../../components/milestones/MilestoneNoticeToast'
 import { recordEvent } from '../../rum'
 import { i18nT } from '../../i18n/t'
 import { uiLocation } from '../../uiLocations/uiLocation'
@@ -178,6 +181,20 @@ export function useNotificationSheet() {
   }), [sheetX, parkedOffset])
   const selected = selectedTs ? items.find(n => n.ts === selectedTs) || null : null
 
+  // A detail that closes while it holds focus (its Close button, Escape, an
+  // Approve or Reject that removes the note) returns focus to the row that
+  // opened it, else the first row, else the bell, not to <body> behind the
+  // open sheet.
+  const shownTs = selected ? selected.ts : null
+  const liveTs = useMemo(() => items.map(n => n.ts), [items])
+  useFeedFocusOnDetailClose(
+    shownTs,
+    liveTs,
+    popoverRef,
+    () => bellRef.current,
+    () => phaseRef.current === 'open',
+  )
+
   // Single dismissal path: every close (bell toggle, outside click, Escape,
   // navigation, error fallback) goes through here so the sheet always gets its
   // slide-out instead of being torn down instantly. Re-entrant by design — a
@@ -220,11 +237,13 @@ export function useNotificationSheet() {
   // local one and hides with it, so a tap there brings the local Crew forward:
   // opening the sheet out of sight would retire the banner and ack the note.
   const crewHidden = useLocalCrewHidden()
+  // A relay tab covers <main> without hiding the local overlay root, so it is read on its own.
+  const relayCovered = useAppSelector(s => s.instances?.relayActive != null)
   const openPanelOn = useCallback((ts: string) => {
-    if (crewHidden) dispatch(setActiveId(null))
+    if (crewHidden || relayCovered) dispatch(setActiveId(null))
     openPanel()
     setSelectedTs(ts)
-  }, [openPanel, crewHidden, dispatch])
+  }, [openPanel, crewHidden, relayCovered, dispatch])
   // Lives with the bell because it reads the bell's notes: a cron run's note is
   // read when the user opens its chat or it arrives while a pane shows that
   // chat (#23564), never behind a remote Crew, while a crew window covers the
@@ -378,6 +397,7 @@ export function NotificationSheet({ sheet }: { sheet: ReturnType<typeof useNotif
   // the `navigate` alone would leave the user's "keep my draft" answer with
   // the panel shut behind it.
   const leave = useGuardedLeave()
+  const explore = useExplorePreview()
   const {
     isMobile, phase, open, closing, selectedTs, setSelectedTs, selected,
     popoverRef, bellRef, sheetRef, sheetX, leavingProps, closePanel, openPanelOn,
@@ -387,6 +407,8 @@ export function NotificationSheet({ sheet }: { sheet: ReturnType<typeof useNotif
     {(open || closing) && <OverlayPortal>
       <div
         ref={popoverRef}
+        // A relay Crew pane hides under it (lib/relayCrewPanes.ts).
+        data-relay-pane-overlay=""
         // Anchored 48px below the viewport top, which the shell has pushed
         // down by the top inset — top-safe-offset-[48px] adds both.
         //
@@ -531,7 +553,7 @@ export function NotificationSheet({ sheet }: { sheet: ReturnType<typeof useNotif
         bellRef={bellRef}
         popoverOpen={phase !== 'closed'}
         onOpenNote={openPanelOn}
-        after={<FileMenuResultToast />}
+        after={<><FileMenuResultToast />{explore && <MilestoneNoticeToast />}</>}
       />,
       document.body
     )}

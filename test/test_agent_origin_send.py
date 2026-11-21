@@ -31,6 +31,7 @@ from guide_route_helpers import CREWMATE, FakeState, agent, run_guide_app
 
 from kiro_crew.dashboard import agent_origin
 from kiro_crew.history import HUMAN_TURN_META_KEY
+from kiro_crew.testing.synthetic_credentials import github_classic
 from kiro_crew.testing.wait import async_wait_until
 
 #: Values that must all read as agent-origin: the one
@@ -127,7 +128,9 @@ class TestStartedTurn:
         assert nudge.notify_user_input.call_args.kwargs["human"] is person
 
 
-_SECRET = "AKIAIOSFODNN7EXAMPLE"
+# A GitHub token with a valid checksum; an AWS key ID and a bare 40-character run are
+# kept visible, so neither can stand in.
+_SECRET = github_classic(seed=52)
 
 
 @pytest.mark.asyncio
@@ -207,7 +210,7 @@ class TestBusySlot:
         """A steer would put the agent's text inside the person's running turn,
         whose ``_directive_user_origin`` its directives keep reading; a marked
         send queues instead, without the act-now intent."""
-        from kiro_crew.dashboard.chat_delivery import STEER_INTENT_META
+        from kiro_crew.dashboard.chat_delivery import COMPOSER_SEND_META
 
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         state = _make_state(tmp_path)
@@ -224,7 +227,7 @@ class TestBusySlot:
             assert resp["queued"] is True
             entry = slot._queue[-1]
             assert entry.get("_directive_user_origin", False) is False
-            assert not (entry.get("meta") or {}).get(STEER_INTENT_META)
+            assert not (entry.get("meta") or {}).get(COMPOSER_SEND_META)
 
     @pytest.mark.parametrize(("body", "person"), [({"turn_origin": "agent"}, False), ({}, True)])
     async def test_an_auto_steer_asks_jev_only_for_a_person(
@@ -256,11 +259,17 @@ class TestBusySlot:
             lambda *_a: True,
         )
 
-        _, resp = await _send(state, body)
+        seen, resp = await _send(state, body)
 
+        if person:
+            # The session's own human is never held behind sub-agents: the turn
+            # starts now, with the person's directive origin.
+            assert resp is None
+            assert seen["_directive_user_origin"] is True
+            return
         assert resp["queued"] is True
-        assert slot._queue[-1].get("_directive_user_origin", False) is person
-        assert (slot._queue[-1].get("meta") or {}).get("turnActor") == (None if person else "crew")
+        assert slot._queue[-1].get("_directive_user_origin", False) is False
+        assert (slot._queue[-1].get("meta") or {}).get("turnActor") == "crew"
 
     @pytest.mark.parametrize(("body", "held"), [({"turn_origin": "agent"}, True), ({}, False)])
     async def test_only_a_persons_steer_skips_the_sub_agent_hold(

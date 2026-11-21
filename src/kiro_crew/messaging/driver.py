@@ -8,7 +8,8 @@ once.
 
 This module stays dependency-neutral: it imports only the ``acp.types``
 event constants (a stdlib-only leaf), the ``security`` redactors (also a
-leaf), and the ``session_directive`` codec (a third stdlib-only leaf). It
+leaf), and ``messaging.directive_tracker`` (the ``session_directive`` codec's
+per-turn consumer). It
 does NOT import ``kiro_crew.slack`` or ``kiro_crew.dashboard``.
 
 This driver is the channel-neutral core shared by every transport;
@@ -25,7 +26,7 @@ import re
 import time
 from typing import Any, Awaitable, Callable
 
-from kiro_crew import name_grant, session_directive
+from kiro_crew import name_grant, redaction_seams
 from kiro_crew.acp.types import (
     EVENT_COMPACTION_STATUS,
     EVENT_COMPLETE,
@@ -37,6 +38,8 @@ from kiro_crew.acp.types import (
     EVENT_TOOL_CALL,
     EVENT_TOOL_RESULT,
     STOP_CLASS_CANCELLED,
+    STOP_CLASS_SUCCEEDED,
+    STOP_REASON_CANCELLED,
     STOP_REASON_COMPACTION_FAILED,
     STOP_REASON_REFUSAL,
     STOP_REASON_STALE_RECOVER,
@@ -54,6 +57,9 @@ from kiro_crew.constants import (
 )
 from kiro_crew.deny_notice import steer_refusal_notice
 from kiro_crew.executors import run_in_tool_gate_pool
+from kiro_crew.messaging.alternation_echo import could_be_echo, echo_prefix_len, is_echo
+from kiro_crew.messaging.directive_tracker import DirectiveTracker
+from kiro_crew.messaging.driver_quoted_markers import QuotedDirectiveFilter
 from kiro_crew.messaging.empty_turn_copy import (
     EMPTY_TURN_NOTICE,
     EMPTY_TURN_NOTICE_AFTER_WORK,
@@ -64,6 +70,7 @@ from kiro_crew.messaging.empty_turn_copy import (
     EMPTY_TURN_NOTICE_UNCLOSED_AFTER_WORK,
     UNFINISHED_TURN_NOTICE,
 )
+from kiro_crew.messaging.link import CHANNEL_SESSION_NAMESPACES, channel_namespace_of
 from kiro_crew.messaging.renderer import (
     COMPACTION,
     DONE,
@@ -75,7 +82,10 @@ from kiro_crew.messaging.renderer import (
     TOOL_RESULT,
     OutputEvent,
     Renderer,
+    trusted_mcp_identity,
 )
+from kiro_crew.messaging.script_hooks import ScriptHookTurn, with_hook_context
+from kiro_crew.messaging.tool_hooks import ChannelTurnHooks
 from kiro_crew.monitoring.completion import (
     MonitorCompletionHook,
     disposition_for_stop_reason,
@@ -86,6 +96,8 @@ from kiro_crew.security import StreamRedactor, redact_credentials, redact_exfilt
 from kiro_crew.sel import sel
 from kiro_crew.tool_call_title import derive_tool_call_title
 from kiro_crew.tool_gate_busy import TOOL_GATE_BUSY_REASON
+from kiro_crew.tracing import steps as trace_steps
+from kiro_crew.tracing import surfaces as trace_surfaces
 
 logger = logging.getLogger(__name__)
 
@@ -101,16 +113,15 @@ APPROVAL_INTERACTIVE = "interactive"
 #:
 #: A decider MAY also carry ``last_deny_cause``: set on every call, ``""`` for a
 #: human's own answer (or no answer worth explaining) and a ``DENY_CAUSE_*``
-#: name from ``kiro_crew.constants`` when the denial was the host's doing.
-#: Today that is :data:`DENY_CAUSE_APPROVAL_TIMEOUT`, recorded by every shipped
-#: decider when its prompt expires unanswered, or
-#: :data:`DENY_CAUSE_APPROVAL_UNDELIVERABLE`, recorded when the prompt never
-#: reached the channel (text-reply, Discord, Telegram and Teams deciders). The
-#: driver steers both, each with its own reason. The driver reads it after a
-#: denial and steers the cause into the running turn BEFORE it rejects, so the
-#: model is not left with kiro-cli's generic "User denied tool execution" for a
-#: call nobody answered. A plain callable without the attribute is a denial
-#: with no cause, exactly as before.
+#: name from ``kiro_crew.constants`` when the denial was the host's doing:
+#: :data:`DENY_CAUSE_APPROVAL_TIMEOUT`, recorded by every shipped decider when
+#: its prompt expires unanswered, or :data:`DENY_CAUSE_APPROVAL_UNDELIVERABLE`,
+#: recorded when the prompt never reached the channel (text-reply, Discord,
+#: Telegram and Teams deciders). After a denial the driver steers the cause into
+#: the running turn BEFORE it rejects, each with its own reason, so the model is
+#: not left with kiro-cli's generic "User denied tool execution" for a call
+#: nobody answered. A plain callable without the attribute is a denial with no
+#: cause.
 ApprovalDecider = Callable[[Any], Awaitable[bool]]
 
 #: Strong references to the teardown-time orphan rejects scheduled by
@@ -137,6 +148,26 @@ AutoApprovePredicate = Callable[[Any], bool]
 #: empty-turn verdict is owed no notice. Any other value (``None`` from an
 #: older consumer) means the turn is judged as usual.
 DirectiveConsumer = Callable[[str, dict[str, Any]], Awaitable[Any]]
+
+
+def directive_event_observer(tracker: DirectiveTracker) -> Callable[[Any], Awaitable[None]]:
+    """An ``on_event`` observer that feeds *tracker* the raw events it reads.
+
+    For a caller that streams with ``stream_and_collect`` rather than this
+    driver, so its turn applies session directives through the same tracker.
+    """
+
+    async def _observe(event: Any) -> None:
+        kind = getattr(event, "kind", "")
+        if kind == EVENT_TOOL_CALL:
+            tracker.record_tool_call(event)
+        elif kind == EVENT_SUBAGENT_ACTIVITY:
+            tracker.on_subagent_activity(event)
+        elif kind == EVENT_TOOL_RESULT:
+            await tracker.on_tool_result(event)
+
+    return _observe
+
 
 # ── Empty-turn verdict ─────────────────────────────────────────────────────
 #
@@ -248,7 +279,7 @@ _MAX_STEER_MARKER_CHARS = 16_384
 #: tail still become a marker?", which is the question the drain below has to ask
 #: before it holds text back. Sourcing the pattern from the one place the grammar
 #: is written keeps the two probes from drifting apart -- a divergence
-#: ``test_the_two_spellings_of_the_grammar_agree`` pins.
+#: ``TestTheTwoSpellingsOfTheGrammarAgree`` pins.
 #:
 #: Recompiled with ``IGNORECASE`` because THIS module's recognizer carries it:
 #: ``constants``' copy is case-sensitive on purpose (it probes the exact
@@ -264,12 +295,14 @@ _STEER_TAIL_PREFIX_RE = re.compile(_STEERING_TAIL_PREFIX_RE.pattern, re.IGNORECA
 # still knows the destination is external, so reserve the prefixes and replace
 # the internal summary with a terse user-safe status. The dashboard does not use
 # TurnDriver and retains its authoritative transcript/audit record.
+# Current writers lead with no glyph; the U+2705 forms are what saved
+# transcripts and older gateways carry, so both stay reserved.
 _COMPACTION_NOTICE_PREFIXES = (
-    "✅ Conversation compacted:",
+    "\u2705 Conversation compacted:",  # emoji-ok: old saved lead
     "Conversation compacted:",
-    "✅ Compacted:",
+    "\u2705 Compacted:",  # emoji-ok: old saved lead
 )
-_COMPACTION_NOTICE_REPLACEMENT = "✅ Context compacted."
+_COMPACTION_NOTICE_REPLACEMENT = "Context compacted."
 _COMPACTION_PROBE_MAX = max(map(len, _COMPACTION_NOTICE_PREFIXES)) + 64
 
 
@@ -430,6 +463,32 @@ class _SteeringMarkerFilter:
         return 0
 
 
+_STEER_PREFIX_SEARCH = re.compile(re.escape(_STEER_PREFIX), re.IGNORECASE)
+
+
+def strip_steering_markers(text: str) -> str:
+    """Remove every complete ``[STEERING steer-…]`` frame from a finished text.
+
+    Unlike the stream filter, the text is whole: an unclosed ``[STEER…`` tail is
+    never a frame cut by a later chunk, so it is the answer's own text and stays.
+    """
+    out: list[str] = []
+    pos = 0
+    # A search, not ``text.upper().find``: upper-casing can change the length
+    # (``ß`` -> ``SS``), which would shift every index after it.
+    while (hit := _STEER_PREFIX_SEARCH.search(text, pos)) is not None:
+        start = hit.start()
+        close = text.find("]", start)
+        if close >= 0 and _STEER_MARKER_RE.match(text[start : close + 1]):
+            out.append(text[pos:start])
+            pos = close + 1
+        else:
+            out.append(text[pos : start + 1])
+            pos = start + 1
+    out.append(text[pos:])
+    return "".join(out)
+
+
 def sanitize_channel_replay_text(text: str) -> str:
     """Strip reserved channel protocol from one already-buffered message.
 
@@ -503,6 +562,13 @@ class TurnDriver:
         drain, and may also reject a structured monitor whose conversation
         generation changed. It must not await: the gate, monitor acceptance, and
         the stream's synchronous turn registration are one event-loop span.
+    prompt_gate:
+        Optional synchronous gate handed to ``provider.stream`` as its
+        ``prompt_gate`` keyword: the provider calls it after its own pre-prompt
+        awaits (a pending MCP change, the prompt build, the wait for the stdin
+        write lock), under that lock right before the prompt is written, so
+        whatever it raises ends the turn with nothing sent. Not passed when
+        ``None``, so a provider without the keyword is called as before.
     event_tap:
         Optional synchronous observer handed every RAW provider event, before
         the driver acts on it. For a second surface that shows the turn as it
@@ -511,6 +577,13 @@ class TurnDriver:
         a tool's result. It only observes: its return value is ignored, and an
         exception it raises is logged and swallowed, so a broken observer can
         never change or end the turn.
+    hook_agent:
+        The agent the session runs, whose spec's own ``hooks`` Crew fires on a
+        backend whose harness never receives them
+        (:mod:`kiro_crew.messaging.tool_hooks`). ``""`` reads the agent the
+        session recorded.
+    is_new_session:
+        This attempt opened a new session, so ``AgentSpawn`` hooks fire.
     """
 
     def __init__(
@@ -528,11 +601,23 @@ class TurnDriver:
         audit_session_key: str = "",
         audit_agent: str = "kirocrew",
         closing_gate: Callable[[], None] | None = None,
+        prompt_gate: Callable[[], None] | None = None,
         monitor_completion: MonitorCompletionHook | None = None,
         undelivered_watch_key: str = "",
         event_tap: Callable[[Any], None] | None = None,
+        script_hooks: ScriptHookTurn | None = None,
+        hook_agent: str = "",
+        is_new_session: bool = False,
     ) -> None:
         self.provider = provider
+        # The turn the Hooks page's hooks that cannot refuse a call, and the user's
+        # standalone hook files on those events, run for
+        # (:mod:`kiro_crew.messaging.script_hooks`). None runs none of those; the
+        # PreToolUse gate and the spec's own hooks still run, on a turn that admits
+        # tools.
+        self.script_hooks = script_hooks
+        self.hook_agent = hook_agent
+        self.is_new_session = is_new_session
         self.renderer = renderer
         # The session key the caller authenticated for this turn, used ONLY to say
         # whose worker-tool call the harness failed to deliver
@@ -568,7 +653,8 @@ class TurnDriver:
         # Terminal stop reason of the last run() — read by the dispatcher's
         # post-turn bookkeeping (e.g. COMPACTION_FAILED -> session reset).
         self.last_stop_reason: str = ""
-        # Whether run() saw an EVENT_COMPLETE at all. ``last_stop_reason`` is
+        # Whether run() saw an EVENT_COMPLETE or settled a pre-stream user cancel.
+        # ``last_stop_reason`` is
         # "" both before any completion and for a completion that carries no
         # reason, and the two mean opposite things to the post-compaction
         # re-injection bookkeeping (no completion: the prompt never landed; an
@@ -605,9 +691,32 @@ class TurnDriver:
         # prompt is registered. A driver built without one keeps the old ungated
         # behaviour, so a stand-in predating the parameter still works.
         self.closing_gate = closing_gate
+        self.prompt_gate = prompt_gate
 
     async def run(self, message: str) -> str:
         """Drive one turn; return the accumulated channel-safe assistant text."""
+        with (
+            trace_surfaces.root(trace_surfaces.TRIGGER_CHANNEL, channel=self._trace_channel()),
+            redaction_seams.output_seam(redaction_seams.CHANNELS),
+        ):
+            return await self._drive(message)
+
+    def _trace_channel(self) -> str:
+        """The channel this turn's message arrived on, from a closed vocabulary.
+
+        The renderer's transport first: a reply in a dashboard-linked thread runs
+        under the dashboard session's key, which names no channel.
+        """
+        transport = str(getattr(self.renderer, "channel_type", "") or "")
+        if transport in CHANNEL_SESSION_NAMESPACES:
+            return transport
+        return channel_namespace_of(self.audit_session_key)
+
+    async def _drive(self, message: str) -> str:
+        # Bound here, not at module scope: ``kiro_crew.acp`` imports this package
+        # while it initialises (``acp.prompt_blocks`` reads ``messaging.raster``).
+        from kiro_crew.agent_sdk.drivers.acp_vocab import continue_timed_out_calls
+
         accumulated = ""
         self.empty_turn_notice = ""
         # Set when the terminal is one of UNFINISHED_STOP_REASONS; the dispatcher
@@ -625,6 +734,7 @@ class TurnDriver:
         # UUID nor its internal summary is ever committed to a renderer. The
         # security redactor then keeps its existing rolling credential boundary.
         compaction_filter = _CompactionNoticeFilter()
+        quoted_marker_filter = QuotedDirectiveFilter()
         steering_filter = _SteeringMarkerFilter()
         stream_redactor = StreamRedactor(_redact)
         # Last character fed to the redactor this turn, and whether a tool call
@@ -679,34 +789,19 @@ class TurnDriver:
         # accumulated — then reported once at turn end. Counts only, by
         # contract: no text in the log line.
         text_after_terminal = 0
-        # tool_call_id -> canonical directive-tool name, recorded at
-        # EVENT_TOOL_CALL from the trusted ``_meta.kiro`` identity and consumed
-        # at the matching EVENT_TOOL_RESULT. Only populated when a directive
-        # consumer is injected, so a consumer-less turn does no extra work.
-        pending_directives: dict[str, str] = {}
-        # tool_call_ids owned by a NATIVE (in-session) sub-agent, announced via
-        # EVENT_SUBAGENT_ACTIVITY before the child's flat tool_call/tool_result
-        # frames arrive on this same stream. A native child's directive call
-        # carries a genuine core-MCP identity but has no independently bindable
-        # session, so it must be REFUSED rather than applied to the parent —
-        # sub-agent isolation, mirroring the dashboard consumer's
-        # ``_native_tc_card`` refusal.
-        native_tool_call_ids: set[str] = set()
-        # Directive tool_call_ids this turn has ALREADY consumed. Consumption
-        # pops ``pending_directives``, so without this a later result frame for
-        # an applied directive is indistinguishable from one that never had an
-        # identity — and would log the "NOT APPLIED" diagnostic for a directive
-        # that in fact applied. Diagnostic-only bookkeeping: nothing reads it to
-        # authorize anything.
-        consumed_directives: set[str] = set()
-        # Identity OBSERVED on each tool_call frame, for the NOT-APPLIED
-        # diagnostic only. It cannot be read off the result frame: the
-        # tool_call_update path builds its event with no identity fields, so
-        # they are always "" there. Two short strings per call, same per-turn
-        # lifetime as the maps beside it. Nothing reads this to authorize
-        # anything — the grant still comes solely from directive_tool_for at
-        # call time.
-        seen_tool_identity: dict[str, tuple[str, str]] = {}
+        # The turn's first text, held while it could still be the backend's
+        # alternation placeholder (``alternation_echo``): the model repeats it at
+        # the start of a turn after one that ended on a tool result. It is
+        # dropped when it is that text and released when it stops matching.
+        echo_held = ""
+        # The turn's session-directive bookkeeping (forgery gate, sub-agent
+        # isolation, single-consume). Only built when a directive consumer is
+        # injected, so a consumer-less turn does no extra work.
+        directives = (
+            DirectiveTracker(self.directive_consumer)
+            if self.directive_consumer is not None
+            else None
+        )
         # A worker-tool call the harness never delivered, judged per turn.
         undelivered_watch = None
         if self.undelivered_watch_key:
@@ -809,6 +904,17 @@ class TurnDriver:
                 self.partial_text = accumulated
                 await self.renderer.dispatch(OutputEvent(kind=TEXT_CHUNK, text=safe))
 
+        async def settle_echo_hold() -> None:
+            """End the placeholder hold: drop the whole placeholder, emit anything else.
+
+            Called where the held segment ends: a tool call, a steer boundary,
+            the turn's end.
+            """
+            nonlocal echo_held
+            held, echo_held = echo_held, ""
+            if not is_echo(held):
+                await emit_text(held)
+
         def steer_entered_turn() -> bool:
             try:
                 stamp = float(getattr(self.provider, "last_steer_monotonic", 0.0) or 0.0)
@@ -818,7 +924,7 @@ class TurnDriver:
 
         async def dispatch_frames(frames: list[tuple[str, str]]) -> None:
             nonlocal pending_steer_events, unmatched_marker_events
-            nonlocal steered_this_turn, text_after_terminal
+            nonlocal steered_this_turn, text_after_terminal, echo_held
             for frame_kind, payload in frames:
                 if frame_kind == "text":
                     if self.terminal_directive_applied and not steered_this_turn:
@@ -834,8 +940,18 @@ class TurnDriver:
                             # tool-result tail. Counted, never rendered.
                             text_after_terminal += 1
                             continue
+                    if not fed_raw:
+                        held = echo_held + payload
+                        if could_be_echo(held):
+                            echo_held = held
+                            continue
+                        echo_held = ""
+                        # The placeholder, then the model's own words after it.
+                        cut = echo_prefix_len(held)
+                        payload = held[cut:].lstrip() if cut else held
                     await emit_text(payload)
                     continue
+                await settle_echo_hold()
                 # An inline steer marker is a consumption echo: a steer is in
                 # this turn, so the text that follows it is kept.
                 steered_this_turn = True
@@ -856,16 +972,44 @@ class TurnDriver:
                 )
 
         await self.renderer.on_turn_start()
+        # Before the monitor claim check, which must reach the stream with no
+        # await between them. So the hook means "a message arrived": a wake the
+        # check refuses, or a turn the closing gate refuses, has still fired it.
+        hooks = await ChannelTurnHooks.prepare(
+            self.provider,
+            self.hook_agent,
+            self.script_hooks or ScriptHookTurn(self.audit_session_key, message, store_hooks=False),
+            admits_tools=not self.deny_all_tools,
+        )
+        message = await with_hook_context(
+            message, await hooks.prompt_context(is_new=self.is_new_session)
+        )
         if self.monitor_completion is not None:
             if not await self.monitor_completion.authorize():
                 return accumulated
         # The closing gate remains yield-free with stream registration. Monitor
         # acceptance below is synchronous, so it cannot reopen that race.
+        if (
+            self.script_hooks is not None
+            and self.script_hooks.cancelled is not None
+            and self.script_hooks.cancelled()
+        ):
+            # A Stop during the hook has no provider turn to cancel yet. Settle
+            # it like a user-cancelled terminal, without registering a prompt.
+            self.last_stop_reason = STOP_REASON_CANCELLED
+            self.completion_observed = True
+            await self.renderer.dispatch(OutputEvent(kind=DONE, stop_reason=STOP_REASON_CANCELLED))
+            return accumulated
         if self.closing_gate is not None:
             self.closing_gate()
         if self.monitor_completion is not None:
             self.monitor_completion.mark_accepted()
-        async for event in self.provider.stream(message):
+        gated = {} if self.prompt_gate is None else {"prompt_gate": self.prompt_gate}
+        # A call whose own silence timer ends the prompt is handed back to the
+        # model in this turn, on the same session (``acp.timed_out_continuation``).
+        async for event in continue_timed_out_calls(
+            lambda prompt: self.provider.stream(prompt, **gated), message
+        ):
             if self.event_tap is not None:
                 try:
                     self.event_tap(event)
@@ -873,7 +1017,7 @@ class TurnDriver:
                     logger.debug("driver: event tap failed; the turn goes on", exc_info=True)
             kind = event.kind
             if kind == EVENT_TEXT_CHUNK:
-                filtered = compaction_filter.feed(event.text or "")
+                filtered = quoted_marker_filter.feed(compaction_filter.feed(event.text or ""))
                 if filtered:
                     await dispatch_frames(steering_filter.feed(filtered))
             elif kind == EVENT_THINKING_CHUNK:
@@ -921,6 +1065,12 @@ class TurnDriver:
                     tool_name=getattr(event, "tool_name", "") or "",
                     mcp_server=getattr(event, "mcp_server_name", "") or "",
                 )
+                # The call ends the line the quoted-marker filter holds, so that
+                # text stays ahead of the card like the rest of the text before it.
+                held_line = quoted_marker_filter.flush()
+                if held_line:
+                    await dispatch_frames(steering_filter.feed(held_line))
+                await settle_echo_hold()
                 tool_gap = True
                 if segment_tail is not None and len(fed_raw) != tail_fed_at:
                     # Text came since the pending run without ending it (it
@@ -954,53 +1104,31 @@ class TurnDriver:
                         ),
                     )
                 )
-                # Forgery gate: record the directive-tool name ONLY from the
-                # trusted ``_meta.kiro`` identity — never the LLM-authored
-                # title. The single shared predicate (also used by the
-                # dashboard consumer in chat_runner) requires Kiro Crew's OWN
-                # core MCP server and a canonical directive-tool name; a shell
-                # tool (no mcp_server_name, canonical tool_name like
-                # "execute_bash") or a third-party server exposing a same-named
-                # tool can never register here.
-                if self.directive_consumer is not None and event.tool_call_id:
-                    canonical = session_directive.directive_tool_for(
-                        getattr(event, "mcp_server_name", "") or "",
-                        getattr(event, "tool_name", "") or "",
-                    )
-                    if canonical:
-                        pending_directives[event.tool_call_id] = canonical
-                    else:
-                        seen_tool_identity[event.tool_call_id] = (
-                            getattr(event, "mcp_server_name", "") or "",
-                            getattr(event, "tool_name", "") or "",
-                        )
+                # Forgery gate: the directive-tool name is recorded ONLY from
+                # the trusted ``_meta.kiro`` identity (``DirectiveTracker``).
+                if directives is not None:
+                    directives.record_tool_call(event)
+                await hooks.on_tool_call(event)
             elif kind == EVENT_SUBAGENT_ACTIVITY:
                 # Native sub-agent lifecycle marker. Its only role in this
-                # driver is the isolation gate above: remember which
-                # tool_call_ids belong to a child session so their directives
-                # are refused. Tracked regardless of the consumer being set at
-                # THIS point in the stream, because the set is only read when a
-                # consumer exists and the bookkeeping is O(1) per event.
-                if event.tool_call_id and getattr(event, "sub_session_id", ""):
-                    native_tool_call_ids.add(event.tool_call_id)
+                # driver is the isolation gate: remember which tool_call_ids
+                # belong to a child session so their directives are refused.
+                if directives is not None:
+                    directives.on_subagent_activity(event)
             elif kind == EVENT_TOOL_RESULT:
                 if undelivered_watch is not None:
                     await undelivered_watch.on_result(event)
                 # Session directive: a stateless session-bound tool returns a
                 # marker instead of resolving its own session identity; the
                 # caller-injected consumer applies it against the caller's own
-                # session. Gated on the identity recorded above — a forged
-                # marker under any other tool resolves no entry and is
+                # session. Gated on the identity recorded at the call — a
+                # forged marker under any other tool resolves no entry and is
                 # ignored. Without a consumer this event stays inert,
                 # preserving the pre-consumer behavior exactly.
-                if self.directive_consumer is not None:
-                    await self._consume_directive(
-                        event,
-                        pending_directives,
-                        native_tool_call_ids,
-                        consumed_directives,
-                        seen_tool_identity,
-                    )
+                if directives is not None:
+                    await directives.on_tool_result(event)
+                    if directives.terminal_applied:
+                        self.terminal_directive_applied = True
                 # Forward a TERMINAL outcome to the renderer so a per-call card
                 # is finalized honestly ("failed" / "cancelled" / "refused"
                 # instead of the blanket "complete" the next tool_call/on_done
@@ -1018,6 +1146,7 @@ class TurnDriver:
                             tool_status=_tool_status,
                         )
                     )
+                await hooks.on_tool_result(event)
             elif kind == EVENT_PERMISSION_REQUEST:
                 # Untrusted sender: no tool runs, full stop. This precedes even
                 # the PreToolUse gate's auto_approve branch and the
@@ -1058,6 +1187,7 @@ class TurnDriver:
                 # auto/trust/YOLO ladder, so a hard DENY can never be
                 # overridden by auto-approve, per-session Trust, or YOLO
                 # (mirrors native handle_message's hooks.on_tool_call gate).
+                _gate = ""
                 if self.tool_gate is not None:
                     # Off the loop: the gate is ``hooks.on_tool_call``, whose path
                     # tier waits on the resolver child (see
@@ -1104,78 +1234,113 @@ class TurnDriver:
                         )
                         await self.provider.reject_tool(event.request_id)
                         continue
-                    if _gate == "auto_approve":
-                        # The gate's hook granted this by NAME (the
-                        # `auto_approve_tools` globs, or the read-only
-                        # allowlist). Honour it only while each program name in
-                        # the command still resolves to the program it appears
-                        # to name; a shadowed, agent-tree or unidentified
-                        # resolution DOWNGRADES to the ladder below (spawn
-                        # hook, session trust, interactive buttons,
-                        # deny-by-default) — never a hard block. The check is
-                        # awaited HERE, at the one honour point shared by every
-                        # channel's gate, because each channel's `_tool_gate`
-                        # is synchronous and loop-bound and must not do the
-                        # check's filesystem work.
-                        _ng_refusal = await name_grant.refusal_for_event(event)
-                        if _ng_refusal is None:
-                            approval_sent = await self.provider.approve_tool(event.request_id)
-                            sel().log_api_access(
-                                caller="turn_driver",
-                                operation="tool_permission",
-                                outcome=(
-                                    "auto_approved"
-                                    if approval_sent is not False
-                                    else OUTCOME_REJECTED_TRANSPORT_FLOOR
-                                ),
-                                source="messaging",
-                                resources=(
-                                    f"request_id={event.request_id} "
-                                    f"mode={self.approval_mode} reason=hook"
-                                ),
-                            )
-                            continue
-                        # Once per session for a platform-scope refusal; the
-                        # audit row below is still written for every call.
-                        if name_grant.should_log_decline(self.audit_session_key, _ng_refusal):
-                            logger.warning(
-                                "declining a hook auto-approve: %s; the request "
-                                "falls through to the channel's normal approval "
-                                "ladder",
-                                _ng_refusal.log_text,
-                            )
-                        # The decline row uses the shared cross-surface writer
-                        # (log_tool_invocation) rather than this ladder's
-                        # log_api_access rows, so every surface's decline has
-                        # ONE shape and the disclosure rule (constant log_text
-                        # + code, redacted title, never the detail) lives in
-                        # one place.
-                        name_grant.log_decline(
-                            # Empty source: SEL infers the real transport
-                            # (discord/telegram/...) from the session key's
-                            # namespace prefix. The driver is channel-neutral,
-                            # so naming a surface here would misattribute all
-                            # four transports to one made-up value.
-                            source="",
-                            # The caller-injected audit identity: the driver
-                            # itself is channel-neutral, but the one security
-                            # decision it makes must be attributable to a
-                            # session and agent.
-                            session_key=self.audit_session_key,
-                            agent=self.audit_agent,
-                            event=event,
-                            refusal=_ng_refusal,
-                            tier="hook_auto_approve",
-                            metadata={"mode": self.approval_mode},
-                            sel_factory=sel,
+                # PreToolUse script hooks: the Hooks page's on every backend, with
+                # the agent spec's own where Crew runs them
+                # (:mod:`kiro_crew.messaging.tool_hooks`). After the gate's deny
+                # and before every approval, so a deny hook outranks the gate's
+                # auto-approve, the spawn hook, Trust and YOLO alike.
+                _hook_refusal = await hooks.pre_tool_refusal(event)
+                if _hook_refusal is not None:
+                    sel().log_api_access(
+                        caller="turn_driver",
+                        operation="tool_permission",
+                        outcome="denied",
+                        source="messaging",
+                        resources=(
+                            f"request_id={event.request_id} "
+                            f"mode={self.approval_mode} reason=pre_tool_hook"
+                        ),
+                    )
+                    await self._steer_host_deny(
+                        event, _hook_refusal, cause=DENY_CAUSE_POLICY, audited=True
+                    )
+                    await self.provider.reject_tool(event.request_id)
+                    continue
+                from kiro_crew.mate_held_rules import held_for
+                from kiro_crew.web_ask_rule import held_phrases
+
+                # A held Bot limit (``mate_held_rules``), or an organisation's
+                # ``ask`` on a KAS web call (``web_ask_rule``): only a person
+                # approves it; with no decider ``_approve`` refuses it.
+                _held = list(
+                    await asyncio.to_thread(
+                        held_for, event, session_key=self.audit_session_key, agent=self.audit_agent
+                    )
+                ) + held_phrases(event)
+                if _gate == "auto_approve" and not _held:
+                    # The gate's hook granted this by NAME (the
+                    # `auto_approve_tools` globs, or the read-only
+                    # allowlist). Honour it only while each program name in
+                    # the command still resolves to the program it appears
+                    # to name; a shadowed, agent-tree or unidentified
+                    # resolution DOWNGRADES to the ladder below (spawn
+                    # hook, session trust, interactive buttons,
+                    # deny-by-default), never a hard block. The check is
+                    # awaited HERE, at the one honour point shared by every
+                    # channel's gate, because each channel's `_tool_gate`
+                    # is synchronous and loop-bound and must not do the
+                    # check's filesystem work.
+                    _ng_refusal = await name_grant.refusal_for_event(event)
+                    if _ng_refusal is None:
+                        approval_sent = await self.provider.approve_tool(event.request_id)
+                        sel().log_api_access(
+                            caller="turn_driver",
+                            operation="tool_permission",
+                            outcome=(
+                                "auto_approved"
+                                if approval_sent is not False
+                                else OUTCOME_REJECTED_TRANSPORT_FLOOR
+                            ),
+                            source="messaging",
+                            resources=(
+                                f"request_id={event.request_id} "
+                                f"mode={self.approval_mode} reason=hook"
+                            ),
                         )
+                        continue
+                    # Once per session for a platform-scope refusal; the
+                    # audit row below is still written for every call.
+                    if name_grant.should_log_decline(self.audit_session_key, _ng_refusal):
+                        logger.warning(
+                            "declining a hook auto-approve: %s; the request "
+                            "falls through to the channel's normal approval "
+                            "ladder",
+                            _ng_refusal.log_text,
+                        )
+                    # The decline row uses the shared cross-surface writer
+                    # (log_tool_invocation) rather than this ladder's
+                    # log_api_access rows, so every surface's decline has
+                    # ONE shape and the disclosure rule (constant log_text
+                    # + code, redacted title, never the detail) lives in
+                    # one place.
+                    name_grant.log_decline(
+                        # Empty source: SEL infers the real transport
+                        # (discord/telegram/...) from the session key's
+                        # namespace prefix. The driver is channel-neutral,
+                        # so naming a surface here would misattribute all
+                        # four transports to one made-up value.
+                        source="",
+                        # The caller-injected audit identity: the driver
+                        # itself is channel-neutral, but the one security
+                        # decision it makes must be attributable to a
+                        # session and agent.
+                        session_key=self.audit_session_key,
+                        agent=self.audit_agent,
+                        event=event,
+                        refusal=_ng_refusal,
+                        tier="hook_auto_approve",
+                        metadata={"mode": self.approval_mode},
+                        sel_factory=sel,
+                    )
                 # Early auto-approve paths take precedence over the interactive
                 # ladder, mirroring native handle_message: approve immediately,
                 # no buttons, no decider wait.
                 #  - hook: auto_approve_subagent_spawn -> spawn_run
                 #  - per-session Trust / global YOLO (injected predicate)
                 _auto_reason = ""
-                if self.auto_approve_tool is not None and self.auto_approve_tool(event):
+                if _held:
+                    pass
+                elif self.auto_approve_tool is not None and self.auto_approve_tool(event):
                     _auto_reason = "hook_auto_approve"
                 elif self.auto_approve_session is not None and self.auto_approve_session():
                     _auto_reason = "session_trust"
@@ -1199,7 +1364,11 @@ class TurnDriver:
                 # Only render approve/deny buttons when there's a decider to
                 # await the click. Without one, _approve() denies by default,
                 # so posting buttons would leave the user with dead controls.
-                if self.approval_mode == APPROVAL_INTERACTIVE and self.decider is not None:
+                # The prompt is answerable from its dispatch: its wait starts here.
+                _asked = trace_steps.asked_now()
+                if (
+                    self.approval_mode == APPROVAL_INTERACTIVE or _held
+                ) and self.decider is not None:
                     # The prompt names the tool from the PERMISSION event's own
                     # title, and its purpose from the tool_call that shares the
                     # id. A renderer that instead remembers the last titled
@@ -1207,6 +1376,9 @@ class TurnDriver:
                     # not immediately preceded by its own, informed consent on a
                     # security prompt, so the correct name travels WITH the ask.
                     _tool_call_id = str(getattr(event, "tool_call_id", "") or "")
+                    # WHICH server the call goes to, from the trusted identity
+                    # only: the title cannot say, and the model wrote it.
+                    _mcp_server, _mcp_tool = trusted_mcp_identity(event)
                     await self.renderer.dispatch(
                         OutputEvent(
                             kind=PROMPT_CHOICE,
@@ -1222,9 +1394,11 @@ class TurnDriver:
                             # channel, so it takes the same redaction as everything
                             # else on this path.
                             tool_input=_redact(getattr(event, "tool_input", "") or ""),
+                            mcp_server=_redact(_mcp_server),
+                            tool_name=_redact(_mcp_tool),
                         )
                     )
-                approved = await self._approve(event)
+                approved = await self._approve(event, asked=_asked, held=_held)
                 if approved:
                     approval_sent = await self.provider.approve_tool(event.request_id)
                     permission_outcome = (
@@ -1275,10 +1449,12 @@ class TurnDriver:
                             "monitor turn completion callback failed",
                             exc_info=True,
                         )
-                pending = compaction_filter.flush()
+                pending = quoted_marker_filter.feed(compaction_filter.flush())
+                pending += quoted_marker_filter.flush()
                 if pending:
                     await dispatch_frames(steering_filter.feed(pending))
                 await dispatch_frames(steering_filter.flush())
+                await settle_echo_hold()
                 await flush_redactor()
                 for _ in range(pending_steer_events):
                     await self.renderer.dispatch(OutputEvent(kind=STEER_CONSUMED))
@@ -1328,21 +1504,23 @@ class TurnDriver:
             )
         if not self.completion_observed:
             # The stream ended without a terminal. The text is not final yet: the
-            # compaction filter, the steering filter and the stream redactor each
-            # hold back a tail (the redactor withholds a whole trailing letter
-            # run, so a last chunk of "Done" is still in its buffer), and only the
-            # terminal branch above flushed them. Flush the same trio in the same
-            # order here, or the verdict below reads a buffer and tells the user
-            # the turn ended without a reply while the reply sits unflushed --
+            # compaction, quoted-marker and steering filters and the stream
+            # redactor each hold back a tail (the redactor withholds a whole
+            # trailing letter run, so a last chunk of "Done" is still in its
+            # buffer), and only the terminal branch above flushed them. Flush them
+            # in the same order here, or the verdict below reads a buffer and tells
+            # the user the turn ended without a reply while the reply sits unflushed --
             # and the dispatcher, which reads ``accumulated`` for the transcript,
             # files the same wrong story. The unmatched steer boundaries are
             # dispatched as the terminal branch dispatches them. No DONE is
             # dispatched: the dispatcher's ``finally`` (or its own synthetic DONE)
             # closes the renderer; the verdict is still owed to the transcript.
-            pending = compaction_filter.flush()
+            pending = quoted_marker_filter.feed(compaction_filter.flush())
+            pending += quoted_marker_filter.flush()
             if pending:
                 await dispatch_frames(steering_filter.feed(pending))
             await dispatch_frames(steering_filter.flush())
+            await settle_echo_hold()
             await flush_redactor()
             for _ in range(pending_steer_events):
                 await self.renderer.dispatch(OutputEvent(kind=STEER_CONSUMED))
@@ -1350,129 +1528,11 @@ class TurnDriver:
             self.empty_turn_notice = empty_turn_notice(
                 accumulated, completed=False, stop_reason="", productive=productive
             )
+        elif classify_stop_reason(self.last_stop_reason).name == STOP_CLASS_SUCCEEDED:
+            # Only a reply the backend finished: not one the user stopped, one
+            # it abandoned, or one that ended on a refusal or an error.
+            await hooks.stop(accumulated)
         return accumulated
-
-    async def _consume_directive(
-        self,
-        event: Any,
-        pending: dict[str, str],
-        native_tool_call_ids: set[str],
-        consumed: set[str] | None = None,
-        seen_identity: dict[str, tuple[str, str]] | None = None,
-    ) -> None:
-        """Decode one directive-tool result and apply it via the consumer.
-
-        SINGLE-CONSUME: one tool call can surface more than one result frame
-        (a mid-stream content frame and the final ``status=completed``
-        rawOutput frame), so the mapping is popped BEFORE the consumer runs —
-        a second frame must never re-apply the effect (two armed loops, a
-        repeated mutation). A mid-stream frame with no decodable marker leaves
-        the mapping in place for the final frame. Mirrors the dashboard
-        consumer in ``chat_runner``.
-        """
-        consumer = self.directive_consumer
-        tool = pending.get(event.tool_call_id or "", "")
-        if consumer is None or not tool:
-            # DIAGNOSTIC ONLY (never a grant) — mirrors the dashboard consumer.
-            # A marker with no recorded identity is the right outcome for a
-            # forged result AND what a backend emitting no ``_meta.kiro``
-            # produces for a real directive; the gate is silent, so log enough
-            # to tell those apart.
-            if (
-                consumer is not None
-                and (event.tool_call_id or "") not in (consumed or ())
-                and session_directive.has_marker(event.tool_output)
-            ):
-                logger.warning(
-                    "session-directive NOT APPLIED: marker present but the tool "
-                    "call carried no core-MCP identity "
-                    "(tool_call_id=%s, mcp_server_name=%r, tool_name=%r, "
-                    "expected mcp_server_name=%r). Either a forged marker, or "
-                    "this ACP backend does not emit _meta.kiro identity.",
-                    event.tool_call_id,
-                    (seen_identity or {}).get(event.tool_call_id or "", ("", ""))[0],
-                    (seen_identity or {}).get(event.tool_call_id or "", ("", ""))[1],
-                    session_directive.CORE_MCP_SERVER,
-                )
-            return
-        if event.tool_call_id in native_tool_call_ids:
-            # Sub-agent ISOLATION: a native child's tool calls surface as flat
-            # events on the parent stream with a genuine core-MCP identity, but
-            # the child has no independently bindable session — applying its
-            # directive here would let a sub-agent arm/mutate its PARENT. Pop
-            # (terminal for this call) and audit the refusal so the denial is
-            # never a silent drop, mirroring the dashboard consumer.
-            pending.pop(event.tool_call_id, None)
-            if consumed is not None and event.tool_call_id:
-                consumed.add(event.tool_call_id)
-            sel().log_api_access(
-                caller="turn_driver",
-                operation="session_directive",
-                outcome="denied",
-                source="messaging",
-                resources=(
-                    f"tool={tool} tool_call_id={event.tool_call_id} "
-                    "reason=native_subagent_isolation"
-                ),
-            )
-            logger.info(
-                "session-directive %r from a native sub-agent refused "
-                "(tool_call_id=%s): no session of its own to act on",
-                tool,
-                event.tool_call_id,
-            )
-            return
-        output = event.tool_output or ""
-        args = session_directive.decode(output, tool)
-        if args is None:
-            if getattr(event, "tool_final", False):
-                if session_directive.is_refusal(output):
-                    # The tool DECLINED and said so in its own result text (an
-                    # oversized payload, a schema rejection ahead of the handler,
-                    # or a session this effect can never apply to): nothing was
-                    # applied and the model was told. Terminal for this call.
-                    pending.pop(event.tool_call_id, None)
-                    if consumed is not None and event.tool_call_id:
-                        consumed.add(event.tool_call_id)
-                    logger.info(
-                        "session-directive REFUSED for %r (tool_call_id=%s, "
-                        "out_len=%d): the tool returned a tagged refusal instead "
-                        "of a directive; nothing applied",
-                        tool,
-                        event.tool_call_id,
-                        len(output),
-                    )
-                else:
-                    # Authenticated directive tool, final frame, no marker:
-                    # the effect is being dropped outright. Never let that be
-                    # silent — and name BOTH causes that reach here now that
-                    # every by-design decline is tagged: the marker was mangled
-                    # in transport, or the tool raised past its own return so its
-                    # decline never passed refuse_if_markerless. Asserting one
-                    # cause sends an operator hunting a bug that is not there.
-                    logger.warning(
-                        "session-directive decode FAILED for %r (tool_call_id=%s, "
-                        "out_len=%d) — effect dropped. Either the marker was lost "
-                        "in transport (a marker-escaping regression) or the tool "
-                        "raised past its own return, so its decline was never "
-                        "tagged a refusal",
-                        tool,
-                        event.tool_call_id,
-                        len(output),
-                    )
-            return
-        pending.pop(event.tool_call_id, None)
-        if consumed is not None and event.tool_call_id:
-            consumed.add(event.tool_call_id)
-        try:
-            applied = await consumer(tool, args)
-        except Exception:
-            # The consumer is injected code applying a side effect; a failure
-            # there must never abort the rest of the turn's stream.
-            logger.warning("session-directive consumer failed for %r", tool, exc_info=True)
-            return
-        if applied is True:
-            self.terminal_directive_applied = True
 
     async def _steer_deny_cause(self, event: Any) -> None:
         """Explain a host-caused denial to the model before the reject goes out.
@@ -1579,13 +1639,58 @@ class TurnDriver:
         except Exception:
             logger.debug("host-deny steer notice failed; rejecting anyway", exc_info=True)
 
-    async def _approve(self, event: Any) -> bool:
-        """Apply the approval ladder to a permission-request event."""
-        if self.approval_mode in (APPROVAL_AUTO, APPROVAL_TRUST):
+    async def _approve(
+        self,
+        event: Any,
+        *,
+        asked: trace_steps.Asked | None = None,
+        held: list[str] | None = None,
+    ) -> bool:
+        """Apply the approval ladder to a permission-request event.
+
+        *asked* is when the prompt became answerable, for its trace span's wait.
+        *held* names the moved Bot's limits the call falls under: a person decides.
+        """
+        from kiro_crew.approval_mode_policy import session_mode_permitted
+
+        if held:
+            if self.decider is None:
+                return False
+        elif self.approval_mode == APPROVAL_AUTO:
             return True
-        if self.approval_mode == APPROVAL_TRUST_READS:
+        # A session mode the ``permission_mode`` policy denies falls through to the
+        # interactive ladder below rather than auto-approving.
+        elif self.approval_mode == APPROVAL_TRUST and session_mode_permitted("trust"):
+            return True
+        elif self.approval_mode == APPROVAL_TRUST_READS and session_mode_permitted("trust_reads"):
             return bool(getattr(event, "tool_kind", "") == "read")
         # interactive: deny-by-default unless a decider approves.
         if self.decider is not None:
-            return bool(await self.decider(event))
+            from kiro_crew import mate_held_rules
+
+            # The one wait a person can answer here: its span (tracing/steps.py).
+            approval = trace_steps.approval_opened(
+                str(event.request_id) if getattr(event, "request_id", None) is not None else "",
+                tool_call_id=str(getattr(event, "tool_call_id", "") or ""),
+                since=asked,
+            )
+            approved = False
+            answered = False
+            try:
+                # Marked held, so a decider that would answer on its own (YOLO, an
+                # ``auto_approve_sources`` entry, slot trust) asks a person instead.
+                marker = mate_held_rules.held_call(held) if held else contextlib.nullcontext()
+                with marker:
+                    approved = bool(await self.decider(event))
+                answered = True
+            finally:
+                # A cancel or a raise out of the wait is no one's answer: the host's.
+                trace_steps.approval_closed(
+                    approval,
+                    approved=approved,
+                    by=trace_steps.decided_by(
+                        host=not answered, cause=getattr(self.decider, "last_deny_cause", "")
+                    ),
+                )
+            return approved
         return False

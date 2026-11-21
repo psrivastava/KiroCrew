@@ -13,8 +13,8 @@ leaves the process. These tests close it by driving that live path and reading
 what an exporter actually received.
 
 Two tiers, because the OTLP exporter is an optional extra
-(``pip install "kirocrew[otlp]"``) that a default dev/CI environment does not
-have:
+(``pip install "kirocrew[otlp]"``) that a default dev environment does not have
+(CI's backend test lanes install it):
 
 * **Tier 1 — serialization (always runs).** The live build's own JSONL exporter
   writes real records to disk. Asserts the full instrument roster arrives, that
@@ -41,6 +41,7 @@ import threading
 from unittest.mock import patch
 
 import pytest
+from loopback_servers import LoopbackHTTPServer
 
 from kiro_crew.metrics import inventory_gauges as ig
 from kiro_crew.metrics import process_gauges as pg
@@ -481,7 +482,7 @@ class _Receiver:
     def __init__(self):
         # 127.0.0.1 explicitly: this listens for our own export and must never be
         # reachable off the machine.
-        self._server = http.server.HTTPServer(("127.0.0.1", 0), _CollectingHandler)
+        self._server = LoopbackHTTPServer(("127.0.0.1", 0), _CollectingHandler)
         self._server.received = []  # type: ignore[attr-defined]
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
 

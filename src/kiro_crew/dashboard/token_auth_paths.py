@@ -46,14 +46,12 @@ logger = logging.getLogger("kiro_crew.dashboard.token_auth")
 # so artifact and widget frames load a real document instead. See
 # dashboard/handlers/sandbox_doc.py for the full security model.
 # Same exposure class as /assets/: static non-secret files.
-# /browser-view/ is the same-origin relay for the Playwright CLI browser view:
-# auth is the per-instance capability token embedded in the path, minted by
-# the view supervisor and disclosed only through the cookie-authed, owner-gated
-# /api/browser/view payload (the panel frames the relay in an opaque-origin
-# sandbox that carries no cookies, exactly like /artifact-app/ above). The
-# relay constant-time-compares the token BEFORE running its per-request
-# ownership probes and answers a uniform 404 without it. See
-# dashboard/handlers/browser_view_relay.py for the full security model.
+# /app-frame/ and /app-frame-fetch/ are an app frame (a link-preview card or a message action):
+# the frame document (auth: an HMAC path token) and its ctx.fetch (auth: the
+# capability in the X-KiroCrew-Capability header, never a cookie), both minted by
+# the session-authed mints under /api/apps/<name>/. The frame is an
+# opaque-origin sandbox that does not reliably send a cookie. See
+# apps/app_frame.py for the full security model.
 _BYPASS_PREFIXES = (
     "/assets/",
     "/static/",
@@ -61,20 +59,14 @@ _BYPASS_PREFIXES = (
     "/vendor/",
     "/artifact-app/",
     "/sandbox-doc/",
-    "/browser-view/",
+    "/app-frame/",
+    "/app-frame-fetch/",
 )
 _BYPASS_EXACT = {
     "/logo.png",
     # Alias of /logo.png for clients that hardcode the favicon path instead of
     # parsing <link rel="icon"> — same handler, same static-asset exposure.
     "/favicon.ico",
-    # The bare relay path (no trailing slash, so the /browser-view/ prefix
-    # above misses it). It is a registered relay route carrying no token
-    # segment, and the relay's contract is a UNIFORM 404 for every tokenless
-    # or wrong-token request — without this entry the middleware answers 403
-    # first, handing an unauthenticated prober a response that distinguishes
-    # the bare path from the tokened misses.
-    "/browser-view",
     "/manifest.json",
     "/sw.js",
     "/pcm-worklet.js",
@@ -157,11 +149,84 @@ _SELF_AUTH_WEBHOOK_METHODS = frozenset({"POST"})
 #: under another method stays on the ordinary token gate.
 UPDATE_REVALIDATE_PATH = "/api/update/revalidate"
 
+#: The inbound agent webhook's read half: the caller that started a run reads how
+#: it ended. Its handler (api_hooks_agent_status) checks the same webhook bearer
+#: the POST does and answers only for that source's own runs. GET only; HEAD and
+#: every other method stay behind the ordinary gate.
+AGENT_HOOK_STATUS_PATH = "/api/hooks/agent/status"
+
+#: A vendor's OAuth redirect back to a DCR Connection sign-in on a gateway with a
+#: public HTTPS URL (``connections.crew_oauth_dcr.gateway_callback``). The browser
+#: arrives from the vendor with no Crew credential; the handler admits only a
+#: pending sign-in's ``state`` (constant-time, single use, 600 s) and answers a
+#: fixed page. GET only.
+CREW_OAUTH_CALLBACK_PATH = "/api/connections/oauth/callback"
+
+#: The relay viewer's access token mint for the desktop app's main process, which
+#: holds the local secret and no dashboard token. Its handler (api_relay_viewer_token)
+#: admits only loopback or the same-user unix socket, the X-Local-Secret and a
+#: verified host process, the /api/token/local admission. POST only.
+RELAY_VIEWER_TOKEN_PATH = "/api/relay-viewer/token"
+
+#: A connected computer's connector socket (the WebSocket upgrade, GET only). It
+#: skips token auth only while the ``connected_computers`` preview is on in the live
+#: configuration (:func:`_exact_method_bypass`); with it off the path goes through
+#: the ordinary token gate and then answers the router's 404, exactly as a path no
+#: route serves. With it on, the handler
+#: (``connected_computers.ws_route.api_connector_connect``) refuses the upgrade
+#: unless Session Environments is reachable too, no ``Origin`` and no
+#: ``Authorization`` header came, and the named device has a record here: an
+#: active one, or, when the connector names a credential generation no newer than
+#: the record's (``protocol.GENERATION_HEADER``), a revoked or removed one too, so
+#: that computer still hears an authenticated refusal; it is never admitted. On the
+#: socket the gateway proves itself first (``hello``); the connector's OWN scoped
+#: credential arrives only after that proof and is verified in full --
+#: signature, expiry, revocation generation, audience, this gateway's id, the
+#: device record, its credential generation and its owner -- before any tool
+#: channel opens, else the socket closes. A dashboard cookie or token is never
+#: accepted there, and a connector credential is never accepted anywhere else
+#: (it is not a session).
+CONNECTOR_CONNECT_PATH = "/api/connected-computers/connect"
+
+#: The four local authorization routes (``routes/local_authorization.py``): an app on
+#: this machine asks for a grant before it holds any credential. Each handler admits
+#: only a direct loopback request and gives nothing by itself: the owner answers the
+#: request through the Owner tier, and a code is redeemed only with the asking app's
+#: PKCE verifier. One method each; every other method stays behind the token gate.
+LOCAL_AUTH_METADATA_PATH = "/.well-known/oauth-authorization-server"
+LOCAL_AUTH_AUTHORIZE_PATH = "/oauth/authorize"
+LOCAL_AUTH_TOKEN_PATH = "/oauth/token"
+LOCAL_AUTH_REVOKE_PATH = "/oauth/revoke"
+
 _BYPASS_EXACT_METHODS: dict[str, frozenset[str]] = {
     AGENT_HOOK_PATH: _SELF_AUTH_WEBHOOK_METHODS,
+    LOCAL_AUTH_METADATA_PATH: frozenset({"GET"}),
+    LOCAL_AUTH_AUTHORIZE_PATH: frozenset({"GET"}),
+    LOCAL_AUTH_TOKEN_PATH: frozenset({"POST"}),
+    LOCAL_AUTH_REVOKE_PATH: frozenset({"POST"}),
+    AGENT_HOOK_STATUS_PATH: frozenset({"GET"}),
+    CREW_OAUTH_CALLBACK_PATH: frozenset({"GET"}),
+    RELAY_VIEWER_TOKEN_PATH: frozenset({"POST"}),
     TEAMS_WEBHOOK_PATH: _SELF_AUTH_WEBHOOK_METHODS,
     UPDATE_REVALIDATE_PATH: _SELF_AUTH_WEBHOOK_METHODS,
 }
+
+
+def _exact_method_bypass(path: str, method: str) -> bool:
+    """Whether *path* + *method* skips token auth by an exact, method-scoped grant.
+
+    :data:`_BYPASS_EXACT_METHODS` grants unconditionally. The connector socket's
+    GET is granted only while its preview is on in the live configuration; off,
+    or before a configuration is loaded, it meets the token gate like any path.
+    """
+    if method in _BYPASS_EXACT_METHODS.get(path, frozenset()):
+        return True
+    if path != CONNECTOR_CONNECT_PATH or method != "GET":
+        return False
+    from kiro_crew.connected_computers.flag import live_preview_on
+
+    return live_preview_on()
+
 
 # Exact-path exemptions from the CSRF **Origin** check, path -> allowed methods.
 # A separate map from the token-auth bypass above, deliberately: skipping the
@@ -202,12 +267,24 @@ CSRF_EXEMPT_EXACT_METHODS: dict[str, frozenset[str]] = {
 }
 
 
-def is_csrf_exempt(path: str, method: str) -> bool:
-    """Whether *path* + *method* is a webhook exempt from the CSRF Origin check.
+# An app frame.s fetch (``apps/app_frame.py``) is exempt on every
+# method for the reason the webhook is: its handler reads no cookie at all and
+# authenticates the capability in the ``X-KiroCrew-Capability`` header, which a
+# cross-origin page can neither obtain nor forge. The exemption is REQUIRED: the
+# caller is an opaque-origin sandboxed frame, whose writes carry ``Origin: null``
+# and so always fail the Origin check. The prefix is spelled out in
+# ``is_csrf_exempt`` below.
 
-    The single read point for :data:`CSRF_EXEMPT_EXACT_METHODS`, so both dashboard
-    middleware chains share one exemption rather than a literal list each.
+
+def is_csrf_exempt(path: str, method: str) -> bool:
+    """Whether *path* + *method* is exempt from the CSRF Origin check.
+
+    The single read point for :data:`CSRF_EXEMPT_EXACT_METHODS` and the
+    app-frame fetch prefix, so both dashboard middleware chains share one
+    exemption rather than a literal list each.
     """
+    if path.startswith("/app-frame-fetch/"):
+        return True
     return method in CSRF_EXEMPT_EXACT_METHODS.get(path, frozenset())
 
 
@@ -253,12 +330,11 @@ SPA_FALLBACK_EXCLUDED_PREFIXES = (
     # 200 and render nothing, and a future non-/api GET registered beside it in
     # routes/realtime.py would inherit the same silent fallback.
     "/feature-videos/",
-    # The browser-view relay (handlers/browser_view_relay.py). A data route
-    # authenticated by its own capability path token: its handler must always
-    # answer — the uniform 404 without the token, the proxied view with it —
-    # never the SPA shell, which would render the dashboard inside the
-    # Browser panel's own frame.
-    "/browser-view",
+    # An app frame and its fetch (apps/app_frame.py):
+    # token-credentialed data routes that must never answer with the shell, which
+    # would load the dashboard inside the app.s frame.
+    "/app-frame/",
+    "/app-frame-fetch/",
 )
 
 # App window entries (`/app-windows/<app>/<name>.html`) are their own Vite bundles, served
@@ -429,6 +505,27 @@ def _deny(request: web.Request, reason: str, code: str = "") -> web.Response:
         # that hides every future regression here.
         return web.json_response(
             {"error": reason, "code": code or "forbidden"}, status=403, headers=headers
+        )
+    # Function-local: the token_auth facade mirrors every module-level name of its
+    # owners, and these are not part of its surface.
+    from kiro_crew.dashboard.crew_api_errors import (
+        contract_error,
+        is_crew_api_path,
+        request_id_for,
+    )
+
+    if is_crew_api_path(request.path):
+        # The Crew API's own error body, on every /v1/ path but the frozen
+        # /v1/chat/completions. ``owner_only`` is the one
+        # refusal about what a known caller may do, so it is the one 403. Every other
+        # refusal here is a credential this layer could not accept, the contract's
+        # 401: ``invalid_token`` unless the refusal names its own reason.
+        return contract_error(
+            403 if code == "owner_only" else 401,
+            code or "invalid_token",
+            reason,
+            request_id_for(request),
+            headers,
         )
     return web.Response(
         text=_403_HTML.format(reason=reason),

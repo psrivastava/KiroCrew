@@ -1,35 +1,14 @@
 """The daemon-global spawn gate and the ``spawn_queue`` protocol around it.
 
-Mirrors ``test_mcp_gateway_breaker.py`` in spirit: the gate is a small
-in-process object, so its contract is pinned directly -- FIFO order, a permit
-whose ``settle`` is exactly-once and separate from ``release``, cancellation
-that is neutral at every boundary, a capacity seam that admits waiters when
-raised and revokes nothing when cut, and a drain that fails every waiter and
-releases every watcher. Time is injected wherever the gate reads it; the one
-real ``asyncio`` timing this file relies on is sub-100 ms.
+The gate is a small in-process object, so its contract is pinned directly: FIFO order,
+exactly-once ``settle``, neutral cancellation, capacity changes, and drain. Time is
+injected; the one real ``asyncio`` timing here is sub-100 ms.
 
-The second half drives ``gatewayd._handle_connection`` with the same scripted
-reader / recording writer the coverage suites use, so the WIRE is pinned too:
-no ``capacity`` refusal carries ``fallback`` on EITHER wire shape -- the legacy
-bare ``ensure_backend`` included, singly and eight at a time, because that tag
-authorised an exec the daemon could not charge and the failure mode was a rate --
-while a target-shaped ``compat`` refusal still does and is still charged; an old
-stub never sees ``queued``; a new stub gets ``queued`` keepalives and
-``retry_after_secs``; pings are answered while an acquire waits; the frames
-parked during that wait are bounded in both count and bytes (a burst one under
-the bound is parked whole; either bound exceeded drops that one connection); and
-a fallback charges the host budget until the connection closes.
-
-Three more properties are timing rather than shape, so no side of them is a
-double. That the daemon's queue wait ends before the stub's -- a stub whose own
-budget expires first runs the unaccounted ``fallback_exec`` the refusal exists to
-withhold -- is measured with the real stub pre-flight and the real handler on
-either end of a REAL endpoint, one budget serving both as the shipped defaults
-do. That a waiter in the gate holds no host charge is measured with a real pool
-and a real budget whose ceiling is the number of waiters. That a prewarm pass
-stands down per key when a live stub queues during it runs a real
-``run_gatewayd``, because the yield and the bounded wait are arguments that pass
-supplies.
+The second half drives ``gatewayd._handle_connection`` to pin the wire. No ``capacity``
+refusal carries ``fallback`` on either wire shape: that exec could not be charged to the
+host budget. A ``compat`` refusal still does. Timing properties (daemon wait ends before
+the stub's, no charge while queued, prewarm yields) use real endpoints, pools and
+``run_gatewayd`` rather than doubles.
 """
 
 from __future__ import annotations
@@ -55,6 +34,7 @@ from kiro_crew.mcp_gateway import stub as stub_mod
 from kiro_crew.mcp_gateway import transport
 from kiro_crew.mcp_gateway.backend import Backend
 from kiro_crew.mcp_gateway.pool import BackendUnavailable, PoolAtCapacity, PoolKey
+from kiro_crew.start_priority import StartPriority
 from kiro_crew.testing.wait import async_wait_until, await_until, finished
 
 _POSIX_ONLY = pytest.mark.skipif(
@@ -63,7 +43,7 @@ _POSIX_ONLY = pytest.mark.skipif(
     "Windows uses a named pipe whose name is not a filesystem path",
 )
 
-# --- clock -------------------------------------------------------------------
+# clock
 
 
 class _Clock:
@@ -105,7 +85,7 @@ async def _within_ceiling(aw: Awaitable[Any], what: str) -> Any:
         ) from None
 
 
-# --- SpawnGate unit --------------------------------------------------------
+# SpawnGate unit
 
 
 class TestPermit:
@@ -330,7 +310,7 @@ class TestDrain:
             watched,
             init_done=done,
             init_state=lambda: "unsent",
-            process_exited=AsyncMock(),
+            process_exited=_never_exits,
             timeout=60.0,
         )
         await gate.close()
@@ -340,6 +320,11 @@ class TestDrain:
         with pytest.raises(adm.SpawnGateClosed):
             await gate.acquire(label="late")
         assert gate.snapshot()["closed"] is True and gate.queued == 0
+
+
+async def _never_exits() -> None:
+    """A backend process that is still running: ``process.wait`` that does not return."""
+    await asyncio.Event().wait()
 
 
 class TestInitializeWatcher:
@@ -353,16 +338,64 @@ class TestInitializeWatcher:
         permit = await gate.acquire(label="p")
         done = asyncio.Event()
         state = self._state_holder("in_flight")
-        exited = AsyncMock()
         task = gate.watch_initialize(
-            permit, init_done=done, init_state=lambda: state[0], process_exited=exited, timeout=5.0
+            permit,
+            init_done=done,
+            init_state=lambda: state[0],
+            process_exited=_never_exits,
+            timeout=5.0,
         )
         state[0] = "ready"
         done.set()
         await task
         assert permit.outcome == adm.OUTCOME_SUCCESS and permit.released
         assert gate.in_flight == 0
-        exited.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_backend_that_exits_before_any_initialize_frees_its_slot_at_once(
+        self,
+    ) -> None:
+        """A stub that left before kiro sent ``initialize`` took its private backend
+        with it, so the permit is not held for the whole initialize window."""
+        gate = adm.SpawnGate(1)
+        permit = await gate.acquire(label="first-stub")
+        exited = asyncio.Event()
+        task = gate.watch_initialize(
+            permit,
+            init_done=asyncio.Event(),
+            init_state=lambda: "unsent",
+            process_exited=exited.wait,
+            timeout=600.0,  # flake-ok: the watcher's own deadline, never waited on
+        )
+        next_spawn = asyncio.create_task(gate.acquire(label="second-stub"))
+        await _settle()
+        assert not next_spawn.done(), "held while the backend process is alive"
+        exited.set()
+        second = await _within_ceiling(
+            next_spawn, "the next spawn is admitted once the process exits"
+        )
+        await _within_ceiling(task, "the watcher ends once the process exits")
+        assert permit.outcome == adm.OUTCOME_NEUTRAL and permit.released
+        assert gate.in_flight == 1
+        second.release()
+
+    @pytest.mark.asyncio
+    async def test_an_exit_with_a_finished_handshake_still_settles_by_that_handshake(
+        self,
+    ) -> None:
+        gate = adm.SpawnGate(1)
+        permit = await gate.acquire(label="p")
+        done = asyncio.Event()
+        done.set()
+        task = gate.watch_initialize(
+            permit,
+            init_done=done,
+            init_state=lambda: "ready",
+            process_exited=AsyncMock(),
+            timeout=5.0,  # flake-ok: the watcher's own deadline, never waited on
+        )
+        await task
+        assert permit.outcome == adm.OUTCOME_SUCCESS and permit.released
 
     @pytest.mark.asyncio
     async def test_failed_settles_failure_and_holds_until_the_process_is_reaped(self) -> None:
@@ -395,7 +428,7 @@ class TestInitializeWatcher:
             permit,
             init_done=asyncio.Event(),
             init_state=lambda: "unsent",
-            process_exited=AsyncMock(),
+            process_exited=_never_exits,
             timeout=0.01,
         )
         await task
@@ -420,7 +453,7 @@ class TestInitializeWatcher:
             permit,
             init_done=done,
             init_state=init_state,
-            process_exited=AsyncMock(),
+            process_exited=_never_exits,
             timeout=0.02,
         )
         await _await_state(lambda: bool(reads), "the watcher's first window expired")
@@ -445,7 +478,7 @@ class TestInitializeWatcher:
                 permit,
                 init_done=done,
                 init_state=lambda: "ready",
-                process_exited=AsyncMock(),
+                process_exited=_never_exits,
                 timeout=timeout,
             )
             assert permit.outcome == adm.OUTCOME_SUCCESS
@@ -494,7 +527,7 @@ class TestAdmissionBundle:
         assert admission.snapshot()["host_budget"]["charges"] == 0
 
 
-# --- daemon protocol -----------------------------------------------------------
+# daemon protocol
 
 _STUB = "stub-admission-0001"
 
@@ -697,14 +730,8 @@ class TestWaitBudgetNegotiation:
     ) -> None:
         """The daemon's wait must END FIRST, at every budget, not tie.
 
-        A tie is not a tie: the stub starts its timer before it writes
-        ``ensure_backend`` and the daemon starts its own only after reading the
-        frame, so at equal budgets the stub is always the one that gives up --
-        and a stub whose budget expires runs ``fallback_exec``, one more process
-        on the host the daemon was refusing one for, charged to nothing. The
-        margin is what turns that into the ``capacity`` refusal that authorises
-        no exec, so it is load-bearing for the same property
-        ``_LEGACY_SPAWN_WAIT_SECS`` is: the answer has to ARRIVE in time.
+        The stub's timer starts before it writes ``ensure_backend``, so at equal budgets
+        the stub gives up first and runs an uncharged ``fallback_exec``.
         """
         armed = gw._negotiated_wait_budget(
             {"wait_budget_secs": asked}, _admission(spawn_queue_wait_secs=ceiling)
@@ -728,6 +755,7 @@ _CAPACITY_FAILURES: list[tuple[str, BaseException, int]] = [
     ("gate wait spent", adm.SpawnGateTimeout(3, 4, 600.0), 30),
     ("gate closed", adm.SpawnGateClosed("drain"), 5),
     ("breaker OPEN", BackendUnavailable("breaker OPEN"), 60),
+    ("owner port unproven", gw.OwnerPortUnproven("'kirocrew-core': no port"), 30),
     *[
         (f"pressure errno {name}", OSError(getattr(errno, name), name), 30)
         for name in ("ENOMEM", "EAGAIN", "EMFILE", "ENFILE", "ENOSPC")
@@ -760,13 +788,8 @@ class TestRejectionClasses:
     ) -> None:
         """No stub shape earns a fallback from a capacity refusal.
 
-        The classifier takes no "what did this stub negotiate" input at all, so
-        there is no argument that turns a ``capacity`` verdict into an exec
-        authorisation -- which is the point: the exec a pre-``spawn_queue`` stub
-        would run is one the daemon cannot charge (it closes its socket first),
-        so N concurrent refusals would leave N backends the host budget never
-        sees. The retry hint is asserted beside it because the hint is what the
-        refusal offers INSTEAD of the exec.
+        A stub's exec after closing its socket cannot be charged, so N refusals would
+        leave N uncounted backends. The retry hint is what the refusal offers instead.
         """
         verdict = gw._classify_rejection(exc, exclusive=False)
         assert verdict is not None, label
@@ -812,6 +835,7 @@ class TestRejectionClasses:
             adm.SpawnGateTimeout,
             adm.SpawnGateClosed,
             BackendUnavailable,
+            gw.OwnerPortUnproven,
         }
         measured = {type(exc) for _, exc, _ in _CAPACITY_FAILURES if not isinstance(exc, OSError)}
         assert measured == set(gw._CAPACITY_FAILURES)
@@ -819,15 +843,8 @@ class TestRejectionClasses:
     def test_the_legacy_gate_wait_stays_under_the_pre_upgrade_stubs_own_window(self) -> None:
         """The capacity guarantee holds only for a refusal that ARRIVES in time.
 
-        A pre-upgrade stub gives up after its own 25 s pre-flight and execs on a
-        path that reads no frame, so a later refusal is unaccounted however it is
-        tagged. Keeping the daemon's legacy gate wait strictly under that window is
-        what makes the untagged refusal reach a stub still listening; the constant
-        is therefore load-bearing for a SECURITY property, not a tuning knob.
-
-        It bounds the gate wait only: a refusal raised past the permit can still
-        exceed the window, which is the residual `mcp.md` states rather than a hole
-        this pin closes.
+        A pre-upgrade stub execs after its own 25 s pre-flight, so this constant is a
+        security bound, not a tuning knob. It bounds the gate wait only (see `mcp.md`).
         """
         assert gw._LEGACY_SPAWN_WAIT_SECS < _PRE_UPGRADE_STUB_PREFLIGHT_SECS
 
@@ -847,12 +864,8 @@ class TestEnsureBackendWire:
     ) -> None:
         """The legacy WIRE -- a bare ``ensure_backend`` -- earns no exec either.
 
-        Driven through ``_handle_connection`` rather than the classifier because
-        the frame is what a pre-upgrade stub reads, and the frame is what
-        authorised the leak: on ``fallback: true`` that stub closes its socket
-        and execs, so the daemon's charge is released before the process exists
-        and nothing bounds the fan-out. A ``retry_after_secs`` with no
-        ``fallback`` key is the whole contract on this wire.
+        Driven through ``_handle_connection`` because the frame is what a pre-upgrade
+        stub reads: on ``fallback: true`` it closes its socket and execs uncharged.
         """
         monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(side_effect=exc))
         writer = _FakeWriter()
@@ -880,11 +893,8 @@ class TestEnsureBackendWire:
     ) -> None:
         """The fan-out shape: many legacy refusals at once, zero exec authorisations.
 
-        One refusal being clean says nothing about the failure mode, which is a
-        RATE -- each pre-upgrade stub that is told ``fallback: true`` execs a
-        backend the budget released at its socket close, so the ceiling is never
-        reached however many arrive. Eight simultaneous refusals against a
-        budget of one must hand out no authorisation at all.
+        The failure mode is a rate, so eight refusals against a budget of one must hand
+        out no authorisation at all.
         """
         monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(side_effect=PoolAtCapacity("full")))
         admission = _admission(max_procs=1)
@@ -914,12 +924,8 @@ class TestEnsureBackendWire:
     ) -> None:
         """The complement, and the reason this is not a blanket refusal.
 
-        ``compat`` is a property of the TARGET: this daemon has no mapping for
-        it, the host is fine, and the stub's own exec is the topology the
-        connection asked for. Refusing that too would strand every pre-upgrade
-        session behind a daemon whose target map drifted -- a worse outage than
-        the one the capacity rule prevents -- so the tag still rides it, and the
-        exec it authorises is still charged to the budget.
+        ``compat`` means the daemon has no mapping for the target; refusing the exec would
+        strand pre-upgrade sessions after map drift. The exec is still charged.
         """
         monkeypatch.setattr(
             gw, "_acquire_backend", AsyncMock(side_effect=gw._TargetUnknown("no mapping"))
@@ -1164,15 +1170,9 @@ class TestAcquireBackendOrder:
     async def test_nothing_is_charged_while_a_spawn_waits_in_the_gate(self, monkeypatch) -> None:
         """A queued spawn holds NO host charge, and none is left after it fails.
 
-        The gate is the only step that waits, so it goes first: a charge taken
-        before it prices a process that does not exist for as long as the wait
-        lasts (up to ``spawn_queue_wait_secs``, 600 s by default). Ten queued
-        stubs then reach the ceiling with nothing running and the eleventh is
-        refused ``capacity`` -- which deliberately authorises no fallback -- on an
-        idle host. Measured with a real ``BackendPool`` and a real budget whose
-        ceiling is exactly the number of waiters, so a charge held across the wait
-        cannot pass this: the third acquire would raise ``HostBudgetExhausted``
-        instead of queueing.
+        A charge taken before the gate would price a nonexistent process for up to
+        ``spawn_queue_wait_secs``. The real budget's ceiling equals the waiter count, so
+        a held charge makes the third acquire raise ``HostBudgetExhausted``.
         """
         from kiro_crew.mcp_gateway.pool import BackendPool
 
@@ -1306,6 +1306,79 @@ class TestAcquireBackendOrder:
         assert admission.gate.snapshot()["outcomes"]["success"] == 1
         await admission.close()
 
+    @pytest.mark.asyncio
+    async def test_a_key_reaped_at_the_initialize_deadline_gets_a_longer_one_next(
+        self, monkeypatch
+    ) -> None:
+        """A respawn after a deadline reap is not reaped at the same point again.
+
+        The reaped backend is killed, so its respawn starts cold. With the same
+        deadline every attempt on a host whose cold start runs a little past it
+        fails the same way, and the server never starts. Each reap in a row
+        doubles the next deadline up to the cap; a completed handshake resets it.
+        """
+        from kiro_crew.mcp_gateway.backend_handshake import (
+            _INITIALIZE_TIMEOUT_COLD_START_FLOOR_SECS as floor,
+        )
+        from kiro_crew.mcp_gateway.pool import BackendPool
+
+        pool = BackendPool(max_backends=4)
+        admission = _admission(
+            capacity=4,
+            max_procs=8,
+            initialize_timeout_secs=10.0,  # flake-ok: only compared, never waited on
+        )
+        deadlines: list[float] = []
+        spawned: list[tuple[Backend, asyncio.Event]] = []
+
+        async def fake_spawn(**kwargs: Any) -> Backend:
+            deadlines.append(kwargs["initialize_timeout_secs"])
+            backend = _fake_backend()
+            exited = asyncio.Event()
+            backend.process.wait = exited.wait
+            spawned.append((backend, exited))
+            return backend
+
+        monkeypatch.setattr(gw, "spawn_backend", fake_spawn)
+        monkeypatch.setattr(gw, "_declared_env_to_forward", lambda k: {})
+        monkeypatch.setattr(gw, "resolve_secret_uris", lambda env, home: (env, []))
+        key = PoolKey.from_register(_register_frame())
+
+        async def spawn_once() -> tuple[Backend, asyncio.Event]:
+            await gw._acquire_backend(pool, key, _resolver, admission=admission)
+            return spawned[-1]
+
+        async def reap_at_deadline(backend: Backend, exited: asyncio.Event) -> None:
+            # The backend's own deadline timer, on a live process still in the handshake.
+            backend._init_state = "in_flight"
+            backend.shutdown = AsyncMock()  # type: ignore[method-assign]
+            await backend._init_deadline(0)
+            backend.process.returncode = -9
+            exited.set()
+            await _settle()
+
+        for _ in range(3):
+            await reap_at_deadline(*await spawn_once())
+        # The first spawn keeps the configured value (the backend lifts it to the
+        # floor); each reap doubles the floor, capped.
+        assert deadlines == [10.0, 2 * floor, adm.INIT_DEADLINE_STRETCH_CAP_SECS]
+
+        backend, exited = await spawn_once()
+        assert deadlines[-1] == adm.INIT_DEADLINE_STRETCH_CAP_SECS, "never past the cap"
+        backend._init_state = "ready"
+        backend._init_done_event.set()
+        await _settle()
+        backend.process.returncode = 0
+        exited.set()
+        await _settle()
+        await spawn_once()
+        assert deadlines[-1] == 10.0, "a completed handshake resets the key"
+
+        # A backend that died for any other reason does not stretch the deadline.
+        other = PoolKey.from_register(_register_frame(server_name="other"))
+        assert admission.initialize_timeout_for(other) == 10.0
+        await admission.close()
+
 
 class TestSetSpawnCapacityFrame:
     """The gate's capacity seam over the wire: every value earns an ANSWER."""
@@ -1314,12 +1387,8 @@ class TestSetSpawnCapacityFrame:
     def test_a_non_finite_capacity_is_refused_not_raised(self, capacity: float) -> None:
         """``int(inf)`` raises, and a raise here costs the REPLY, not the gate.
 
-        An exception escaping ``_apply_set_spawn_capacity`` propagates out of the
-        control short-circuit, which drops the connection with NO reply of either
-        kind -- so the controller keeps the value PENDING and retries it against a
-        daemon that answers nothing, instead of being told no once. And ``inf`` is
-        not an exotic input: it is what ``json.loads`` returns for a well-formed
-        ``1e400``, asserted below so the premise is measured, not claimed.
+        A raise drops the connection with no reply, so the controller retries the pending
+        value forever. ``json.loads`` yields ``inf`` for ``1e400``, as asserted below.
         """
         assert json.loads('{"capacity": 1e400}')["capacity"] == float("inf")
         admission = _admission(capacity=2)
@@ -1415,11 +1484,8 @@ class TestTheRefusalArrivesBeforeTheStubGivesUp:
 class TestPrewarmYieldsToALiveStub:
     """A real ``run_gatewayd`` prewarm pass, because the yield lives at its call site.
 
-    ``_acquire_backend`` cannot express this on its own: what the pass owes a
-    live session is a per-key decision and a bounded wait, and both are arguments
-    the pass passes IN. Driven the way ``test_gatewayd_more_coverage.py`` drives
-    prewarming -- seeded hot keys, a real daemon, ``_acquire_backend`` recording
-    what it was handed.
+    The per-key decision and bounded wait are arguments the pass hands to
+    ``_acquire_backend``, so seeded hot keys run through a real daemon.
     """
 
     @pytest.mark.asyncio
@@ -1509,3 +1575,59 @@ class TestPrewarmYieldsToALiveStub:
             for task in queued:
                 task.cancel()
             await asyncio.gather(*queued, return_exceptions=True)
+
+
+# start order at the daemon: the gate's own order is pinned in test_mcp_gateway_spawn_order.py
+
+
+_FG = StartPriority.FOREGROUND
+_BG = StartPriority.BACKGROUND
+
+
+class TestStartPriorityAtTheDaemon:
+    @pytest.mark.asyncio
+    async def test_positions_follow_the_order_a_free_slot_is_handed_out_in(self) -> None:
+        gate = adm.SpawnGate(1)
+        held = await gate.acquire(label="held")
+        positions: dict[str, int] = {}
+
+        def seen(label: str) -> Callable[[adm.QueuePosition], Awaitable[None]]:
+            async def record(position: adm.QueuePosition) -> None:
+                positions[label] = position.position
+
+            return record
+
+        background = asyncio.create_task(
+            gate.acquire(label="bg", on_queued=seen("bg"), keepalive_secs=0.01)
+        )
+        await _settle()
+        person = asyncio.create_task(
+            gate.acquire(label="fg", on_queued=seen("fg"), keepalive_secs=0.01, priority=_FG)
+        )
+        await _await_state(lambda: {"bg", "fg"} <= positions.keys(), "both waiters reported")
+        assert positions == {"fg": 1, "bg": 2}
+
+        held.release()
+        (await _within_ceiling(person, "the person's grant")).release()
+        (await _within_ceiling(background, "the background grant")).release()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("frame", "priority"),
+        [({"start_priority": "fg"}, _FG), ({}, _BG), ({"start_priority": "urgent"}, _BG)],
+        ids=["person", "old-stub", "unknown-value"],
+    )
+    async def test_the_daemon_queues_a_spawn_at_the_priority_its_stub_registered(
+        self, peer_ok, monkeypatch, frame: dict[str, Any], priority: StartPriority
+    ) -> None:
+        acquire = AsyncMock(side_effect=PoolAtCapacity("full"))
+        monkeypatch.setattr(gw, "_acquire_backend", acquire)
+
+        await _handle(
+            _ScriptedReader(_register_frame(**frame), {"type": "ensure_backend"}),
+            _FakeWriter(),
+            _fake_pool(),
+            _admission(),
+        )
+
+        assert acquire.await_args.kwargs["priority"] is priority

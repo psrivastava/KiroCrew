@@ -1,3 +1,5 @@
+import { withDeadline } from '../lib/withDeadline'
+import { agentPath } from './agentPath'
 import { apiTransport } from './apiTransport'
 
 export type CapabilitySection = 'mcpServers' | 'tools' | 'allowedTools' | 'autoApprove' | 'skills' | 'prompt' | 'model' | 'resources'
@@ -62,10 +64,18 @@ export interface CapabilityPreview extends CapabilityView {
    * or Kiro Crew rebuilds that connection without approvals. */
   withheld_approvals?: (CapabilityRef & { reason: 'governed' | 'not_connected' | 'managed' | 'unexplained' })[]
 }
-const endpoint = (member: string) => `/api/agents/${encodeURIComponent(member)}/capabilities`
-const { get, post, put, j } = apiTransport
+/** Deadline for the two reads the Bot editor's Abilities pane waits on, which
+ *  shows its spinner until they settle. Longer than the gateway's own 20s bound
+ *  on each read (`GET_TIMEOUT_SECS` in `dashboard/handlers/_bounded_read.py`),
+ *  so its coded 503 normally answers first; this
+ *  ends the wait when no answer comes back at all. */
+export const ABILITIES_READ_TIMEOUT_MS = 30_000
+const { getWithSignal, post, put, j } = apiTransport
+const getWithDeadline = (url: string): Promise<unknown> =>
+  withDeadline(ABILITIES_READ_TIMEOUT_MS, undefined, signal => getWithSignal(url, signal).then(j))
+const endpoint = (member: string) => agentPath(member, '/capabilities')
 export const crewCapabilitiesApi = {
-  get: (member: string): Promise<CapabilityView> => get(endpoint(member)).then(j) as Promise<CapabilityView>,
+  get: (member: string): Promise<CapabilityView> => getWithDeadline(endpoint(member)) as Promise<CapabilityView>,
   preview: (member: string, draft: CapabilityDraft): Promise<CapabilityPreview> =>
     post(`${endpoint(member)}/preview`, draft).then(j) as Promise<CapabilityPreview>,
   save: (member: string, draft: CapabilityDraft & { preview_token: string }): Promise<CapabilityView> =>
@@ -77,10 +87,15 @@ export const crewCapabilitiesKey = (member: string) => ['crew-capabilities', mem
 export interface WorkerKitView {
   member: string
   revision: string
+  /** The file's blocked commands nobody can check, as written; the worker refuses its non-read-only commands while any is left. */
+  unenforced_denies?: string[]
+  /** The file's blocked commands only the gate checks, in a simple command or plain chain; the worker refuses any other non-read-only command while one is left. */
+  conditional_denies?: string[]
 }
 export interface WorkerKitChange {
   /** `disabledTools` / `disabledServers`: a limit on a server the worker base declares. */
-  section: 'prompt' | 'mcpServers' | 'resources' | 'skills' | 'allowedTools' | 'excludedTools' | 'disabledTools' | 'disabledServers' | 'tools'
+  /** `hooks` / `permissions` / `toolsSettings`: run on the crewmate's worker only. */
+  section: 'prompt' | 'mcpServers' | 'resources' | 'skills' | 'allowedTools' | 'excludedTools' | 'disabledTools' | 'disabledServers' | 'tools' | 'hooks' | 'permissions' | 'toolsSettings'
   id: string
   /** `added`: written by the add. `skipped`: already present, so left alone. */
   /** `replaced`: the behaviour-directions slot already holds other directions. */
@@ -91,6 +106,10 @@ export interface WorkerKitPreview {
   template: string
   revision: string
   runs_unasked: boolean
+  /** The blocked commands nobody can check once the add lands, as written. */
+  unenforced_denies?: string[]
+  /** The blocked commands only the gate checks, in a simple command or plain chain, once the add lands. */
+  conditional_denies?: string[]
   /** The behaviour directions the add writes; `""` when the agent has none. */
   directions?: string
   /** The directions the slot holds now, which a `replaced` row overwrites; `""` when empty. */
@@ -101,9 +120,9 @@ export interface WorkerKitRequest {
   template: string
   revision?: string
 }
-const workerKitEndpoint = (member: string) => `/api/agents/${encodeURIComponent(member)}/worker-kit`
+const workerKitEndpoint = (member: string) => agentPath(member, '/worker-kit')
 export const crewWorkerKitApi = {
-  get: (member: string): Promise<WorkerKitView> => get(workerKitEndpoint(member)).then(j) as Promise<WorkerKitView>,
+  get: (member: string): Promise<WorkerKitView> => getWithDeadline(workerKitEndpoint(member)) as Promise<WorkerKitView>,
   preview: (member: string, body: WorkerKitRequest): Promise<WorkerKitPreview> =>
     post(`${workerKitEndpoint(member)}/preview`, body).then(j) as Promise<WorkerKitPreview>,
   apply: (member: string, body: WorkerKitRequest & { revision: string }): Promise<WorkerKitView> =>

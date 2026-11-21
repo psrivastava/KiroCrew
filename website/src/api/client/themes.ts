@@ -7,9 +7,20 @@
 import type { ClientTransport } from './transport'
 import type { TranslucentPanelsStored } from '../../utils/liquidGlass'
 
-export function createThemesEndpoints({ post, put, del, j, jfetch: fetch }: ClientTransport) {
+export function createThemesEndpoints({ post, put, del, j, jfetch: fetch, sessionKeyHeader: _sk }: ClientTransport) {
   const branding = {
-    branding: () => fetch('/api/dashboard/branding').then(j) as Promise<{ bot_name: string; avatar: string; direct_local?: boolean }>,
+    branding: () => fetch('/api/dashboard/branding').then(j) as Promise<{
+      bot_name: string
+      /** `dashboard.instance_label`; empty when unset. */
+      instance_label?: string
+      avatar: string
+      direct_local?: boolean
+      /** Whether the gateway host can open a file manager right now: the launcher
+       *  `/api/reveal` starts, and on Linux a desktop session for it. */
+      desktop_launcher?: boolean
+      /** `dashboard.remote_editor`, each value the schema refuses already read as "". */
+      remote_editor?: { editor?: string; host?: string }
+    }>,
   }
 
   const themeList = {
@@ -21,6 +32,15 @@ export function createThemesEndpoints({ post, put, del, j, jfetch: fetch }: Clie
     createTheme: (body: object) => post('/api/themes', body).then(j),
     installTheme: (source: { type: 'local'; path: string } | { type: 'github'; url: string }) =>
       post('/api/themes/install', { source }).then(j),
+    /** Install a pack from a `.zip` the browser picked. The body is the archive
+     *  itself, so a browser that is not on the gateway host (a phone, a laptop
+     *  through a tunnel) can install without a folder path on the gateway. */
+    installThemeZip: (file: Blob) =>
+      fetch('/api/themes/install-zip', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/zip', ..._sk },
+        body: file,
+      }).then(j),
     updateTheme: (slug: string, body: object) => put('/api/themes/' + encodeURIComponent(slug), body).then(j),
     deleteTheme: (slug: string) => del('/api/themes/' + encodeURIComponent(slug)).then(j),
     themeDetail: (slug: string) => fetch('/api/themes/' + encodeURIComponent(slug)).then(j),
@@ -33,10 +53,11 @@ export function createThemesEndpoints({ post, put, del, j, jfetch: fetch }: Clie
       language?: string
       /** The Translucent panels switch; '' means never chosen on this workspace. */
       translucent_panels?: TranslucentPanelsStored
+      /** Scheduled mode's switch times, 24-hour `HH:MM`; '' means never saved. */
+      schedule_light?: string
+      schedule_dark?: string
       onboarded?: boolean
       import_onboarded?: boolean
-      /** Gates the gateway's first heartbeat; see `beacon.telemetry_permitted`. */
-      privacy_acked?: boolean
     }) =>
       put('/api/config/theme', body).then(j),
   }

@@ -1,15 +1,9 @@
 """The Crew Members roster previews SPEECH only.
 
-A member's chat draws only what the member says (crew-mode.md, "A crewmate's
-chat"), so the roster row beside it must quote the same thing. A patroller
-whose newest rows are an auto-nudge turn, a shell call and a say-nothing reply
-would otherwise sit under a row quoting `gh issue list …` while its chat says
-it has not spoken yet -- the blind reader concluded the conversation was lost.
-
-Two paths produce that preview and both are pinned here: the cold roster read
-(`ConversationLog.last_speech_info`) and the live
-`member/message` projection, which must keep the last thing SAID when a
-machinery row bumps recency.
+A member's chat draws only what it says (crew-mode.md, "A crewmate's chat"), so the
+roster row must quote the same, not a shell call. Pinned on both paths: the cold read
+(`ConversationLog.last_speech_info`) and the live `member/message` projection, which
+keeps the last thing SAID when a machinery row bumps recency.
 """
 
 from __future__ import annotations
@@ -21,6 +15,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from chat_test_helpers import _make_state
+from redaction_structured_cases import github_classic
 
 from kiro_crew import members
 from kiro_crew.config.sections import KiroCrewAgentConfig
@@ -154,9 +149,7 @@ class TestLiveProjectionKeepsTheLastThingSaid:
         assert out["last_active_ts"] == 200.0
 
 
-# ---------------------------------------------------------------------------
 # Legacy machinery previews are corrected on the roster read
-# ---------------------------------------------------------------------------
 CREW = "radar"
 
 
@@ -382,8 +375,8 @@ class TestLivePreviewEqualsTheRosterRead:
             "**Bold** and `code` with a [link](https://example.com) — done.",
             "## Heading\n\n- one\n- two\n\n> quoted",
             "a long reply " * 40,
-            # The AWS-documented example key, as test_members_dm_thread.py spells it.
-            "Token AKIAIOSFODNN7EXAMPLE in the middle of " + "padding " * 30,
+            # A synthetic GitHub token, which the redaction chain masks.
+            f"Token {github_classic(seed=23)} in the middle of " + "padding " * 30,
         ],
     )
     def test_formatted_message_folds_to_the_read(self, tmp_path: Path, content) -> None:
@@ -394,7 +387,7 @@ class TestLivePreviewEqualsTheRosterRead:
         read, _ts, _stopped, _exhaustive = log.last_speech_info("k", sanitize=_redaction_chain)
         payload = member_message_payload("assistant", content, None, 5.0, sanitize=_redaction_chain)
         assert payload == {"ts": 5.0, "preview": read}
-        assert read and "AKIA" not in read
+        assert read and "ghp_" not in read
 
     def test_machinery_and_say_nothing_rows_carry_no_preview(self) -> None:
         from kiro_crew.eventlog_hooks import member_message_payload

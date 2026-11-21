@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import pytest
 
+from kiro_crew.testing.synthetic_credentials import github_classic
 from kiro_crew.workflows.preview import (
     MAX_LABEL_CHARS,
     MAX_PHASE_TITLE_CHARS,
@@ -77,6 +78,29 @@ class TestPhases:
         plan = _plan('with ctx.phase("Read"):\n    await ctx.agent("look")\n')
         assert _titles(plan) == ["Read"]
         assert plan["phases"][0]["certain"] is True
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            'with ctx.phase(title="Read"):\n    await ctx.agent("look")\n',
+            'ctx.phase(title="Read")\nawait ctx.agent("look")\n',
+        ],
+        ids=["with", "bare"],
+    )
+    def test_a_keyword_phase_title_opens_the_same_phase_as_a_positional_one(self, body):
+        # ``title`` is positional-or-keyword on the runner, so both spellings name it.
+        plan = _plan(body)
+        assert plan["phases"] == [
+            {
+                "title": "Read",
+                "certain": True,
+                "nodes": [{"kind": "agent", "label": "look", "certain": True}],
+            }
+        ]
+
+    def test_a_keyword_phase_title_that_is_not_a_literal_is_still_unknown(self):
+        plan = _plan('ctx.phase(title=name)\nawait ctx.agent("look")\n')
+        assert _nodes(plan, "")[0] == {"kind": "unknown", "label": "phase", "certain": False}
 
     def test_a_bare_phase_call_opens_a_phase_for_the_statements_after_it(self):
         # The runner's phase persists until the next call; __exit__ restores nothing.
@@ -219,6 +243,20 @@ class TestUnpredictableRegions:
         assert [n["label"] for n in _nodes(plan, "")] == ["try", "try", "finally", "except"]
         assert all(n["certain"] is False for n in _nodes(plan, ""))
 
+    def test_an_except_star_try_is_marked_like_a_plain_try(self):
+        # ``try`` / ``except*`` parses to ``ast.TryStar``, not ``ast.Try``; a handler
+        # body still runs only when its exception group matches.
+        plan = _plan(
+            "try:\n"
+            '    await ctx.agent("try")\n'
+            "except* ValueError:\n"
+            '    await ctx.agent("except")\n'
+            "finally:\n"
+            '    await ctx.agent("finally")\n'
+        )
+        assert [n["label"] for n in _nodes(plan, "")] == ["try", "try", "finally", "except"]
+        assert all(n["certain"] is False for n in _nodes(plan, ""))
+
     def test_a_while_loop_is_marked(self):
         plan = _plan('while go:\n    await ctx.agent("again")\n')
         assert _nodes(plan, "")[0]["label"] == "while"
@@ -332,6 +370,20 @@ class TestContextNameIsTakenFromTheSignature:
             }
         ]
 
+    def test_a_positional_only_context_parameter_is_followed(self):
+        # ``def workflow(ctx, /)`` validates, and keeps ``ctx`` in ``posonlyargs``.
+        plan = plan_from_source(
+            'async def workflow(ctx, /):\n    with ctx.phase("Read"):\n        await ctx.agent("x")\n'
+        )
+        assert plan is not None
+        assert plan["phases"] == [
+            {
+                "title": "Read",
+                "certain": True,
+                "nodes": [{"kind": "agent", "label": "x", "certain": True}],
+            }
+        ]
+
     def test_a_call_on_some_other_object_is_not_a_node(self):
         plan = _plan('await other.agent("x")\n')
         assert plan == {"phases": [], "truncated": False, "titleLimit": MAX_PHASE_TITLE_CHARS}
@@ -392,20 +444,18 @@ class TestACutNeverLeavesACredentialFragment:
     a cut that lands inside one leaves a fragment their patterns do not match -- the cut has
     to happen on already-redacted text, not before it.
 
-    Measured against the real redactor: of a 40-character ``ghp_`` token, a 33-character
-    prefix survives unredacted, and of a 20-character AWS key id a 19-character prefix
-    does. Each case below places the token so the cut leaves exactly that prefix, which
-    is the state a cut-then-redact order ships.
+    Measured against the real redactor: a 40-character ``ghp_`` token cut short fails
+    its checksum, so a 39-character prefix survives unredacted. Each case below places
+    the token so the cut leaves exactly that prefix, which is the state a
+    cut-then-redact order ships.
     """
 
     # (token, the longest prefix the redactor does NOT recognize)
-    TOKENS = (
-        ("ghp_" + "a" * 36, 33),
-        ("AKIAIOSFODNN7EXAMPLE", 19),
-    )
+    TOKENS = ((github_classic(seed=34), 39),)
 
     def _pad(self, token: str, survives: int, limit: int) -> str:
-        return "x" * (limit - survives)
+        # A blank ends the pad: a token glued to a letter is no token.
+        return "x" * (limit - survives - 1) + " "
 
     @pytest.mark.parametrize("token,survives", TOKENS)
     def test_an_agent_label_leaks_no_fragment(self, token, survives):
@@ -542,8 +592,15 @@ class TestThePreviewerTracksTheDSL:
 
         from kiro_crew.workflows import runner
 
-        expected = f"label or prompt[:{RUNNER_PROMPT_LABEL_CHARS}]"
-        assert expected in inspect.getsource(runner), (
-            f"the runner does not spell {expected!r}; find its current agent label "
-            "expression and move RUNNER_PROMPT_LABEL_CHARS to match"
+        # The runner labels an unlabeled call with
+        # ``label or _fallback_label(str(prompt))``; the helper takes the first N
+        # characters of the already-redacted prompt.
+        expected = f"prompt[:{RUNNER_PROMPT_LABEL_CHARS}]"
+        assert "label or _fallback_label(str(prompt))" in inspect.getsource(runner), (
+            "the runner no longer spells 'label or _fallback_label(str(prompt))'; find its "
+            "current agent label expression and update this guard"
+        )
+        assert expected in inspect.getsource(runner._fallback_label), (
+            f"the runner's fallback label does not spell {expected!r}; find its current "
+            "agent label expression and move RUNNER_PROMPT_LABEL_CHARS to match"
         )

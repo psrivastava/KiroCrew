@@ -23,6 +23,7 @@ from kiro_crew.dashboard.handlers import session_control as handlers_sc
 from kiro_crew.mcp_dashboard import TABLE
 from kiro_crew.mcp_tools.dashboard_client import DashboardRequest, InMemoryDashboardClient
 from kiro_crew.mcp_tools.table import Caller, ToolContext
+from kiro_crew.testing.synthetic_credentials import github_classic
 
 
 @pytest.fixture(autouse=True)
@@ -251,7 +252,18 @@ def test_a_caller_fenced_after_queuing_is_rechecked(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "model", ["auto", "Auto", " auto ", "Auto (Jev)", "auto (jev)", "AUTO:JEV", "auto:jev"]
+    "model",
+    [
+        "auto",
+        "Auto",
+        " auto ",
+        "Auto (decision model)",
+        "AUTO (DECISION MODEL)",
+        "Auto (Jev)",
+        "auto (jev)",
+        "AUTO:JEV",
+        "auto:jev",
+    ],
 )
 def test_auto_is_owner_only(tmp_path, model):
     """With the Jev preview on, a slot on ``auto`` routes each turn through Jev;
@@ -532,6 +544,33 @@ def test_a_target_with_attached_subagents_is_refused(tmp_path, monkeypatch):
     assert target._pending_model_pick is None
 
 
+def test_a_subagent_refusal_names_the_attached_runs(tmp_path, monkeypatch):
+    from kiro_crew.dashboard import chat_handlers
+
+    state = _make_state(tmp_path)
+    caller = state.get_or_create_slot("chat-1")
+    state.get_or_create_slot("chat-2")
+
+    async def _children(*_a, **_kw):
+        return chat_handlers.web.json_response(
+            {
+                "error": "sub-agents are running",
+                "code": "slot_subagents_running",
+                "runs": [{"id": "r1", "state": "running"}],
+                "queued": [],
+                "queued_partial": False,
+            },
+            status=409,
+        )
+
+    monkeypatch.setattr(chat_handlers, "_subagents_attached_response", _children)
+
+    with pytest.raises(sc.SessionControlError) as exc:
+        _set_model(state, caller, "chat-2", "sonnet")
+
+    assert exc.value.message.endswith("Still running or queued: r1 (running).")
+
+
 def test_a_turn_starting_during_the_idle_check_is_refused(tmp_path, monkeypatch):
     """The idle check re-runs after the sub-agent probe's await."""
     from kiro_crew.dashboard import chat_handlers
@@ -639,7 +678,7 @@ def test_a_credential_shaped_model_is_refused_before_it_is_stored(tmp_path):
     target = state.get_or_create_slot("chat-2")
 
     with pytest.raises(sc.SessionControlError) as exc:
-        _set_model(state, caller, "chat-2", "ghp_" + "a" * 36)
+        _set_model(state, caller, "chat-2", github_classic(seed=107))
 
     assert exc.value.code == "model_rejected"
     assert target._pending_model_pick is None
@@ -771,7 +810,7 @@ def test_a_read_redacts_a_credential_shaped_model(tmp_path):
     state = _make_state(tmp_path)
     caller = state.get_or_create_slot("chat-1")
     target = state.get_or_create_slot("chat-2")
-    secret = "ghp_" + "a" * 36
+    secret = github_classic(seed=108)
     target.model = secret
 
     read = sc.read_messages(state, caller_session_key=_key(caller), target="chat-2")

@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { Provider } from 'react-redux'
+import { createConnectedTestStore } from './helpers'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 
 // --- Mocks (same shape as AppsPageDiscover.test.tsx) -------------------------
@@ -52,14 +54,16 @@ const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
 
 function renderPage() {
   return render(
-    <QueryClientProvider client={qc}>
-      <MemoryRouter initialEntries={['/apps']}>
-        <Routes>
-          <Route path="/apps" element={<AppsPage />} />
-          <Route path="/apps/detail/:name" element={<div data-testid="detail-route" />} />
-        </Routes>
-      </MemoryRouter>
-    </QueryClientProvider>,
+    <Provider store={createConnectedTestStore()}>
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={['/apps']}>
+          <Routes>
+            <Route path="/apps" element={<AppsPage />} />
+            <Route path="/apps/detail/:name" element={<div data-testid="detail-route" />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>
+    </Provider>,
   )
 }
 
@@ -128,8 +132,8 @@ describe('AppsPage — builtin rows come from the catalog', () => {
     await screen.findAllByRole('button', { name: /View details for Meetings/ })
     // Catalog says code-review -> Developer Tools; the local manifest's
     // 'productivity' must NOT produce a Productivity rail entry.
-    expect(screen.getByRole('button', { name: /Developer Tools 1/ })).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /Productivity 1/ })).not.toBeInTheDocument()
+    expect(screen.getByRole('radio', { name: /Developer Tools 1/ })).toBeInTheDocument()
+    expect(screen.queryByRole('radio', { name: /Productivity 1/ })).not.toBeInTheDocument()
   })
 
   it('renders the builtin exactly once (no duplicate synthesized card)', async () => {
@@ -141,7 +145,7 @@ describe('AppsPage — builtin rows come from the catalog', () => {
     // single app legitimately renders two view-details affordances (spotlight
     // + list row), but the server row and a locally synthesized twin both
     // surviving would read "All apps 2".
-    expect(screen.getByRole('button', { name: /All apps 1/ })).toBeInTheDocument()
+    expect(screen.getByRole('radio', { name: /All apps 1/ })).toBeInTheDocument()
   })
 
   it('shows NOTHING local when the registry response is empty (the shelf is the registry)', async () => {

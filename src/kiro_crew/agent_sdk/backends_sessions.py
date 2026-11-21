@@ -14,7 +14,12 @@ in ``VOCABULARY_PATHS``, which is what lets its ``ACP_BACKEND*`` names be define
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
+from typing import Any
+
 from kiro_crew.agent_sdk.backends import (
+    ACP_BACKEND_ANTIGRAVITY,
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
     ACP_BACKEND_COPILOT,
@@ -22,8 +27,10 @@ from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_MIMOCODE,
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
+    ACP_BACKEND_STRANDS,
 )
 
 # Backends whose single process can host N concurrent ACP sessions (AcpRuntime
@@ -94,6 +101,100 @@ from kiro_crew.agent_sdk.backends import (
 # reach is recorded here rather than claimed.
 ACP_BACKENDS_SESSION_SHARING = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_CODEX})
 
+# Backends a top-level DASHBOARD CHAT slot may share a runtime on, behind the
+# off-by-default ``chat_runtime_sharing`` feature preview. Deliberately SEPARATE
+# from ``ACP_BACKENDS_SESSION_SHARING`` above (harness-parity H6): serving several
+# SUBAGENT sessions on one process does not establish that a top-level chat may
+# share one, because the two teardowns differ and it is the CHAT teardown whose
+# safety this set asserts. A chat leaving a shared process must evict only its own
+# session and keep its resume record.
+#
+# KAS: the shared teardown evicts with ``session/close``, which keeps the stored
+# record (``AcpRuntime.evict_session``); the delete verb is never sent for a shared
+# chat. Membership here is necessary, not sufficient: a KAS start may share only
+# when the engine its route runs is at or above ``KAS_CHAT_SHARING_MIN_ENGINE``
+# (``@kiro/agent`` 0.66.104), which admits one turn per session itself, runs
+# turns of different sessions in parallel, and names the session on every
+# ``session/update`` (``acp.chat_runtime_sharing.kas_chat_sharing_ready``).
+#
+# codex: the shared teardown ends the session with the harness's own teardown
+# verb, ``session/close``, which evicts the thread and keeps its rollout under
+# ``CODEX_HOME``; a persistent session's rollout is never deleted by Crew
+# (``delete_disposable_record`` runs for incognito and temporary sessions only, and
+# those never share). codex-acp keeps one thread per session on its one
+# ``app-server`` and runs their turns in parallel, so a chat waits for no other
+# chat. The lane covers both, through the verb Crew sends:
+# ``test_codex_chat_runtime_sharing_real.py``.
+#
+# claude: one claude-agent-acp process serves each shared session with its own
+# ``claude`` child, and runs their turns in parallel; ``session/close`` ends one
+# session and keeps its transcript, which ``session/load`` replays. claude is not
+# served by ``AcpRuntime`` otherwise, so a claude chat moves onto it ONLY when it
+# shares (``ACP_BACKENDS_SHARED_RUNTIME_ONLY_FOR_CHATS`` below), and its own setup
+# -- the settings seed, the starting-mode pin, the session's identity -- is done
+# per session by ``ClaudeHarness``.
+#
+# goose: one ``goose acp`` process keeps an agent per session and runs their turns
+# in parallel (goose 1.57.0: a 60 s command in one session, the other answering in
+# 0.02 s); ``session/close`` drops one session and keeps its record, which
+# ``session/load`` restores on the same process. Like claude it is served by
+# ``AcpRuntime`` only for a chat that shares, and ``GooseHarness`` reads each
+# session's mode back and holds it there. A goose Side Chat never shares: its goose
+# home is a process-wide setting.
+#
+# deepseek: one ``dsh --profile acp`` process keeps a record per session, runs their
+# turns in parallel (dsh 0.2.0-rc.2: a 60 s command in one session, the other
+# answering in 0.02 s) and mounts each session's MCP servers on that session alone;
+# ``session/close`` keeps the record, which ``session/resume`` restores on the same
+# process. Like claude and goose it is served by ``AcpRuntime`` only for a chat
+# that shares; Crew's gate is composed into the process once, and
+# ``DeepseekHarness`` keeps each session's tripwire ledger. A deepseek Side Chat
+# never shares: its read-only proof is a process-wide reading.
+#
+# kiro-cli is NOT a member although it shares subagent sessions: some of its
+# session-control frames (compaction, ``/clear``, an agent switch) name no
+# session, so chats sharing one kiro-cli process would have to take turns to keep
+# each frame's owner unambiguous, and a shared chat must never wait for another
+# chat. Every other backend is out because it is not served by ``AcpRuntime``
+# (one process per session).
+#
+# The members are the keys of ``CHAT_RUNTIME_SHARING_HARNESSES`` just below, so
+# letting a harness share chats is one row there.
+ACP_BACKENDS_CHAT_RUNTIME_SHARING = frozenset(
+    {
+        ACP_BACKEND_KAS,
+        ACP_BACKEND_CODEX,
+        ACP_BACKEND_CLAUDE,
+        ACP_BACKEND_GOOSE,
+        ACP_BACKEND_DEEPSEEK,
+    }
+)
+
+# Members of ``ACP_BACKENDS_CHAT_RUNTIME_SHARING`` that ``AcpRuntime`` serves only
+# for a chat that shares: every other session of theirs keeps its own process on
+# ``AcpClient``. A chat start asks the placement first and takes the shared runtime
+# only when it got one (``providers.acp_lifecycle.start``).
+ACP_BACKENDS_SHARED_RUNTIME_ONLY_FOR_CHATS = frozenset(
+    {ACP_BACKEND_CLAUDE, ACP_BACKEND_GOOSE, ACP_BACKEND_DEEPSEEK}
+)
+
+# One row per member of ``ACP_BACKENDS_CHAT_RUNTIME_SHARING``: the backend and the
+# default of its own switch under the preview (``agent.chat_runtime_sharing_harnesses``,
+# Settings > Developer > Feature previews > ACP runtime sharing). KAS defaults on:
+# it shared before the per-harness switches existed, so an upgrade keeps it
+# sharing. codex, claude, goose and deepseek default off: they are new to chat
+# sharing, so an operator turns each on deliberately. ``test_chat_runtime_sharing``
+# pins that the keys equal the set.
+CHAT_RUNTIME_SHARING_HARNESSES: Mapping[str, bool] = MappingProxyType(
+    {
+        ACP_BACKEND_KAS: True,
+        ACP_BACKEND_CODEX: False,
+        ACP_BACKEND_CLAUDE: False,
+        ACP_BACKEND_GOOSE: False,
+        ACP_BACKEND_DEEPSEEK: False,
+    }
+)
+
 # Backends served by AcpRuntime + AcpSessionHandle — the kiro-agent family
 # (kiro-cli and KAS) whose single process hosts N sessions via demux.
 # claude-agent-acp runs one AcpClient per session and is NOT a
@@ -148,15 +249,19 @@ ACP_BACKENDS_ACP_RUNTIME = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS, ACP_BAC
 # (report not-spawnable) rather than silently fall to the kiro-cli branch under
 # its own identity the way kas and codex do today -- the exact bug this fact
 # exists to let a caller avoid.
+# mimocode is a member: ``MimoCodeLaunch`` is its entry in ``_PROCESS_ADAPTERS``.
 ACP_BACKENDS_ACP_CLIENT_SPAWNABLE = frozenset(
     {
         ACP_BACKEND_KIRO,
         ACP_BACKEND_CLAUDE,
         ACP_BACKEND_OPENCODE,
+        ACP_BACKEND_MIMOCODE,
         ACP_BACKEND_GOOSE,
         ACP_BACKEND_PI,
         ACP_BACKEND_DEEPSEEK,
         ACP_BACKEND_COPILOT,
+        ACP_BACKEND_STRANDS,
+        ACP_BACKEND_ANTIGRAVITY,
     }
 )
 
@@ -212,6 +317,21 @@ ACP_BACKENDS_ACP_CLIENT_SPAWNABLE = frozenset(
 # captures are the replayed record.
 ACP_BACKENDS_SESSION_EVICTION = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS, ACP_BACKEND_CODEX})
 
+# Backends on their own ``AcpClient`` whose process starts a fresh conversation in
+# place: ``AcpClient.new_conversation`` closes the old session and opens a new one
+# on the same process, instead of a kill and respawn. Read only by that method; a
+# reused workflow-pool worker and a consolidation pass reach it through
+# ``AcpProvider.new_conversation``, and a non-member raises there so both callers take
+# their kill-and-respawn fallback. The method runs claude's own session setup, so a
+# second member brings its harness's setup steps into it with its capture.
+#
+# claude is a member on a live capture: claude-agent-acp 0.94.0
+# ``test/fixtures/acp_frames/claude/new-conversation-live.jsonl`` answered two
+# ``session/new`` on one process, then ``session/close`` for the first with {}; the
+# first id then answered set_mode with -32603 Session not found while the second
+# still answered, and the first session's Claude Code process had exited.
+ACP_BACKENDS_CLIENT_NEW_CONVERSATION = frozenset({ACP_BACKEND_CLAUDE})
+
 # Backends whose process answers ``session/new``, ``session/load`` and
 # ``session/set_mode`` one at a time, so a session start sent while one of those is
 # unanswered spends its budget waiting for it. Membership decides only whether a
@@ -254,15 +374,26 @@ ACP_BACKENDS_SERIAL_SESSION_STARTS = frozenset({ACP_BACKEND_KIRO})
 # restored session came back with ``allow_all`` as it was LEFT -- ``on`` after a
 # ``/allow-all on`` -- which is why the routing write runs after a load too. It is
 # NOT in ``ACP_BACKENDS_LOAD_WITHOUT_MODES``: that same load answer carries ``modes``.
+# mimocode is a member on a capture: a second ``mimo acp`` process answered
+# ``session/load`` for the first one's id from the id alone, replayed the
+# conversation, and answered a question only that history held
+# (``test/fixtures/acp_frames/mimocode/session-load-live.jsonl``). Its load result
+# carries ``modes``, so it is NOT in ``ACP_BACKENDS_LOAD_WITHOUT_MODES``.
 ACP_BACKENDS_HARNESS_OWNED_SESSIONS = frozenset(
     {
         ACP_BACKEND_CLAUDE,
         ACP_BACKEND_CODEX,
         ACP_BACKEND_OPENCODE,
+        ACP_BACKEND_MIMOCODE,
         ACP_BACKEND_PI,
         ACP_BACKEND_GOOSE,
         ACP_BACKEND_DEEPSEEK,
         ACP_BACKEND_COPILOT,
+        # strands persists each session under the directory Crew names (its gate
+        # module's ``session`` option) and restores it on ``session/load`` by id:
+        # ``test/fixtures/acp_frames/strands/session-load-live.jsonl``.
+        ACP_BACKEND_STRANDS,
+        ACP_BACKEND_ANTIGRAVITY,
     }
 )
 
@@ -285,7 +416,13 @@ ACP_BACKENDS_HARNESS_OWNED_SESSIONS = frozenset(
 # rejects modes across its whole surface, so it can never return one. Membership is
 # what keeps a restored conversation from being discarded by a check for a block this
 # harness has nothing to put in.
-ACP_BACKENDS_LOAD_WITHOUT_MODES = frozenset({ACP_BACKEND_OPENCODE, ACP_BACKEND_DEEPSEEK})
+#
+# strands is a member on a capture: its project-mode ``session/load`` answers ``{}``
+# after replaying the restored history
+# (``test/fixtures/acp_frames/strands/session-load-live.jsonl``).
+ACP_BACKENDS_LOAD_WITHOUT_MODES = frozenset(
+    {ACP_BACKEND_OPENCODE, ACP_BACKEND_DEEPSEEK, ACP_BACKEND_STRANDS}
+)
 
 # Backends that restore a session with ``session/resume`` instead of
 # ``session/load``, and advertise it under ``sessionCapabilities.resume`` instead of
@@ -323,6 +460,39 @@ ACP_BACKENDS_LOAD_WITHOUT_MODES = frozenset({ACP_BACKEND_OPENCODE, ACP_BACKEND_D
 # behind it (harness-parity H6, the same reason every capability here is opt-in).
 ACP_BACKENDS_RESUME_WITHOUT_LOAD = frozenset({ACP_BACKEND_DEEPSEEK})
 
+
+def can_restore_session(backend: str, agent_capabilities: Mapping[str, Any]) -> bool:
+    """Whether a host that answered ``initialize`` with *agent_capabilities* restores
+    a saved session. The one reading both ACP drivers use (``AcpClient`` and
+    ``AcpRuntime``).
+
+    Both spellings are standard ACP v1: ``loadSession`` is the flag for
+    ``session/load``, and ``sessionCapabilities.resume`` is the object -- an empty
+    one means supported -- for ``session/resume``. Keyed on
+    ``ACP_BACKENDS_RESUME_WITHOUT_LOAD`` rather than probing both, so a harness
+    cannot be read as restorable through a capability it never advertised and then
+    sent a verb it does not serve.
+    """
+    if backend in ACP_BACKENDS_RESUME_WITHOUT_LOAD:
+        session_capabilities = agent_capabilities.get("sessionCapabilities")
+        return isinstance(session_capabilities, dict) and isinstance(
+            session_capabilities.get("resume"), dict
+        )
+    return bool(agent_capabilities.get("loadSession", False))
+
+
+# Harnesses that keep a saved session on the directory it was created in, so it is
+# restored only in that directory. opencode 1.x runs one instance per directory and
+# a session stays with the instance it was created by: a ``session/load`` naming
+# another ``cwd`` answers from the new instance while the session's permission asks
+# keep coming from the old one, so every approval reply is dropped, and the MCP
+# servers sent with the load are mounted on the instance the model is not using.
+# For a member, a chat whose folder changed since its session was saved starts a
+# fresh session in the new folder and gets its conversation replayed as text
+# (``session_allocation_parts.get_or_create``). kiro-cli takes the cwd from each
+# load, so it is not a member and a moved chat keeps its native history.
+ACP_BACKENDS_CWD_BOUND_SESSIONS = frozenset({ACP_BACKEND_OPENCODE})
+
 # Harnesses whose ``session/fork`` copies a stored session only up to a given
 # assistant message, which is what lets a rewind keep the native history it
 # retains. Advertising ``sessionCapabilities.fork`` is not enough: a fork that
@@ -331,3 +501,29 @@ ACP_BACKENDS_RESUME_WITHOUT_LOAD = frozenset({ACP_BACKEND_DEEPSEEK})
 # ``_meta.jetbrains.air.fork.messageId`` (from 0.71.0; see
 # ``CLAUDE_ACP_FORK_POINT_MIN_VERSION``).
 ACP_BACKENDS_FORK_AT_MESSAGE = frozenset({ACP_BACKEND_CLAUDE})
+
+# Harnesses that can dispose ONE session's backend inside a process that stays up,
+# after which every ``session/prompt`` on that id answers the same error. The
+# process is no use to that session any more, but its saved session is: a fresh
+# process ``session/load``s it. For a member, :mod:`kiro_crew.acp.disposed_session`
+# names the error text the harness writes when it disposes a backend, and
+# ``AcpClient`` answers it: a cancelled turn ends as cancelled, any other turn
+# surfaces the error once, and the next ``ensure_ready`` replaces the process and
+# loads the same id before the next prompt goes out. A request for approval that
+# arrives after Crew sent ``session/cancel`` is answered ``cancelled`` at once,
+# because the harness holds its turn open on that answer and the cancel cannot
+# finish while it waits.
+#
+# strands is a member: the Strands CLI kills its Python worker when a cancel does
+# not stop it within 3s, then answers that prompt, and every later one on the same
+# id, with ``-32603`` and ``data.details`` "The Python agent did not stop after
+# cancellation. Reload it to continue." A second process loaded the same id, replayed
+# the conversation and answered the next prompt
+# (``test/fixtures/acp_frames/strands/cancel-dispose-live.jsonl``, then
+# ``test/fixtures/acp_frames/strands/cancel-dispose-reload-live.jsonl``).
+#
+# antigravity is NOT a member: membership needs a capture of the disposal error and
+# of a ``session/load`` in a second process, and Antigravity ACP 1.4.4 has neither
+# (no cancelled turn was captured, ``test/fixtures/acp_frames/antigravity/``), so its
+# prompt errors stay ordinary turn failures.
+ACP_BACKENDS_RELOAD_DISPOSED_SESSION = frozenset({ACP_BACKEND_STRANDS})

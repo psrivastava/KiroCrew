@@ -179,6 +179,16 @@ describe('useMessageSearch', () => {
     expect(result.current.focusNonce).toBe(before + 2)
   })
 
+  it('Ctrl/Cmd+Shift+F is left to Search all chats, even with a lower-case key', () => {
+    const { result } = renderHook(() => useMessageSearch(messages, 'slot-1'))
+    const shifted = (init: KeyboardEventInit) => new KeyboardEvent('keydown', { key: 'f', shiftKey: true, cancelable: true, ...init })
+    const ctrl = shifted({ ctrlKey: true })
+    const meta = shifted({ metaKey: true })
+    act(() => { document.dispatchEvent(ctrl); document.dispatchEvent(meta) })
+    expect(result.current.isOpen).toBe(false)
+    expect(ctrl.defaultPrevented || meta.defaultPrevented).toBe(false)
+  })
+
   it('currentIdx clamped when matches shrink', () => {
     const { result } = renderHook(() => useMessageSearch(messages, 'slot-1'))
     act(() => result.current.setTerm('world'))
@@ -445,5 +455,36 @@ describe('useMessageSearch with no term', () => {
     msgs = [...msgs, msg('assistant', 'another chunk')]
     rerender()
     expect(result.current.matches).toBe(first)
+  })
+})
+
+describe('useMessageSearch over a superseded steer', () => {
+  beforeEach(() => { vi.useFakeTimers() })
+  afterEach(() => { vi.useRealTimers() })
+
+  it('matches only the drawn successor row', () => {
+    const rows: ChatMessage[] = [
+      { role: 'user', content: 'check the logs', cls: '', meta: { mid: 'm-old', steer: true, steerState: 'superseded', supersededBy: 'm-new' } },
+      { role: 'user', content: 'check the logs', cls: '', meta: { mid: 'm-new' } },
+    ]
+    const { result } = renderHook(() => useMessageSearch(rows, 'slot-1'))
+    act(() => { result.current.open(); result.current.setTerm('logs') })
+    act(() => { vi.advanceTimersByTime(50) })
+    expect(result.current.matches).toEqual([{ msgIdx: 1, occ: 0 }])
+  })
+})
+
+describe('useMessageSearch over a superseded steer whose successor is cut off', () => {
+  beforeEach(() => { vi.useFakeTimers() })
+  afterEach(() => { vi.useRealTimers() })
+
+  it('still matches the old row, the only copy in the view', () => {
+    const rows: ChatMessage[] = [
+      { role: 'user', content: 'check the logs', cls: '', meta: { mid: 'm-old', steer: true, steerState: 'superseded', supersededBy: 'm-new' } },
+    ]
+    const { result } = renderHook(() => useMessageSearch(rows, 'slot-1'))
+    act(() => { result.current.open(); result.current.setTerm('logs') })
+    act(() => { vi.advanceTimersByTime(50) })
+    expect(result.current.matches).toEqual([{ msgIdx: 0, occ: 0 }])
   })
 })

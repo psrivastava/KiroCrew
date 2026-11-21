@@ -41,6 +41,7 @@ from kiro_crew.agent_sdk.mcp_problems import (
     session_mcp_problems,
     wait_for_declared_mcp,
 )
+from kiro_crew.config.fields import _coerce_bool
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.constants import (
     DENY_CAUSE_AUDIT_UNAVAILABLE,
@@ -57,6 +58,7 @@ from kiro_crew.dashboard.handlers.hooks_webhook_intake import (
     _HOOK_SESSION_PREFIX,
     _HOOK_TIMEOUT_DEFAULT,
     _HOOK_TIMEOUT_MAX,
+    _hook_credential,
     _hook_inflight_sessions,
     _hook_semaphore,
     _HookBodyTooLarge,
@@ -66,11 +68,13 @@ from kiro_crew.dashboard.handlers.hooks_webhook_intake import (
     _read_hook_body,
     _verify_hook_signature,
     _verify_hook_token,
+    _with_restored_context,
 )
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.execution_context import ExecutionContext, clear_session_execution
 from kiro_crew.executors import run_in_embed_pool, run_in_tool_gate_pool
 from kiro_crew.memory_startup import MemoryStartupUnavailable, wait_for_memory_preparation
+from kiro_crew.metrics.usage_attrs import ORIGIN_WEBHOOK, TRIGGER_WEBHOOK
 from kiro_crew.permission_floor import (
     OUTCOME_PENDING_APPROVAL,
     OUTCOME_REJECTED_TRANSPORT_FLOOR,
@@ -80,8 +84,98 @@ from kiro_crew.session_capabilities import CapabilityStartupError
 from kiro_crew.shared_crew.admission import OperationKind
 from kiro_crew.shared_crew.turn_gate import TurnRefused, run_admitted_or_raise
 from kiro_crew.tool_gate_busy import hook_gate_busy
+from kiro_crew.tracing import inbound as trace_inbound
+from kiro_crew.tracing import surfaces as trace_surfaces
 
 logger = logging.getLogger(__name__)
+
+#: The longest a caller's ``wait`` may hold its request open for the answer.
+_HOOK_ANSWER_WAIT_MAX = 300
+
+#: The most answer characters a ``wait`` response carries.
+_HOOK_ANSWER_MAX_CHARS = 20_000
+
+#: Run outcomes whose text is the agent's answer; any other carries none.
+_HOOK_ANSWER_OUTCOMES = frozenset({webhooks.OUTCOME_COMPLETED, webhooks.OUTCOME_DEGRADED})
+
+
+def _answer_return_enabled() -> bool:
+    """Whether ``hooks.return_answer`` is the JSON boolean ``true``.
+
+    Off when config cannot be read, so an unreadable ``config.json`` never turns
+    the answer on.
+    """
+    try:
+        loaded = KiroCrewConfig.load()
+    except Exception:
+        logger.debug("webhook answer setting unreadable; answer off", exc_info=True)
+        return False
+    if getattr(loaded, "_base_unreadable", False) or getattr(loaded, "_overlay_unreadable", False):
+        return False
+    section = loaded.hooks if isinstance(loaded.hooks, dict) else {}
+    return section.get("return_answer") is True
+
+
+def _answer_wait(raw: object, enabled: bool) -> tuple[int, str]:
+    """``(seconds to wait, warning)`` for the body's ``wait`` value.
+
+    Never a refusal: a value that cannot be honoured is dropped and named in the
+    warning, and the call keeps the plain accept receipt.
+    """
+    if not enabled:
+        return 0, "wait ignored: hooks.return_answer is off"
+    if isinstance(raw, bool):
+        return 0, "wait ignored: not a whole number of seconds"
+    try:
+        secs = body_int(raw)
+    except (TypeError, ValueError):
+        return 0, "wait ignored: not a whole number of seconds"
+    if secs <= 0:
+        return 0, ""
+    if secs > _HOOK_ANSWER_WAIT_MAX:
+        return _HOOK_ANSWER_WAIT_MAX, f"wait capped at {_HOOK_ANSWER_WAIT_MAX} seconds"
+    return secs, ""
+
+
+async def _wait_for_answer(task: asyncio.Task[Any], secs: float) -> tuple[str, str] | None:
+    """The run's ``(outcome, redacted answer)`` if it ends within *secs*, else ``None``.
+
+    ``asyncio.wait`` never cancels *task*: on a timeout, or when the caller hangs
+    up and this await is cancelled, the run goes on and delivers as before.
+    """
+    done, _pending = await asyncio.wait({task}, timeout=secs)
+    if task not in done or task.cancelled() or task.exception() is not None:
+        return None
+    result = task.result()
+    if not (isinstance(result, tuple) and len(result) == 2):
+        return None
+    return str(result[0]), str(result[1])
+
+
+async def _answer_fields(body: dict[str, Any], task: asyncio.Task[Any]) -> dict[str, Any]:
+    """The fields a ``wait`` call adds to the accept receipt.
+
+    Opt-in: called only when the body names ``wait``, so a call without it takes
+    exactly the path it took before. The setting is read off the event loop; a
+    finished run replaces ``status`` with ``completed`` and carries the text the
+    run delivers, after the same redaction.
+    """
+    enabled = await asyncio.to_thread(_answer_return_enabled)
+    secs, warning = _answer_wait(body["wait"], enabled)
+    fields: dict[str, Any] = {"warning": warning} if warning else {}
+    answer = await _wait_for_answer(task, secs) if secs else None
+    if answer is not None:
+        outcome, text = answer
+        fields.update(status="completed", outcome=outcome)
+        # A run that did not finish its turn carries no answer: its text is a
+        # failure detail for the owner's notifications, and the caller gets the
+        # outcome alone, as the status read answers.
+        if outcome not in _HOOK_ANSWER_OUTCOMES:
+            return fields
+        fields["answer"] = text[:_HOOK_ANSWER_MAX_CHARS]
+        if len(text) > _HOOK_ANSWER_MAX_CHARS:
+            fields["answerTruncated"] = True
+    return fields
 
 
 # Deliberately NOT wrapped in @_store_failure_guard. This route is externally
@@ -410,6 +504,11 @@ async def api_hooks_agent(request: web.Request) -> web.Response:
             {"error": "agent must be a string", "code": "agent_not_a_string"}, status=400
         )
     deliver = body.get("deliver", True)
+    if isinstance(deliver, str):
+        # A JSON string such as "false" is truthy, so it delivered anyway. The
+        # shared reader maps the usual spellings; any other value keeps the
+        # same truth test as before.
+        deliver = _coerce_bool(deliver, bool(deliver))
     try:
         timeout_secs = max(
             60,
@@ -421,7 +520,6 @@ async def api_hooks_agent(request: web.Request) -> web.Response:
             {"error": "timeoutSeconds must be an integer", "code": "timeout_not_an_integer"},
             status=400,
         )
-
     mapped_agent = str(source_entry.get("agent") or "") if source_entry else ""
     if mapped_agent and requested_agent and requested_agent != mapped_agent:
         _sel().log_api_access(
@@ -571,6 +669,9 @@ async def api_hooks_agent(request: web.Request) -> web.Response:
             source="webhook",
             resources=session_key,
         )
+        # The caller passed the token and signature checks above: join its trace when
+        # asked to (tracing/inbound.py).
+        traceparent = trace_inbound.begin(request.headers)
         task = asyncio.create_task(
             _run_hook_agent(
                 state,
@@ -594,7 +695,76 @@ async def api_hooks_agent(request: web.Request) -> web.Response:
     state._background_tasks.add(task)
     task.add_done_callback(state._background_tasks.discard)
 
-    return web.json_response({"status": "accepted", "sessionKey": session_key})
+    extra: dict[str, Any] = {"sessionKey": session_key}
+    if "wait" in body:
+        extra.update(await _answer_fields(body, task))
+    headers = {"traceparent": traceparent} if traceparent else None
+    return web.json_response({"status": "accepted", **extra}, headers=headers)
+
+
+async def api_hooks_agent_status(request: web.Request) -> web.Response:
+    """GET /api/hooks/agent/status?sessionKey=<key> — how a webhook run ended.
+
+    Authorized by the bearer of the source that started the run, and by nothing
+    else: it reads back only that source's turn
+    (:meth:`webhooks.WebhookRunStore.latest_turn`), so any other run is the same
+    404 as an unknown key. No signature: signing protects a body and a replayed
+    run, and a read has neither. Nothing is recorded as a run.
+    """
+    try:
+        switch_on = await asyncio.to_thread(webhooks.token_store().is_switch_on)
+    except webhooks.WebhookStoreUnreadable:
+        return web.json_response(
+            {"error": "inbound webhooks are unavailable", "code": "webhooks_unavailable"},
+            status=503,
+        )
+    if not switch_on:
+        return web.json_response(
+            {"error": "inbound webhooks are disabled", "code": "webhooks_disabled"}, status=503
+        )
+    source = request.remote or "unknown"
+    if webhooks.auth_throttle_blocked(source):
+        return web.json_response(
+            {"error": "too many failed attempts", "code": "auth_throttled"}, status=429
+        )
+    # A page open in the operator's browser can load this GET cross-origin (GET
+    # skips the Origin check) but cannot attach a credential header. Counting such
+    # a request would let any page throttle every loopback webhook caller.
+    if not _hook_credential(request):
+        return web.json_response({"error": "unauthorized", "code": "unauthorized"}, status=401)
+    try:
+        token_id = await asyncio.to_thread(_verify_hook_token, request)
+        run = None
+        if token_id:
+            run = await asyncio.to_thread(
+                webhooks.run_store().latest_turn, request.query.get("sessionKey", ""), token_id
+            )
+    except webhooks.WebhookStoreUnreadable:
+        return web.json_response(
+            {"error": "inbound webhooks are unavailable", "code": "webhooks_unavailable"},
+            status=503,
+        )
+    if not token_id:
+        throttled = webhooks.record_auth_failure(source)
+        _sel().log_api_access(
+            caller=source,
+            operation="hooks.agent.status",
+            outcome="denied",
+            source="webhook",
+            error="invalid token" + (" (source now throttled)" if throttled else ""),
+        )
+        return web.json_response({"error": "unauthorized", "code": "unauthorized"}, status=401)
+    webhooks.record_auth_success(source)
+    if run is None:
+        return web.json_response({"error": "run not found", "code": "run_not_found"}, status=404)
+    return web.json_response(
+        {
+            "outcome": run["outcome"],
+            "startedAt": run["started_at"],
+            "endedAt": run["started_at"] + run["duration_ms"] / 1000,
+            "missingServers": run.get("missing_servers", []),
+        }
+    )
 
 
 # The permission-request event kind, spelled locally: the agent-sdk-boundary
@@ -611,6 +781,11 @@ _EVENT_PERMISSION_REQUEST_KIND = "permission_request"
 #: owes the in-band notice that corrects kiro-cli's "User denied tool
 #: execution". ``hook_deny`` is not here: its reason is the gate's own.
 _WEBHOOK_DENY_NOTICE: dict[str, tuple[str, str]] = {
+    "web_ask_rule": (
+        DENY_CAUSE_SURFACE_POLICY,
+        "the organization's policy asks a person before this web call, and a webhook "
+        "turn has no person to ask",
+    ),
     "no_hook_store": (
         DENY_CAUSE_SURFACE_POLICY,
         "this webhook turn has no hook gate to authorize a tool call, so every call is refused",
@@ -665,7 +840,7 @@ def _capability_refusal_text(
     a save or could not be verified after the process ran, which a resend may
     clear, so its text asks for a resend first.
     """
-    member = (getattr(exc, "member", "") or agent or "").strip() or "this crew member"
+    member = (getattr(exc, "member", "") or agent or "").strip() or "this Bot"
     if isinstance(exc, CapabilityStartupError):
         return (
             f"Hook agent did not run: the start of {member} could not be verified "
@@ -686,6 +861,7 @@ def _capability_refusal_text(
     )
 
 
+@trace_surfaces.rooted(trace_surfaces.TRIGGER_WEBHOOK)
 async def _run_hook_inner(
     state: DashboardState,
     session_key: str,
@@ -713,6 +889,7 @@ async def _run_hook_inner(
         identity_grant_covers_child,
     )
     from kiro_crew.llm_helpers import _steer_host_deny
+    from kiro_crew.messaging.driver import strip_steering_markers
     from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK  # noqa: F811
 
     execution: ExecutionContext = (
@@ -769,6 +946,8 @@ async def _run_hook_inner(
             message,
             is_new,
             session_key,
+            # Unattended: a webhook turn has no user reading it live.
+            interactive=False,
             agent=agent,
             resumed=resumed,
             # Fallback label only: with the session's provider passed below,
@@ -847,6 +1026,14 @@ async def _run_hook_inner(
                     # downgrade to, so the downgrade is deny.
                     approve = False
                     deny_error = "child_low_fidelity"
+            if approve:
+                # An organisation's ``ask`` on a KAS web call (``web_ask_rule``):
+                # nobody is attached to a webhook turn, so it is refused.
+                from kiro_crew.web_ask_rule import held_phrases
+
+                if held_phrases(event):
+                    approve = False
+                    deny_error = "web_ask_rule"
             if approve:
                 # An auto-approve tier is a statement about a PROGRAM name,
                 # and the shell re-resolves that name through a PATH that can
@@ -984,11 +1171,14 @@ async def _run_hook_inner(
             context_window=_window,
             elapsed_ms=int((time.monotonic() - _turn_t0) * 1000),
             model_source=client,
+            trigger=TRIGGER_WEBHOOK,
+            origin=ORIGIN_WEBHOOK,
         )
     except Exception:
         logger.debug("usage row (webhook) persist failed", exc_info=True)
 
-    return result_text
+    # kiro-cli's [STEERING steer-…] ack is protocol, not the result.
+    return strip_steering_markers(result_text)
 
 
 async def _run_hook_agent(
@@ -1001,8 +1191,11 @@ async def _run_hook_agent(
     timeout_secs: int,
     token_id: str | None = None,
     execution_context: ExecutionContext | None = None,
-) -> None:
+) -> tuple[str, str]:
     """Execute a webhook-triggered agent turn in an ephemeral session.
+
+    Returns ``(outcome, result text)``, the text redacted as delivery sends it,
+    for a caller that waits for the answer.
 
     Sessions are always destroyed after the turn completes (like subagents).
     Context continuity across webhook calls is provided by hooks.json —
@@ -1039,13 +1232,8 @@ async def _run_hook_agent(
         # `BaseException` and passes straight through that leg. The `finally` is
         # what covers it, and only from inside the try.
         saved_context = await asyncio.to_thread(_load_hook_context, hook_id)
-        if saved_context:
-            message = (
-                f"=== Restored Context (from prior session) ===\n"
-                f"{saved_context}\n"
-                f"=== End Restored Context ===\n\n"
-                f"{message}"
-            )
+        # Unconditional: it also scrubs a forged frame from the payload alone.
+        message = await asyncio.to_thread(_with_restored_context, saved_context, message)
 
         # The inner turn's first step opens the session's memory, which the
         # gateway keeps closed from boot until its startup preparation task has
@@ -1053,7 +1241,7 @@ async def _run_hook_agent(
         # that task before it reads memory; this turn takes the same bounded
         # wait, so a webhook accepted during startup runs once memory is ready
         # instead of failing on its first read.
-        await wait_for_memory_preparation(getattr(state, "memory_startup_task", None))
+        await wait_for_memory_preparation(lambda: getattr(state, "memory_startup_task", None))
 
         # Shared Crew fair admission, charged to Crew automation (a webhook
         # caller has no principal); a refusal raises ``TurnRefused``.
@@ -1216,6 +1404,7 @@ async def _run_hook_agent(
         token_id=token_id,
         delivered=delivered,
         detail=detail,
+        missing_servers=mcp_missing,
     )
 
     _sel().log_tool_invocation(
@@ -1226,6 +1415,7 @@ async def _run_hook_agent(
         downstream_service="slack" if "Slack DM" in destinations else "internal",
     )
     logger.info("Hook agent %s: %s (%d chars)", outcome, session_key, len(result_text))
+    return outcome, result_text
 
 
 #: Owner modules, lowest layer first: the first holder of a name answers its reads.
@@ -1256,10 +1446,12 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         api_hooks,
         api_hooks_create,
         api_kiro_hooks,
+        api_kiro_hooks_rescan,
     )
     from kiro_crew.dashboard.handlers.hooks_webhook_intake import (  # noqa: F401
         _HOOK_READ_CHUNK_BYTES,
         _HOOK_STORE_PATH,
+        _RESTORED_CONTEXT_GUIDANCE,
         _hook_store_path,
         _json_object,
         _legacy_hook_token,
@@ -1289,4 +1481,6 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
 
 if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     from kiro_crew.agent_discovery import _read_agent_spec, list_agents  # noqa: F401
+    from kiro_crew.context_assembly.markers import neutralize_restored_context_frame  # noqa: F401
+    from kiro_crew.shell_audit_log import platform_spec_hooks  # noqa: F401
     from kiro_crew.validation import sanitize_string  # noqa: F401

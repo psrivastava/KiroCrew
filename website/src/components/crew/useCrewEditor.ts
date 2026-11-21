@@ -25,6 +25,7 @@ import type React from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { api, type WebhookTokenEntry } from '../../api/client'
+import { acpBackendName } from '../../api/acpBackend'
 import { i18nT } from '../../i18n/t'
 import { useAvailableModelsQuery } from '../../hooks/useAvailableModels'
 import {
@@ -180,11 +181,28 @@ export interface CrewEditorController {
    *  cached list after a transport failure rather than rejecting). Surfaced as a
    *  warn-toned status beside the Model field, NOT as an options-load error. */
   modelsDegraded: boolean
+  /** Refetch that list, and whether the refetch is in flight. */
+  retryModels: () => void
+  retryingModels: boolean
+  /** The name of the harness whose list the Model field offers and whose build takes the effort pin. */
+  pinHarness: string
 
   // Derived model/effort readout.
-  resolved: { model?: string; pinned?: boolean; reasoning_effort?: string; effort_pinned?: boolean } | undefined
+  resolved: {
+    model?: string; pinned?: boolean; reasoning_effort?: string; effort_pinned?: boolean
+    /** The model a crew with a `member_id` starts its DM on; absent otherwise, so `model` applies. */
+    harness_model?: string
+    /** The pair-id harness build's effort verdict; null until known, absent elsewhere. */
+    effort_supported?: boolean | null
+    /** Present when the pin's list is another harness's than the configured backend's. */
+    models_backend?: string
+    /** The id that harness serves the stored pin as, `''` for none; absent until a live session says. */
+    pin_served_as?: string
+  } | undefined
   resolvedError: unknown
   effortCapable: boolean
+  /** The pin backend's own levels, when it reported them. */
+  effortLevels: string[] | undefined
   effortModel: string
 
   // Sharing collisions.
@@ -263,6 +281,10 @@ export interface CrewEditorController {
    *  the embedded sub-sections that would otherwise discard the modal's unsaved
    *  panes with a raw navigate. */
   guardedNavigate: (to: string) => void
+  /** The editor's leave guard for an action that navigates on its own (an
+   *  error notice's agent hand-off): it asks first when the modal holds
+   *  unsaved edits, then runs `proceed`. */
+  leaveGate: (proceed: () => void) => void
   /** Every crew's name — the capabilities pane's `members` list. */
   memberNames: string[]
 
@@ -359,6 +381,16 @@ export function useCrewEditor(args: UseCrewEditorArgs): CrewEditorController {
     enabled: open,
   })
 
+  const { data: served, error: resolvedError } = useQuery({
+    queryKey: ['agent-resolved-model', editing],
+    queryFn: () => api.agentResolvedModel(editing),
+    enabled: !!editing,
+  })
+  // `model` is resolved on the configured backend; this crew's own sessions run the
+  // harness `harness_model` was resolved on, which can be another harness's member
+  // route. Every reader below names and judges that one.
+  const resolved = served?.harness_model === undefined ? served : { ...served, model: served.harness_model }
+
   // The model list surfaces a transport failure as `isDegraded` (the adapter
   // resolves with an auto-only/cached list rather than rejecting). A genuine
   // query ERROR (the fetch rejected) belongs in the shared options-load notice;
@@ -369,12 +401,15 @@ export function useCrewEditor(args: UseCrewEditorArgs): CrewEditorController {
   // field instead (see `modelsDegraded` below), not as an options-load error.
   const modelsQuery = useAvailableModelsQuery({ enabled: open })
   const availableModels = modelsQuery.data
-  const modelsDegraded = !modelsQuery.error && modelsQuery.isDegraded
-  const editorOptionsError = installedError ?? workspacesError ?? cfgError ?? modelsQuery.error
+  // The pin's list is the harness's that judges it, when that is not the configured one. The
+  // template pane keeps the configured list: other crews run the same template file.
+  const pinModelsQuery = useAvailableModelsQuery({ enabled: open, backend: resolved?.models_backend })
+  const modelsDegraded = !pinModelsQuery.error && pinModelsQuery.isDegraded
+  const editorOptionsError = installedError ?? workspacesError ?? cfgError ?? modelsQuery.error ?? pinModelsQuery.error
 
   const modelOptions = [
     INHERIT_MODEL,
-    ...(availableModels || []).map((m: { name: string }) => m.name).filter((n: string) => n && n !== INHERIT_MODEL),
+    ...(pinModelsQuery.data || []).map((m: { name: string }) => m.name).filter((n: string) => n && n !== INHERIT_MODEL),
   ]
 
   // ── Edit field state (own copies, seeded from the record on open) ──
@@ -560,16 +595,13 @@ export function useCrewEditor(args: UseCrewEditorArgs): CrewEditorController {
   }, [queryClient, editing])
 
   // ── Resolved model + effort ──
-  const { data: resolved, error: resolvedError } = useQuery({
-    queryKey: ['agent-resolved-model', editing],
-    queryFn: () => api.agentResolvedModel(editing),
-    enabled: !!editing,
-  })
   const modelPinPendingClear = editModel === INHERIT_MODEL && !!editingAgent?.model
   const effortModel = editModel !== INHERIT_MODEL
     ? editModel
     : modelPinPendingClear ? '' : (resolved?.model || '')
-  const effortCapable = modelSupportsEffort(effortModel)
+  // The server answers only for a harness build (codex), which holds for any pick.
+  const effortCapable = resolved?.effort_supported ?? modelSupportsEffort(effortModel)
+  const effortLevels: string[] | undefined = resolved?.effort_levels?.length ? resolved.effort_levels : undefined
 
   // ── Mutations ──
   const settleFor = useCallback((epoch: number, err?: string) => {
@@ -768,6 +800,10 @@ export function useCrewEditor(args: UseCrewEditorArgs): CrewEditorController {
     return () => clearTimeout(t)
   }, [discardAsk, schedSaving])
   const collapseProceed = useRef<(() => void) | null>(null)
+  // What runs after a confirmed close-discard: an action that leaves the editor
+  // (an error notice's hand-off) and waited on the discard confirm.
+  const closeProceed = useRef<(() => void) | null>(null)
+  const leaveAfterClose = useRef<(() => void) | null>(null)
   // Reset the pane whenever the editor points at a new crew (or closes).
   const paneSeededFor = useRef<string | null>(null)
   useEffect(() => {
@@ -883,14 +919,31 @@ export function useCrewEditor(args: UseCrewEditorArgs): CrewEditorController {
     const target = discardAsk
     setDiscardAsk(null)
     settleDiscardAnswer(true)
-    if (target === 'close') closeSheet()
-    else if (target === 'collapse') { collapseProceed.current?.(); collapseProceed.current = null }
+    if (target === 'close') {
+      closeSheet()
+      // A hand-off that asked to leave over unsaved edits runs once they are
+      // discarded (`leaveGate`). Discarding the editor's edits is not consent
+      // to lose the host page's own drafts or pending writes, so it still goes
+      // through the host's `leave`, after the close has rendered.
+      leaveAfterClose.current = closeProceed.current
+      closeProceed.current = null
+    } else if (target === 'collapse') { collapseProceed.current?.(); collapseProceed.current = null }
     else if (target) setPane(target)
   }, [discardAsk, closeSheet, settleDiscardAnswer])
 
   useEffect(() => {
-    if (discardAsk === null) settleDiscardAnswer(false)
+    if (discardAsk === null) {
+      settleDiscardAnswer(false)
+      // Kept editing: the hand-off waiting on the discard is dropped.
+      closeProceed.current = null
+    }
   }, [discardAsk, settleDiscardAnswer])
+  useEffect(() => {
+    const after = leaveAfterClose.current
+    if (discardAsk !== null || !after) return
+    leaveAfterClose.current = null
+    leave(after)
+  }, [discardAsk, leave])
 
   const discardTakesSheet =
     discardAsk === 'close'
@@ -930,8 +983,8 @@ export function useCrewEditor(args: UseCrewEditorArgs): CrewEditorController {
   })
   const boundWebhookTokens = useMemo(
     () => (webhooksQuery.data?.tokens || []).filter(
-      (t: WebhookTokenEntry) => webhookBoundToCrew(t, editing)),
-    [webhooksQuery.data, editing],
+      (t: WebhookTokenEntry) => webhookBoundToCrew(t, editingAgent)),
+    [webhooksQuery.data, editingAgent],
   )
   const boundWebhooks = boundWebhookTokens.length
   const activeWebhooks = boundWebhookTokens.filter(
@@ -971,6 +1024,18 @@ export function useCrewEditor(args: UseCrewEditorArgs): CrewEditorController {
   const guardedNavigate = useCallback((to: string) => {
     leave(() => navigate(to), to)
   }, [navigate, leave])
+  // The leave guard for an action that navigates on its own. With unsaved panes
+  // it asks through the editor's own discard confirm and runs `proceed` once
+  // the user discards; the host page's guard only refuses and raises that
+  // confirm, so routing this through `leave` alone would drop the action. A
+  // write still in flight refuses, as Close does. With nothing unsaved it goes
+  // through the host's guard, which still holds a page-level draft.
+  const leaveGate = useCallback((proceed: () => void) => {
+    if (dirtyPanes.size === 0) { leave(proceed); return }
+    if (capabilityBusy || committing || templateSwitchInflight.current || instantSaveInflight.current) return
+    closeProceed.current = proceed
+    requestClose()
+  }, [leave, dirtyPanes, capabilityBusy, committing, requestClose])
 
   // ── Avatar builder apply ──
   const applyAvatar = useCallback((next: CrewAvatarOverride | null) => {
@@ -1024,9 +1089,13 @@ export function useCrewEditor(args: UseCrewEditorArgs): CrewEditorController {
     kirocrewCfg,
     editorOptionsError,
     modelsDegraded,
+    retryModels: () => { void pinModelsQuery.refetch() },
+    retryingModels: pinModelsQuery.isFetching,
+    pinHarness: acpBackendName({ id: resolved?.models_backend ?? kirocrewCfg?.agent?.acp_backend ?? '' }),
     resolved,
     resolvedError,
     effortCapable,
+    effortLevels,
     effortModel,
     collidingCrews,
     sharingWorkspace,
@@ -1071,6 +1140,7 @@ export function useCrewEditor(args: UseCrewEditorArgs): CrewEditorController {
     isDefaultCrew,
     navigateManageMemory,
     guardedNavigate,
+    leaveGate,
     memberNames,
     error,
     sheetHint,

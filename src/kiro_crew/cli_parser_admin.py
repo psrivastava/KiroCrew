@@ -18,7 +18,7 @@ from __future__ import annotations
 import argparse
 from typing import TYPE_CHECKING
 
-from kiro_crew import cli_help
+from kiro_crew import cli_help, platform_compat
 from kiro_crew.cli_arg_types import positive_int
 from kiro_crew.cli_cloud import add_size_choices as _cloud_size_choices
 
@@ -103,7 +103,10 @@ def register_restore_parser(sub: _Commands) -> None:
     rest_parser.add_argument(
         "--mode",
         choices=("replace", "merge"),
-        help="replace = overwrite existing state, merge = keep it and add (default: auto-detect)",
+        help=(
+            "replace = overwrite existing state, merge = keep it and add; "
+            "asked on a terminal when omitted, refused off a terminal"
+        ),
     )
     rest_parser.add_argument(
         "--dry-run", action="store_true", help="Preview what would be restored, write nothing"
@@ -171,6 +174,11 @@ Examples:
   kirocrew eval                         # smoke test (~30s)
   kirocrew eval memory_recall_basic     # specific scenario
   kirocrew eval --all                   # all scenarios (slow)
+  kirocrew eval --dir ./evals           # your own scenario files (.json, .yaml, .yml)
+  kirocrew eval --file ./evals/a.yaml --agent reviewer --model my-model-id --repeat 3
+  kirocrew eval --dir ./evals --baseline eval_results/main.json --max-drop 0.05 --junit eval.xml
+  kirocrew eval run --suite tasks --check   # each case fails on its base, passes on its reference
+  kirocrew eval run --suite tasks --tier simple --harness crew-chat,claude-code --eval-home /srv/eval
 """,
         formatter_class=_fmt,
         parents=[_jail_opts],
@@ -185,6 +193,81 @@ Examples:
         "--all", action="store_true", dest="all_scenarios", help="Run all scenarios"
     )
     eval_parser.add_argument("--judge", action="store_true", help="Enable LLM judge scoring")
+    eval_parser.add_argument(
+        "--dir",
+        dest="eval_dir",
+        metavar="PATH",
+        help="Run every scenario file (.json, .yaml, .yml) in this folder instead of the bundled ones",
+    )
+    eval_parser.add_argument(
+        "--file",
+        dest="eval_file",
+        metavar="PATH",
+        help="Run one scenario file instead of the bundled ones",
+    )
+    eval_parser.add_argument(
+        "--agent", metavar="NAME", help="Crew member or agent that answers (default: from config)"
+    )
+    eval_parser.add_argument(
+        "--model", metavar="ID", help="Model that answers (default: the agent's or the config's)"
+    )
+    eval_parser.add_argument(
+        "--repeat",
+        type=positive_int,
+        default=None,
+        metavar="N",
+        help="Run the scenarios N times; a scenario passes only when all N runs pass (pass^k). "
+        "With eval run: runs per case (default: the tier's k)",
+    )
+    eval_parser.add_argument(
+        "--baseline",
+        metavar="PATH",
+        help="A saved eval_<timestamp>.json to compare with; exit 1 when a scenario's score drops",
+    )
+    eval_parser.add_argument(
+        "--max-drop",
+        dest="max_drop",
+        metavar="FRACTION",
+        help="With --baseline, how far (0 to 1) a scenario's score may fall before it is named a regression (default 0)",
+    )
+    eval_parser.add_argument(
+        "--junit", metavar="PATH", help="Also write the results as a JUnit XML file at PATH"
+    )
+    # kirocrew eval run (rfc-builtin-eval.md §3.4): `run` as the first name selects it.
+    run = eval_parser.add_argument_group("kirocrew eval run")
+    run.add_argument(
+        "--suite", metavar="tasks|DIR", help="tasks (evals/tasks here) or a suite directory"
+    )
+    run.add_argument(
+        "--tier", choices=["simple", "medium", "complex", "all"], default=None, help="Default: all"
+    )
+    run.add_argument(
+        "--harness",
+        metavar="LIST",
+        help="Comma list of crew-chat, crew-conductor, kiro-cli-v3, claude-code, codex, or all",
+    )
+    run.add_argument(
+        "--case", dest="case_ids", action="append", metavar="ID", help="Only this case (repeatable)"
+    )
+    run.add_argument(
+        "--eval-home",
+        dest="eval_home",
+        metavar="DIR",
+        help="Root for the per-run isolated homes (required to run arms)",
+    )
+    run.add_argument("--out", metavar="DIR", help="Results directory (default: ./eval_results)")
+    run.add_argument("--json", action="store_true", help="Print the summary as one JSON object")
+    run.add_argument(
+        "--use-operator-credentials",
+        dest="use_operator_credentials",
+        action="store_true",
+        help="Run every arm as you, with your own kiro-cli and Claude Code sign-ins (risky)",
+    )
+    run.add_argument(
+        "--check",
+        action="store_true",
+        help="No model: check each case fails on its base and passes on its reference",
+    )
 
 
 def register_tailnet_parser(sub: _Commands) -> None:
@@ -214,10 +297,15 @@ def register_telemetry_parser(sub: _Commands) -> None:
     tel_parser = cli_help.add_command(sub, "telemetry")
     tel_sub = tel_parser.add_subparsers(dest="telemetry_action")
     tel_sub.add_parser(
-        "status", help="Show exactly what the anonymous beacon sends (and whether it will)"
+        "status",
+        help="Show whether local metric recording is on and exactly what the anonymous beacon sends",
     )
-    tel_sub.add_parser("disable", help="Turn the anonymous beacon off permanently")
-    tel_sub.add_parser("enable", help="Turn the anonymous beacon back on")
+    tel_sub.add_parser(
+        "disable", help="Turn local metric recording and the anonymous beacon off permanently"
+    )
+    tel_sub.add_parser(
+        "enable", help="Turn local metric recording and the anonymous beacon back on"
+    )
 
 
 def register_policy_parser(sub: _Commands) -> None:
@@ -242,13 +330,24 @@ def register_policy_parser(sub: _Commands) -> None:
     explain_parser = policy_sub.add_parser(
         "explain", help="Explain a tool/scope decision for a surface"
     )
-    explain_parser.add_argument("scope", help="Governed scope, e.g. 'commands' or 'mcp'")
-    explain_parser.add_argument("item", help="The item to evaluate, e.g. 'git push origin'")
+    explain_parser.add_argument("scope", nargs="?", help="Governed scope, e.g. 'commands' or 'mcp'")
+    explain_parser.add_argument(
+        "item", nargs="?", help="The item to evaluate, e.g. 'git push origin'"
+    )
     explain_parser.add_argument(
         "--session-key", default="cli_chat", help="Surface session key (default: cli_chat)"
     )
     explain_parser.add_argument("--agent", default="", help="Agent name (optional)")
     explain_parser.add_argument("--app", default="", help="App slug (optional)")
+    explain_parser.add_argument(
+        "--json", action="store_true", help="Print the answer as one JSON object"
+    )
+    explain_parser.add_argument(
+        "--batch",
+        metavar="FILE",
+        help="Explain each JSON Lines request in FILE ('-' for stdin): "
+        "scope, item, and optional session_key, agent, app; one JSON answer per line",
+    )
     profile_show = policy_sub.add_parser("profile", help="Show a profile by name")
     profile_show.add_argument("name", help="Profile file stem (without .json)")
     policy_sub.add_parser(
@@ -322,12 +421,50 @@ def register_secrets_parser(sub: _Commands) -> None:
     )
 
 
+def _add_pod_limit_args(parser: argparse.ArgumentParser) -> None:
+    """``--memory`` / ``--cpu`` for ``pod up`` and ``pod restart``.
+
+    Validated by ``kiro_crew.pod.limits``, which this parser does not import at
+    startup; argparse only carries the strings.
+    """
+    parser.add_argument(
+        "--memory",
+        metavar="SIZE",
+        default=None,
+        help=(
+            "Memory ceiling for this pod, e.g. 16G or 8192M (default 4G). Capped at "
+            "80%% of host RAM. Persisted per pod as MEMORY= in its env file; "
+            "applies at boot. Enforced as MemoryMax on Linux; recorded but not "
+            "enforced on macOS and Windows."
+        ),
+    )
+    parser.add_argument(
+        "--cpu",
+        metavar="QUOTA",
+        default=None,
+        help=(
+            "CPU ceiling for this pod as a percentage of one core, e.g. 800%% for "
+            "eight cores, or a bare core count such as 8 (default 200%%). Capped at "
+            "the host CPU count. Persisted per pod as CPU= in its env file; applies "
+            "at boot. Enforced as CPUQuota on Linux only."
+        ),
+    )
+
+
 def register_pod_parser(sub: _Commands) -> None:
     # pod — isolated, throwaway, full-stack test instances per worktree (kubectl-style)
+    #
+    # Help that names a mechanism names the one this host runs: only Linux
+    # has the systemd --user template unit and a journal; launchd and Task
+    # Scheduler route a pod's stdout/stderr to files and have nothing to install,
+    # and Windows refuses `pod restart` (runtime_lifecycle.restart_pod). Read at
+    # call time, not import time, so tests can monkeypatch the platform.
+    on_linux = not (platform_compat.IS_MACOS or platform_compat.IS_WINDOWS)
+    on_windows = platform_compat.IS_WINDOWS
     pod_parser = cli_help.add_command(sub, "pod")
     pod_sub = pod_parser.add_subparsers(
         dest="pod_action",
-        metavar="{up,down,ls,prune,status,token,url,scenarios,api,logs,exec,provision,install}",
+        metavar="{up,down,restart,ls,prune,status,token,url,scenarios,api,logs,exec,provision,install}",
     )
     pod_up = pod_sub.add_parser("up", help="Schedule an isolated pod for a worktree")
     pod_up.add_argument("name", help="Worktree name")
@@ -369,8 +506,14 @@ def register_pod_parser(sub: _Commands) -> None:
         choices=["reads", "yolo", "interactive"],
         help=(
             "Approval mode the pod's gateway boots with, forwarded to "
-            "`kirocrew gateway --approval`. Persisted per pod so it survives a "
-            "service-manager restart. Omit to leave the gateway's own default in "
+            "`kirocrew gateway --approval`. "
+            + (
+                # Task Scheduler never restarts a crashed pod (pod/windows.py).
+                "Persisted per pod in its env file. "
+                if on_windows
+                else "Persisted per pod so it survives a service-manager restart. "
+            )
+            + "Omit to leave the gateway's own default in "
             "force, which resolves from config agent.approval_mode (default: "
             "auto). Applies at boot, so re-up a stopped pod to change it."
         ),
@@ -399,6 +542,20 @@ def register_pod_parser(sub: _Commands) -> None:
         ),
     )
     pod_up.add_argument(
+        "--env",
+        dest="env",
+        action="append",
+        metavar="KEY=VALUE",
+        default=None,
+        help=(
+            "Set an environment variable in the pod's gateway, to point it at a "
+            "test double. Repeatable. Only KIROCREW_KIRO_BIN is accepted (an "
+            "absolute path to an executable, such as a fake kiro-cli); other keys "
+            "are refused. Every `pod up` replaces the pod's overrides with the ones "
+            "it names, so an up without --env clears them. Applies at boot."
+        ),
+    )
+    pod_up.add_argument(
         "--wait-secs",
         dest="wait_secs",
         type=int,
@@ -412,6 +569,35 @@ def register_pod_parser(sub: _Commands) -> None:
             "below 5 are raised to 5, values above 3600 are capped at 3600."
         ),
     )
+    _add_pod_limit_args(pod_up)
+    if on_windows:
+        restart_help = "Not supported on Windows; use `pod down` then `pod up`"
+        restart_description = (
+            "Not supported on Windows, and refused before anything is stopped: a "
+            "Windows pod cannot start again over the home and run record its stop "
+            "keeps. `kirocrew pod down <name>` then `kirocrew pod up <name>` "
+            "restarts it with a fresh home."
+        )
+    else:
+        restart_help = "Restart a pod in place, keeping its home (applies new --memory/--cpu)"
+        restart_description = (
+            "Stop the pod's gateway, keep its isolated home (sessions, config, apps, "
+            "models), and start it again from its env file. Use it to apply a new "
+            "--memory or --cpu, or to revive a pod that crashed. No token is minted; "
+            "`kirocrew pod token <name>` mints one."
+        )
+    pod_restart = pod_sub.add_parser("restart", help=restart_help, description=restart_description)
+    pod_restart.add_argument("name", help="Worktree name")
+    pod_restart.add_argument("--json", action="store_true", help="Emit the handle as JSON")
+    pod_restart.add_argument(
+        "--wait-secs",
+        dest="wait_secs",
+        type=int,
+        metavar="SECS",
+        default=None,
+        help="Health-wait budget in seconds (same default and bounds as `pod up`)",
+    )
+    _add_pod_limit_args(pod_restart)
     pod_down = pod_sub.add_parser("down", help="Evict a pod (zero residue)")
     pod_down.add_argument("name", help="Worktree name")
     pod_ls = pod_sub.add_parser("ls", help="List running pods")
@@ -504,7 +690,15 @@ def register_pod_parser(sub: _Commands) -> None:
         action="store_true",
         help="Permit POST, PUT, PATCH, or DELETE (off by default)",
     )
-    pod_logs = pod_sub.add_parser("logs", help="Tail a pod's journal")
+    pod_logs = pod_sub.add_parser(
+        "logs",
+        help=(
+            "Tail a pod's journal"
+            if on_linux
+            # pod/cli.py _logs: launchd and Task Scheduler have no journal.
+            else "Tail a pod's stdout/stderr log files"
+        ),
+    )
     pod_logs.add_argument("name", help="Worktree name")
     pod_logs.add_argument(
         "-n", "--lines", type=positive_int, default=50, help="Lines to tail (default: 50)"
@@ -527,8 +721,17 @@ def register_pod_parser(sub: _Commands) -> None:
     pod_prov.add_argument(
         "--venv-only", action="store_true", help="Build only the venv (skip the slow dist)"
     )
-    pod_sub.add_parser("install", help="Lay down the systemd --user template unit (once)")
-    # Hidden verbs: `_run` is the unit's ExecStart body; `_cleanup` is the
+    pod_sub.add_parser(
+        "install",
+        help=(
+            "Lay down the systemd --user template unit (once)"
+            if on_linux
+            # runtime_lifecycle.install_backend returns early off Linux.
+            else "Linux only; a no-op here (each pod's definition is created at `pod up`)"
+        ),
+    )
+    # Hidden verbs: `_run` is the boot body (the systemd unit's ExecStart, the
+    # launchd plist's program, the Windows .cmd wrapper's re-entry); `_cleanup` is the
     # single-name manual reclaim (teardown itself lives on the `down` path).
     # Registered without `help=` so they stay out of `pod --help` while remaining
     # dispatchable (the metavar above also omits them from the usage line).
@@ -655,6 +858,12 @@ Examples:
         help="Do not inherit this machine's Kiro sign-in (kiro-cli whoami) as the "
         "crew's identity; sign the crew in with Builder ID unless --identity-provider is given",
     )
+    _c_launch.add_argument(
+        "--no-login",
+        action="store_true",
+        help="Skip the Kiro sign-in on the new crew (a crew on another agent harness "
+        "needs none); sign in later from the crew's Settings or with `kirocrew cloud login`",
+    )
 
     _c_list = cloud_sub.add_parser("list", help="List your Kiro Crew cloud instances")
     _cloud_creds_opts(_c_list)
@@ -711,7 +920,14 @@ Examples:
     )
 
     _c_iam = cloud_sub.add_parser(
-        "iam-policy", help="Print the least-privilege IAM policy to apply"
+        "iam-policy",
+        help="Print the least-privilege IAM policy to apply",
+        description="Print the launcher's least-privilege IAM policy as one JSON document. "
+        "It is too big for an inline user policy: create it as a customer-managed policy "
+        "(aws iam create-policy --policy-document file://launcher-policy.json) and attach "
+        "it to the IAM user, group or role behind the launch profile, or reference it from "
+        "an Identity Center permission set. See 'Applying the launcher policy' in "
+        "docs/guides/cloud-instance-ssm-vs-ssh.md, which also lists what it denies.",
     )
     _cloud_creds_opts(_c_iam)
     _c_iam.add_argument(

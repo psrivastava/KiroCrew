@@ -5,6 +5,8 @@ The app-facing way to read and answer the ``ask_question`` card a slot raised
 
 * the owner app of a slot, holding ``permissions.sessionApproval``, reads its card,
   answers it (the blocked wait gets the answer) and the card is gone after;
+* an agent ask that reaches no dashboard socket stays open while the app's embed
+  is still polling, so an app in its own window still shows the card;
 * an app never reads or answers a card on a slot it does not own --
   another app's slot or a user session, even with the grant -- and never answers a
   foreign slot's ask by naming its id under its own slot;
@@ -30,7 +32,7 @@ from slot_ownership_checkpoint_helpers import (  # noqa: F401 -- fixtures are re
     state_fixture,
 )
 
-from kiro_crew.dashboard import slot_ownership
+from kiro_crew.dashboard import interaction_coordinator, slot_ownership
 from kiro_crew.dashboard.handlers.ask_question import (
     api_ask_question_answer,
     api_ask_question_pending,
@@ -43,6 +45,8 @@ from kiro_crew.dashboard.state import SlotOrigin
 from kiro_crew.testing.wait import await_until
 
 _QUESTIONS = [{"question": "Which branch?", "options": [{"label": "main"}, {"label": "dev"}]}]
+#: Why the refusal says the grant is not held; read only to word the 403.
+_CAUSE = "kiro_crew.apps.permissions.session_approval_denial_cause"
 
 
 def _client(state, caller: str | None) -> TestClient:
@@ -99,11 +103,36 @@ async def test_owner_app_reads_answers_and_the_card_clears(state, sel_spy) -> No
 
 
 @pytest.mark.asyncio
+async def test_an_agent_ask_waits_for_a_polling_embed_with_no_dashboard_socket(
+    state, sel_spy, monkeypatch
+) -> None:
+    """An app in its own window: no socket gets the card, so the embed's poll must."""
+    now = [1000.0]
+    monkeypatch.setattr(interaction_coordinator, "_monotonic", lambda: now[0])
+    _seed(state)
+    session = "dashboard:mine"
+    assert await state.open_agent_ask(_ask_id(10), "mine", session, _QUESTIONS) == 0
+    with patch(_GRANT, return_value=True):
+        async with _client(state, APP) as client:
+            await client.get("/api/chat/slots/mine/question")
+            now[0] += 10.0  # the embed's idle poll interval
+            assert await state.open_agent_ask(_ask_id(11), "mine", session, _QUESTIONS) == 1
+            resp = await client.get("/api/chat/slots/mine/question")
+            assert [c["ask_id"] for c in (await resp.json())["pending"]] == [_ask_id(11)]
+    # An embed silent for a minute has stopped polling: it is not a receiver any more.
+    now[0] += 60.0
+    assert await state.open_agent_ask(_ask_id(12), "mine", session, _QUESTIONS) == 0
+    watcher = state._agent_asks[_ask_id(11)]["watcher"]
+    assert state.withdraw_agent_ask(_ask_id(11), session)
+    watcher.cancel()
+
+
+@pytest.mark.asyncio
 async def test_a_slot_replaced_during_the_grant_read_is_not_read(state, sel_spy) -> None:
     """A close and same-name user slot inside the caller check's await: no cards leak."""
     _seed(state)
 
-    def replace(_app: str) -> bool:
+    def replace(_app: str, **_kw: object) -> bool:
         state._slots.pop("mine")
         state.get_or_create_slot("mine", origin=SlotOrigin.USER)
         return True
@@ -213,11 +242,14 @@ async def test_an_app_cannot_answer_a_foreign_ask_under_its_own_slot(state, sel_
 async def test_without_the_grant_the_owner_app_is_refused(state, sel_spy) -> None:
     _seed(state)
     task = await _ask(state, "mine", _ask_id(5))
-    with patch(_GRANT, return_value=False):
+    with patch(_GRANT, return_value=False), patch(_CAUSE, return_value="consent_pending"):
         async with _client(state, APP) as client:
             resp = await client.get("/api/chat/slots/mine/question")
             assert resp.status == 403
-            assert (await resp.json())["code"] == "session_approval_not_granted"
+            body = await resp.json()
+            assert body["code"] == "session_approval_not_granted"
+            assert body["cause"] == "consent_pending"
+            assert '"Enable and allow chat control"' in body["error"]
             resp = await client.post(
                 "/api/chat/slots/mine/question/answer",
                 json={"ask_id": _ask_id(5), "answers": {"Which branch?": "dev"}},
@@ -233,13 +265,19 @@ async def test_a_grant_removed_during_the_body_read_refuses_the_write(state, sel
     _seed(state)
     task = await _ask(state, "mine", _ask_id(6))
     reads = iter([True, False])
-    with patch(_GRANT, side_effect=lambda _app: next(reads)):
+    with (
+        patch(_GRANT, side_effect=lambda _app, **_kw: next(reads)),
+        patch(_CAUSE, return_value="disabled"),
+    ):
         async with _client(state, APP) as client:
             resp = await client.post(
                 "/api/chat/slots/mine/question/answer",
                 json={"ask_id": _ask_id(6), "answers": {"Which branch?": "dev"}},
             )
             assert resp.status == 403
+            body = await resp.json()
+            assert (body["code"], body["cause"]) == ("session_approval_not_granted", "disabled")
+            assert f"/apps/detail/{APP}" in body["error"]
     assert not task.done()
     state.resolve_question(_ask_id(6), None)
     await await_until(task, what="the ask")

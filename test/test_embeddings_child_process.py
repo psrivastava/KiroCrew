@@ -34,7 +34,7 @@ from kiro_crew.embeddings import (
     embedding_work,
 )
 from kiro_crew.embeddings_child import ChildEmbeddingError, ChildLlama
-from kiro_crew.testing.wait import wait_until
+from kiro_crew.testing.wait import FALLBACK_TIMEOUT_SECS, wait_until
 
 _reset_embedding_singletons = embeddings_helpers._reset_embedding_singletons
 
@@ -148,6 +148,74 @@ class TestOffByDefault:
         finally:
             emb.retire()
         assert not [t for t in threading.enumerate() if t.name.startswith("kc-embed-child")]
+
+
+class TestChildStartFailure:
+    """A child that cannot start costs nothing: the model loads in the gateway."""
+
+    @pytest.fixture
+    def switched_on(self, tmp_path: Path, monkeypatch):
+        fake_cls = embeddings_helpers._make_fake_llama_class(dim=16)
+        monkeypatch.setattr(embeddings_mod, "embedding_child_process_enabled", lambda: True)
+        monkeypatch.setattr(embeddings_mod, "_load_llama_class", lambda: fake_cls)
+        monkeypatch.setattr(embeddings_mod, "is_vendored_llama_class", lambda cls: True)
+        return fake_cls, _write_model_file(tmp_path / "model.gguf")
+
+    def test_a_child_that_cannot_start_falls_back_to_the_model_in_process(
+        self, switched_on, monkeypatch, caplog
+    ):
+        fake_cls, model = switched_on
+
+        def cannot_start(self):
+            raise OSError("spawn refused")
+
+        monkeypatch.setattr(child_mod._ChildState, "spawn", cannot_start)
+        emb = LlamaCppEmbedder(model_path=model, dim=16)
+        try:
+            with caplog.at_level("WARNING", logger="kiro_crew.embeddings"):
+                assert emb.wait_ready(timeout=FALLBACK_TIMEOUT_SECS)
+            assert emb.embed_batch(["hello"]) == [[0.1] * 16]
+            (llm,) = fake_cls.instances
+            assert emb._llm is llm
+            assert "Embedding child could not start" in caplog.text
+        finally:
+            emb.retire()
+
+    def test_a_protected_path_refused_by_the_child_is_not_opened_in_process(
+        self, switched_on, monkeypatch
+    ):
+        """The child's refusal is not a start failure: the gateway must not open the path."""
+        import kiro_crew.embeddings_llama as llama_mod
+
+        fake_cls, model = switched_on
+
+        def refused(*_a, **_k):
+            raise ChildEmbeddingError(
+                "refusing to load an embedding model from a protected location"
+            )
+
+        monkeypatch.setattr(llama_mod, "ChildLlama", refused)
+        monkeypatch.setattr(embeddings_mod, "_is_sensitive_model_path", lambda path: True)
+        with pytest.raises(ChildEmbeddingError):
+            llama_mod._construct_llama(fake_cls, {"model_path": str(model)}, None)
+        assert not fake_cls.instances
+
+    def test_a_file_changed_since_the_parent_checked_is_not_opened_in_process(
+        self, switched_on, monkeypatch
+    ):
+        import kiro_crew.embeddings_llama as llama_mod
+
+        fake_cls, model = switched_on
+
+        def refused(*_a, **_k):
+            raise ChildEmbeddingError("embedding model file changed since the parent checked it")
+
+        monkeypatch.setattr(llama_mod, "ChildLlama", refused)
+        stale_stamp = llama_mod._model_file_stamp_unaliased(model)
+        model.write_bytes(model.read_bytes() + b"changed")
+        with pytest.raises(ChildEmbeddingError):
+            llama_mod._construct_llama(fake_cls, {"model_path": str(model)}, stale_stamp)
+        assert not fake_cls.instances
 
 
 class TestSameVectors:
@@ -528,16 +596,26 @@ class TestChildSide:
         with pytest.raises(ChildEmbeddingError, match="protected"):
             child_mod._load(self._load_request())
 
-    def test_set_threads_tolerates_a_runtime_without_the_dial(self):
-        child_mod._set_threads(object(), 2, 2)  # no _ctx: keeps the loaded count
-
+    def test_set_threads_tolerates_a_runtime_without_the_dial(self, caplog):
         class _Broken:
             class _ctx:  # noqa: N801 - mirrors the runtime attribute name
                 @staticmethod
                 def set_n_threads(a: int, b: int) -> None:
                     raise RuntimeError("no dial")
 
-        child_mod._set_threads(_Broken(), 2, 2)
+        with caplog.at_level("DEBUG", logger="kiro_crew.embeddings"):
+            child_mod._set_threads(object(), 2, 2)  # no _ctx: keeps the loaded count
+            child_mod._set_threads(_Broken(), 2, 2)
+        # This thread's records only: an earlier test's child-respawn thread on the same
+        # worker can log a child exit to this logger while the block runs.
+        me = threading.get_ident()
+        logged = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "kiro_crew.embeddings" and r.thread == me
+        ]
+        # Only the dial that raised is reported; a runtime without one is silent.
+        assert logged == ["Could not set the embedding thread count"]
 
     def test_vendored_class_detection(self):
         assert not child_mod.is_vendored_llama_class(embed_child_fake.FakeLlama)

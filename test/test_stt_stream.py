@@ -10,12 +10,13 @@ shared socket helpers in ``stt_stream_helpers.py``.
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
-from aiohttp import WSMsgType
+from aiohttp import WSMsgType, web
 from aiohttp.test_utils import TestClient, TestServer
 from stt_stream_helpers import transcribe_consented_fixture  # noqa: F401
 from stt_stream_helpers import (
@@ -29,6 +30,8 @@ from stt_stream_helpers import (
 
 from kiro_crew import stt
 from kiro_crew.config.loader import SttConfig
+from kiro_crew.dashboard.ws_heartbeat import LagTolerantWebSocketResponse
+from kiro_crew.testing.synthetic_credentials import SAMPLE_SLACK_BOT_TOKEN
 from kiro_crew.testing.wait import await_until, default_timeout
 
 
@@ -316,6 +319,32 @@ class TestAppleStreamingSession:
             await ws.close()
 
     @pytest.mark.asyncio
+    async def test_the_session_socket_tolerates_a_loop_stall(self, monkeypatch):
+        """A loop stall must not end dictation whose client answered the PING in time.
+
+        The stall itself is driven in ``test_ws_heartbeat_loop_lag.py``; this pins
+        that the socket a session streams over is the lag-tolerant one.
+        """
+        self._install(monkeypatch)
+        prepared: list[type] = []
+        real_prepare = web.WebSocketResponse.prepare
+
+        async def _recording_prepare(ws, request):
+            prepared.append(type(ws))
+            return await real_prepare(ws, request)
+
+        monkeypatch.setattr(web.WebSocketResponse, "prepare", _recording_prepare)
+        async with TestClient(TestServer(_make_app())) as client:
+            ws = await client.ws_connect("/api/ws/stt")
+            assert (await _recv_json(ws))["type"] == "ready"
+            await ws.send_json({"type": "stop"})
+            await ws.close()
+
+        # aiohttp prepares the returned response again; both calls are this socket.
+        assert prepared, "the session socket was never prepared"
+        assert all(issubclass(t, LagTolerantWebSocketResponse) for t in prepared), prepared
+
+    @pytest.mark.asyncio
     async def test_the_cap_finishes_the_helper_before_its_error_frame(self, monkeypatch):
         """The cap must reach `session.finish()` while the socket is still open.
 
@@ -528,10 +557,10 @@ class TestAppleStreamingSession:
         async with TestClient(TestServer(_make_app())) as client:
             ws = await client.ws_connect("/api/ws/stt")
             assert (await ws.receive_json())["type"] == "ready"
-            await events.put({"type": "partial", "text": "  my key is AKIAIOSFODNN7EXAMPLE  "})
+            await events.put({"type": "partial", "text": f"  my key is {SAMPLE_SLACK_BOT_TOKEN}  "})
             got = await ws.receive_json()
             assert got["type"] == "partial"
-            assert "AKIAIOSFODNN7EXAMPLE" not in got["text"]
+            assert SAMPLE_SLACK_BOT_TOKEN not in got["text"]
             # Edge whitespace is stripped: the frontend re-joins finals with a
             # space of its own, so a leading space would double it.
             assert got["text"] == got["text"].strip()
@@ -621,6 +650,29 @@ class TestAppleStreamingSession:
             assert msg["type"] == "error"
             assert msg["code"] == "stt_session_failed"
             await ws.close()
+
+    @pytest.mark.asyncio
+    async def test_start_failure_is_logged_not_only_audited(self, monkeypatch, caplog):
+        """A helper that refuses to start must leave its reason in gateway.log.
+
+        The audit trail records only `stt_stream_end outcome=error`, so with nothing
+        at WARNING an operator chasing a silent microphone on a non-en-US host found
+        no trace of the helper's own reason (a missing dictation model).
+        """
+        reason = "no on-device speech model is installed for locale zh-CN"
+        self._install(monkeypatch, start_error=reason)
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.dashboard.stt_stream"):
+            async with TestClient(TestServer(_make_app())) as client:
+                ws = await client.ws_connect("/api/ws/stt")
+                msg = await ws.receive_json()
+                assert msg["type"] == "error"
+                await ws.close()
+        logged = [
+            r
+            for r in caplog.records
+            if r.name == "kiro_crew.dashboard.stt_stream" and r.levelno >= logging.WARNING
+        ]
+        assert any(reason in r.getMessage() for r in logged), [r.getMessage() for r in logged]
 
     @pytest.mark.asyncio
     async def test_cancelled_start_still_closes_the_session(self, monkeypatch):
@@ -1149,7 +1201,7 @@ class TestStreamLifecycle:
             async def send_json(self, data):
                 captured.append(data)
 
-        alt = MagicMock(transcript="leaked AKIAIOSFODNN7EXAMPLE secret")
+        alt = MagicMock(transcript=f"leaked {SAMPLE_SLACK_BOT_TOKEN} secret")
         result = MagicMock(is_partial=False, alternatives=[alt])
         event = MagicMock()
         event.transcript.results = [result]
@@ -1160,7 +1212,7 @@ class TestStreamLifecycle:
         await h.handle_transcript_event(event)
 
         assert captured and captured[0]["type"] == "final"
-        assert "AKIAIOSFODNN7EXAMPLE" not in captured[0]["text"]
+        assert SAMPLE_SLACK_BOT_TOKEN not in captured[0]["text"]
 
     @pytest.mark.asyncio
     async def test_partial_transcript_is_redacted(self, monkeypatch):
@@ -1175,7 +1227,7 @@ class TestStreamLifecycle:
             async def send_json(self, data):
                 captured.append(data)
 
-        alt = MagicMock(transcript="partial AKIAIOSFODNN7EXAMPLE text")
+        alt = MagicMock(transcript=f"partial {SAMPLE_SLACK_BOT_TOKEN} text")
         result = MagicMock(is_partial=True, alternatives=[alt])
         event = MagicMock()
         event.transcript.results = [result]
@@ -1186,7 +1238,7 @@ class TestStreamLifecycle:
         await h.handle_transcript_event(event)
 
         assert captured and captured[0]["type"] == "partial"
-        assert "AKIAIOSFODNN7EXAMPLE" not in captured[0]["text"]
+        assert SAMPLE_SLACK_BOT_TOKEN not in captured[0]["text"]
 
     @pytest.mark.asyncio
     async def test_send_audio_failure_still_cleans_up(self, monkeypatch):

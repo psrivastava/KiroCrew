@@ -204,14 +204,12 @@ describe('composer collapse', () => {
     renderWithProviders(<ChatInput {...base} />)
     collapse()
     const bar = await screen.findByTestId('composer-collapsed-bar')
-    await new Promise(requestAnimationFrame)
     // Not `body`: a keyboard user must not be dropped to the top of the page.
-    expect(document.activeElement).toBe(bar)
+    await waitFor(() => expect(document.activeElement).toBe(bar))
 
     fireEvent.click(bar)
     const ta = await screen.findByLabelText('Message input')
-    await new Promise(requestAnimationFrame)
-    expect(document.activeElement).toBe(ta)
+    await waitFor(() => expect(document.activeElement).toBe(ta))
   })
 
   /**
@@ -404,6 +402,8 @@ describe('composer collapse', () => {
     openOverflow()
     const item = sketchRow()
     expect(item).toHaveAttribute('data-disabled')
+    expect(item.querySelector('.lucide-inline')).toHaveClass('group-data-[disabled]:opacity-40')
+    expect(item.querySelector('.text-text')).toHaveClass('group-data-[disabled]:opacity-40')
     // ... and the collapse stays reachable, because disabling the whole trigger
     // mid-upload would take the collapse away with it.
     expect(screen.getByTestId('composer-collapse-row')).toBeInTheDocument()

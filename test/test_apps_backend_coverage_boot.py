@@ -33,9 +33,7 @@ from apps_backend_coverage_helpers import (
 import kiro_crew.apps.backend as bmod
 from kiro_crew.apps.backend import AppProcess
 
-# ---------------------------------------------------------------------------
 # Boot reconcile
-# ---------------------------------------------------------------------------
 
 
 def _app(
@@ -60,6 +58,7 @@ def boot_env(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[Any]]:
         "dereg_skills": [],
         "register": [],
         "reconcile_skills": [],
+        "scrub_legacy": [],
     }
 
     def _start(name: str) -> AppProcess | None:
@@ -67,6 +66,9 @@ def boot_env(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[Any]]:
         return None
 
     monkeypatch.setattr(bmod, "_reap_stale_app_backends", lambda: 0)
+    # The fabricated apps are not in installed.json; the spawn-time enablement
+    # re-read is pinned in test_app_backend_spawn_env.py.
+    monkeypatch.setattr(bmod, "_app_enabled_state", lambda _name: True)
     monkeypatch.setattr(bmod, "get_app_manifest", lambda _name: None)
     monkeypatch.setattr(bmod, "shipped_builtin_app_root", lambda _name: None)
     monkeypatch.setattr(bmod, "app_admission_denied", lambda _name, **_kw: None)
@@ -95,11 +97,16 @@ def boot_env(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[Any]]:
     def _reconcile(name: str) -> None:
         calls["reconcile_skills"].append(name)
 
+    def _scrub_legacy(name: str) -> int:
+        calls["scrub_legacy"].append(name)
+        return 0
+
     monkeypatch.setattr("kiro_crew.apps.bridges._deregister_mcp_servers", _dereg_mcp)
     monkeypatch.setattr("kiro_crew.apps.bridges._deregister_agents", _dereg_agents)
     monkeypatch.setattr("kiro_crew.apps.bridges._deregister_skills", _dereg_skills)
-    monkeypatch.setattr("kiro_crew.apps.bridges.register_app", _register)
+    monkeypatch.setattr("kiro_crew.apps.bridges.reconcile_enabled_app_resources", _register)
     monkeypatch.setattr("kiro_crew.apps.bridges.reconcile_app_skills", _reconcile)
+    monkeypatch.setattr("kiro_crew.apps.bridges._scrub_legacy_shared_mcp", _scrub_legacy)
     return calls
 
 
@@ -161,7 +168,7 @@ class TestBootResourceReconcile:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         monkeypatch.setattr(
-            "kiro_crew.apps.bridges.register_app",
+            "kiro_crew.apps.bridges.reconcile_enabled_app_resources",
             lambda _n: SimpleNamespace(errors=["skill clash"]),
         )
         monkeypatch.setattr(bmod, "list_apps", lambda: [_app("noisy")])
@@ -178,7 +185,7 @@ class TestBootResourceReconcile:
         def _boom(_name: str) -> Any:
             raise RuntimeError("registry corrupt")
 
-        monkeypatch.setattr("kiro_crew.apps.bridges.register_app", _boom)
+        monkeypatch.setattr("kiro_crew.apps.bridges.reconcile_enabled_app_resources", _boom)
         monkeypatch.setattr(bmod, "list_apps", lambda: [_app("broken")])
         with caplog.at_level(logging.WARNING):
             bmod.start_enabled_app_backends()
@@ -200,6 +207,7 @@ class TestBootResourceReconcile:
         assert boot_env["dereg_agents"] == ["banned"]
         assert boot_env["dereg_skills"] == ["banned"]
         assert boot_env["dereg_mcp"] == ["banned"]
+        assert boot_env["scrub_legacy"] == ["banned"]
         assert boot_env["register"] == []
         assert boot_env["started"] == []
 
@@ -325,9 +333,7 @@ class TestPreclaimFixedPorts:
         assert bmod._start_backends_concurrently([]) == []
 
 
-# ---------------------------------------------------------------------------
 # Remaining defensive branches
-# ---------------------------------------------------------------------------
 
 
 class TestDefensiveBranches:

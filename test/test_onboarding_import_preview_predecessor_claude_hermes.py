@@ -31,11 +31,14 @@ from onboarding_import_helpers import (  # noqa: F401 -- the autouse fixture reg
     _select,
     _write_lineage_memory_db,
 )
+from redaction_structured_cases import github_classic
 
 from kiro_crew import onboarding_plan, onboarding_scan
 from kiro_crew.cron import CronService
 from kiro_crew.onboarding_sources import lineage as lineage_source
 from kiro_crew.vector_memory import VectorMemoryStore
+
+_KEY = github_classic(seed=18)  # a token the credential plan redacts
 
 # Keep apply_import's MCP sidecar lock off the real ~/.kiro/settings (see the
 # shared fixture in test/conftest.py).
@@ -339,9 +342,7 @@ class TestPreviewPredecessor:
         assert any(item["reason"] == "injection_instruction_excluded" for item in scan.skipped)
 
         credential = onboarding_scan._Scan("predecessor", tmp_path, tmp_path)
-        onboarding_plan._add_db_directive(
-            credential, "lesson.cred", "Use key AKIAIOSFODNN7EXAMPLE always"
-        )
+        onboarding_plan._add_db_directive(credential, "lesson.cred", f"Use key {_KEY} always")
 
         assert credential.items["instructions"] == []
         assert any(
@@ -356,7 +357,7 @@ class TestPreviewPredecessor:
         BROKEN code and lock in nothing. Escaped, the credential is invisible until
         `json.loads` runs, which is exactly the gap.
         """
-        secret = "AKIAIOSFODNN7EXAMPLE"
+        secret = _KEY
         # value_json as it sits on disk: the key present only as escape sequences.
         raw = '"Use this deploy key %s always"' % "".join("\\u%04x" % ord(c) for c in secret)
         assert secret not in raw
@@ -443,7 +444,7 @@ class TestPreviewPredecessor:
 
     def test_nested_decoded_credential_is_screened(self, tmp_path: Path) -> None:
         """The screen walks string leaves, so a key nested in an object is caught too."""
-        secret = "AKIAIOSFODNN7EXAMPLE"
+        secret = _KEY
         escaped = "".join("\\u%04x" % ord(char) for char in secret)
         raw = '{"rule": "Use key %s now", "note": "harmless"}' % escaped
         assert secret not in raw
@@ -483,7 +484,7 @@ class TestPreviewPredecessor:
         always-injected lesson tier — the bound becomes the bypass.
         """
         api = _api()
-        secret = "AKIAIOSFODNN7EXAMPLE"
+        secret = _KEY
         escaped = "".join("\\u%04x" % ord(char) for char in secret)
         raw = '"Use key %s now"' % escaped
         for _ in range(onboarding_scan._MAX_DECODED_VALUE_DEPTH + 4):
@@ -1279,6 +1280,69 @@ class TestPreviewHermes:
                         {
                             "name": "timezone-free cron",
                             "prompt": "must not guess a timezone",
+                            "schedule": {"kind": "cron", "expr": "0 9 * * *"},
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        plan = _api().preview_import(home=tmp_path / "home", env={})
+
+        assert "schedules" not in _categories(plan, "hermes")
+        assert any(
+            item["source_id"] == "hermes"
+            and item["category_id"] == "schedules"
+            and item["reason"] == "timezone_required"
+            for item in plan["skipped"]
+        )
+
+    def test_hermes_profile_cron_uses_its_own_profile_timezone(self, tmp_path: Path) -> None:
+        hermes = tmp_path / "home" / ".hermes"
+        hermes.mkdir(parents=True)
+        (hermes / "config.yaml").write_text("timezone: Europe/London\n", encoding="utf-8")
+        work = hermes / "profiles" / "work"
+        (work / "cron").mkdir(parents=True)
+        (work / "config.yaml").write_text("timezone: Asia/Tokyo\n", encoding="utf-8")
+        (work / "cron" / "jobs.json").write_text(
+            json.dumps(
+                {
+                    "jobs": [
+                        {
+                            "name": "tokyo standup",
+                            "prompt": "summarize the standup notes",
+                            "schedule": {"kind": "cron", "expr": "0 9 * * *"},
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        plan = _select(
+            _api().preview_import(home=tmp_path / "home", env={}),
+            ("hermes", "schedules"),
+        )
+        _api().apply_import(plan, data_home=tmp_path / "destination")
+        jobs = CronService(base_dir=tmp_path / "destination").list_jobs(include_disabled=True)
+
+        assert [(job.name, job.timezone) for job in jobs] == [("tokyo standup", "Asia/Tokyo")]
+
+    def test_hermes_profile_cron_does_not_borrow_a_sibling_profile_timezone(
+        self, tmp_path: Path
+    ) -> None:
+        profiles = tmp_path / "home" / ".hermes" / "profiles"
+        (profiles / "alpha").mkdir(parents=True)
+        (profiles / "alpha" / "config.yaml").write_text("timezone: Asia/Tokyo\n", encoding="utf-8")
+        (profiles / "beta" / "cron").mkdir(parents=True)
+        (profiles / "beta" / "cron" / "jobs.json").write_text(
+            json.dumps(
+                {
+                    "jobs": [
+                        {
+                            "name": "beta cron",
+                            "prompt": "must not take alpha's timezone",
                             "schedule": {"kind": "cron", "expr": "0 9 * * *"},
                         }
                     ]

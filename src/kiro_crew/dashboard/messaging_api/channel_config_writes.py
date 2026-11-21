@@ -96,10 +96,12 @@ class _LockedSectionWrite:
         blank_keys: tuple[str, ...] = (),
         seed_from: str | None = None,
         finalize: Callable[[dict], None] | None = None,
+        merge_nested: tuple[str, ...] = (),
     ) -> None:
         self._path = path
         self._section = section
         self._changes = dict(changes)
+        self._merge_nested = merge_nested
         self._drop_keys = drop_keys
         self._blank_keys = blank_keys
         self._seed_from = seed_from
@@ -117,6 +119,25 @@ class _LockedSectionWrite:
         # ``restore`` uses it to recognise a section that exists only because this
         # write created it, seeded contents included.
         self._created_from: dict | None = None
+
+    def _merged_changes(self, section: dict) -> dict[str, object]:
+        """``changes`` with each ``merge_nested`` object merged into the stored one.
+
+        A nested object the caller changed only part of (Slack's
+        ``code_channel_defaults``) is merged key by key into the object as
+        re-read inside the lock, so a concurrent edit to a sibling key -- a
+        ``kirocrew config set slack.code_channel_defaults.agent`` that landed
+        while the save verified a token -- is kept rather than replaced by the
+        caller's older snapshot of the whole object.
+        """
+        changes = dict(self._changes)
+        for key in self._merge_nested:
+            stored, new = section.get(key), changes.get(key)
+            if isinstance(new, dict):
+                # Always a fresh object: the section must never share a dict
+                # with the caller's request or with ``_written``.
+                changes[key] = {**stored, **new} if isinstance(stored, dict) else dict(new)
+        return changes
 
     def apply(self, fresh: dict) -> dict | None:
         """Merge into *fresh*; ``None`` when the section would be unchanged.
@@ -141,7 +162,7 @@ class _LockedSectionWrite:
         for key in self._blank_keys:
             if key in section:
                 section[key] = ""
-        section.update(self._changes)
+        section.update(self._merged_changes(section))
         touched = set(self._changes)
         if self._finalize is not None:
             pre = dict(section)
@@ -152,10 +173,39 @@ class _LockedSectionWrite:
             touched |= {
                 k for k in set(pre) | set(section) if pre.get(k, _ABSENT) != section.get(k, _ABSENT)
             }
-        self._written = {k: section[k] for k in touched if k in section}
+        # Copies of the nested objects: ``restore`` compares against what was
+        # WRITTEN, which a later in-place edit of the section must not move.
+        self._written = {
+            k: dict(section[k]) if isinstance(section[k], dict) else section[k]
+            for k in touched
+            if k in section
+        }
         if isinstance(self._prior, dict) and section == self._prior:
             return None
         return fresh
+
+    def _restore_nested(self, section: dict, key: str, written: dict, prior: Any) -> None:
+        """Undo this save's part of a ``merge_nested`` object, field by field.
+
+        Only the sub-keys this save asked for are undone, and only where the
+        stored value is still the one it wrote; a sibling a concurrent writer
+        changed in between stays, so their edit neither blocks this rollback
+        nor is lost to it.
+        """
+        stored = section.get(key)
+        if not isinstance(stored, dict):
+            return  # replaced wholesale by another writer since; theirs
+        requested = self._changes.get(key)
+        before = prior if isinstance(prior, dict) else {}
+        for sub in requested if isinstance(requested, dict) else ():
+            if sub not in written or stored.get(sub, _ABSENT) != written[sub]:
+                continue  # not ours any more
+            if sub in before:
+                stored[sub] = before[sub]
+            else:
+                stored.pop(sub, None)
+        if prior is _ABSENT and not stored:
+            section.pop(key, None)
 
     def restore(self, fresh: dict) -> dict:
         section = fresh.get(self._section)
@@ -171,6 +221,9 @@ class _LockedSectionWrite:
         else:
             before = self._created_from if self._created_from is not None else {}
         for key, written in self._written.items():
+            if key in self._merge_nested and isinstance(written, dict):
+                self._restore_nested(section, key, written, before.get(key, _ABSENT))
+                continue
             if section.get(key) != written:
                 continue  # not ours any more
             if key in before:
@@ -253,6 +306,8 @@ def _clean_id_list(raw: object, is_valid: Callable[[str], bool], label: str) -> 
 async def _write_env_or_roll_back(
     env_updates: dict[str, str | None],
     rollback: Callable[[], Awaitable[None]] | None,
+    *,
+    check: Callable[[str], None] | None = None,
 ) -> None:
     """Write a channel save's ``.env`` half, undoing its config half on failure.
 
@@ -273,7 +328,14 @@ async def _write_env_or_roll_back(
     otherwise keep reading as installed until restart, and spawned children
     would inherit the stale value.
     """
-    write = asyncio.ensure_future(_write_env_off_loop(env_updates))
+    # *check*, when given, runs on the ``.env`` text under the cross-process
+    # ``.env`` lock right before the write, and raises to refuse it: a
+    # compare-then-write that a CLI writer cannot slip between.
+    write = asyncio.ensure_future(
+        _write_env_off_loop(env_updates)
+        if check is None
+        else _write_env_off_loop(env_updates, check=check)
+    )
     try:
         await asyncio.shield(write)
     except asyncio.CancelledError:
@@ -322,8 +384,13 @@ def _wide_env_refusal(exc: _loader.EnvFileWideEncodingError) -> web.HTTPConflict
     )
 
 
-def _write_env_updates(updates: dict[str, str | None]) -> None:
+def _write_env_updates(
+    updates: dict[str, str | None], check: Callable[[str], None] | None = None
+) -> None:
     """Update select keys in config_dir/.env, preserving comments and order.
+
+    *check*, when given, receives the file's current text under the ``.env``
+    lock before anything is staged, and refuses the write by raising.
 
     A value of ``None`` deletes the key; new keys are appended. A new channel
     secret (:data:`~kiro_crew.config.loader.VAULT_CHANNEL_CREDENTIAL_KEYS`) is
@@ -376,6 +443,8 @@ def _write_env_updates(updates: dict[str, str | None]) -> None:
             "the other operation finishes."
         )
     try:
+        if check is not None:
+            check(_loader.read_env_text(ep, encoding="utf-8") if ep.exists() else "")
         # A new channel token goes to the vault and its .env line becomes the
         # secret:// reference; a failed .env write puts the vault back.
         store = ChannelSecretStore(ep)
@@ -429,6 +498,21 @@ def _write_env_updates_locked(ep: "Path", updates: dict[str, str | None]) -> Non
             out.append(f"{k}={new_val}")
     content = "\n".join(out) + ("\n" if out else "")
     publish_env(ep, _loader.env_bom_prefix(ep) + content)
+
+
+def _stored_threshold_pct(cfg: dict[str, Any], key: str, default: int) -> int:
+    """The stored *cfg[key]* as the config loader reads it.
+
+    ``config.json`` is a file an operator can hand-edit, so the stored side of a
+    "did it change?" check can be ``null``, a word, a numeric string or a bool.
+    Read raw, ``null`` or a word makes ``int()`` raise out of the save as a 500
+    and nothing is saved. The loader's own coercion is used instead, so the
+    check compares against the value the channel runs with: ``"75"`` reads as
+    75, and ``null``, a word or a bool read as *default*.
+    """
+    from kiro_crew.config.sections_channels import _threshold_pct
+
+    return _threshold_pct(cfg.get(key), default)
 
 
 def _threshold_pct_rejection(body: dict[str, Any], key: str) -> tuple[str, str] | None:

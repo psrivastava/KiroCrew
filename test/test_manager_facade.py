@@ -24,6 +24,7 @@ import importlib
 from collections.abc import Iterable
 from pathlib import Path
 
+import owner_import_scan
 import pytest
 import source_corpus
 
@@ -47,7 +48,7 @@ _BASE_MODULE_NAMES = frozenset("""
     APPROVED_GRANTS_FILENAME APP_MANIFEST_FILENAME AgentOwner Any AppManifest AppResult
     Callable ConfigReadError ContextVar INSTALLED_META_FILENAME InstalledApp
     InstalledTreeRefused Iterator LoopBoundLock OrderedDict Path RESERVED_APP_NAME_CODE
-    STAGED_GRANT_FAMILIES Sequence TASK_RUNNER_APP TASK_RUNNER_DISABLED_MESSAGE
+    STAGED_GRANT_FAMILIES Sequence
     _BUILTIN_APPS _COPY_IGNORE _DEFAULT_ON_BACKFILL _DEFAULT_ON_BUILTINS
     _DEPS_STAGING_SWEEP_RE _LIFECYCLE_LOCKS _REGISTRY_SOURCE_REPOSITORY
     _REQUIRED_BUILTIN_FIELDS _SwapState _TREE_SWAP_LAST_CAP _UpdateMarker _VALID_LIFECYCLE
@@ -68,7 +69,7 @@ _BASE_MODULE_NAMES = frozenset("""
     _trust_grant_repository _update_in_progress _update_marker_dir
     _update_retired_tree_prefix _validate_builtin_app _validate_source_path
     _write_approved_grants _write_installed app_admission_denied app_agent_backend_refusal
-    app_command_agent_refusal app_data_dir app_dir app_disabled app_enabled_state
+    app_command_agent_refusal app_data_dir app_dir app_enabled_state
     app_execution_denied app_lifecycle_lock app_name_error approved_manifest_permissions
     apps_dir asdict atomic_write backfill_default_on_builtins builtin_owns_installed
     cleanup_migrated_builtin config_dir config_local_path config_path contain_command_agents
@@ -174,29 +175,11 @@ def test_the_refusal_exception_keeps_the_facade_module() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _imported_modules(node: ast.Import | ast.ImportFrom, module: str) -> list[str]:
-    """Dotted names an import statement in *module* reaches, relative spellings resolved."""
-    if isinstance(node, ast.Import):
-        return [alias.name for alias in node.names]
-    base = node.module or ""
-    if node.level:
-        package = module.split(".")[: -node.level]
-        base = ".".join([*package, *([node.module] if node.module else [])])
-    return [base, *(f"{base}.{alias.name}" for alias in node.names)]
-
-
 def _owner_importers(sources: Iterable[tuple[Path, str]], root: Path) -> set[str]:
     """The files among *sources* (relative to *root*) whose code imports a family owner."""
-    found = set()
-    for path, text in sources:
-        rel = path.relative_to(root)
-        module = ".".join([root.name, *rel.with_suffix("").parts])
-        for node in ast.walk(ast.parse(text)):
-            if isinstance(node, (ast.Import, ast.ImportFrom)) and any(
-                name.startswith(_OWNER_PREFIX) for name in _imported_modules(node, module)
-            ):
-                found.add(rel.as_posix())
-    return found
+    return owner_import_scan.owner_importers(
+        sources, root, lambda name: name.startswith(_OWNER_PREFIX)
+    )
 
 
 def test_only_the_family_imports_an_owner() -> None:

@@ -100,23 +100,19 @@ class TestNoBackendGetsThePointerBack:
 
     @_POSIX_ONLY
     def test_the_md_notebook_carveout_leaves_the_pointer_masked(self) -> None:
-        """The one carve-out that DOES exist must not lift this leaf as a side effect."""
-        hidden = _launcher_hidden(
-            "standard",
-            extra_visible_dirs=sandbox.app_backend_visible_targets(sandbox.MD_NOTEBOOK_APP_NAME),
-        )
+        """What the Notes backend's spawn lifts must not lift this leaf as a side effect."""
+        lifted = sandbox.app_declared_mask_targets(sandbox.MD_NOTEBOOK_APP_NAME, builtin=True)
+        assert lifted, "the Notes backend lifted nothing, so this pins nothing"
+        hidden = _launcher_hidden("standard", extra_visible_dirs=lifted)
         for prefix in _CREW_PREFIXES:
             assert _crew_path(prefix, sandbox._LIVE_TARGET_LEAF) in hidden
 
     def test_the_isolated_startup_stays_scoped_to_md_notebook(self) -> None:
-        """The ``-I`` rider the carve-out needed is gone with it: dev-fleet owns no
-        hidden leaf, and the isolated start is keyed on md-notebook alone. (The
-        ``DEV_FLEET_APP_NAME`` constant in ``apps.backend`` names the bound-port
-        deferral, not a carve-out.)"""
-        import kiro_crew.apps.backend as backend_mod
+        """dev-fleet owns no hidden leaf; the isolated start is keyed on md-notebook alone."""
+        import kiro_crew.apps.backend  # noqa: F401 -- the source read below
 
         source = inspect.getsource(sys.modules["kiro_crew.apps.backend"])
-        assert backend_mod.DEV_FLEET_APP_NAME not in sandbox._APP_BACKEND_OWNED_LEAVES
+        assert "dev-fleet" not in sandbox._APP_BACKEND_OWNED_LEAVES
         assert "_shipped_md_notebook" in source
         assert "_shipped_dev_fleet" not in source
 

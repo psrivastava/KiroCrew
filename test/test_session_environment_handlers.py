@@ -21,6 +21,7 @@ from kiro_crew.coder import session_browse, session_launch
 from kiro_crew.coder.client import CoderClient, CoderClientError
 from kiro_crew.coder.registry import WorkspaceBindingRegistry
 from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.config.session_environments import PROVIDERS
 from kiro_crew.dashboard import chat_runner
 from kiro_crew.dashboard.handlers import session_environments as handlers
 from kiro_crew.dashboard.handlers import terminal
@@ -72,6 +73,7 @@ async def _client(tmp_path, monkeypatch, *, owner=True):
     app.router.add_get("/s/{slot}", handlers.api_chat_slot_environment_get)
     app.router.add_put("/s/{slot}", handlers.api_chat_slot_environment_put)
     app.router.add_get("/b/{slot}", handlers.api_chat_slot_environment_browse)
+    app.router.add_get("/h/{slot}", handlers.api_chat_slot_environment_health)
     app.router.add_put("/w/{slot}", handlers.api_chat_slot_environment_file_put)
     app.router.add_post("/check", handlers.api_session_environments_check)
     app.router.add_get("/ws", handlers.api_session_environments_workspaces_get)
@@ -596,6 +598,17 @@ async def test_terminal_remote_slot_never_falls_back_to_a_local_shell(tmp_path, 
     argv, why, code = await terminal._remote_terminal_argv(request, "main")
     assert argv is None and "not available" in why and code == "terminal_placement_unavailable"
 
+    async def cloud(key):
+        raise session_browse.CloudSandboxOnly("this session runs in a Kiro Cloud Sessions sandbox")
+
+    # A Kiro Cloud chat has no shell Kiro Crew can reach, and never will: the tab
+    # parks instead of redialing an outage that is not one.
+    monkeypatch.setattr(session_browse, "remote_terminal_argv", cloud)
+    argv, why, code = await terminal._remote_terminal_argv(request, "main")
+    assert (
+        argv is None and "Kiro Cloud Sessions sandbox" in why and code == "terminal_wrong_machine"
+    )
+
     async def remote(key):
         return ["coder", "ssh", "--disable-autostart", "crewenv-x"]
 
@@ -633,6 +646,8 @@ async def test_the_title_poller_never_reports_gateway_paths_for_a_workspace_shel
     finally:
         poller.cancel()
         await asyncio.gather(poller, return_exceptions=True)
+    # Nothing was pushed, so the dedup markers still hold no gateway value.
+    assert (sess.last_title, sess.last_cwd) == (None, None)
     title.assert_not_called()
     cwd.assert_not_called()
     ws.send_str.assert_not_awaited()
@@ -1014,3 +1029,240 @@ async def test_a_failing_pty_test_leaves_no_shell_running(tmp_path, monkeypatch)
             await _close_with_shells(client, app)
     assert sess is not None and not registry
     assert not terminal._sess_alive(sess)
+
+
+@sync
+async def test_the_git_views_are_unreachable_with_the_developer_flag_off(tmp_path, monkeypatch):
+    """The Git panel's three reads go through the real browse path and choices
+    gate: with KIROCREW_DEV_MODE off a chat bound to a remote profile reads as
+    local, so every git op answers ``not_remote`` and nothing reaches a guest.
+    Removing the flag check from the choices gate fails this test."""
+    async with _client(tmp_path, monkeypatch) as client:
+        assert (await _choose(client, "dev")).status == 200
+        assert (await _env_of(client))["profile"] == "dev"
+
+        async def never_asked(*_args, **_kwargs):
+            raise AssertionError("flag off must not reach the workspace")
+
+        monkeypatch.setattr(session_browse, "_ask", never_asked)
+        monkeypatch.delenv("KIROCREW_DEV_MODE")
+        for query in ("op=git_status", "op=git_log", "op=git_diff&path=a.py&from=b.py"):
+            resp = await client.get("/b/main?" + query)
+            assert resp.status == 409, query
+            assert (await resp.json())["code"] == "not_remote", query
+
+
+@sync
+async def test_browse_endpoint_forwards_a_rename_source(tmp_path, monkeypatch):
+    calls = []
+
+    async def fake_browse(*args):
+        calls.append(args[1:])
+        return {"root": "/r", "git": True, "output": ""}
+
+    async with _client(tmp_path, monkeypatch) as client:
+        monkeypatch.setattr(session_browse, "browse_session", fake_browse)
+        await client.get("/b/main?op=git_diff&path=new.txt&from=old.txt")
+        await client.get("/b/main?op=git_diff&path=new.txt")
+    assert calls == [("git_diff", "new.txt", "old.txt"), ("git_diff", "new.txt", None)]
+
+
+@sync
+@pytest.mark.parametrize(
+    "profiles",
+    [
+        pytest.param({}, id="cloud-profile-deleted"),
+        pytest.param(
+            {"profiles": [SimpleNamespace(id="cloud", name="R", template="micro", workdir="/w")]},
+            id="id-reused-by-coder",
+        ),
+        pytest.param(
+            {"sprites_profiles": [{"id": "cloud", "name": "R", "workdir": "/w"}]},
+            id="id-reused-by-sprites",
+        ),
+    ],
+)
+async def test_a_cloud_chat_stays_a_cloud_sandbox_once_its_profile_is_gone(
+    tmp_path, monkeypatch, profiles
+):
+    """The row's recorded ``kiro_cloud`` decides before any profile lookup: a deleted
+    or reused profile id never sends a cloud chat's files, health or terminal to
+    Coder or to another provider, and the terminal parks instead of redialing."""
+    from kiro_crew.config import live
+    from kiro_crew.dashboard import chat_utils
+
+    section = _config(**{"profiles": [], "kiro_cloud_profiles": [], **profiles})
+    monkeypatch.setattr(live, "snapshot", lambda: SimpleNamespace(session_environments=section))
+
+    def no_compute(*_a, **_k):
+        raise AssertionError("a Kiro Cloud Sessions chat reaches no Coder or VM provider")
+
+    monkeypatch.setattr(session_launch, "resolve_coder_bin", no_compute)
+    monkeypatch.setattr(session_launch, "CoderSessionEnvironments", no_compute)
+    monkeypatch.setattr(session_browse.vm_browse, "_resolve_persistent", no_compute)
+    async with _client(tmp_path, monkeypatch) as client:
+        session_launch.SessionEnvironmentChoices(tmp_path / "coder" / "session-choices.json").set(
+            "dashboard:main", "cloud", session_launch.KIRO_CLOUD_PROVIDER_ID
+        )
+        for path in ("/b/main?op=list&path=.", "/h/main"):
+            resp = await client.get(path)
+            assert resp.status == 409, path
+            assert (await resp.json())["code"] == "cloud_sandbox", path
+        monkeypatch.setattr(
+            chat_utils, "effective_session_key", lambda slot: f"dashboard:{slot.key}"
+        )
+        argv, why, code = await terminal._remote_terminal_argv(
+            SimpleNamespace(app=client.app), "main"
+        )
+    assert argv is None and code == "terminal_wrong_machine"
+    assert "only by its own agent" in why
+
+
+@sync
+async def test_health_of_a_cloud_sandbox_is_a_409_not_a_failure(tmp_path, monkeypatch):
+    """Only a Kiro Cloud sandbox's own agent reaches it, so a health read is answered
+    with ``cloud_sandbox`` (the browse routes' code), never the 502 of a broken read."""
+    async with _client(tmp_path, monkeypatch) as client:
+
+        async def cloud(_key):
+            raise session_browse.CloudSandboxOnly("runs in a Kiro Cloud Sessions sandbox")
+
+        monkeypatch.setattr(session_browse, "session_health", cloud)
+        resp = await client.get("/h/main")
+        assert resp.status == 409
+        assert (await resp.json())["code"] == "cloud_sandbox"
+
+
+@sync
+async def test_an_enabled_connected_computer_chat_is_not_sent_to_coder(tmp_path, monkeypatch):
+    """A chat on a connected computer records a device id no profile carries: its
+    files, health, save and terminal are refused with ``connected_computer`` before
+    any config or Coder lookup, never the 502 of a missing Coder profile."""
+    from kiro_crew.config import live
+    from kiro_crew.dashboard import chat_utils
+
+    def no_compute(*_a, **_k):
+        raise AssertionError("a connected computer chat reaches no Coder or VM provider")
+
+    from kiro_crew.connected_computers import flag
+
+    monkeypatch.setattr(flag, "preview_on", lambda: True)
+    monkeypatch.setattr(live, "snapshot", no_compute)
+    monkeypatch.setattr(session_launch, "resolve_coder_bin", no_compute)
+    monkeypatch.setattr(session_launch, "CoderSessionEnvironments", no_compute)
+    monkeypatch.setattr(session_browse.vm_browse, "_resolve_persistent", no_compute)
+    async with _client(tmp_path, monkeypatch) as client:
+        monkeypatch.setenv("KIROCREW_DEV_MODE", "1")
+        session_launch.SessionEnvironmentChoices(tmp_path / "coder" / "session-choices.json").set(
+            "dashboard:main", "laptop", session_launch.CONNECTED_COMPUTER_PROVIDER_ID
+        )
+        for path in ("/b/main?op=list&path=.", "/b/main?op=git_status&path=.", "/h/main"):
+            resp = await client.get(path)
+            assert resp.status == 409, path
+            body = await resp.json()
+            assert body["code"] == "connected_computer", path
+            assert "connected computer" in body["error"], path
+        resp = await client.put("/w/main", json={"path": "a.txt", "content": "x"})
+        assert resp.status == 409
+        assert (await resp.json())["code"] == "connected_computer"
+        monkeypatch.setattr(
+            chat_utils, "effective_session_key", lambda slot: f"dashboard:{slot.key}"
+        )
+        argv, why, code = await terminal._remote_terminal_argv(
+            SimpleNamespace(app=client.app), "main"
+        )
+    assert argv is None and code == "terminal_wrong_machine"
+    assert "connected computer" in why
+
+
+@pytest.fixture
+def computer_picker(tmp_path, monkeypatch):
+    from kiro_crew.config import live
+    from kiro_crew.connected_computers import broker, flag, remote_routes
+    from kiro_crew.connected_computers.devices import DeviceRegistry
+    from kiro_crew.secrets.vault import SecretVault
+
+    registry = DeviceRegistry(SecretVault(tmp_path / "computer-vault"))
+    for device_id, fingerprint in (("laptop", "a" * 64), ("desktop", "b" * 64)):
+        registry.enroll(base=device_id, fingerprint=fingerprint, label=device_id, owner="me")
+    monkeypatch.setattr(remote_routes, "_registry", lambda: registry)
+    monkeypatch.setattr(broker, "get_broker", lambda: SimpleNamespace(live=lambda _id: None))
+    monkeypatch.setattr(flag, "remote_enabled", lambda: True)
+    monkeypatch.setattr(se, "session_environments_enabled", lambda: True)
+    section = SimpleNamespace(
+        coder_url="", profiles=[], sprites_profiles=[], boxd_profiles=[], kiro_cloud_profiles=[]
+    )
+    monkeypatch.setattr(live, "snapshot", lambda: SimpleNamespace(session_environments=section))
+    return section
+
+
+def test_hidden_coder_profile_reserves_its_id_from_enrolled_computers(computer_picker):
+    computer_picker.profiles = [
+        SimpleNamespace(id="laptop", name="Coder laptop", workdir="/w", template="t")
+    ]
+    rows = handlers._profiles()
+    assert [(row["id"], row["provider"]) for row in rows] == [("desktop", "connected_computer")]
+
+
+@pytest.mark.parametrize("provider,key", [(provider, key) for provider, key, _label in PROVIDERS])
+def test_every_configured_provider_reserves_its_id_from_computers(computer_picker, provider, key):
+    computer_picker.coder_url = "https://coder.example.test"
+    profile = {"id": "laptop", "name": "Configured laptop", "workdir": "/w", "template": "t"}
+    setattr(computer_picker, key, [SimpleNamespace(**profile) if provider == "coder" else profile])
+    rows = handlers._profiles()
+    assert [(row["id"], row["provider"]) for row in rows] == [
+        ("laptop", provider),
+        ("desktop", "connected_computer"),
+    ]
+
+
+def test_ambiguous_hidden_profile_ids_are_not_offered_as_computers(computer_picker):
+    computer_picker.sprites_profiles = [{"id": "laptop"}]
+    computer_picker.boxd_profiles = [{"id": "laptop"}]
+    assert [(row["id"], row["provider"]) for row in handlers._profiles()] == [
+        ("desktop", "connected_computer")
+    ]
+
+
+def test_computer_preview_off_skips_profile_id_exclusion_reads(monkeypatch):
+    from kiro_crew.connected_computers import flag, remote_routes
+
+    class UnreadableProfiles:
+        @property
+        def profiles(self):
+            raise AssertionError("preview off must not enumerate configured profile ids")
+
+    def no_device_read():
+        raise AssertionError("preview off must not read the enrolled computers")
+
+    monkeypatch.setattr(flag, "remote_enabled", lambda: False)
+    monkeypatch.setattr(remote_routes, "device_rows", no_device_read)
+    assert handlers._connected_computer_choices(UnreadableProfiles()) == []
+
+
+@pytest.mark.asyncio
+async def test_hidden_coder_collision_put_is_refused_before_same_id_noop(
+    computer_picker, monkeypatch
+):
+    from kiro_crew.testing.wait import FALLBACK_TIMEOUT_SECS
+
+    computer_picker.profiles = [SimpleNamespace(id="laptop")]
+    slot = SimpleNamespace(key="main")
+    request = SimpleNamespace(
+        app={"state": SimpleNamespace(_slots={"main": slot})}, match_info={"slot": "main"}
+    )
+    monkeypatch.setattr(handlers, "effective_session_key", lambda _slot: "dashboard:main")
+    monkeypatch.setattr(handlers, "require_owner_dashboard_request", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        handlers, "read_bounded_json", AsyncMock(return_value=({"profile": "laptop"}, None))
+    )
+
+    def no_choice_read():
+        raise AssertionError("a colliding id must be refused before any same-id comparison or save")
+
+    monkeypatch.setattr(handlers, "_choices", no_choice_read)
+    response = await asyncio.wait_for(
+        handlers.api_chat_slot_environment_put(request), FALLBACK_TIMEOUT_SECS
+    )
+    assert response.status == 400
+    assert json.loads(response.text)["code"] == "unknown_profile"

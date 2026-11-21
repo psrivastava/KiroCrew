@@ -27,6 +27,7 @@ from kiro_crew.acp._dispatch import (
 )
 from kiro_crew.acp.client import _select_tool_title
 from kiro_crew.acp.types import EVENT_TOOL_CALL_UPDATE, TOOL_PURPOSE_KEYS
+from kiro_crew.testing.synthetic_credentials import SAMPLE_SLACK_BOT_TOKEN
 
 
 @pytest.mark.parametrize("key", list(TOOL_PURPOSE_KEYS))
@@ -116,6 +117,13 @@ def test_non_string_keys_are_tolerated() -> None:
     assert extract_tool_purpose({42: "nope", "__purpose": "yes"}) == "yes"
 
 
+def test_a_deferred_call_reads_the_purpose_inside_its_envelope() -> None:
+    """A Tool Search deferred call (KAS) nests the tool's own arguments, purpose included."""
+    args = {"query": "r2 probe", "__tool_use_purpose": "Recall the probe"}
+    wrapped = {"tool_id": "kirocrew-core::memory_recall", "arguments": args}
+    assert extract_tool_purpose(wrapped) == "Recall the probe"
+
+
 # ── the purpose must survive the second-phase refinement ──
 
 
@@ -179,13 +187,13 @@ def test_refinement_purpose_is_redacted() -> None:
             "toolCallId": "tc-4",
             "rawInput": {
                 "command": "aws s3 ls",
-                "__tool_use_purpose": "Use AKIAIOSFODNN7EXAMPLE to list buckets",
+                "__tool_use_purpose": f"Use {SAMPLE_SLACK_BOT_TOKEN} to list buckets",
             },
         }
     )
     assert event.tool_purpose.startswith("Use ")
     assert event.tool_purpose.endswith("to list buckets")
-    assert "AKIAIOSFODNN7EXAMPLE" not in event.tool_purpose
+    assert SAMPLE_SLACK_BOT_TOKEN not in event.tool_purpose
 
 
 @pytest.mark.parametrize("select_title", [select_tool_title, _select_tool_title])

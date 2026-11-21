@@ -6,8 +6,12 @@
 import { safeGetItem, safeSetItem } from '../../utils/safeStorage'
 import { markCompositeFieldsDirty } from '../../lib/uiPrefs'
 import { DEFAULT_MESSAGE_FONT_SIZE, MAX_MESSAGE_FONT_SIZE, MIN_MESSAGE_FONT_SIZE } from './contentWidth'
+import { isCardLineCount, type CardLineCount } from './cardLineCount'
 
 export type ContentWidth = 'compact' | 'comfortable' | 'full'
+
+export type CodeWrap = 'auto' | 'wrap' | 'nowrap'
+const VALID_CODE_WRAPS: ReadonlySet<string> = new Set(['auto', 'wrap', 'nowrap'])
 
 /* The font-size bounds live in ./contentWidth (with the width scaling that
  * needs them) and are re-exported here so importers of the config module keep
@@ -32,6 +36,16 @@ export const CONTENT_WIDTH: Record<ContentWidth, { messages: string; input: stri
 
 export interface ChatConfig {
   contentWidth: ContentWidth
+  /** Widen transcript tables into the pane's spare width. Set by any table's
+   *  own Widen / Narrow button and followed by every table, so the choice holds
+   *  across tables and reloads. Default false: a table keeps the reading
+   *  column's width until the reader asks. */
+  widenTables: boolean
+  /** Line wrap for code blocks. Set by any code block's own Wrap button and
+   *  followed by every code block, so the choice holds across blocks, sessions
+   *  and reloads. `auto` (the default, until the first press) keeps each block's
+   *  own default: prose fences wrap, code scrolls sideways. */
+  codeWrap: CodeWrap
   historyExpanded: boolean
   showTimestamps: boolean
   showTurnStats: boolean
@@ -52,6 +66,9 @@ export interface ChatConfig {
    *  `spellCheck={false}` so the browser draws no red misspelled-word
    *  underlines. Default true — the behaviour every install has always had. */
   spellcheck: boolean
+  /** ↑/↓ in the composer recall the prompts this chat sent (#17498). Default
+   *  true. When false the keys only move the caret. */
+  arrowKeyPromptHistory: boolean
   /** Style bold, italic, strikethrough and inline code in the composer as the
    *  user types. Display only: the markers stay visible and the sent message is
    *  the markdown they typed. A textarea cannot draw styled text, so turning
@@ -60,16 +77,44 @@ export interface ChatConfig {
    *  so it is the user's call rather than something a client with no stored
    *  config inherits. */
   inlineMarkdown: boolean
+  /** Opt in to Send running "Optimize prompt" first: the first Send of a
+   *  draft leaves the rewrite in the composer for review, and the next Send
+   *  sends it. Default false: it adds an optimizer call before every
+   *  message, so it is the user's call. */
+  optimizeBeforeSend: boolean
+  /** Offer "Optimize prompt" in the composer: its button, "+" menu row and
+   *  Cmd/Ctrl+Shift+Enter shortcut. Off also stops Optimize Before Sending,
+   *  which runs the same optimizer. Default true, the composer's long-standing
+   *  shape. */
+  showOptimizePrompt: boolean
   /** Opt in to giving a folder that holds nothing no body at all, so it costs one
    *  row instead of two. Default false: this changes how every empty folder in
    *  the sidebar reads, and the row it removes is the only labelled "New chat in
    *  <name>" affordance those folders have, so it is the user's call rather than
    *  something a client with no stored config inherits. */
   hideEmptyFolderBody: boolean
+  /** Opt in to a folder's count adding up what its subfolders hold, so a
+   *  collapsed folder says how much sits under it. Default false: off, the
+   *  count is what sits directly in the folder. */
+  countSubfolderContents: boolean
+  /** Opt in to dropping a folder whose subtree holds no open session from the
+   *  sidebar's List view. Default false, so an empty folder stays a labelled drop
+   *  target. It comes back once a session lands in it, and while one is dragged. */
+  hideEmptyFolders: boolean
   /** While the session list scrolls, titles the rows clip are shown in full
    *  in a floating layer over them; rows keep their width (desktop only).
    *  Off by default. */
   fullTitlesOnScroll: boolean
+  /** Hovering a needs-me session row (or pressing → on it) opens the quick
+   *  reply card beside it (`NeedsMeHoverCard`). Default true. When false no
+   *  card opens; the rows and their badges are unchanged. */
+  needsMeHoverCard: boolean
+  /** How many lines a session card's title may wrap onto before it is cut
+   *  off. 1 (the default) keeps the single-line ellipsis. */
+  sessionTitleLines: CardLineCount
+  /** How many lines a session card's latest-message preview may wrap onto
+   *  before it is cut off. 1 (the default) keeps the single-line ellipsis. */
+  sessionPreviewLines: CardLineCount
   /** Opt in to a plain click on a sidebar session giving it its own session
    *  tab, as the row menu's "Open in a session tab" does, instead of replacing
    *  the session in the active tab. Default false: the replace is what keeps
@@ -91,12 +136,20 @@ export interface ChatConfig {
    *  toggled keeps that choice. Default false, so a client with no stored
    *  choice keeps today's collapsed rows (#18254). */
   toolCallsStartExpanded: boolean
+  /** Open the "Thought process" reasoning rows expanded instead of collapsed.
+   *  Initial state only: a row the user toggled keeps that choice. Default
+   *  false, so a client with no stored choice keeps today's collapsed rows. */
+  reasoningStartsExpanded: boolean
   /** Opt in to a double-click on one of your own messages opening the editor
    *  (#7911). Default false: the gesture takes the double-click that would
    *  otherwise select a word in the bubble, so it is the user's call rather
    *  than something a client with no stored config inherits. The pencil button
    *  is the edit path either way. */
   doubleClickToEdit: boolean
+  /** Opt in to Escape in the composer needing a second press to stop a running
+   *  turn (#23462): the first arms and shows "Esc again to stop". Default false,
+   *  so a client with no stored choice keeps the single-press stop (#22315). */
+  doubleEscapeToStop: boolean
   /** Move the transcript to the bottom when you send (#25754). Default true.
    *  When false a send leaves the view where it is; following a streaming reply
    *  while you are already at the bottom is unchanged. */
@@ -132,7 +185,7 @@ const LS_KEY = 'mc-chat-config'
  *  it. The sidebar's view toggle persists this flag BEFORE creating its first
  *  column, so a deliberate board user always has an explicit `true` stored and
  *  is unaffected by the default. */
-const DEFAULTS: ChatConfig = { historyExpanded: true, showTimestamps: true, showTurnStats: true, sendOnEnter: 'enter', collapseAllSteps: true, confirmCloseSession: false, simplifiedToolNames: true, contentWidth: 'compact', tagColumnsEnabled: false, fileChipStyle: 'expanded', followUpLayout: 'scroll', streamMode: 'smooth', showContextPct: false, showContextTokens: false, pinLastPrompt: true, hideEmptyFolderBody: false, sidebarClickOpensTab: false, spellcheck: true, inlineMarkdown: false, showFullPastes: false, toolCallsStartExpanded: false, doubleClickToEdit: false, scrollOnSend: true, dimInactivePanes: true, minimapSide: 'left', messageFontSize: DEFAULT_MESSAGE_FONT_SIZE, fullTitlesOnScroll: false }
+const DEFAULTS: ChatConfig = { historyExpanded: true, showTimestamps: true, showTurnStats: true, sendOnEnter: 'enter', collapseAllSteps: true, confirmCloseSession: false, simplifiedToolNames: true, contentWidth: 'compact', widenTables: false, codeWrap: 'auto', tagColumnsEnabled: false, fileChipStyle: 'expanded', followUpLayout: 'scroll', streamMode: 'smooth', showContextPct: false, showContextTokens: false, pinLastPrompt: true, hideEmptyFolderBody: false, countSubfolderContents: false, hideEmptyFolders: false, sidebarClickOpensTab: false, spellcheck: true, arrowKeyPromptHistory: true, inlineMarkdown: false, optimizeBeforeSend: false, showOptimizePrompt: true, showFullPastes: false, toolCallsStartExpanded: false, reasoningStartsExpanded: false, doubleClickToEdit: false, doubleEscapeToStop: false, scrollOnSend: true, dimInactivePanes: true, minimapSide: 'left', messageFontSize: DEFAULT_MESSAGE_FONT_SIZE, fullTitlesOnScroll: false, needsMeHoverCard: true, sessionTitleLines: 1, sessionPreviewLines: 1 }
 
 const clampMessageFontSize = (n: number): number =>
   Math.max(MIN_MESSAGE_FONT_SIZE, Math.min(MAX_MESSAGE_FONT_SIZE, Math.round(n)))
@@ -154,6 +207,8 @@ export function loadChatConfig(): ChatConfig {
     const stored = JSON.parse(localStorage.getItem(LS_KEY) || '{}')
     const cfg = { ...DEFAULTS, ...stored, sendOnEnter: migrateSendMode(stored.sendOnEnter) }
     if (!(cfg.contentWidth in CONTENT_WIDTH)) cfg.contentWidth = 'compact'
+    if (typeof cfg.widenTables !== 'boolean') cfg.widenTables = false
+    if (!VALID_CODE_WRAPS.has(cfg.codeWrap)) cfg.codeWrap = 'auto'
     // Map legacy fileChipStyle values onto the current set:
     //   'tooltip'                                 → 'minimal'
     //   'pebble' / 'full' / 'compact'             → 'expanded'
@@ -167,16 +222,32 @@ export function loadChatConfig(): ChatConfig {
     if (!VALID_STREAM_MODES.has(cfg.streamMode)) cfg.streamMode = 'smooth'
     if (typeof cfg.showContextPct !== 'boolean') cfg.showContextPct = false
     if (typeof cfg.showContextTokens !== 'boolean') cfg.showContextTokens = false
+    // Coerced, not trusted: these are read live through `useChatSetting`,
+    // whose snapshot must be a primitive, so a stored object or array here
+    // would re-render every message row without end.
+    if (typeof cfg.showTimestamps !== 'boolean') cfg.showTimestamps = true
+    if (typeof cfg.collapseAllSteps !== 'boolean') cfg.collapseAllSteps = true
+    if (typeof cfg.simplifiedToolNames !== 'boolean') cfg.simplifiedToolNames = true
     if (typeof cfg.showTurnStats !== 'boolean') cfg.showTurnStats = true
     if (typeof cfg.pinLastPrompt !== 'boolean') cfg.pinLastPrompt = true
     // Coerced, not trusted: a stored non-boolean must not decide whether the
     // composer draws the browser's red spellcheck underlines.
     if (typeof cfg.spellcheck !== 'boolean') cfg.spellcheck = true
+    if (typeof cfg.arrowKeyPromptHistory !== 'boolean') cfg.arrowKeyPromptHistory = true
     if (typeof cfg.inlineMarkdown !== 'boolean') cfg.inlineMarkdown = false
+    if (typeof cfg.optimizeBeforeSend !== 'boolean') cfg.optimizeBeforeSend = false
+    if (typeof cfg.showOptimizePrompt !== 'boolean') cfg.showOptimizePrompt = true
     // Coerced, not trusted: a stored non-boolean would otherwise make the empty
     // folder shape depend on a truthy string.
     if (typeof cfg.hideEmptyFolderBody !== 'boolean') cfg.hideEmptyFolderBody = false
+    if (typeof cfg.countSubfolderContents !== 'boolean') cfg.countSubfolderContents = false
+    if (typeof cfg.hideEmptyFolders !== 'boolean') cfg.hideEmptyFolders = false
     if (typeof cfg.fullTitlesOnScroll !== 'boolean') cfg.fullTitlesOnScroll = false
+    if (typeof cfg.needsMeHoverCard !== 'boolean') cfg.needsMeHoverCard = true
+    // Coerced, not trusted: anything but 1, 2 or 3 would pick no clamp class
+    // and leave the card's text unbounded.
+    if (!isCardLineCount(cfg.sessionTitleLines)) cfg.sessionTitleLines = 1
+    if (!isCardLineCount(cfg.sessionPreviewLines)) cfg.sessionPreviewLines = 1
     // Coerced, not trusted: a stored non-boolean must not decide whether a
     // sidebar click opens a tab.
     if (typeof cfg.sidebarClickOpensTab !== 'boolean') cfg.sidebarClickOpensTab = false
@@ -185,9 +256,11 @@ export function loadChatConfig(): ChatConfig {
     // very large paste.
     if (typeof cfg.showFullPastes !== 'boolean') cfg.showFullPastes = false
     if (typeof cfg.toolCallsStartExpanded !== 'boolean') cfg.toolCallsStartExpanded = false
+    if (typeof cfg.reasoningStartsExpanded !== 'boolean') cfg.reasoningStartsExpanded = false
     // Coerced, not trusted: a stored non-boolean must not attach the
     // double-click gesture that replaces word selection on the bubble.
     if (typeof cfg.doubleClickToEdit !== 'boolean') cfg.doubleClickToEdit = false
+    if (typeof cfg.doubleEscapeToStop !== 'boolean') cfg.doubleEscapeToStop = false
     if (typeof cfg.scrollOnSend !== 'boolean') cfg.scrollOnSend = true
     if (typeof cfg.dimInactivePanes !== 'boolean') cfg.dimInactivePanes = true
     if (cfg.minimapSide !== 'left' && cfg.minimapSide !== 'right') cfg.minimapSide = 'left'
@@ -353,9 +426,12 @@ export interface DashboardConfig {
   restore_window_minutes: number
   merge_queued_messages: boolean
   default_memory_mode: MemoryMode
+  /** New chats start in conductor mode where it is offered (`dashboard.new_chat_crew_mode`). */
+  new_chat_crew_mode?: boolean
   widget_density: 'more' | 'less'
-  use_builtin_browser: boolean
   verbosity: 'default' | 'concise' | 'answer_only'
+  /** Language code the agent replies in; '' = the language of the user's message. */
+  preferred_language?: string
   quick_send: boolean
   session_grid: boolean
   tail_fork_enabled: boolean
@@ -365,12 +441,18 @@ export interface DashboardConfig {
   auto_open_git_panel: boolean
   side_panel_always_open?: boolean
   side_panel_pin_summary?: boolean
+  /** A conductor mode chat's first entry opens the side panel on its Board
+   *  (`dashboard.auto_open_conductor_board`). An absent value reads as on. */
+  auto_open_conductor_board?: boolean
   session_card_source_links: boolean
   /** Directory each new chat gets its own fresh folder under; '' = off. */
   session_folder_root?: string
   /** Sidebar folder ID new chats are filed into when started without one; '' = unfiled. */
   default_session_folder?: string
   folder_suggestions_enabled: boolean
+  /** File the suggested folder without asking; read only while suggestions are on. */
+  folder_suggestions_auto_apply?: boolean
+  project_tags_enabled?: boolean
   topic_tags_enabled?: boolean
   model_picker_hidden_models: string[]
   model_picker_configured?: boolean

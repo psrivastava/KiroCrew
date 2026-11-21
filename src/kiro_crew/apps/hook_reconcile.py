@@ -66,6 +66,8 @@ from kiro_crew.apps.bridges import (
     deregister_app_crons_reporting_failures,
     pending_reload_cron_rollback,
 )
+from kiro_crew.apps.builtin_adoption_gate import refresh_gate_app_trust
+from kiro_crew.apps.frame_sources import refresh_frame_sources
 from kiro_crew.apps.hooks_integration import (
     clear_loaded_hook_signature,
     compute_hook_signature,
@@ -147,6 +149,18 @@ def _clear_inflight(app_name: str, task: asyncio.Task) -> None:
     """
     if _inflight_app_tasks.get(app_name) is task:
         _inflight_app_tasks.pop(app_name, None)
+
+
+def _prune_inflight_from_other_loops(loop: asyncio.AbstractEventLoop) -> None:
+    """Drop per-app tasks bound to a loop other than the running one.
+
+    The registry outlives its loop (a test loop per test). A task whose loop was
+    torn down never finishes and never runs :func:`_clear_inflight`, so its app
+    would be skipped on every tick as still in flight.
+    """
+    for app_name, task in list(_inflight_app_tasks.items()):
+        if task.get_loop() is not loop:
+            del _inflight_app_tasks[app_name]
 
 
 # The gateway services an enable/disable needs, captured at watcher start so the
@@ -504,6 +518,7 @@ async def reconcile_once(installed: list[dict[str, Any]]) -> None:
     # task is SKIPPED this tick (it is retried once the straggler finishes and its
     # done-callback clears the entry). At most one reconcile per app is ever live.
     app_tasks: dict[asyncio.Task, str] = {}
+    _prune_inflight_from_other_loops(asyncio.get_running_loop())
     for name in candidates:
         existing = _inflight_app_tasks.get(name)
         if existing is not None and not existing.done():
@@ -546,7 +561,15 @@ async def _reconcile_loop() -> None:
     global _active_pass
     while True:
         try:
+            # Publish the apps' frame origins for the dashboard CSP: first at once,
+            # off the boot path (this loop is a task started after the boot pass,
+            # and the CSP admits no app origin until then), then every tick, so a
+            # CLI enable/disable or a trust grant edited in config.json lands too.
+            await asyncio.to_thread(refresh_frame_sources)
             await asyncio.sleep(POLL_INTERVAL_SECS)
+            # The gate's own-server sets, for a CLI install, uninstall or adoption
+            # this process never saw (in-process changes refresh them at once).
+            await asyncio.to_thread(refresh_gate_app_trust)
             # list_apps walks the apps dir + reads two files per app — off loop.
             installed = await asyncio.to_thread(list_apps)
             # Run the pass as a tracked task and await it SHIELDED: if the loop is
@@ -707,6 +730,7 @@ async def stop_hook_reconciler() -> None:
         # racing the sweep. Not cancelled (a teardown mid-on_shutdown must finish);
         # bounded so a genuine hang cannot exceed the shutdown budget -- process
         # exit reclaims it.
+        _prune_inflight_from_other_loops(asyncio.get_running_loop())
         inflight = [t for t in _inflight_app_tasks.values() if not t.done()]
         if inflight:
             try:

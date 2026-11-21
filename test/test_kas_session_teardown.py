@@ -2,10 +2,11 @@
 
 kiro-cli's terminate evicts the session from the multiplexed process and leaves
 the transcript for the caller to unlink. KAS's extension namespace is ``_kiro/``
-(no ``.dev``) and it offers no evict-only verb, so its delete disposes the
-resident AND removes the persisted record. Reusing the kiro verb against KAS
-returns ``-32603``, so the session would never be freed and RSS would grow with
-every background task.
+(no ``.dev``), and its teardown, the delete, disposes the resident AND removes the
+persisted record. Reusing the kiro verb against KAS returns ``-32603``, so the
+session would never be freed and RSS would grow with every background task. KAS's
+evict-only ``session/close`` is sent only to release a session whose record is
+kept for a while (``test_kas_released_sessions.py``).
 """
 
 from __future__ import annotations
@@ -111,7 +112,9 @@ def _readiness_subject(tmp_path, monkeypatch, wait_mcp_ready):
     monkeypatch.setattr(runtime, "_send_and_await", send)
     monkeypatch.setattr(runtime_mod, "required_managed_servers", lambda *_a, **_k: {"core"})
     monkeypatch.setattr(runtime_mod, "active_custom_agent", lambda *_a, **_k: None)
-    handle = SimpleNamespace(session_id="failed", wait_mcp_ready=wait_mcp_ready)
+    handle = SimpleNamespace(
+        session_id="failed", wait_mcp_ready=wait_mcp_ready, settle_kas_model_select=AsyncMock()
+    )
     return runtime, handle, send, sibling_queue
 
 
@@ -204,7 +207,10 @@ class TestReadinessReadsTheWireBatch:
             waited.append("drain")
 
         handle = SimpleNamespace(
-            session_id="s", wait_mcp_ready=wait_mcp_ready, drain_init=drain_init
+            session_id="s",
+            wait_mcp_ready=wait_mcp_ready,
+            drain_init=drain_init,
+            settle_kas_model_select=AsyncMock(),
         )
         params: dict = {"mcpServers": []}
         attach_kas_custom_agents(

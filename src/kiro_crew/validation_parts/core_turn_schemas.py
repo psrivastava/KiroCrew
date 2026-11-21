@@ -1,7 +1,7 @@
 """``kirocrew-core`` tool schemas a turn uses on its own conversation and workspace.
 
 Message edits, the skill catalog, ``kiro_cli_logs``, ``set_project``,
-``reset_conversation``, ``chat_tag``, ``suggest_followup`` with its git branch
+``reset_conversation``, ``chat_tag``, ``chat_rename``, ``suggest_followup`` with its git branch
 grammar, ``nothing_to_do`` and the ``workflow_*`` tools.
 
 Callers import these names from :mod:`kiro_crew.validation`, which serves them; this
@@ -21,6 +21,13 @@ from kiro_crew.validation_parts.input_bounds import (
     MAX_SKILL_KEY_CHARS,
 )
 from kiro_crew.validation_parts.text_sanitizer import sanitize_string
+
+# The fallback-slot title cap lives in workflows.registry and is the ONE source
+# of that bound; importing it here ties WORKFLOW_RUN_SCHEMA's ``title`` max_len
+# to the run handle's retention cap and the injector's cleaner, so they cannot
+# drift (``a-bound-bounds-every-field-it-retains``). registry imports nothing
+# from validation, so this is acyclic.
+from kiro_crew.workflows.registry import FALLBACK_TITLE_MAX
 
 # delete_message reads args["channel"] and args["ts"] by subscript. Without a
 # schema, a call omitting either key raised KeyError, which is NOT caught by
@@ -158,6 +165,18 @@ def _validate_chat_tag(cleaned: dict[str, Any]) -> None:
 # a name like "Needs: review" is valid vocabulary — a charset gate here would
 # refuse handles the resolver could match, while admitting nothing an
 # attacker needs (authorization lives in the grants store, not the argv).
+# request_server names a server and where it comes from; the gateway resolves
+# the rest. Bounded here so a malformed call is a clean ValidationError.
+REQUEST_SERVER_SCHEMA = ToolSchema(
+    tool_name="request_server",
+    fields=[
+        FieldSpec("server", str, max_len=128),
+        FieldSpec("source", str, required=True, max_len=16),
+        FieldSpec("registry_id", str, max_len=200),
+        FieldSpec("reason", str, max_len=500),
+    ],
+)
+
 CHAT_TAG_SCHEMA = ToolSchema(
     tool_name="chat_tag",
     fields=[
@@ -178,6 +197,19 @@ CHAT_TAG_SCHEMA = ToolSchema(
         ),
     ],
     custom_validator=_validate_chat_tag,
+)
+
+# chat_rename renames the calling session's own sidebar title. A transport bound
+# only, as SESSION_RENAME_SCHEMA's: the 200-character title rule is applied by the
+# applier AFTER surrounding whitespace is stripped
+# (``session_control._clean_rename_title``). Every title that rule accepts fits
+# the directive marker, even at six escaped characters per non-ASCII character;
+# a longer one is refused by ``session_directive.encode`` before any marker is made.
+CHAT_RENAME_SCHEMA = ToolSchema(
+    tool_name="chat_rename",
+    fields=[
+        FieldSpec("title", str, required=True, max_len=MAX_SHORT_STRING),
+    ],
 )
 
 # suggest_followup renders an agent-authored follow-up card in the calling
@@ -333,6 +365,12 @@ WORKFLOW_RUN_SCHEMA = ToolSchema(
         FieldSpec("name", str, max_len=MAX_SHORT_STRING),
         FieldSpec("args", dict),
         FieldSpec("budget_total", int, min_val=0, max_val=100_000_000),
+        # Opt-in titling/filing for the fallback ``workflow-<run_id>`` slot a run
+        # gets when its originating session is gone (e.g. a webhook turn). With
+        # neither given the fallback keeps its default ``Workflow: <name>`` title,
+        # unfiled. A live originating session is never touched.
+        FieldSpec("title", str, max_len=FALLBACK_TITLE_MAX),
+        FieldSpec("folder", str, max_len=MAX_SHORT_STRING),
     ],
 )
 

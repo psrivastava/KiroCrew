@@ -2,18 +2,22 @@
 
 ``_install_shutdown_signal_handlers`` puts one handler on SIGINT and SIGTERM. The
 first signal cancels any wheel apply in flight and sets the shared shutdown event;
-the second force-exits after reaping orphaned sessions and draining the member
-event log and the ``gateway.log`` queue, none of which may stop the exit by
-raising. These tests capture the installed handler and drive each path with
-every effect replaced. ``_shutdown_and_exit`` runs every drain and exits once even
-when the graceful teardown and the drains fail; ``os._exit`` is replaced, so the
-test process never exits.
+the second claims the exit and hands it to one non-daemon ``kc-force-exit``
+thread, which drains the SEL audit queue, reaps orphaned sessions, drains the
+member event log, drains SEL again and then the ``gateway.log`` queue, none of
+which may stop the exit by raising. These tests capture the installed handler and
+drive each path with every effect replaced, joining that thread. ``_shutdown_and_exit``
+runs every drain and exits once even when the graceful teardown and the drains
+fail, and parks instead once a force exit is claimed; ``os._exit`` is replaced,
+so the test process never exits.
 """
 
 from __future__ import annotations
 
 import asyncio
+import functools
 import signal
+import sys
 import threading
 import time
 import weakref
@@ -28,84 +32,373 @@ from kiro_crew import eventlog_hooks
 from kiro_crew import session as session_mod
 from kiro_crew import skill_usage
 from kiro_crew.slack import gateway as gw
+from kiro_crew.testing.wait import FALLBACK_TIMEOUT_SECS, async_wait_until
 
 
 @pytest.fixture
-def seams(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+def seams(monkeypatch: pytest.MonkeyPatch):
     found = SimpleNamespace(
         compat=MagicMock(name="platform_compat"),
         event=MagicMock(name="shutdown_event"),
         cleanup=MagicMock(name="cleanup_orphaned_sessions"),
         drain=MagicMock(name="drain_for_shutdown"),
         stop_log=MagicMock(name="_stop_log_queue_listener"),
+        flush=MagicMock(name="flush_audit_queue"),
     )
     monkeypatch.setattr(gw, "platform_compat", found.compat)
     monkeypatch.setattr(gw, "shutdown_event", found.event)
+    monkeypatch.setattr(gw, "flush_audit_queue", found.flush)
     monkeypatch.setattr(session_mod, "cleanup_orphaned_sessions", found.cleanup)
     monkeypatch.setattr(eventlog_hooks, "drain_for_shutdown", found.drain)
     monkeypatch.setattr(cli_mod, "_stop_log_queue_listener", found.stop_log)
-    return found
+    # The real threading module, with every thread and timer the handler starts
+    # recorded: the force-exit thread can finish before a test could find it by
+    # enumerating live threads.
+    found.threads = []
+    found.timers = []
+
+    def _thread(*args: Any, **kwargs: Any) -> threading.Thread:
+        thread = threading.Thread(*args, **kwargs)
+        found.threads.append(thread)
+        return thread
+
+    def _timer(*args: Any, **kwargs: Any) -> threading.Timer:
+        timer = threading.Timer(*args, **kwargs)
+        found.timers.append(timer)
+        return timer
+
+    monkeypatch.setattr(
+        gw, "threading", SimpleNamespace(Event=threading.Event, Thread=_thread, Timer=_timer)
+    )
+    yield found
+    # Retire whatever a test started, so no deadline timer fires into a later
+    # test and no drain thread outlives this one.
+    for timer in found.timers:
+        timer.cancel()
+        if timer.is_alive():
+            timer.join(5.0)
+    for thread in found.threads:
+        if thread.is_alive():
+            thread.join(5.0)
 
 
-def _install(monkeypatch: pytest.MonkeyPatch) -> dict[Any, Any]:
+def _install(monkeypatch: pytest.MonkeyPatch, orch: Any = None) -> dict[Any, Any]:
     """Install the handlers on the running loop and return them by signal."""
     handlers: dict[Any, Any] = {}
     loop = asyncio.get_running_loop()
-    monkeypatch.setattr(loop, "add_signal_handler", lambda sig, cb: handlers.__setitem__(sig, cb))
-    orch = gw.GatewayOrchestrator.__new__(gw.GatewayOrchestrator)
+    monkeypatch.setattr(
+        loop,
+        "add_signal_handler",
+        lambda sig, cb, *args: handlers.__setitem__(sig, functools.partial(cb, *args)),
+    )
+    if orch is None:
+        orch = gw.GatewayOrchestrator.__new__(gw.GatewayOrchestrator)
     orch._install_shutdown_signal_handlers()
     return handlers
+
+
+def _join_force_exit(seams: SimpleNamespace) -> threading.Thread:
+    """Wait for the one force-exit thread the second signal started to finish."""
+    assert len(seams.threads) == 1, f"expected one force-exit thread, got {seams.threads}"
+    (thread,) = seams.threads
+    assert thread.name == "kc-force-exit"
+    thread.join(10.0)
+    assert not thread.is_alive(), "the force-exit thread did not finish"
+    return thread
 
 
 @pytest.mark.asyncio
 async def test_both_signals_share_one_handler(monkeypatch, seams) -> None:
     handlers = _install(monkeypatch)
     assert set(handlers) == {signal.SIGINT, signal.SIGTERM}
-    assert handlers[signal.SIGINT] is handlers[signal.SIGTERM]
+    assert handlers[signal.SIGINT].func is handlers[signal.SIGTERM].func
+    assert handlers[signal.SIGINT].args == (signal.SIGINT,)
+    assert handlers[signal.SIGTERM].args == (signal.SIGTERM,)
+
+
+@pytest.mark.asyncio
+async def test_a_repeat_sigterm_while_stopping_is_ignored_and_logged_once(
+    monkeypatch, seams
+) -> None:
+    """A service manager can deliver SIGTERM twice during one stop (systemd's
+    control-group kill plus a forwarded one). The repeat must not cut the
+    graceful shutdown short: no force exit, no drain thread, one log line."""
+    event = threading.Event()
+    monkeypatch.setattr(gw, "shutdown_event", event)
+    log = MagicMock(name="logger")
+    monkeypatch.setattr(gw, "logger", log)
+    orch = gw.GatewayOrchestrator.__new__(gw.GatewayOrchestrator)
+    handlers = _install(monkeypatch, orch)
+
+    handlers[signal.SIGTERM]()
+    handlers[signal.SIGTERM]()
+    handlers[signal.SIGTERM]()
+
+    assert event.is_set()
+    assert not orch._force_exit_claimed.is_set()
+    assert seams.threads == [] and seams.timers == []
+    seams.compat.hard_exit.assert_not_called()
+    seams.flush.assert_not_called()
+    assert log.warning.call_count == 1
+    # A stop still owns any apply, on every signal.
+    assert seams.compat.cancel_wheel_applies_in_flight.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_ctrl_c_still_force_exits_a_sigterm_shutdown(monkeypatch, seams) -> None:
+    """Only a repeat SIGTERM is ignored: Ctrl-C stays the escape from a stuck stop."""
+    monkeypatch.setattr(gw, "logger", MagicMock(name="logger"))
+    orch = gw.GatewayOrchestrator.__new__(gw.GatewayOrchestrator)
+    handlers = _install(monkeypatch, orch)
+
+    handlers[signal.SIGTERM]()
+    handlers[signal.SIGTERM]()
+    handlers[signal.SIGINT]()
+
+    assert orch._force_exit_claimed.is_set()
+    _join_force_exit(seams)
+    seams.compat.hard_exit.assert_called_once_with(0)
 
 
 @pytest.mark.asyncio
 async def test_the_first_signal_stops_the_apply_and_sets_the_event(monkeypatch, seams) -> None:
-    handlers = _install(monkeypatch)
+    event = threading.Event()
+    monkeypatch.setattr(gw, "shutdown_event", event)
+    orch = gw.GatewayOrchestrator.__new__(gw.GatewayOrchestrator)
+    handlers = _install(monkeypatch, orch)
 
     handlers[signal.SIGTERM]()
 
     seams.compat.cancel_wheel_applies_in_flight.assert_called_once_with("shutdown")
-    seams.event.set.assert_called_once_with()
+    assert event.is_set()
     seams.compat.hard_exit.assert_not_called()
     seams.cleanup.assert_not_called()
+    seams.flush.assert_not_called()
+    assert not orch._force_exit_claimed.is_set()
+    assert seams.threads == [] and seams.timers == []
 
 
 @pytest.mark.asyncio
-async def test_a_second_signal_drains_and_force_exits(monkeypatch, seams, capsys) -> None:
-    handlers = _install(monkeypatch)
+async def test_a_second_signal_drains_the_audit_tail_and_force_exits(
+    monkeypatch, seams, capsys
+) -> None:
+    """The queued SEL tail is drained before the exit -- once before the orphan
+    sweep and once more before the gateway.log tail -- and every drain runs on
+    the dedicated non-daemon thread, not on the loop thread that runs the
+    signal handler."""
+    order: list[tuple[str, int]] = []
+
+    def _record(name: str) -> Any:
+        return lambda *_a, **_k: order.append((name, threading.get_ident()))
+
+    seams.flush.side_effect = _record("sel")
+    seams.cleanup.side_effect = _record("orphans")
+    seams.drain.side_effect = _record("eventlog")
+    seams.stop_log.side_effect = _record("gateway.log")
+    seams.compat.hard_exit.side_effect = _record("exit")
+    orch = gw.GatewayOrchestrator.__new__(gw.GatewayOrchestrator)
+    handlers = _install(monkeypatch, orch)
 
     handlers[signal.SIGINT]()
     handlers[signal.SIGINT]()
+    assert orch._force_exit_claimed.is_set()
+    thread = _join_force_exit(seams)
+    assert not thread.daemon, "interpreter shutdown would kill a daemon drain mid-write"
 
+    assert [name for name, _ in order] == [
+        "sel",
+        "orphans",
+        "eventlog",
+        "sel",
+        "gateway.log",
+        "exit",
+    ]
+    assert {ident for _, ident in order} == {thread.ident}
+    assert threading.get_ident() != thread.ident
     assert seams.compat.cancel_wheel_applies_in_flight.call_count == 2
     seams.cleanup.assert_called_once_with(narrow_with_leaders=False)
-    seams.drain.assert_called_once_with()
     seams.stop_log.assert_called_once_with(timeout=2.0)
     seams.compat.hard_exit.assert_called_once_with(0)
     assert "Force exit!" in capsys.readouterr().out
 
 
 @pytest.mark.asyncio
+async def test_the_signal_handler_does_not_wait_for_the_drain(monkeypatch, seams) -> None:
+    """The handler is a loop callback: it hands the drain off and returns while
+    the drain is still running, so the loop is never parked on a blocking flush."""
+    entered = threading.Event()
+    release = threading.Event()
+
+    def _wedged_flush(*_a: Any, **_k: Any) -> None:
+        entered.set()
+        release.wait(10.0)
+
+    seams.flush.side_effect = _wedged_flush
+    handlers = _install(monkeypatch)
+    try:
+        handlers[signal.SIGINT]()
+        handlers[signal.SIGINT]()  # returns although the flush below is wedged
+        assert entered.wait(10.0), "the force-exit thread never reached the SEL drain"
+        seams.compat.hard_exit.assert_not_called()
+    finally:
+        release.set()
+    _join_force_exit(seams)
+    seams.compat.hard_exit.assert_called_once_with(0)
+
+
+@pytest.mark.asyncio
+async def test_a_repeat_signal_mid_drain_starts_no_second_drain(monkeypatch, seams) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    first_flush = True
+
+    def _held_flush(*_a: Any, **_k: Any) -> None:
+        nonlocal first_flush
+        if first_flush:
+            first_flush = False
+            entered.set()
+            release.wait(10.0)
+
+    seams.flush.side_effect = _held_flush
+    handlers = _install(monkeypatch)
+    try:
+        handlers[signal.SIGINT]()
+        handlers[signal.SIGINT]()
+        assert entered.wait(10.0), "the force-exit thread never reached the SEL drain"
+        handlers[signal.SIGINT]()  # mid-drain
+        handlers[signal.SIGTERM]()
+        assert len(seams.threads) == 1
+        seams.compat.hard_exit.assert_not_called()
+    finally:
+        release.set()
+    _join_force_exit(seams)
+    assert seams.flush.call_count == 2
+    seams.cleanup.assert_called_once_with(narrow_with_leaders=False)
+    seams.compat.hard_exit.assert_called_once_with(0)
+    # A stop still owns any apply, on every signal.
+    assert seams.compat.cancel_wheel_applies_in_flight.call_count == 4
+
+
+@pytest.mark.asyncio
 async def test_a_failing_drain_never_blocks_the_force_exit(monkeypatch, seams) -> None:
+    seams.cleanup.side_effect = OSError("pid file unreadable")
     seams.drain.side_effect = OSError("disk wedged")
     seams.stop_log.side_effect = RuntimeError("listener gone")
     handlers = _install(monkeypatch)
 
     handlers[signal.SIGINT]()
     handlers[signal.SIGINT]()
+    _join_force_exit(seams)
 
+    assert seams.flush.call_count == 2
     seams.compat.hard_exit.assert_called_once_with(0)
 
 
 @pytest.mark.asyncio
+async def test_a_closed_stdout_cannot_strand_the_claimed_force_exit(monkeypatch, seams) -> None:
+    """The claim turns every later signal away, so the status line failing
+    (a closed stdout pipe) must not stop the exit from being started."""
+
+    class _ClosedPipe:
+        def write(self, _text: str) -> int:
+            raise BrokenPipeError("stdout reader went away")
+
+        def flush(self) -> None:
+            raise BrokenPipeError("stdout reader went away")
+
+    monkeypatch.setattr(sys, "stdout", _ClosedPipe())
+    handlers = _install(monkeypatch)
+
+    handlers[signal.SIGINT]()
+    handlers[signal.SIGINT]()  # does not raise
+    _join_force_exit(seams)
+
+    assert len(seams.timers) == 1
+    assert seams.flush.call_count == 2
+    seams.compat.hard_exit.assert_called_once_with(0)
+
+
+@pytest.mark.asyncio
+async def test_the_force_exit_is_backstopped_by_a_deadline(monkeypatch, seams) -> None:
+    """A step that overruns its own bound (the orphan sweep has none) cannot
+    hold the process: a daemon timer hard-exits at the deadline."""
+    release = threading.Event()
+    seams.cleanup.side_effect = lambda **_k: release.wait(10.0)
+    handlers = _install(monkeypatch)
+    try:
+        handlers[signal.SIGINT]()
+        handlers[signal.SIGINT]()
+        (timer,) = seams.timers
+        assert timer.name == "kc-force-exit-deadline"
+        assert timer.daemon
+        assert timer.is_alive()
+        assert timer.interval == gw._FORCE_EXIT_DEADLINE_SECS  # type: ignore[attr-defined]
+        timer.function(*timer.args)  # type: ignore[attr-defined]  # what it does at expiry
+        seams.compat.hard_exit.assert_called_once_with(0)
+    finally:
+        release.set()
+    _join_force_exit(seams)
+
+
+def test_the_deadline_never_cuts_a_drain_keeping_to_its_bound() -> None:
+    from kiro_crew import sel as sel_mod
+
+    bounds = 2 * sel_mod._HARD_EXIT_FLUSH_TIMEOUT_SECS + eventlog_hooks.SHUTDOWN_DRAIN_SECONDS + 2.0
+    assert gw._FORCE_EXIT_DEADLINE_SECS > bounds
+
+
+@pytest.mark.asyncio
+async def test_without_a_thread_the_force_exit_drains_inline(monkeypatch, seams) -> None:
+    """When no thread can be started the handler drains inline: a blocked loop
+    for the drains' bounded time beats exiting over the audit tail."""
+
+    def _no_thread(*_a: Any, **_k: Any) -> Any:
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(
+        gw,
+        "threading",
+        SimpleNamespace(Event=threading.Event, Timer=MagicMock(), Thread=_no_thread),
+    )
+    handlers = _install(monkeypatch)
+
+    handlers[signal.SIGINT]()
+    handlers[signal.SIGINT]()
+
+    assert seams.flush.call_count == 2
+    seams.stop_log.assert_called_once_with(timeout=2.0)
+    seams.compat.hard_exit.assert_called_once_with(0)
+
+
+# ── the graceful exit yields to a claimed force exit ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_the_park_returns_when_no_force_exit_is_claimed() -> None:
+    orch = gw.GatewayOrchestrator.__new__(gw.GatewayOrchestrator)
+    await orch._park_if_force_exit_claimed()  # handlers never installed
+    orch._force_exit_claimed = threading.Event()
+    await orch._park_if_force_exit_claimed()
+
+
+@pytest.mark.asyncio
+async def test_the_park_never_returns_once_a_force_exit_is_claimed() -> None:
+    """Returning would unwind run() and start interpreter shutdown under the
+    force thread's drain; the park keeps the coroutine suspended instead."""
+    orch = gw.GatewayOrchestrator.__new__(gw.GatewayOrchestrator)
+    orch._force_exit_claimed = threading.Event()
+    orch._force_exit_claimed.set()
+    task = asyncio.create_task(orch._park_if_force_exit_claimed())
+    await asyncio.sleep(0)  # the task's first step has run
+    assert not task.done()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
 async def test_off_the_main_thread_no_handler_is_installed(monkeypatch, seams) -> None:
-    def _not_main_thread(_sig: Any, _cb: Any) -> None:
+    def _not_main_thread(_sig: Any, _cb: Any, *_args: Any) -> None:
         raise RuntimeError("set_wakeup_fd only works in main thread")
 
     loop = asyncio.get_running_loop()
@@ -268,3 +561,320 @@ async def test_the_exit_path_releases_shared_crew_slices_a_timed_out_shutdown_sk
     # After the runtimes are reaped, before the hard exit.
     assert order == ["reap", "release"]
     no_exit._exit.assert_called_once_with(0)
+
+
+@pytest.mark.asyncio
+async def test_the_exit_path_stops_app_backends_a_timed_out_shutdown_never_reached(
+    monkeypatch, seams
+) -> None:
+    """The dashboard cleanup hook that stops the spawned app backends runs only once
+    the web server's in-flight requests drain, so an open log stream lets the
+    graceful deadline cut the shutdown before it. The exit path stops what is still
+    tracked before its hard exit, and leaves an adopted backend running."""
+    import kiro_crew.apps.backend as backend
+    from kiro_crew.apps import hooks_integration
+
+    no_exit = _graceful_exit_seams(monkeypatch)
+    order: list[str] = []
+    no_exit._exit.side_effect = lambda code: order.append("exit")
+    spawned = backend.AppProcess(app_name="spawned-app", proc=MagicMock(name="proc"))
+    adopted = backend.AppProcess(app_name="adopted-app", proc=None, port=4242, adopted_pids=[123])
+    monkeypatch.setattr(backend, "_processes", {"spawned-app": spawned, "adopted-app": adopted})
+
+    def _stop(name: str) -> bool:
+        order.append(f"stop {name}")
+        return True
+
+    monkeypatch.setattr(hooks_integration, "stop_app_backend", _stop)
+    orch = _bare_orchestrator()
+    orch._shutdown = AsyncMock(side_effect=asyncio.TimeoutError())
+
+    await orch._shutdown_and_exit()
+
+    assert order == ["stop spawned-app", "exit"]
+
+
+@pytest.mark.asyncio
+async def test_the_exit_sweep_starts_every_stop_at_once_even_past_the_shared_pool(
+    monkeypatch,
+) -> None:
+    """A stop drops its records before it signals, then waits before escalating, so a
+    stop left queued behind other stops when the hard exit lands leaves a backend
+    nothing records. The exit sweep gives every backend its own worker: with one more
+    backend than the shared subprocess pool has workers, every stop is running at
+    the same moment."""
+    import kiro_crew.apps.backend as backend
+    from kiro_crew.apps import hooks_integration
+    from kiro_crew.executors import subprocess_executor
+
+    count = subprocess_executor()._max_workers + 1
+    names = [f"app-{i}" for i in range(count)]
+    monkeypatch.setattr(
+        backend,
+        "_processes",
+        {name: backend.AppProcess(app_name=name, proc=MagicMock(name=name)) for name in names},
+    )
+    all_running = threading.Barrier(count)
+    met: list[str] = []
+
+    def _stop(name: str) -> bool:
+        # Returns only once every stop is running at once. A stop that had to queue
+        # never arrives, so the sweep's own budget ends the wait and the barrier is
+        # broken below to free the workers.
+        try:
+            all_running.wait(timeout=FALLBACK_TIMEOUT_SECS)
+        except threading.BrokenBarrierError:
+            return False
+        met.append(name)
+        return True
+
+    monkeypatch.setattr(hooks_integration, "stop_app_backend", _stop)
+
+    try:
+        await hooks_integration.stop_spawned_backends_at_exit()
+    finally:
+        all_running.abort()
+
+    assert sorted(met) == sorted(names)
+
+
+@pytest.mark.asyncio
+async def test_the_exit_sweep_waits_for_a_stop_the_cleanup_hook_left_running(
+    monkeypatch, caplog
+) -> None:
+    """The cleanup hook's sweep can reach its deadline with a stop still in its wait
+    before SIGKILL, and that stop already dropped the backend's records, so the
+    tracking table is empty at exit. The exit sweep still waits for it: the stop
+    finishes, and is logged, before the hard exit."""
+    import logging
+
+    from kiro_crew.apps import hooks_integration
+
+    started = threading.Event()
+    release = threading.Event()
+    tracked = [["slow-app"], []]
+
+    def _names() -> list[str]:
+        names = tracked.pop(0)
+        if not names:
+            release.set()  # the exit sweep has looked; only then may the stop end
+        return names
+
+    def _stop(name: str) -> bool:
+        started.set()
+        return release.wait(timeout=FALLBACK_TIMEOUT_SECS)
+
+    monkeypatch.setattr(hooks_integration, "spawned_backend_names", _names)
+    monkeypatch.setattr(hooks_integration, "stop_app_backend", _stop)
+    # A zero budget: the cleanup sweep returns at its deadline with the stop unfinished.
+    monkeypatch.setattr(hooks_integration, "_BACKEND_STOP_BUDGET_SECS", 0)
+    await hooks_integration._stop_spawned_backends()
+    await async_wait_until(started.is_set, describe=lambda: "the cleanup stop never started")
+    monkeypatch.setattr(hooks_integration, "_BACKEND_STOP_BUDGET_SECS", FALLBACK_TIMEOUT_SECS)
+
+    with caplog.at_level(logging.INFO, logger=hooks_integration.logger.name):
+        await hooks_integration.stop_spawned_backends_at_exit()
+
+    assert "Stopped app backend on gateway shutdown: slow-app" in caplog.messages
+
+
+async def _reached(barrier: asyncio.Event, task: asyncio.Task[Any]) -> None:
+    """Wait for ``barrier``, bounded, and fail at once if ``task`` ends first.
+
+    A producer that raises before it sets the barrier would otherwise leave
+    the test waiting until the outer pytest timeout kills the worker.
+    """
+    waiter = asyncio.ensure_future(barrier.wait())
+    done, _ = await asyncio.wait({waiter, task}, timeout=10.0, return_when=asyncio.FIRST_COMPLETED)
+    if waiter in done:
+        return
+    waiter.cancel()
+    if task in done:
+        task.result()  # re-raises the producer's failure
+        pytest.fail("the exit path returned before reaching the barrier")
+    pytest.fail("the exit path never reached the barrier")
+
+
+def _graceful_exit_seams(monkeypatch: pytest.MonkeyPatch) -> _NoExitOs:
+    no_exit = _NoExitOs()
+    monkeypatch.setattr(gw, "os", no_exit)
+    monkeypatch.setattr(gw, "drain_sign_in_refresher", AsyncMock())
+    monkeypatch.setattr(gw, "flush_audit_queue_before_hard_exit", AsyncMock())
+    monkeypatch.setattr(cli_mod, "drain_log_queue_before_hard_exit", AsyncMock())
+    monkeypatch.setattr(skill_usage, "flush_all_for_shutdown", MagicMock(return_value=True))
+    from kiro_crew.shared_crew import admission_gate
+
+    monkeypatch.setattr(admission_gate, "shutdown_cleanup", AsyncMock(return_value=0))
+    return no_exit
+
+
+@pytest.mark.asyncio
+async def test_a_claimed_force_exit_parks_the_graceful_exit_before_its_drains(
+    monkeypatch, seams
+) -> None:
+    """The force thread owns both drains and the exit once claimed, so the
+    graceful exit neither drains under it nor ``os._exit``s over its tail."""
+    no_exit = _graceful_exit_seams(monkeypatch)
+    orch = _bare_orchestrator()
+    orch._force_exit_claimed = threading.Event()
+    orch._force_exit_claimed.set()
+    parked = asyncio.Event()
+    real_park = orch._park_if_force_exit_claimed
+
+    async def _observed_park() -> None:
+        parked.set()
+        await real_park()
+
+    orch._park_if_force_exit_claimed = _observed_park
+
+    task = asyncio.create_task(orch._shutdown_and_exit())
+    try:
+        await _reached(parked, task)
+        await asyncio.sleep(0)
+        assert not task.done()
+        gw.flush_audit_queue_before_hard_exit.assert_not_awaited()
+        cli_mod.drain_log_queue_before_hard_exit.assert_not_awaited()
+        no_exit._exit.assert_not_called()
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_a_force_exit_claimed_during_the_sel_drain_parks_before_the_log_drain(
+    monkeypatch, seams
+) -> None:
+    """A second signal landing while the graceful SEL drain runs: the graceful
+    exit must not stop the gateway.log listener under the force thread's SEL
+    drain, nor exit over it."""
+    no_exit = _graceful_exit_seams(monkeypatch)
+    orch = _bare_orchestrator()
+    orch._force_exit_claimed = threading.Event()
+    flushed = asyncio.Event()
+
+    async def _flush_then_second_signal() -> None:
+        orch._force_exit_claimed.set()
+        flushed.set()
+
+    gw.flush_audit_queue_before_hard_exit.side_effect = _flush_then_second_signal
+
+    task = asyncio.create_task(orch._shutdown_and_exit())
+    try:
+        await _reached(flushed, task)
+        await asyncio.sleep(0)
+        assert not task.done()
+        gw.flush_audit_queue_before_hard_exit.assert_awaited_once_with()
+        cli_mod.drain_log_queue_before_hard_exit.assert_not_awaited()
+        no_exit._exit.assert_not_called()
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_an_unclaimed_force_exit_leaves_the_graceful_exit_as_it_was(
+    monkeypatch, seams
+) -> None:
+    no_exit = _graceful_exit_seams(monkeypatch)
+    orch = _bare_orchestrator()
+    orch._force_exit_claimed = threading.Event()
+
+    await orch._shutdown_and_exit()
+
+    gw.flush_audit_queue_before_hard_exit.assert_awaited_once_with()
+    cli_mod.drain_log_queue_before_hard_exit.assert_awaited_once_with()
+    no_exit._exit.assert_called_once_with(0)
+
+
+@pytest.mark.asyncio
+async def test_the_exit_path_marks_the_clean_exit_last_before_its_hard_exit(
+    monkeypatch, seams
+) -> None:
+    # A teardown that wedges and is then killed never reaches the mark, so its
+    # header-only crash dump is kept as the trace of that death.
+    from kiro_crew.dashboard import crash_dump_store
+
+    order: list[str] = []
+    no_exit = _graceful_exit_seams(monkeypatch)
+    no_exit._exit.side_effect = lambda _code: order.append("exit")
+    cli_mod.drain_log_queue_before_hard_exit.side_effect = lambda: order.append("log drain")
+    monkeypatch.setattr(crash_dump_store, "record_clean_exit", lambda *_: order.append("marked"))
+    orch = _bare_orchestrator()
+    orch._shutdown = AsyncMock(side_effect=lambda: order.append("shutdown"))
+
+    await orch._shutdown_and_exit()
+
+    assert order[0] == "shutdown"
+    assert order[-3:] == ["log drain", "marked", "exit"]
+
+
+@pytest.mark.asyncio
+async def test_a_force_exit_claimed_during_the_clean_exit_mark_still_owns_the_exit(
+    monkeypatch, seams
+) -> None:
+    # The mark is awaited off the loop, so a second signal can land while it is
+    # written; the graceful exit must then park instead of exiting over the force
+    # thread's drains.
+    from kiro_crew.dashboard import crash_dump_store
+
+    no_exit = _graceful_exit_seams(monkeypatch)
+    orch = _bare_orchestrator()
+    orch._force_exit_claimed = threading.Event()
+    monkeypatch.setattr(
+        crash_dump_store, "record_clean_exit", lambda *_: orch._force_exit_claimed.set()
+    )
+    parked = asyncio.Event()
+    real_park = orch._park_if_force_exit_claimed
+
+    async def _park() -> None:
+        # The mark is the only thing that claims, so a claimed park comes after it.
+        if orch._force_exit_claimed.is_set():
+            parked.set()
+        await real_park()
+
+    orch._park_if_force_exit_claimed = _park
+
+    task = asyncio.create_task(orch._shutdown_and_exit())
+    try:
+        # Unparked, the mocked os._exit returns, the task ends, and _reached fails.
+        await _reached(parked, task)
+        await asyncio.sleep(0)
+        assert not task.done()
+        no_exit._exit.assert_not_called()
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("test_mode", [False, True])
+async def test_the_teardown_awaits_one_skill_view_prune_after_the_sessions_close(
+    monkeypatch, test_mode
+) -> None:
+    # Each closed runtime prunes its views on a daemon thread the hard exit can cut,
+    # and a home stopped then deleted has no next boot drain. So the
+    # teardown awaits one more prune once every session has ended and the cut turns
+    # have saved; test mode skips it, like the boot drain.
+    from slack_gateway_helpers import _make_orchestrator, _mock_sessions
+
+    from kiro_crew.agent_sdk.drivers import acp as acp_driver
+
+    order: list[str] = []
+
+    async def _unwound(_state: Any) -> None:
+        order.append("unwound")
+
+    monkeypatch.setattr(gw, "wait_for_unwinding_turns", _unwound)
+    monkeypatch.setattr(
+        acp_driver, "prune_skill_view_aliases_at_stop", lambda: order.append("prune") or 0
+    )
+    orch = _make_orchestrator(test_mode=test_mode)
+    orch.sessions = _mock_sessions()
+    orch.sessions.close_all = AsyncMock(side_effect=lambda: order.append("close_all"))
+
+    await orch._stop_services_and_sessions()
+
+    assert order == ["close_all", "unwound"] + ([] if test_mode else ["prune"])

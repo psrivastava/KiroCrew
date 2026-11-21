@@ -14,6 +14,7 @@ differ by a known sign, which back-to-back store writes cannot guarantee.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 
@@ -23,6 +24,7 @@ from aiohttp.test_utils import make_mocked_request
 from kiro_crew import work_ledger as wl
 from kiro_crew.dashboard.handlers import work_ledger as wlh
 from kiro_crew.dashboard.handlers import work_ledger_board as board
+from kiro_crew.testing.synthetic_credentials import SAMPLE_SLACK_BOT_TOKEN
 
 CONDUCTOR = "chat-1-conductor"
 OTHER_CONDUCTOR = "chat-9-other-conductor"
@@ -57,12 +59,20 @@ def _report(item_id: str, status: str, summary: str = "here is where it is", **k
 
 
 def _slot(*, running: bool = False):
-    return SimpleNamespace(running=running)
+    return SimpleNamespace(key="", linked_session_key="", running=running)
 
 
 def _state(slots: dict | None = None):
     table = dict(slots or {})
-    return SimpleNamespace(_slots=table, get_slot=lambda key: table.get(key), owner_id=OWNER)
+    for key, slot in table.items():
+        slot.key = key
+    return SimpleNamespace(
+        _slots=table,
+        get_slot=lambda key: table.get(key),
+        owner_id=OWNER,
+        subagents=None,
+        workflow_service=None,
+    )
 
 
 def _as_owner(request, caller: str | None = None, app_token: str = ""):
@@ -163,7 +173,15 @@ async def test_a_row_is_the_conductor_item_shape_minus_the_masked_field():
     row = body["items"][0]
 
     item_keys = set(wl.WorkItem().to_dict()) - {"worker_session_key"}
-    derived = {"orphaned", "stale", "acceptance_concrete", "report_undelivered", "events"}
+    derived = {
+        "orphaned",
+        "stale",
+        "looping",
+        "acceptance_concrete",
+        "report_undelivered",
+        "awaits_person",
+        "events",
+    }
     joined = {"alive", "outstanding", "terminal"}
     assert set(row) == item_keys | derived | joined
 
@@ -179,6 +197,38 @@ async def test_events_ride_on_the_row_in_the_store_s_event_shape():
     assert events, "a bound, reported item has events"
     assert set(events[0]) == set(wl.WorkEvent().to_dict())
     assert {e["kind"] for e in events} <= wl.EVENT_KINDS
+
+
+@pytest.mark.asyncio
+async def test_every_event_tail_is_read_in_one_executor_hop(monkeypatch):
+    """Each executor hop queues behind the shared pool, so a large board must not
+    take one per item: five items cost the hops one does, each row its own tail."""
+    hops: list[object] = []
+    real = asyncio.to_thread
+
+    async def counting(func, /, *args, **kwargs):
+        hops.append(func)
+        return await real(func, *args, **kwargs)
+
+    async def hops_of_a_read() -> tuple[int, dict]:
+        # Counted on a second read of the same board, so a once-only load on a
+        # first read is never taken for a per-item cost.
+        await _call(_state(), CONDUCTOR)
+        hops.clear()
+        body, _ = await _call(_state(), CONDUCTOR)
+        return len(hops), body
+
+    monkeypatch.setattr(board.asyncio, "to_thread", counting)
+    _item(title="item 0")
+    one_item, _ = await hops_of_a_read()
+    for n in range(1, 5):
+        _item(title=f"item {n}")
+    five_items, body = await hops_of_a_read()
+    assert len(body["items"]) == 5
+    assert five_items == one_item
+    for row in body["items"]:
+        tail = board._tail_events(CONDUCTOR, row["item_id"], board._MAX_EVENT_TAIL)
+        assert row["events"] == [event.to_dict() for event in tail]
 
 
 # ── the "Needs a ruling" band ─────────────────────────────────────────────
@@ -229,6 +279,17 @@ def test_a_question_whose_ask_cannot_be_dated_is_left_outstanding():
     assert board._is_outstanding(item, events) is True
 
 
+def test_a_peer_stamp_without_an_offset_does_not_fail_the_board():
+    """A remote item's report stamp may carry no offset; an aware/naive compare
+    would raise and take the whole board GET down with it."""
+    item = wl.WorkItem(status="question", last_report_at="2000-01-01T00:00:00")
+    events = [{"ts": "2026-09-22T05:00:00+00:00", "kind": "decision", "status": None}]
+    assert board._is_outstanding(item, events) is False
+    naive_answer = [{"ts": "2000-01-01T00:00:00", "kind": "decision", "status": None}]
+    later = wl.WorkItem(status="question", last_report_at="2026-09-22T05:00:00Z")
+    assert board._is_outstanding(later, naive_answer) is True
+
+
 def test_only_a_question_status_can_be_outstanding():
     for status in ("progress", "done", "blocked"):
         item = wl.WorkItem(status=status)
@@ -250,6 +311,84 @@ async def test_alive_is_joined_server_side_from_the_worker_slot():
     body, _ = await _call(state, CONDUCTOR)
     alive = {row["title"]: row["alive"] for row in body["items"]}
     assert alive == {"busy": "running", "waiting": "idle", "finished": "closed"}
+
+
+@pytest.mark.asyncio
+async def test_the_board_reports_workflow_activity_owned_by_its_conductor():
+    _item()
+    state = _state({CONDUCTOR: _slot()})
+    state.workflow_service = SimpleNamespace(
+        registry=SimpleNamespace(has_pending_work_for=lambda key: key == f"dashboard:{CONDUCTOR}")
+    )
+    body, _ = await _call(state, CONDUCTOR)
+    assert body["conductor_working"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_worker_workflow_keeps_its_milestone_live(monkeypatch):
+    item_id = _item()
+    _bind(item_id)
+    _report(item_id, "progress")
+    state = _state({WORKER: _slot()})
+    state.workflow_service = SimpleNamespace(
+        registry=SimpleNamespace(has_pending_work_for=lambda key: key == f"dashboard:{WORKER}")
+    )
+    real = wl.is_stale
+    monkeypatch.setattr(
+        board.work_ledger,
+        "is_stale",
+        lambda item, **kwargs: real(item, **{**kwargs, "window_secs": 0}),
+    )
+    body, _ = await _call(state, CONDUCTOR)
+    assert body["items"][0]["alive"] == "running"
+    assert body["items"][0]["stale"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("turn", "awaits"),
+    [(False, True), (True, False)],
+    ids=["background-work", "model-turn"],
+)
+async def test_only_a_model_turn_clears_the_persons_ask_on_the_board(turn, awaits):
+    """The page's Needs you reads the board's ``awaits_person`` alone: a worker's
+    workflow keeps the item running without answering the person; its next
+    model turn means it moved on."""
+    item_id = _item()
+    _bind(item_id)
+    _report(item_id, "question", "pick a region", reason="needs_human")
+    wl.apply_ask_record(CONDUCTOR, item_id, what="Pick a region")
+    worker = SimpleNamespace(key="", linked_session_key="", running=turn, turn_running=turn)
+    state = _state({WORKER: worker})
+    state.workflow_service = SimpleNamespace(
+        registry=SimpleNamespace(has_pending_work_for=lambda key: key == f"dashboard:{WORKER}")
+    )
+    body, _ = await _call(state, CONDUCTOR)
+    row = body["items"][0]
+    assert row["alive"] == "running"
+    assert row["awaits_person"] is awaits
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_activity_probe_does_not_hide_a_stale_worker(monkeypatch):
+    item_id = _item()
+    _bind(item_id)
+    _report(item_id, "progress")
+    state = _state({WORKER: _slot()})
+
+    def unreadable(_key):
+        raise RuntimeError("unreadable")
+
+    state.subagents = SimpleNamespace(running_agents_for=unreadable)
+    real = wl.is_stale
+    monkeypatch.setattr(
+        board.work_ledger,
+        "is_stale",
+        lambda item, **kwargs: real(item, **{**kwargs, "window_secs": 0}),
+    )
+    body, _ = await _call(state, CONDUCTOR)
+    assert body["items"][0]["alive"] == "idle"
+    assert body["items"][0]["stale"] is True
 
 
 @pytest.mark.asyncio
@@ -291,10 +430,16 @@ async def test_the_board_reads_a_looping_worker_through_the_gates_resolver(monke
     monkeypatch.setattr(wlh.ledger_wake, "worker_looping", lambda _svc, key: key == WORKER)
     body, _ = await _call(state, CONDUCTOR)
     assert body["items"][0]["stale"] is False
+    # The page reads the loop itself, so the milestone shows as running.
+    assert body["items"][0]["looping"] is True
+    # A turn in flight keeps its own live reading: `looping` is for the idle wait only.
+    body, _ = await _call(_state({WORKER: _slot(running=True)}), CONDUCTOR)
+    assert body["items"][0]["looping"] is False
     monkeypatch.setattr(wlh.ledger_wake, "worker_looping", lambda _svc, _key: False)
     body, _ = await _call(state, CONDUCTOR)
     assert body["items"][0]["stale"] is True
-    assert seen == [True, False]
+    assert body["items"][0]["looping"] is False
+    assert seen == [True, True, False]
 
 
 @pytest.mark.asyncio
@@ -312,6 +457,7 @@ async def test_an_unbound_item_is_closed_not_running():
 async def test_terminal_comes_from_the_store_s_own_property():
     open_id = _item(title="still open")
     closed_id = _item(title="finished")
+    wl.apply_conductor_action(CONDUCTOR, "verdict", item_id=closed_id, verdict="pass")
     wl.apply_conductor_action(
         CONDUCTOR, "close", item_id=closed_id, state="accepted", decision="looks right"
     )
@@ -348,6 +494,17 @@ async def test_a_report_the_harness_never_delivered_is_on_the_board_without_the_
     flag = body["items"][0]["report_undelivered"]
     assert set(flag) == {"tool", "at"} and flag["tool"] == "work_report"
     assert WORKER not in response.body.decode()
+
+
+@pytest.mark.asyncio
+async def test_a_hosted_discussion_reaches_the_board_row():
+    """The Board's "discussing" row reads `discussion` from this payload."""
+    item_id = _item()
+    _bind(item_id)
+    _report(item_id, "progress", discussion={"phase": "talking", "round": 2, "agreed": ["ship A"]})
+    body, _ = await _call(_state({WORKER: _slot(running=True)}), CONDUCTOR)
+    talk = body["items"][0]["discussion"]
+    assert (talk["phase"], talk["round"], talk["agreed"]) == ("talking", 2, ["ship A"])
 
 
 @pytest.mark.asyncio
@@ -783,6 +940,7 @@ async def test_a_non_orphaned_item_is_refused_409(_stop_calls):
 async def test_a_terminal_item_is_refused_because_it_is_not_orphaned(_stop_calls):
     """``is_orphaned`` is a conjunction: a closed item never qualifies."""
     item_id = _orphaned_item()
+    wl.apply_conductor_action(CONDUCTOR, "verdict", item_id=item_id, verdict="pass")
     wl.apply_conductor_action(CONDUCTOR, "close", item_id=item_id, state="accepted")
     body, response = await _act(_state({WORKER: _slot()}), CONDUCTOR, item_id, "stop")
     assert response.status == 409
@@ -852,11 +1010,11 @@ async def test_a_credential_in_a_worker_summary_is_redacted():
     """
     item_id = _item()
     _bind(item_id)
-    _report(item_id, "progress", summary="pushed with AKIAIOSFODNN7EXAMPLE just now")
+    _report(item_id, "progress", summary=f"pushed with {SAMPLE_SLACK_BOT_TOKEN} just now")
     body, response = await _call(_state({WORKER: _slot()}), CONDUCTOR)
     raw = response.body.decode()
-    assert "AKIAIOSFODNN7EXAMPLE" not in raw
-    assert "AKIAIOSFODNN7EXAMPLE" not in json.dumps(body)
+    assert SAMPLE_SLACK_BOT_TOKEN not in raw
+    assert SAMPLE_SLACK_BOT_TOKEN not in json.dumps(body)
 
 
 @pytest.mark.asyncio
@@ -867,10 +1025,10 @@ async def test_redaction_reaches_nested_artifact_values():
     _report(
         item_id,
         "progress",
-        artifacts={"note": "token AKIAIOSFODNN7EXAMPLE in the branch name"},
+        artifacts={"note": f"token {SAMPLE_SLACK_BOT_TOKEN} in the branch name"},
     )
     _body, response = await _call(_state({WORKER: _slot()}), CONDUCTOR)
-    assert "AKIAIOSFODNN7EXAMPLE" not in response.body.decode()
+    assert SAMPLE_SLACK_BOT_TOKEN not in response.body.decode()
 
 
 @pytest.mark.asyncio
@@ -886,11 +1044,11 @@ async def test_redaction_reaches_artifact_keys_not_only_values():
     _report(
         item_id,
         "progress",
-        artifacts={"AKIAIOSFODNN7EXAMPLE": "the branch"},
+        artifacts={SAMPLE_SLACK_BOT_TOKEN: "the branch"},
     )
     body, response = await _call(_state({WORKER: _slot()}), CONDUCTOR)
-    assert "AKIAIOSFODNN7EXAMPLE" not in response.body.decode()
-    assert "AKIAIOSFODNN7EXAMPLE" not in json.dumps(body)
+    assert SAMPLE_SLACK_BOT_TOKEN not in response.body.decode()
+    assert SAMPLE_SLACK_BOT_TOKEN not in json.dumps(body)
 
 
 def test_two_keys_redacting_alike_both_survive(monkeypatch):
@@ -910,6 +1068,87 @@ def test_two_keys_redacting_alike_both_survive(monkeypatch):
     assert len(out) == 2
     assert sorted(out.values()) == ["[redacted]", "[redacted]"]
     assert sorted(out.keys()) == ["[redacted]", "[redacted] (2)"]
+
+
+def _old_redact_deep(value):
+    """The pre-memo walk, kept verbatim as the reference the memo must equal."""
+    if isinstance(value, str):
+        return board.redact_via_context(value)
+    if isinstance(value, dict):
+        redacted = {}
+        for key, item in value.items():
+            safe_key = board.redact_via_context(key) if isinstance(key, str) else key
+            if safe_key in redacted:
+                suffix = 2
+                while f"{safe_key} ({suffix})" in redacted:
+                    suffix += 1
+                safe_key = f"{safe_key} ({suffix})"
+            redacted[safe_key] = _old_redact_deep(item)
+        return redacted
+    if isinstance(value, list):
+        return [_old_redact_deep(item) for item in value]
+    return value
+
+
+def _repetitive_board():
+    """A board whose keys, states and prose repeat, with secrets among them."""
+    secret = SAMPLE_SLACK_BOT_TOKEN
+    items = []
+    for n in range(40):
+        items.append(
+            {
+                "item_id": f"it_{n % 7:08x}",
+                "state": "open" if n % 3 else "accepted",
+                "summary": f"pushed {secret}" if n % 5 == 0 else "waiting on CI",
+                "artifacts": {secret: "the branch", "pr": str(n % 4), 7: None},
+                "events": [{"kind": "report", "ts": "2026-11-03", "n": n}] * 3,
+            }
+        )
+    return {"items": items, "take_over_available": False}
+
+
+def test_redact_deep_output_matches_the_per_string_walk():
+    """Memoising must not change one byte of the reply, real redactor included."""
+    payload = _repetitive_board()
+    new = board._redact_deep(payload)
+    assert json.dumps(new) == json.dumps(_old_redact_deep(payload))
+    assert SAMPLE_SLACK_BOT_TOKEN not in json.dumps(new)
+
+
+def _distinct_strings(value, seen):
+    if isinstance(value, str):
+        seen.add(value)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _distinct_strings(key, seen)
+            _distinct_strings(item, seen)
+    elif isinstance(value, list):
+        for item in value:
+            _distinct_strings(item, seen)
+    return seen
+
+
+def test_redact_deep_redacts_each_distinct_string_once_per_call(monkeypatch):
+    """One redactor call per distinct string, and a fresh memo on every call.
+
+    The second half pins that nothing is cached ACROSS calls: a memo that outlived
+    one reply would hand one user's redacted text to another's read.
+    """
+    calls: list[str] = []
+    real = board.redact_via_context
+
+    def counting(text):
+        calls.append(text)
+        return real(text)
+
+    monkeypatch.setattr(board, "redact_via_context", counting)
+    payload = _repetitive_board()
+    distinct = len(_distinct_strings(payload, set()))
+    board._redact_deep(payload)
+    assert len(calls) == distinct
+    assert len(calls) == len(set(calls))
+    board._redact_deep(payload)
+    assert len(calls) == 2 * distinct
 
 
 @pytest.mark.asyncio

@@ -14,6 +14,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import channel_options_checks
+import pytest
 from telegram_helpers import FakeCtx  # noqa: F401
 from telegram_helpers import FakeProvider  # noqa: F401
 from telegram_helpers import _cfg  # noqa: F401
@@ -26,7 +28,6 @@ from telegram_helpers import _press  # noqa: F401
 from telegram_helpers import _prime_live  # noqa: F401
 from telegram_helpers import FakeClient
 
-from conftest import assert_rejected_without_backtracking
 from kiro_crew.dashboard.token_auth import parse_duration
 from kiro_crew.messaging.commands import parse_dashboard_ttl
 from kiro_crew.messaging.renderer import session_provenance_tag
@@ -457,10 +458,10 @@ class TestTruncateHtmlSafe:
             assert len(out) <= limit, f"limit={limit} produced {len(out)}"
 
     def test_never_emits_unclosed_tags_when_closers_do_not_fit(self) -> None:
-        # Regression (HIGH): a fixed 3-iteration reserve loop bailed to a bare
-        # prefix here, leaving <b> and <i> unclosed -- the exact
-        # "Can't find end tag" 400 this helper exists to prevent. A 4th pass
-        # would have converged, so the budget, not the algorithm, was the bug.
+        # A fixed 3-iteration reserve loop bails to a bare prefix here, leaving
+        # <b> and <i> unclosed -- the exact "Can't find end tag" 400 this helper
+        # exists to prevent. A 4th pass converges, so the loop must not stop on a
+        # fixed pass count.
         text = "<b><i><u><s><code>WXYZ</code></s></u></i></b>"
         out = truncate_html_safe(text, 37)
         assert len(out) <= 37
@@ -653,10 +654,10 @@ class TestRenderedBudget:
         assert _may_exceed_rendered("just some plain prose with no markup", 4000) is False
 
     def test_split_preserves_code_indentation_across_chunks(self) -> None:
-        # Regression: the continuation used a bare lstrip(), which ate the
-        # leading indentation of the first line of every continuation chunk and
-        # silently re-indented split code blocks. Render-aware splitting fires on
-        # more shapes, making that pre-existing corruption much easier to hit.
+        # A bare lstrip() on the continuation eats the leading indentation of
+        # the first line of every continuation chunk and silently re-indents
+        # split code blocks. Render-aware splitting fires on many shapes, so
+        # that corruption is easy to hit.
         body = "\n".join(f'    if a["k{i}"] < b & c:   # <indented>' for i in range(120))
         src = f"```python\n{body}\n```"
         chunks = _split_markdown_bounded(src, 800)
@@ -669,8 +670,8 @@ class TestRenderedBudget:
             ), f"indentation lost on continuation: {code_lines[0][:60]!r}"
 
     def test_shrinks_to_the_floor_instead_of_giving_up_early(self) -> None:
-        # Regression: a fixed pass budget returned still-oversize chunks, which
-        # the client backstop then truncated -- silently dropping content. Only
+        # A fixed pass budget can return still-oversize chunks, which the
+        # client backstop then truncates -- silently dropping content. Only
         # the _MIN_SPLIT_LIMIT floor may yield oversize chunks.
         cap = 4000
         for src in (
@@ -785,7 +786,7 @@ class TestInlineKeyboard:
         assert [len(row) for row in kb["inline_keyboard"]] == [1, 1]
 
 
-class TestExtractOptions:
+class TestExtractOptions(channel_options_checks.UnterminatedOptionsTagIsNotRedos):
     def test_trailing_options_extracted(self) -> None:
         body, opts = _extract_options("Answer here\n\n[OPTIONS: Yes | No | Maybe]")
         assert body == "Answer here"
@@ -800,24 +801,6 @@ class TestExtractOptions:
         body, opts = _extract_options("text so far [OPTIONS: Ye")
         assert "[OPTIONS" not in body
         assert opts == []
-
-    def test_unterminated_options_tag_is_not_redos(self) -> None:
-        # Regression (py/polynomial-redos): a plain greedy ``.*`` body could
-        # consume a "[" that ALSO starts the outer "[OPTIONS:" literal, so over
-        # text with many "[OPTIONS:" prefixes search() re-explored the body from
-        # each position — polynomial. The tempered body
-        # (?:[^[]|\[(?!OPTIONS:))* forbids only a re-occurring "[OPTIONS:", so
-        # the body is unambiguous (linear). A whitespace-padded unterminated tag
-        # and many repeated "[OPTIONS:" prefixes (the real pump) must both be
-        # rejected in CPU time linear in the pump -- see
-        # conftest.assert_rejected_without_backtracking for why this is not a
-        # 1.0 s wall-clock bound.
-        def reject(text: str) -> None:
-            body, opts = _extract_options(text)
-            assert opts == []
-
-        assert_rejected_without_backtracking(reject, lambda n: "[OPTIONS:" + ("\t" * n) + "x")
-        assert_rejected_without_backtracking(reject, lambda n: "[OPTIONS:" * n + "x")
 
 
 # ── transport.py: deny-by-default auth + capabilities + inbound ─────────────
@@ -850,6 +833,34 @@ class TestTransportAuth:
         assert TELEGRAM_CAPABILITIES.edit is True
         assert TELEGRAM_CAPABILITIES.max_message_chars == TELEGRAM_CHUNK_LIMIT
         assert TELEGRAM_CAPABILITIES.max_buttons == 25
+
+    @pytest.mark.parametrize(
+        ("target", "expected"),
+        [
+            ("user:111", ("111", None)),
+            ("topic:111:9", ("111", "9")),
+            ("topic:111:009", ("111", "9")),
+            ("topic:111:2147483647", ("111", "2147483647")),
+            ("topic:222:9", None),
+            ("topic:-100123:9", None),
+            ("topic:111:0", None),
+            ("topic:111:-9", None),
+            ("topic:111:9a", None),
+            ("topic:111:\u0669", None),
+            ("topic:111:", None),
+            ("topic:111:2147483648", None),
+            ("topic:111:" + "9" * 5000, None),
+            ("user:111:topic:9", None),
+        ],
+    )
+    def test_a_private_chat_topic_is_a_configured_target(
+        self, target: str, expected: tuple[str, str | None] | None
+    ) -> None:
+        """A topic target resolves only inside an allow-listed user's private chat,
+        to a positive 32-bit topic id; a group chat id, an unlisted user and a
+        malformed or oversized id are refused."""
+        t = TelegramTransport(FakeClient(), allowed_user_ids=[111, -100123])  # type: ignore[arg-type]
+        assert asyncio.run(t.resolve_configured_target(target)) == expected
 
 
 class TestTransportReceive:

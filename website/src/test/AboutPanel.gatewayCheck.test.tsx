@@ -18,7 +18,7 @@
 // - available + self_updatable     -> the Update button, unchanged
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, cleanup, act, within } from '@testing-library/react'
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { QueryClient, QueryClientProvider, focusManager } from '@tanstack/react-query'
 import { Provider } from 'react-redux'
 import { store } from '../store'
 import { sseStatus } from '../store/dashboardSlice'
@@ -26,15 +26,18 @@ import { MemoryRouter } from 'react-router-dom'
 import { AboutPanel } from '../pages/settings/AboutPanel'
 import { SETTINGS_REGISTRY } from '../components/commandPalette/settingsRegistry.gen'
 import { i18nT } from '../i18n/t'
+import { __resetErrorJournalForTests, consumeChatHandoff } from '../utils/errorReport'
 
 type Answer = { status: number; body: unknown }
 
 /** Route the component's requests; /api/update/check answers with `check`. */
 function stubFetch(
   check: Record<string, unknown>,
-  { config = () => Promise.resolve({ status: 200, body: { auto_update: true } }), autoUpdateSave }: {
+  { config = () => Promise.resolve({ status: 200, body: { auto_update: true } }), autoUpdateSave, autoUpdatePin }: {
     config?: () => Promise<Answer>
     autoUpdateSave?: (body: Record<string, unknown>) => Answer
+    /** GET /api/update/auto; unpinned when absent. */
+    autoUpdatePin?: () => Answer
   } = {},
 ) {
   const json = ({ status, body }: Answer) => ({
@@ -48,6 +51,9 @@ function stubFetch(
     const url = String(input)
     if (url.includes('/api/update/check')) return json({ status: 200, body: check })
     if (url.includes('/api/config/kirocrew')) return json(await config())
+    if (url.includes('/api/update/auto') && (init?.method ?? 'GET').toUpperCase() === 'GET') {
+      return json(autoUpdatePin ? autoUpdatePin() : { status: 200, body: { overlay_override: false } })
+    }
     if (url.includes('/api/update/auto')) {
       const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>
       return json(autoUpdateSave ? autoUpdateSave(body) : { status: 200, body: { ok: true, auto_update: body.enabled } })
@@ -59,9 +65,9 @@ function stubFetch(
   return spy
 }
 
-function mountWeb() {
+function mountWeb({ staleTime }: { staleTime?: number } = {}) {
   // No window.updateAPI => isDesktop false => the gateway branch renders.
-  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false, ...(staleTime === undefined ? {} : { staleTime }) } } })
   return { qc, ...render(
     <Provider store={store}>
       <QueryClientProvider client={qc}>
@@ -123,6 +129,99 @@ describe('AboutPanel gateway update check', () => {
     expect(failed.textContent).toContain("Couldn't check for updates")
     expect(failed.textContent).toContain('release feed')
     expect(screen.queryByTestId('up-to-date')).toBeNull()
+  })
+
+  it('says so when taking the armed update back fails', async () => {
+    __resetErrorJournalForTests()
+    const spy = stubFetch({ check_status: 'succeeded', update_available: false, error_code: null })
+    const base = spy.getMockImplementation()!
+    spy.mockImplementation(async (input: unknown, init?: RequestInit) => {
+      if (new URL(String(input), 'http://x').pathname === '/api/update' && init?.method === 'POST') {
+        return {
+          ok: false, status: 500,
+          json: async () => ({ error: 'disk full', code: 'disarm_failed' }),
+          text: async () => JSON.stringify({ error: 'disk full', code: 'disarm_failed' }),
+          headers: new Headers({ 'content-type': 'application/json' }),
+        } as Response
+      }
+      return base(input, init)
+    })
+    store.dispatch(sseStatus({ ...BLANK_STATUS, update_armed_version: '9.9.9' } as never))
+    mountWeb()
+
+    fireEvent.click(await screen.findByTestId('about-update-cancel-armed'))
+
+    const note = await screen.findByTestId('about-update-cancel-armed-error')
+    expect(note.textContent).toContain(i18nT('components.updateFoundModal.cancel_update_failed'))
+    // The notice is worded from the catalog, so it carries the failed request's
+    // report itself: the transport filed it under the gateway's message.
+    fireEvent.click(within(note).getByRole('button', { name: 'Ask the agent' }))
+    const prompt = consumeChatHandoff() ?? ''
+    expect(prompt).toContain('HTTP 500')
+    expect(prompt).toContain('disarm_failed')
+    expect(prompt).toContain('disk full')
+  })
+
+  it('hands the agent the report of a check request that failed', async () => {
+    __resetErrorJournalForTests()
+    const spy = stubFetch({ check_status: 'succeeded', update_available: false, error_code: null })
+    const base = spy.getMockImplementation()!
+    spy.mockImplementation(async (input: unknown, init?: RequestInit) => {
+      if (String(input).includes('/api/update/check')) {
+        const body = { error: 'feed timed out', code: 'check_crashed' }
+        return {
+          ok: false, status: 500,
+          json: async () => body,
+          text: async () => JSON.stringify(body),
+          headers: new Headers({ 'content-type': 'application/json' }),
+        } as Response
+      }
+      return base(input, init)
+    })
+    mountWeb()
+    await pressCheck()
+
+    const failed = await screen.findByTestId('check-failed')
+    expect(failed.textContent).toContain("Couldn't check for updates")
+    fireEvent.click(within(failed).getByRole('button', { name: 'Ask the agent' }))
+    const prompt = consumeChatHandoff() ?? ''
+    expect(prompt).toContain('HTTP 500')
+    expect(prompt).toContain('check_crashed')
+  })
+
+  it('hands over no older check report once a channel switch has answered', async () => {
+    // The switch's re-check is now the answer on screen; the earlier failed
+    // request's report must not stand in for it.
+    __resetErrorJournalForTests()
+    const spy = stubFetch({ check_status: 'succeeded', update_available: false, error_code: null })
+    const base = spy.getMockImplementation()!
+    const reply = (status: number, body: unknown) => ({
+      ok: status < 400, status,
+      json: async () => body,
+      text: async () => JSON.stringify(body),
+      headers: new Headers({ 'content-type': 'application/json' }),
+    } as Response)
+    spy.mockImplementation(async (input: unknown, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/api/update/check')) return reply(500, { error: 'feed timed out', code: 'check_crashed' })
+      if (url.includes('/api/update/channel')) {
+        return reply(200, {
+          ok: true, channel: 'insider', check_status: 'failed', update_available: null,
+          error_code: 'feed_unreachable', last_checked_at: 200,
+        })
+      }
+      return base(input, init)
+    })
+    store.dispatch(sseStatus({ ...BLANK_STATUS, update_channel: 'stable' } as never))
+    mountWeb()
+    await pressCheck()
+    await screen.findByTestId('check-failed')
+
+    fireEvent.click(within(await screen.findByTestId('gateway-channel-switcher')).getByTitle('Insider'))
+    await waitFor(() => expect(screen.getByTestId('check-failed').textContent).toContain('release feed'))
+    fireEvent.click(within(screen.getByTestId('check-failed')).getByRole('button', { name: 'Ask the agent' }))
+    const prompt = consumeChatHandoff() ?? ''
+    expect(prompt).not.toContain('check_crashed')
   })
 
   it('an unrecognised error code falls back to the generic reason', async () => {
@@ -276,7 +375,7 @@ describe('AboutPanel gateway update check', () => {
     const dialog = await screen.findByRole('dialog')
     // Scoped to the dialog: the page's own trigger button behind the backdrop
     // legitimately still exists in the DOM.
-    expect(within(dialog).queryByRole('button', { name: /^Update now$/i })).toBeNull()
+    expect(within(dialog).queryByRole('button', { name: /^Update when I restart$/i })).toBeNull()
   })
 
   it('the confirm modal opened from a stale flag disarms once the check says diverged', async () => {
@@ -301,7 +400,7 @@ describe('AboutPanel gateway update check', () => {
 
     const note = await screen.findByTestId('diverged-modal')
     expect(note.textContent?.toLowerCase()).toContain('rebase')
-    expect(screen.queryByRole('button', { name: /^Update now$/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /^Update when I restart$/i })).toBeNull()
     const dialog = screen.getByRole('dialog')
     expect(dialog).toBeTruthy()
     fireEvent.click(screen.getByTestId('diverged-modal-close'))
@@ -388,8 +487,8 @@ describe('AboutPanel gateway update check', () => {
     // A promoted stable candidate keeps its rc stamp in latest_version (that is
     // what arm/apply key on); the check response carries the folded sibling
     // latest_version_display for the human-facing line. The manual-check
-    // handler must adopt it -- this is the path the About panel's "a new
-    // version (vX) is available" text renders from.
+    // handler must adopt it -- this is the path the About panel's "Kiro Crew X
+    // is available." line renders from.
     stubFetch({
       check_status: 'succeeded',
       update_available: true,
@@ -406,7 +505,7 @@ describe('AboutPanel gateway update check', () => {
 
     await waitFor(() => {
       const body = document.body.textContent || ''
-      expect(body).toContain('(v0.4.0)')
+      expect(body).toContain('Kiro Crew 0.4.0 is available.')
       expect(body).not.toContain('0.4.0rc14')
     })
   })
@@ -426,7 +525,7 @@ describe('AboutPanel gateway update check', () => {
     await pressCheck()
 
     await waitFor(() => {
-      expect(document.body.textContent || '').toContain('(v0.4.0rc14)')
+      expect(document.body.textContent || '').toContain('Kiro Crew 0.4.0rc14 is available.')
     })
   })
 
@@ -494,6 +593,45 @@ describe('AboutPanel gateway update check', () => {
     expect(screen.queryByTestId('check-failed')).toBeNull()
   })
 
+  it('a container names the newer pullable image and links its notes, with no Update button', async () => {
+    stubFetch({
+      check_status: 'deferred',
+      update_available: null,
+      error_code: null,
+      unavailable_reason: 'managed_by_image',
+      managed_by: 'container',
+      can_apply: false,
+      image_available_version: '0.12.2',
+      image_release_notes_url: 'https://github.com/kirodotdev/KiroCrew/releases/tag/v0.12.2',
+    })
+    mountWeb()
+    await pressCheck()
+
+    const note = await screen.findByTestId('container-image-available')
+    expect(note.textContent).toContain('0.12.2')
+    const link = within(note).getByRole('link', { name: /release notes/i })
+    expect(link.getAttribute('href')).toBe('https://github.com/kirodotdev/KiroCrew/releases/tag/v0.12.2')
+    // The action stays "pull a newer image"; nothing offers to apply.
+    expect((await screen.findByTestId('check-not-applicable')).textContent).toContain('newer image')
+    expect(screen.queryByRole('button', { name: /^Update(?! the gateway)/ })).toBeNull()
+  })
+
+  it('a container with no confirmed image keeps only today\'s line, and an off-site notes link is dropped', async () => {
+    stubFetch({
+      check_status: 'deferred',
+      update_available: null,
+      unavailable_reason: 'managed_by_image',
+      managed_by: 'container',
+      image_release_notes_url: 'https://evil.example/notes',
+    })
+    mountWeb()
+    await pressCheck()
+
+    await screen.findByTestId('check-not-applicable')
+    expect(screen.queryByTestId('container-image-available')).toBeNull()
+    expect(screen.queryByRole('link', { name: /release notes/i })).toBeNull()
+  })
+
   it('a git checkout still gets the Update button', async () => {
     stubFetch({
       check_status: 'succeeded',
@@ -527,6 +665,35 @@ describe('AboutPanel gateway update check', () => {
     await waitFor(() =>
       expect(screen.getByRole('button', { name: /Update to v0\.1\.3rc2/ })).toBeTruthy(),
     )
+  })
+
+  it('names no version when a behind-only checkout reports the running one', async () => {
+    // Behind its upstream at the same version string: "Update to v0.13.0"
+    // would name the build already running.
+    stubFetch({
+      check_status: 'succeeded',
+      update_available: true,
+      version_newer: false,
+      commits_behind: 3,
+      managed_by: 'git',
+      can_apply: true,
+      latest_version: '0.13.0',
+      latest_version_display: '0.13.0',
+    })
+    store.dispatch(sseStatus({ ...BLANK_STATUS, version: '0.13.0' } as never))
+    mountWeb()
+    await pressCheck()
+
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: i18nT('pages.settings.aboutPanel.update_when_i_restart') })).toBeTruthy(),
+    )
+    expect(screen.queryByRole('button', { name: /Update to v0\.13\.0/ })).toBeNull()
+    expect(screen.queryByText(/\(v0\.13\.0\)/)).toBeNull()
+
+    // The confirm dialog it opens names no version either.
+    fireEvent.click(screen.getByRole('button', { name: i18nT('pages.settings.aboutPanel.update_when_i_restart') }))
+    const confirm = await screen.findByRole('dialog', { name: i18nT('pages.settings.aboutPanel.update') })
+    expect(within(confirm).queryByText(/v0\.13\.0/)).toBeNull()
   })
 
   // ---- the BACKGROUND-check path (no manual check run) ----------------------
@@ -576,6 +743,19 @@ describe('AboutPanel gateway update check', () => {
     expect(screen.queryByTestId('hero-up-to-date')).toBeNull()
   })
 
+  it('a background check that ran without a verdict is not "Not checked yet"', async () => {
+    // The backend stamps `update_last_checked_at` on failure too, so the card
+    // reads "Last checked ..." and the hero must not deny the check ran.
+    stubFetch({})
+    pushStatus({ update_check_status: 'failed', update_last_checked_at: 1_700_000_000 })
+    mountWeb()
+    await screen.findByText(/Last checked/)
+    expect(screen.queryByTestId('hero-not-checked')).toBeNull()
+    expect(screen.queryByTestId('hero-up-to-date')).toBeNull()
+    // The failure itself is shown once, in the card's notice.
+    expect(screen.getByTestId('check-failed')).toBeTruthy()
+  })
+
   it('the hero pill goes green once a check reports current', async () => {
     stubFetch({ check_status: 'succeeded', update_available: false, error_code: null })
     mountWeb()
@@ -591,6 +771,95 @@ describe('AboutPanel gateway update check', () => {
     await screen.findByTestId('check-failed')
     expect(screen.queryByTestId('hero-up-to-date')).toBeNull()
     expect(screen.getByTestId('hero-not-checked')).toBeTruthy()
+  })
+
+  // The panel has two answers to "did the update check work": the background
+  // check on the status frame and this tab's own check. The newest one, by the
+  // backend's check stamp, drives the hero and the card together (#34868).
+  it('a failed background check gets the failure notice with its hand-off', async () => {
+    stubFetch({})
+    pushStatus({ update_check_status: 'failed', update_last_checked_at: 100 })
+    mountWeb()
+    const failed = await screen.findByTestId('check-failed')
+    expect(within(failed).getByRole('button', { name: /ask the agent/i })).toBeTruthy()
+    expect(screen.queryByTestId('hero-up-to-date')).toBeNull()
+  })
+
+  it('a newer background failure supersedes an older manual success', async () => {
+    stubFetch({ check_status: 'succeeded', update_available: false, error_code: null, last_checked_at: 100 })
+    pushStatus({ update_check_status: 'succeeded', update_last_checked_at: 100 })
+    mountWeb()
+    await pressCheck()
+    await screen.findByTestId('up-to-date')
+    act(() => { pushStatus({ update_check_status: 'failed', update_last_checked_at: 200 }) })
+    expect(await screen.findByTestId('check-failed')).toBeTruthy()
+    expect(screen.queryByTestId('hero-up-to-date')).toBeNull()
+    expect(screen.queryByTestId('up-to-date')).toBeNull()
+  })
+
+  it('a newer background success supersedes an older manual failure', async () => {
+    stubFetch({ check_status: 'failed', update_available: null, error_code: 'feed_unreachable', last_checked_at: 100 })
+    pushStatus({ update_check_status: 'failed', update_last_checked_at: 100 })
+    mountWeb()
+    await pressCheck()
+    expect((await screen.findByTestId('check-failed')).textContent).toContain('release feed')
+    act(() => { pushStatus({ update_check_status: 'succeeded', update_available: false, update_last_checked_at: 200 }) })
+    await waitFor(() => expect(screen.getByTestId('hero-up-to-date')).toBeTruthy())
+    expect(screen.queryByTestId('check-failed')).toBeNull()
+  })
+
+  it('a newer background "no update" withdraws an update an older manual check found', async () => {
+    stubFetch({ check_status: 'succeeded', update_available: true, latest_version: '9.9.9', error_code: null, last_checked_at: 100 })
+    pushStatus({ update_check_status: 'succeeded', update_last_checked_at: 100 })
+    mountWeb()
+    await pressCheck()
+    await screen.findByText('Update available')
+    act(() => { pushStatus({ update_check_status: 'succeeded', update_available: false, update_last_checked_at: 200 }) })
+    await waitFor(() => expect(screen.getByTestId('hero-up-to-date')).toBeTruthy())
+    expect(screen.queryByText('Update available')).toBeNull()
+    expect(screen.queryByRole('button', { name: /^Update(?! the gateway)/ })).toBeNull()
+  })
+
+  it('a request that fails outright after a found update shows the failure, not the update', async () => {
+    stubFetch({ check_status: 'succeeded', update_available: true, latest_version: '9.9.9', error_code: null, last_checked_at: 100 })
+    pushStatus({ update_check_status: 'succeeded', update_last_checked_at: 100 })
+    mountWeb()
+    await pressCheck()
+    await screen.findByText('Update available')
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new TypeError('Failed to fetch') }))
+    // With an update on offer, the Update button is what re-runs the check.
+    fireEvent.click(screen.getByRole('button', { name: /^Update to v9\.9\.9/ }))
+    expect(await screen.findByTestId('check-failed')).toBeTruthy()
+    expect(screen.queryByText('Update available')).toBeNull()
+  })
+
+  it('a late status push of the earlier success does not hide a newer outright failure', async () => {
+    // Check succeeds at 200 while the status frame still says 100, then the
+    // next request fails outright; the push carrying the 200 success arrives
+    // after that failure and must not outrank it.
+    stubFetch({ check_status: 'succeeded', update_available: false, error_code: null, last_checked_at: 200 })
+    pushStatus({ update_check_status: 'succeeded', update_last_checked_at: 100 })
+    mountWeb()
+    await pressCheck()
+    await screen.findByTestId('up-to-date')
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new TypeError('Failed to fetch') }))
+    await pressCheck()
+    await screen.findByTestId('check-failed')
+    act(() => { pushStatus({ update_check_status: 'succeeded', update_available: false, update_last_checked_at: 200 }) })
+    expect(screen.getByTestId('check-failed')).toBeTruthy()
+    expect(screen.queryByTestId('hero-up-to-date')).toBeNull()
+  })
+
+  it('a check request that fails outright replaces an earlier success', async () => {
+    stubFetch({ check_status: 'succeeded', update_available: false, error_code: null, last_checked_at: 100 })
+    pushStatus({ update_check_status: 'succeeded', update_last_checked_at: 100 })
+    mountWeb()
+    await pressCheck()
+    await screen.findByTestId('up-to-date')
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new TypeError('Failed to fetch') }))
+    await pressCheck()
+    expect(await screen.findByTestId('check-failed')).toBeTruthy()
+    expect(screen.queryByTestId('hero-up-to-date')).toBeNull()
   })
 
   // The gateway's `auto_update` row is one SettingsToggle in every state. The
@@ -629,6 +898,18 @@ describe('AboutPanel gateway update check', () => {
     expect(autoUpdateRow()).toBe(row)
   })
 
+  it('reads off, not on, where the gateway cannot install (GH #34684)', async () => {
+    // The saved value is still `true` (the schema default), but a notify-only
+    // install never installs on its own: a held switch drawn on says it does.
+    stubFetch({})
+    pushStatus({ update_auto_effect: 'notify', update_can_apply: false })
+    mountWeb()
+
+    await waitFor(held)
+    expect(screen.getByRole('switch', { name: LABEL })).toHaveAttribute('aria-checked', 'false')
+    expect(note()).toHaveTextContent(NOTIFY_ONLY)
+  })
+
   it.each([
     ['mandatory', 'pages.settings.aboutPanel.gateway_auto_update_mandatory_note'],
     // A gateway without the field has not said what the switch does.
@@ -640,6 +921,25 @@ describe('AboutPanel gateway update check', () => {
 
     await waitFor(live)
     expect(note()).toHaveTextContent(i18nT(key))
+  })
+
+  it('says Update still installs where the policy turns unattended installs off', async () => {
+    // A managed venv's Update is the arm and approve flow, so its
+    // `update_can_apply` is false; `update_auto_manual_only` is what says a
+    // person's Update still installs here.
+    stubFetch({})
+    pushStatus({
+      update_auto_effect: 'notify',
+      update_auto_manual_only: true,
+      update_can_apply: false,
+      update_can_arm: true,
+    })
+    mountWeb()
+
+    await waitFor(held)
+    expect(screen.getByRole('switch', { name: LABEL })).toHaveAttribute('aria-checked', 'false')
+    expect(note()).toHaveTextContent(i18nT('pages.settings.aboutPanel.auto_update_notify_manual_apply'))
+    expect(note()).not.toHaveTextContent(NOTIFY_ONLY)
   })
 
   it('carries both deep-link anchors from the first paint, before the saved value is read', async () => {
@@ -782,27 +1082,111 @@ describe('AboutPanel gateway update check', () => {
     expect(screen.getByRole('switch', { name: LABEL })).toHaveAttribute('aria-checked', 'false')
   })
 
-  it('reports a write config.local.json refused, and notes the pin until a save says it is gone', async () => {
-    let pinned = true
+  it('reports a write config.local.json refused, holds the switch, and frees it once a read says the pin is gone', async () => {
+    // The pin landed after the page read it: only the refusal can say so.
+    let pinned = false
     stubFetch({}, {
-      autoUpdateSave: body => pinned
-        ? { status: 409, body: { error: 'auto_update is set in config.local.json', code: 'auto_update_overlay_owned', overlay_override: true } }
-        : { status: 200, body: { ok: true, auto_update: body.enabled, overlay_override: false } },
+      autoUpdatePin: () => ({ status: 200, body: { overlay_override: pinned } }),
+      autoUpdateSave: () => ({ status: 409, body: { error: 'auto_update is set in config.local.json', code: 'auto_update_overlay_owned', overlay_override: true } }),
     })
     pushStatus({ update_auto_effect: 'install' })
-    mountWeb()
+    // The dashboard client's default: nothing goes stale on its own.
+    mountWeb({ staleTime: Infinity })
     await waitFor(live)
-    const pinText = i18nT('pages.settings.privacyPanel.recordMetricsOverlayPinned')
+    const pinText = i18nT('pages.settings.aboutPanel.auto_update_pinned_user')
 
+    pinned = true
     fireEvent.click(screen.getByRole('switch', { name: LABEL }))
     expect(await screen.findByTestId('auto-update-save-error')).toHaveTextContent(pinText)
     await waitFor(() => expect(screen.getByRole('switch', { name: LABEL })).toHaveAttribute('aria-checked', 'true'))
-    // Still usable: a click is how a removed override is noticed.
-    live()
+    // Held: another click would only be refused again.
+    held()
 
+    // The entry is removed by hand in an editor; coming back to the tab frees it.
     pinned = false
+    act(() => { focusManager.setFocused(false) })
+    act(() => { focusManager.setFocused(true) })
+    await waitFor(live)
+    act(() => { focusManager.setFocused(undefined) })
+    expect(screen.queryByTestId('auto-update-pin-note')).toBeNull()
+  })
+
+  it('holds the switch with its note from the first read when config.local.json pins it, before any click', async () => {
+    const fetchSpy = stubFetch({}, {
+      autoUpdatePin: () => ({ status: 200, body: { overlay_override: true } }),
+    })
+    pushStatus({ update_auto_effect: 'install' })
+    mountWeb()
+
+    const pin = await screen.findByTestId('auto-update-pin-note')
+    expect(pin).toHaveTextContent(i18nT('pages.settings.aboutPanel.auto_update_pinned_user'))
+    await waitFor(held)
+    expect(screen.getByRole('switch', { name: LABEL }).closest('[aria-describedby]')?.getAttribute('aria-describedby') ?? '')
+      .toContain(pin.id)
+    // Read on its own: no update check ran to learn it, and nothing was saved.
+    const calls = fetchSpy.mock.calls.map(([u, init]) => `${(init as RequestInit | undefined)?.method ?? 'GET'} ${String(u)}`)
+    expect(calls.some(c => c.includes('/api/update/check'))).toBe(false)
+    expect(calls.some(c => c.startsWith('POST') && c.includes('/api/update/auto'))).toBe(false)
+  })
+
+  // An edition that writes the entry back on every boot owns it: the note names
+  // its policy, and never tells the person to remove what the next boot restores.
+  const POLICY = { label: 'Example update policy', detail: 'Example installs updates; see its doctor.' }
+  const policyPin = { overlay_override: true, overlay_source: 'policy', overlay_policy: POLICY }
+  const policyText = () => i18nT('pages.settings.aboutPanel.auto_update_pinned_policy', POLICY).trim()
+
+  it("names an edition's policy pin from the first read, holds the switch, and gives no removal advice", async () => {
+    stubFetch({}, { autoUpdatePin: () => ({ status: 200, body: policyPin }) })
+    pushStatus({ update_auto_effect: 'install' })
+    mountWeb()
+
+    const pin = await screen.findByTestId('auto-update-pin-note')
+    await waitFor(() => expect(pin).toHaveTextContent(policyText()))
+    expect(pin.textContent).toContain(POLICY.label)
+    expect(pin.textContent).toContain(POLICY.detail)
+    expect(pin.textContent).not.toContain(i18nT('pages.settings.aboutPanel.auto_update_pinned_user'))
+    expect(pin.textContent ?? '').not.toMatch(/config\.local\.json/)
+    await waitFor(held)
+    expect(screen.getByRole('switch', { name: LABEL }).closest('[aria-describedby]')?.getAttribute('aria-describedby') ?? '')
+      .toContain(pin.id)
+  })
+
+  it("names the edition's policy when a refused save is the first word of the pin", async () => {
+    stubFetch({}, {
+      autoUpdateSave: () => ({ status: 409, body: { error: 'held', code: 'auto_update_overlay_owned', ...policyPin } }),
+    })
+    pushStatus({ update_auto_effect: 'install' })
+    mountWeb({ staleTime: Infinity })
+    await waitFor(live)
+
     fireEvent.click(screen.getByRole('switch', { name: LABEL }))
-    await waitFor(() => expect(screen.queryByTestId('auto-update-save-error')).toBeNull())
+    expect(await screen.findByTestId('auto-update-save-error')).toHaveTextContent(policyText())
+    held()
+  })
+
+  it('names the policy a check reports, and goes back to the removal advice once the entry is the person\'s', async () => {
+    let answer: Record<string, unknown> = policyPin
+    stubFetch({ check_status: 'succeeded', ...policyPin }, { autoUpdatePin: () => ({ status: 200, body: answer }) })
+    pushStatus({ update_auto_effect: 'install' })
+    mountWeb()
+    await pressCheck()
+    await waitFor(() => expect(screen.getByTestId('auto-update-pin-note')).toHaveTextContent(policyText()))
+
+    answer = { overlay_override: true, overlay_source: 'user', overlay_policy: null }
+    act(() => { focusManager.setFocused(false) })
+    act(() => { focusManager.setFocused(true) })
+    await waitFor(() => expect(screen.getByTestId('auto-update-pin-note'))
+      .toHaveTextContent(i18nT('pages.settings.aboutPanel.auto_update_pinned_user')))
+    act(() => { focusManager.setFocused(undefined) })
+  })
+
+  it('leaves the switch usable when the pin cannot be read', async () => {
+    const fetchSpy = stubFetch({}, { autoUpdatePin: () => ({ status: 500, body: { error: 'zzq' } }) })
+    pushStatus({ update_auto_effect: 'install' })
+    const { qc } = mountWeb()
+    await waitFor(() => expect(fetchSpy.mock.calls.some(([u, init]) => String(u).includes('/api/update/auto') && ((init as RequestInit | undefined)?.method ?? 'GET').toUpperCase() === 'GET')).toBe(true))
+    await waitFor(() => expect(qc.getQueryState(['update.auto_update.overlay'])?.status).toBe('error'))
+    live()
     expect(screen.queryByTestId('auto-update-pin-note')).toBeNull()
   })
 

@@ -594,6 +594,39 @@ async def test_registry_install_forwards_initial_state_to_external_registration(
     assert json.loads(record_path.read_text(encoding="utf-8"))["enabled"] is not start_disabled
 
 
+@pytest.mark.parametrize("confirmed", [True, False])
+@pytest.mark.asyncio
+async def test_an_owner_tier_confirmed_install_is_owner_designated_for_the_clone(
+    home, monkeypatch, confirmed
+):
+    # A cross-repo app that an owner-tier registry re-confirmed is cloned as owner
+    # designated, so a private GitHub repository there may go on to the host's gh
+    # sign-in (`_git_clone_or_pull` with index_originated=False). An unconfirmed
+    # row stays index-originated and anonymous, and never reaches gh.
+    from unittest.mock import AsyncMock
+
+    _seed_agent({"apps_allow_third_party": True})
+    source = home / "app-sources" / "chorus"
+    source.mkdir(parents=True)
+    manifest = {"name": "chorus", "version": "1.0.0", "resources": "app"}
+    (source / "app.json").write_text(json.dumps(manifest), encoding="utf-8")
+    clone = AsyncMock(return_value={"ok": True, "pkg_dir": source})
+    monkeypatch.setattr(reg_mod, "get_registry_app", lambda name: _row(resources="app"))
+    monkeypatch.setattr(reg_mod, "_fetch_app_manifest", AsyncMock(return_value=manifest))
+    monkeypatch.setattr(reg_mod, "_clone_build_app", clone)
+    monkeypatch.setattr(reg_mod, "app_source_dir", lambda name: source)
+    monkeypatch.setattr(reg_mod, "_resolved_clone_commit", lambda path: "")
+    monkeypatch.setattr(reg_mod, "_owner_designated_repo_target", lambda entry: "")
+    monkeypatch.setattr(reg_mod, "_owner_tier_confirmed", AsyncMock(return_value=confirmed))
+    monkeypatch.setattr(reg_mod, "is_clone_host_trusted", lambda url: True)
+    monkeypatch.setattr(reg_mod, "_sweep_stale_checkouts", AsyncMock())
+
+    result = await reg_mod.install_from_registry("chorus")
+
+    assert result["ok"] is True, result
+    assert clone.await_args.kwargs["index_originated"] is (not confirmed)
+
+
 class _Lifecycle:
     """The real ``_install_transaction`` with every side-effecting step faked."""
 
@@ -605,6 +638,8 @@ class _Lifecycle:
         may_run=True,
         install_ok=True,
         cancel_at=None,
+        real_gate=False,
+        consent_pending=False,
     ):
         # Lifecycle helpers are patched on ``routes``, the facade: they are shared by
         # the routes family, and the facade mirror test refuses a patch on one owner.
@@ -613,18 +648,26 @@ class _Lifecycle:
         from kiro_crew.apps.manager_records import AppResult
 
         self.calls: list[str] = []
-        self.record = {"name": "chorus", "enabled": False, "resources": "app"}
+        self.record = {
+            "name": "chorus",
+            "enabled": False,
+            "resources": "app",
+            "sessionApprovalConsentPending": consent_pending,
+        }
         self.landed = False
         self.install_kwargs: dict = {}
         self.install_result = {"ok": install_ok, "name": "chorus"}
         if not install_ok:
             self.install_result["error"] = "provenance write failed"
 
-        async def _install(name, log_lines=None, *, resolved_entry=None, start_disabled=False):
+        async def _install(
+            name, log_lines=None, *, resolved_entry=None, start_disabled=False, via="store"
+        ):
             self.calls.append("install")
             self.install_kwargs = {
                 "resolved_entry": resolved_entry,
                 "start_disabled": start_disabled,
+                "via": via,
             }
             if cancel_at == "before_landing":
                 raise asyncio.CancelledError
@@ -650,7 +693,7 @@ class _Lifecycle:
         async def _start(name):
             self.calls.append("start")
 
-        async def _may_run(name, *, fresh_install=False):
+        async def _may_enable(name):
             return may_run
 
         async def _suspend(name):
@@ -661,7 +704,11 @@ class _Lifecycle:
         monkeypatch.setattr(mgr, "get_app", _get_app)
         monkeypatch.setattr(rl, "_register_app_off_loop", _register)
         monkeypatch.setattr(rl, "_start_backend_after_install", _start)
-        monkeypatch.setattr(rl, "_app_may_run_after_install", _may_run)
+        if real_gate:
+            # The shipped gate, reading this record through the facade's binding.
+            monkeypatch.setattr(rl, "get_app", _get_app)
+        else:
+            monkeypatch.setattr(rl, "_app_may_enable_after_install", _may_enable)
         monkeypatch.setattr(rl, "_suspend_app_for_session_approval_reconsent", _suspend)
 
 
@@ -672,7 +719,11 @@ async def test_install_transaction_requests_a_disabled_record(monkeypatch, enabl
     entry = _row()
 
     assert (await di._install_transaction("chorus", entry, enabled=enabled))["ok"] is True
-    assert life.install_kwargs == {"resolved_entry": entry, "start_disabled": True}
+    assert life.install_kwargs == {
+        "resolved_entry": entry,
+        "start_disabled": True,
+        "via": "default",
+    }
     assert life.install_kwargs["resolved_entry"] is entry
 
 
@@ -766,6 +817,27 @@ async def test_pending_session_consent_is_suspended_not_enabled(monkeypatch):
     assert result["enabled"] is False
     assert life.record["enabled"] is False
     assert life.calls == ["install", "suspend"]
+
+
+@pytest.mark.asyncio
+async def test_the_shipped_gate_enables_a_disabled_consent_free_record(monkeypatch):
+    """The install writes a disabled record; the gate must not read that as "may not run"."""
+    life = _Lifecycle(monkeypatch, real_gate=True)
+
+    result = await di._install_transaction("chorus", _row(), enabled=True)
+    assert result["ok"] is True
+    assert life.record["enabled"] is True
+    assert [c for c in life.calls if c != "get_app"] == ["install", "enable", "register", "start"]
+
+
+@pytest.mark.asyncio
+async def test_the_shipped_gate_suspends_a_consent_pending_record(monkeypatch):
+    life = _Lifecycle(monkeypatch, real_gate=True, consent_pending=True)
+
+    result = await di._install_transaction("chorus", _row(), enabled=True)
+    assert result["enabled"] is False
+    assert life.record["enabled"] is False
+    assert [c for c in life.calls if c != "get_app"] == ["install", "suspend"]
 
 
 @pytest.mark.asyncio

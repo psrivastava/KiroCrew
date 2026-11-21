@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
 import { MemoryRouter, useLocation } from 'react-router-dom'
+import { PREVIEW_EXPLORE, setPreviewFlag } from '../../utils/previewFlags'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Provider } from 'react-redux'
 
@@ -8,6 +9,7 @@ import { api } from '../../api/client'
 import { createTestStore } from '../../test/helpers'
 
 import { SidePanelDockContext } from '../../components/SidePanelLayout'
+import { __setFeaturePreviewLockKnownForTests } from '../../utils/editionLocks'
 import SettingsSearch from './SettingsSearch'
 
 /**
@@ -61,6 +63,15 @@ const input = () => screen.getByRole('combobox')
 describe('SettingsSearch', () => {
   afterEach(() => {
     vi.restoreAllMocks()
+  })
+
+  it('offers Start New Chats in conductor mode in an open search once the edition lock is known', () => {
+    __setFeaturePreviewLockKnownForTests(false)
+    setup()
+    fireEvent.change(input(), { target: { value: 'Start New Chats in conductor mode' } })
+    expect(screen.queryByText('Start New Chats in conductor mode')).toBeNull()
+    act(() => { __setFeaturePreviewLockKnownForTests(true) })
+    expect(screen.getByText('Start New Chats in conductor mode')).toBeInTheDocument()
   })
 
   it('shows matching rows for a query against a stable registry entry', () => {
@@ -163,6 +174,20 @@ describe('SettingsSearch', () => {
     fireEvent.keyDown(input(), { key: 'Escape' })
     expect(screen.queryByRole('listbox')).not.toBeInTheDocument()
     expect(input()).toHaveValue('zoom')
+  })
+
+  it('withdraws Display > Explore from an open search once the Explore preview turns off', () => {
+    const displayExplore = () => screen.queryAllByRole('option').filter(o => /Display/.test(o.textContent ?? '') && /Explore/.test(o.textContent ?? ''))
+    try {
+      setPreviewFlag(PREVIEW_EXPLORE, true)
+      setup()
+      fireEvent.change(input(), { target: { value: 'Explore' } })
+      expect(displayExplore()).toHaveLength(1)
+      act(() => { setPreviewFlag(PREVIEW_EXPLORE, false) })
+      expect(displayExplore()).toHaveLength(0)
+    } finally {
+      setPreviewFlag(PREVIEW_EXPLORE, false)
+    }
   })
 
   it('shows the no-results row for a nonsense query', () => {

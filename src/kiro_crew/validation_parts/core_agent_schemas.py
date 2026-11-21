@@ -70,6 +70,8 @@ SPAWN_RUN_TASK_ITEM_SCHEMA = ToolSchema(
         FieldSpec("backend", str, max_len=MAX_SHORT_STRING, pattern=_BACKEND_NAME_RE),
         # Display name for this task's row; see ``normalize_spawn_label``.
         FieldSpec("label", str, max_len=MAX_SHORT_STRING),
+        # This task is a helper job; see ``light`` on ``SPAWN_RUN_SCHEMA``.
+        FieldSpec("light", bool),
     ],
 )
 
@@ -125,10 +127,20 @@ SPAWN_RUN_SCHEMA = ToolSchema(
         # Display only: the task the sub-agent receives is unchanged, and the
         # value is normalized to one bounded line (``normalize_spawn_label``).
         FieldSpec("label", str, max_len=MAX_SHORT_STRING),
+        # light=True marks a helper job (search, lookup, run-and-report,
+        # summarize). While ``agent.subagent_light_tier`` is on, the gateway
+        # fills a model and effort the call left unset from the ``subagent_light``
+        # role pins. Batch-wide; a tasks[] object's own value wins for its task.
+        FieldSpec("light", bool),
         # keep=True makes the run a continuable conversation: its session
         # persists (hibernated on disk) after completion, and spawn_continue
         # can dispatch follow-up turns into it with full prior context.
         FieldSpec("keep", bool),
+        # silent=True drops only the run's completion notifications (the bell
+        # note; under a cron also the channel post of the cron's reply) —
+        # docs/decisions/, "a silent parent's sub-agent completions never
+        # ring the bell".
+        FieldSpec("silent", bool),
         # Legacy solo-spawn fields: unadvertised and ignored, but accepted
         # so a skill or workflow that still sends them is not refused as
         # "unknown field".
@@ -202,6 +214,8 @@ SPAWN_SUB_AGENTS_SCHEMA = ToolSchema(
             item_type=dict,
         ),
         FieldSpec("cwd", str, max_len=MAX_MEDIUM_STRING),
+        # As on spawn_run: batch-wide completion-notification opt-out.
+        FieldSpec("silent", bool),
         # Context groups, as on spawn_run: batch-wide, all default True.
         FieldSpec("include_memory", bool, default=True),
         FieldSpec("include_lessons", bool, default=True),
@@ -263,6 +277,21 @@ LEARN_REMOVE_SCHEMA = ToolSchema(
         # Collapse duplicates: of the matches, keep the oldest row of each
         # (rule, scope) group and remove the rest.
         FieldSpec("keep_one", bool),
+    ],
+)
+
+# ``PATCH /api/lessons`` and ``learn_update``: change one lesson's tier in place.
+LEARN_UPDATE_SCHEMA = ToolSchema(
+    tool_name="learn_update",
+    fields=[
+        # The lesson's whole text as learn_list shows it, NOT-clause included. Bounded
+        # by the stored value rather than learn_add's rule cap: older lessons are
+        # longer than a new rule may be, and a re-tier has to reach them too.
+        FieldSpec("rule", str, required=True, max_len=MAX_MEDIUM_STRING),
+        FieldSpec("repo_scope", str, max_len=MAX_SHORT_STRING, pattern=SCOPE_FRAGMENT_RE),
+        # The tier the caller read, checked before anything is written.
+        FieldSpec("current", str, required=True, allowed=ALLOWED_LESSON_APPLIES),
+        FieldSpec("applies", str, required=True, allowed=ALLOWED_LESSON_APPLIES),
     ],
 )
 
@@ -331,7 +360,21 @@ FILE_SEND_SCHEMA = ToolSchema(
     tool_name="file_send",
     fields=[
         FieldSpec("path", str, required=True, max_len=MAX_SHORT_STRING),
-        FieldSpec("description", str, max_len=MAX_SHORT_STRING),
+        # The file's preamble. ONE field, served to every leg as the caption of
+        # the one chat item the upload makes. On the Slack leg it is the file's
+        # ``initial_comment``; on the non-Slack leg it is the ``send_document``
+        # caption the channel already accepted. Each leg redacts it like outbound
+        # text.
+        #
+        # The cap here is a generous FLOOR, not the per-leg ceiling: a caller may
+        # pass a real preamble (a paragraph, a signature, a request to review), so
+        # the boundary lets it through. The per-leg ceiling is enforced where the
+        # transport is known -- the Slack leg against its message limit, the
+        # channel leg against its transport's caption cap -- which answers 400
+        # ``too_long_for_channel`` naming the channel and the number, instead of
+        # silently slicing it on the leg that would. Each leg counts in its
+        # platform's unit: Telegram UTF-16 units, WeCom UTF-8 bytes.
+        FieldSpec("description", str, max_len=MAX_MEDIUM_STRING),
         FieldSpec("channel", str, max_len=MAX_SHORT_STRING),
     ],
 )
@@ -383,9 +426,9 @@ MONITOR_WATCH_SCHEMA = ToolSchema(
     tool_name="monitor_watch",
     custom_validator=_validate_monitor_runtime,
     fields=[
-        FieldSpec("kind", str, required=True, allowed=publicly_armable_kinds()),
+        FieldSpec("kind", str, required=True, allowed=publicly_armable_kinds),
         FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
-        FieldSpec("objective", str, required=True, allowed=publicly_armable_objectives()),
+        FieldSpec("objective", str, required=True, allowed=publicly_armable_objectives),
         FieldSpec(
             "interval_secs",
             int,
@@ -398,6 +441,7 @@ MONITOR_WATCH_SCHEMA = ToolSchema(
         FieldSpec("max_tokens", int, min_val=1, max_val=MAX_MONITOR_TOKENS),
         FieldSpec("max_provider_errors", int, min_val=1, max_val=MAX_MONITOR_PROVIDER_ERRORS),
         FieldSpec("wake_instructions", str, max_len=MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS),
+        FieldSpec("wake_on_terminal", bool),
     ],
 )
 
@@ -553,7 +597,7 @@ MONITOR_UPDATE_SCHEMA = ToolSchema(
         FieldSpec("max_cycles", int, min_val=1, max_val=1000),
         FieldSpec("max_runtime_secs", (int, float), min_val=1, max_val=MAX_RUNTIME_CEILING_SECS),
         FieldSpec("target", str, max_len=MAX_SHORT_STRING),
-        FieldSpec("objective", str, allowed=publicly_armable_objectives()),
+        FieldSpec("objective", str, allowed=publicly_armable_objectives),
         # Floor 0, not 1: zero is the unlimited sentinel for this one budget.
         FieldSpec("max_agent_turns", int, min_val=0, max_val=MAX_MONITOR_AGENT_TURNS),
         FieldSpec("max_tokens", int, min_val=1, max_val=MAX_MONITOR_TOKENS),

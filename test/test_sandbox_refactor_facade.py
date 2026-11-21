@@ -55,6 +55,7 @@ from typing import Callable
 from unittest import mock
 
 import pytest
+import source_corpus
 import test_sandbox_refactor_create_guard as create_guard
 
 from kiro_crew import (
@@ -154,7 +155,7 @@ _MOVED: dict[str, tuple[str, ...]] = {
     "kiro_crew.sandbox_leaves": tuple("""
         _POLICY_CACHE_LEAF _VOICE_RUNTIME_LEAF _CREW_HOME_DEFAULT _CREW_HOME_PREFIXES
         _LIVE_TARGET_LEAF _LIVE_TARGET_STAGING_LEAF _AUTH_STORE_STAGING_LEAF
-        _SECRET_REQUEST_POLICY_LEAF MD_NOTEBOOK_APP_NAME
+        _SECRET_REQUEST_POLICY_LEAF _UPDATE_STAGING_LEAF MD_NOTEBOOK_APP_NAME
         _MD_NOTEBOOK_STATE_LEAVES _MD_NOTEBOOK_STAGING_LEAF _CREW_HIDDEN_LEAVES
         _MD_NOTEBOOK_STATE_FILES _MD_NOTEBOOK_RETIRED_STATE_LEAVES
         _CREW_UNREADABLE_MASK_LEAVES _RELOCATED_CREW_HIDDEN_LEAVES _CREW_READONLY_LEAVES
@@ -164,8 +165,11 @@ _MOVED: dict[str, tuple[str, ...]] = {
     "kiro_crew.sandbox_tiers": tuple("""
         _resolved_kiro_agents_targets _PACKAGED_INSTALL_DIR_NAMES install_root_targets_for
         _install_root_targets_with _install_root_targets_cached _resolved_install_root_targets
-        _bundled_kas_targets_cached
+        _bundled_kas_targets_cached _bundled_kiro_cli_targets_cached _bundled_root_spellings
         _gateway_package_dir _APP_BACKEND_OWNED_LEAVES app_backend_visible_targets
+        app_backend_secret_mask_targets
+        app_declared_mask_targets app_declared_readonly_targets _liftable_declared_file
+        _liftable_declared_dir
         crew_home_visible_spellings carveout_chain_has_planted_link
         enterprise_policy_cache_view _caller_mask_contains _POLICY_CACHE_META_LEAF
         _policy_cache_meta_names_its_source
@@ -177,7 +181,8 @@ _MOVED: dict[str, tuple[str, ...]] = {
         _IN_SANDBOX_MARKER _IN_SANDBOX_LEVEL_VAR _TIER_ORDINALS _mode_to_level _SANDBOX_MODE_ALIASES
         _CGROUP_AGENTS_SLICE
         effective_sandbox_mode _governance_sandbox_floor _clamp_sandbox_mode _floor_mandates_sandbox
-        _clamp_sandbox_mode_to_floor
+        _clamp_sandbox_mode_to_floor configured_readonly_layer warn_readonly_layer_unenforced
+        _READONLY_LAYER_CACHE _READONLY_LAYER_WARNED _readonly_layer_from
         """.split()),
     "kiro_crew.sandbox_precreate": tuple("""
         _CREW_PRECREATE_READONLY_DIR_LEAVES _CREW_NOFOLLOW_READONLY_DIR_LEAVES
@@ -203,9 +208,11 @@ _MOVED: dict[str, tuple[str, ...]] = {
         _InodeAliases _inode_aliases_under _refuse_multilinked_credential_leaves _referent_identity
         _refuse_aliased_masked_leaves _masked_leaf_pathonly_alias_detail
         _masked_leaf_multilink_detail _masked_leaf_alias_search_hint masked_credential_leaf_aliases
+        _app_declared_leaves _hidden_leaves _hardlink_refused_leaves
+        _app_declared_readonly_leaves _establish_app_readonly_dirs _app_data_dir_settled
         """.split()),
     "kiro_crew.sandbox_staging": tuple("""
-        _materialize_maskable_dirs _materialize_live_target_mask_target
+        _materialize_maskable_dirs _materialize_declared_mask_dirs _materialize_live_target_mask_target
         _refuse_if_live_target_symlink LiveTargetUnfitness _live_target_irregular_detail
         _live_target_multilink_detail _live_target_symlink_detail _refuse_unless_sole_regular_link
         live_target_pointer_unfitness _md_notebook_degraded_mask_dirs
@@ -213,11 +220,15 @@ _MOVED: dict[str, tuple[str, ...]] = {
         _migrate_md_notebook_legacy_state _member_records_move
         _AUTH_STORE_PUBLISHED_KEY_LEAF _AUTH_STORE_LEGACY_TEMP_PREFIX
         _reconcile_auth_store_staging_links _sweep_legacy_auth_store_temps
+        _LEGACY_AUTH_SWEEP_CLEAN _materialize_env_mask_target
+        _materialize_refresh_chains_mask_target _create_absent_mask_target
+        _materialize_signing_key_mask_target
         _sweep_one_md_notebook_state_dir _materialize_md_notebook_mask_targets
         """.split()),
     "kiro_crew.sandbox_workspace": tuple("""
         _voice_runtime_paths_lock _voice_runtime_paths_cache _ensure_voice_runtime_directory
-        _literal_ancestor_guards prime_voice_runtime_sandbox_paths
+        _literal_ancestor_guards _caller_can_rename _renameable_ancestor_guards
+        _MAX_LINK_HOPS _resolution_entries prime_voice_runtime_sandbox_paths
         _restore_missing_voice_runtime_roots _voice_runtime_sandbox_paths
         _voice_runtime_parent_paths _voice_runtime_ancestor_guards _path_identity
         _identity_within_sealed_parent CANONICAL_TEMP_KEYS DECLARED_TEMP_REFUSAL_REASONS
@@ -236,19 +247,21 @@ _MOVED: dict[str, tuple[str, ...]] = {
         _SEATBELT_PROFILE_SUFFIX _PI_GATE_ARTIFACT_PREFIX _PI_GATE_ARTIFACT_SUFFIXES
         _RUN_DIR_ARTIFACTS _DSH_GATE_ARTIFACT_PREFIX _DSH_PATCH_ARTIFACT_PREFIX
         _DSH_GATE_ARTIFACT_SUFFIXES _PI_GATE_DIR_ARTIFACTS _LEGACY_LAUNCHER_DIR
-        _resolve_agent_executable _ssh_supports_accept_new namespace_launcher_script_dir
+        _resolve_agent_executable _ssh_supports_accept_new _runtime_dir_is_durable
+        namespace_launcher_script_dir
         _ensure_run_dir _LAUNCHER_INTERPRETER_FLAGS _launcher_script_of _log_refusals
         _carveout_probes _plan_cwd _live_plan_host _spawn_plan _build_launcher_script
         _build_seatbelt_profile namespace_argv _pinned_env_bin sandbox_exec_argv
         _sandbox_env_scrub_keys _sandbox_env_unset_args cleanup_stale_sandbox_profiles
-        _ENV_BINARY_CANDIDATES _unset_env_argv
+        _ENV_BINARY_CANDIDATES _unset_env_argv _operator_layer_probes
         """.split()),
     "kiro_crew.sandbox_delegation": tuple("""
         _KIRO_INTERNAL_SETTINGS_PATH _KIRO_INTERNAL_SANDBOX_KEY _kiro_delegation_warned
         kiro_internal_sandbox_enabled kiro_internal_sandbox_switch SANDBOX_LAYER_CREW
         SANDBOX_LAYER_HARNESS wrapped_by_crew_sandbox sandbox_init_remediation
         delegated_workspace_exposes_sealed_target _spawns_kiro_cli
-        _delegate_to_kiro_internal_sandbox _command_log_label
+        _delegate_to_kiro_internal_sandbox _command_log_label _first_json_value
+        _kiro_settings_concat_warned
         """.split()),
     "kiro_crew.sandbox_probe": tuple("""
         _CLONE_NEWUSER _CLONE_NEWNS _PROBE_MS_REC _PROBE_MS_PRIVATE _TRANSIENT_PROBE_ERRNOS
@@ -314,10 +327,12 @@ _MOVED: dict[str, tuple[str, ...]] = {
         _SLICE_MEMHIGH_MUTEX _reconcile_slice_memory_high_off_thread
         _WINDOWS_INERT_RESOURCE_LIMIT_KEYS _WINDOWS_INERT_LIMITS_WARNED
         _warn_windows_inert_resource_limits_once apply_windows_resource_ceiling
-        _SCOPE_UNIT_PREFIX _SCOPE_UNIT_TOKEN_SAFE scope_unit_name cgroup_scope_argv
+        _SCOPE_UNIT_PREFIX _CLIENT_SCOPE_UNIT_PREFIX _SCOPE_UNIT_TOKEN_SAFE scope_unit_name
+        cgroup_scope_argv
         name_scope_unit _CGROUP_TOTAL_MEMORY_FRACTION _CGROUP_FALLBACK_MAX_TOTAL_MEMORY_MB
         _CGROUP_DEFAULT_MAX_TOTAL_TASKS _default_max_total_tasks _default_max_total_memory_mb
         _slice_limits_from_config _SLICE_LIMITS_APPLIED ensure_agents_slice_limits
+        _slice_limits_unit _slice_limits_dir _fill_unset_parent_limits
         _USER_MANAGER_CGROUP_BASE _agents_slice_cgroup_dir _read_cgroup_counters
         read_cgroup_int _SLICE_THROTTLE_PROBE_SEEN _SLICE_THROTTLE_EDGE_AT
         _SLICE_THROTTLE_EDGE_HOLD_SECS agents_slice_throttling _SLICE_OOM_SEEN
@@ -341,7 +356,7 @@ _MOVED: dict[str, tuple[str, ...]] = {
         resource_limit_supervisor_argv _SESSION_HOST_PREEXEC session_host_preexec
         _BUILD_NOFILE_CEILING _BUILD_RESOURCE_PREEXEC build_resource_limit_preexec
         _SPAWN_SHIM_SOURCE _SPAWN_SHIM_CODE RLIMIT_PROFILE_TOOL RLIMIT_PROFILE_BUILD
-        RLIMIT_PROFILE_SESSION_HOST RLIMIT_PROFILE_EXTRACTOR _EXTRACTOR_MAX_AS_BYTES
+        RLIMIT_PROFILE_SESSION_HOST RLIMIT_PROFILE_UNBOUNDED_SESSION_HOST RLIMIT_PROFILE_EXTRACTOR _EXTRACTOR_MAX_AS_BYTES
         _EXTRACTOR_MAX_CPU_SECS _EXTRACTOR_MAX_NOFILE RLIMIT_PROFILE_NONE _PROFILE_OOM_BIAS
         _SHIM_ARGV_SEPARATOR _SHIM_CHDIR_FD_FLAG _SHIM_CTTY_FD_FLAG _SHIM_ARGV_CACHE
         _SHIM_UNAVAILABLE_LOGGED _rlimit_spec spawn_shim_argv _shim_prefix_entering_fd
@@ -1063,6 +1078,7 @@ CENSUS_PARTS = 4
 
 
 @functools.lru_cache(maxsize=1)
+@source_corpus.untraced()
 def census_parts() -> tuple[tuple[Path, ...], ...]:
     """The files the census parses, dealt into ``CENSUS_PARTS`` parts of about equal
     source size: each file, largest first, joins the lightest part so far. Only the
@@ -1085,6 +1101,7 @@ def census_parts() -> tuple[tuple[Path, ...], ...]:
 
 
 @functools.lru_cache(maxsize=CENSUS_PARTS)
+@source_corpus.untraced()
 def census_part(index: int) -> tuple[_Patch, ...]:
     """``(file, line, enclosing function, facade, name)`` for every facade patch in the
     files of census part *index*, read once for both facades."""

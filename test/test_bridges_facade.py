@@ -22,6 +22,7 @@ import importlib
 from collections.abc import Iterable
 from pathlib import Path
 
+import owner_import_scan
 import pytest
 import source_corpus
 
@@ -83,7 +84,7 @@ _BASE_MODULE_NAMES = frozenset("""
     registered_app_mcp_servers reregister_app_mcp_servers resolve_app_python
     resolve_script_path resolve_stdio_command schedule_materialized_agents_refresh
     screen_app_path scrub_backend_mcp_url sel shipped_builtin_app_root shutil stat
-    strip_ungoverned_auto_approve sys urlparse urlunparse venv_provided_command
+    strip_ungoverned_auto_approve strip_utf8_bom sys urlparse urlunparse venv_provided_command
     vet_zip_inventory without_mcp_refs zipfile
     """.split())
 
@@ -164,29 +165,11 @@ def test_the_type_checker_census_finds_a_dropped_name() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _imported_modules(node: ast.Import | ast.ImportFrom, module: str) -> list[str]:
-    """Dotted names an import statement in *module* reaches, relative spellings resolved."""
-    if isinstance(node, ast.Import):
-        return [alias.name for alias in node.names]
-    base = node.module or ""
-    if node.level:
-        package = module.split(".")[: -node.level]
-        base = ".".join([*package, *([node.module] if node.module else [])])
-    return [base, *(f"{base}.{alias.name}" for alias in node.names)]
-
-
 def _owner_importers(sources: Iterable[tuple[Path, str]], root: Path) -> set[str]:
     """The files among *sources* (relative to *root*) whose code imports a family owner."""
-    found = set()
-    for path, text in sources:
-        rel = path.relative_to(root)
-        module = ".".join([root.name, *rel.with_suffix("").parts])
-        for node in ast.walk(ast.parse(text)):
-            if isinstance(node, (ast.Import, ast.ImportFrom)) and any(
-                name.startswith(_OWNER_PREFIX) for name in _imported_modules(node, module)
-            ):
-                found.add(rel.as_posix())
-    return found
+    return owner_import_scan.owner_importers(
+        sources, root, lambda name: name.startswith(_OWNER_PREFIX)
+    )
 
 
 def test_only_the_family_imports_an_owner() -> None:

@@ -34,6 +34,7 @@ const rowName = (labelKey: string, server: string) => `${M(labelKey)} ${server}`
 /** A row's share switch, bounded so a hang fails here. */
 const findRowSwitch = (server = 'alpha-mcp') =>
   screen.findByRole('switch', { name: rowName('share_toggle', server) }, { timeout: 5000 })
+const queryRowSwitch = (server = 'alpha-mcp') => screen.queryByRole('switch', { name: rowName('share_toggle', server) })
 
 /** A launch block's text as drawn: the tokens are separate spans inside one <pre>. */
 const pres = (root: HTMLElement) => Array.from(root.querySelectorAll('pre')).map(p => p.textContent)
@@ -87,7 +88,7 @@ function mount() {
   return render(
     <MemoryRouter>
       <QueryClientProvider client={qc}>
-        <McpManagement initialAdvancedOpen />
+        <McpManagement />
       </QueryClientProvider>
     </MemoryRouter>,
   )
@@ -209,8 +210,8 @@ describe('one-step sharing', () => {
     expect(screen.getAllByText(M('state_needs_reapproval')).length).toBeGreaterThan(0)
     // The row keeps the chip and the button; the "why" waits in Details.
     expect(screen.queryByText(M('command_changed_hint_command'))).toBeNull()
-    // Nothing runs shared while it is paused, so the switch beside it reads off.
-    expect((await findRowSwitch()).getAttribute('aria-checked')).toBe('false')
+    // Nothing runs shared while it is paused, so the row draws no switch.
+    expect(queryRowSwitch()).toBeNull()
     expect(container.textContent).not.toContain('/opt/alpha')
 
     const details = await openDetails()
@@ -257,8 +258,8 @@ describe('one-step sharing', () => {
     expect(within(details).queryByText(M('details_approved'))).toBeNull()
     expect(screen.queryByText(M('state_needs_reapproval'))).toBeNull()
     expect(screen.queryByRole('button', { name: rowName('new_command_button', 'alpha-mcp') })).toBeNull()
-    // Never approved, so nothing runs shared: the switch reads off.
-    expect((await findRowSwitch()).getAttribute('aria-checked')).toBe('false')
+    // Never approved, so nothing runs shared: the row draws no switch.
+    expect(queryRowSwitch()).toBeNull()
     fireEvent.click(approve)
 
     await waitFor(() => expect(setStub).toHaveBeenCalledWith('alpha-mcp', true, 'first-identity'), { timeout: 5000 })
@@ -274,7 +275,7 @@ describe('one-step sharing', () => {
       },
       'new_command_button',
     ],
-  ])('sends the off switch of a refused row (%s) to its Approve button, writing nothing', async (_l, refusal, buttonKey) => {
+  ])("offers a refused row (%s) exactly Approve and Don't share this server, writing nothing on render", async (_l, refusal, buttonKey) => {
     vi.spyOn(api, 'mcpGatewayStatus').mockResolvedValue(
       status({ enabled: true, stub: ['alpha-mcp'], launch_refused: { 'alpha-mcp': refusal } }) as never,
     )
@@ -285,14 +286,10 @@ describe('one-step sharing', () => {
     const preview = vi.spyOn(api, 'mcpGatewayLaunchPreview')
 
     mount()
-    const control = await findRowSwitch()
-    expect(control.getAttribute('aria-checked')).toBe('false')
-    fireEvent.click(control)
-
-    // The switch is not an approval: only the button beside it approves.
-    const approve = screen.getByRole('button', { name: rowName(buttonKey, 'alpha-mcp') })
-    expect(document.activeElement).toBe(approve)
-    // The press is synchronous: it only moves focus, so nothing can be in flight.
+    // Only the Approve button approves; nothing else in the row can.
+    await screen.findByRole('button', { name: rowName(buttonKey, 'alpha-mcp') }, { timeout: 5000 })
+    expect(screen.getByRole('button', { name: rowName('stop_sharing', 'alpha-mcp') })).toBeTruthy()
+    expect(queryRowSwitch()).toBeNull()
     expect(setStub).not.toHaveBeenCalled()
     expect(preview).not.toHaveBeenCalled()
   })
@@ -514,6 +511,54 @@ describe('the page-wide switch', () => {
     const dialog = await screen.findByRole('dialog', undefined, { timeout: 5000 })
     expect(within(dialog).getByText('alpha-mcp')).toBeTruthy()
     expect(within(dialog).queryByText('beta-mcp')).toBeNull()
+  })
+
+  it('leaves out of its confirm a marked server its env will keep unshared once sharing is on', async () => {
+    vi.spyOn(api, 'mcpGatewayStatus').mockResolvedValue(
+      status({ enabled: false, stub: ['alpha-mcp', 'gamma-mcp'] }) as never,
+    )
+    vi.spyOn(api, 'mcpGatewayServers').mockResolvedValue({
+      servers: [
+        server({ stub: true, in_allowlist: true }),
+        server({
+          name: 'gamma-mcp',
+          stub: true,
+          in_allowlist: true,
+          pooling_blocked_by_env: false,
+          pooling_blocked_by_env_when_shared: true,
+        }),
+      ],
+    } as never)
+
+    mount()
+    const sharing = await screen.findByRole('switch', { name: M('hero_title') }, { timeout: 5000 })
+    await waitFor(() => expect((sharing as HTMLButtonElement).disabled).toBe(false), { timeout: 5000 })
+    fireEvent.click(sharing)
+    const dialog = await screen.findByRole('dialog', undefined, { timeout: 5000 })
+    expect(within(dialog).getByText('alpha-mcp')).toBeTruthy()
+    expect(within(dialog).queryByText('gamma-mcp')).toBeNull()
+  })
+
+  it('names as skipped, not shared, a server it would enable that its env keeps unshared', async () => {
+    vi.spyOn(api, 'mcpGatewayStatus').mockResolvedValue(status({ enabled: false, stub: ['alpha-mcp'] }) as never)
+    vi.spyOn(api, 'mcpGatewayServers').mockResolvedValue({
+      servers: [
+        server({ stub: true, in_allowlist: true }),
+        server({ name: 'gamma-mcp', pooling_blocked_by_env: false, pooling_blocked_by_env_when_shared: true }),
+      ],
+    } as never)
+    const preview = vi
+      .spyOn(api, 'mcpGatewayLaunchPreview')
+      .mockImplementation(async (name: string) => launch({ name }) as never)
+
+    mount()
+    const sharing = await screen.findByRole('switch', { name: M('hero_title') }, { timeout: 5000 })
+    await waitFor(() => expect((sharing as HTMLButtonElement).disabled).toBe(false), { timeout: 5000 })
+    fireEvent.click(sharing)
+    const dialog = await screen.findByRole('dialog', undefined, { timeout: 5000 })
+    expect(within(dialog).getByText('alpha-mcp')).toBeTruthy()
+    expect(within(dialog).getByText(M('enable_all_review_skipped_names', { names: 'gamma-mcp' }))).toBeTruthy()
+    expect(preview).not.toHaveBeenCalledWith('gamma-mcp')
   })
 
   it('offers one Remove button, not an on switch, on a marked row its env keeps unshared', async () => {
@@ -858,7 +903,7 @@ describe('enable all shareable', () => {
     render(
       <MemoryRouter>
         <QueryClientProvider client={qc}>
-          <McpManagement initialAdvancedOpen />
+          <McpManagement />
         </QueryClientProvider>
       </MemoryRouter>,
     )

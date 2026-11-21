@@ -13,6 +13,7 @@ and board rows, and binds ``_session_tools`` so it reads and patches as
 from __future__ import annotations
 
 from kiro_crew.config.sections import AUTOCOMPACT_PCT_MAX, AUTOCOMPACT_PCT_MIN
+from kiro_crew.mcp_crew_list import crew_list_tool
 from kiro_crew.mcp_dashboard_session_runs import (
     _run_session_adopt,
     _run_session_broadcast,
@@ -24,15 +25,18 @@ from kiro_crew.mcp_dashboard_session_runs import (
     _run_session_generate_title,
     _run_session_handoff,
     _run_session_history_list,
+    _run_session_queue,
     _run_session_read_message,
     _run_session_release,
     _run_session_reload,
     _run_session_rename,
     _run_session_retry,
     _run_session_revive,
+    _run_session_run_queued,
     _run_session_send,
     _run_session_set_color,
     _run_session_set_model,
+    _run_session_set_note,
     _run_session_status,
     _run_session_stop,
     _run_session_summary,
@@ -47,15 +51,18 @@ def _session_tools() -> tuple[Tool, ...]:
         Tool(
             name="session_create",
             description=(
-                "Open a NEW chat session, pre-named and bound to the agent you pick, so a "
-                "separate workstream has a home of its own. The new session appears in "
-                "the user's sidebar like any other — they can read it, take it over and "
-                "close it — so use it to stand up a workstream alongside this one (watch a "
-                "build, grind a long refactor) rather than to hide work. It starts empty: "
-                "the person is the one who types the first message into it. Returns its "
-                "key; pass that as `target` to the other session tools. To open a session "
-                "that already CARRIES a transcript (splitting your own investigation into "
-                "several sessions), use session_fork instead."
+                "Open a NEW chat session, pre-named and bound to the agent you pick, as a "
+                "home for a separate workstream. It appears in the user's sidebar — they "
+                "can read it, take it over and close it — so use it to run work alongside "
+                "this one, not to hide work. Without `message` it starts empty. `message` "
+                "starts its first turn in this same call, attributed to you as a "
+                "session_send would be. An agent that auto-approves session_create but "
+                "not session_send (conductor, team lead) must not pass it (refused, "
+                "`message_needs_send_approval`): create, then session_send. Returns its "
+                "key and, with `message`, the delivery receipt; pass the key as `target` "
+                "to the other session tools. Never session_send to a key this call has "
+                "not returned yet. For a session that already CARRIES a transcript, use "
+                "session_fork instead."
             ),
             schema={
                 "type": "object",
@@ -77,8 +84,8 @@ def _session_tools() -> tuple[Tool, ...]:
                             "therefore gets a second conductor, which has no fs_write and "
                             "cannot do the work. Name the agent the child needs "
                             "explicitly \u2014 kirocrew-worker for a leaf work item. "
-                            "In a crewmate's own chat this field is not used: the "
-                            "session is always that crewmate's own worker."
+                            "In a Bot's own chat this field is not used: the "
+                            "session is always that Bot's own worker."
                         ),
                     },
                     "agent_kind": {
@@ -86,7 +93,7 @@ def _session_tools() -> tuple[Tool, ...]:
                         "enum": ["template"],
                         "description": (
                             "Pass 'template' to run the shared template `agent` names "
-                            "on YOUR OWN memory, even when a crew member carries the "
+                            "on YOUR OWN memory, even when a Bot carries the "
                             "same name. Omit for the usual name-first resolution (a "
                             "member wins, with its own memory). Always pass 'template' "
                             "for kirocrew-worker: a worker needs no memory of its own, "
@@ -110,7 +117,7 @@ def _session_tools() -> tuple[Tool, ...]:
                             "Model the new session starts on, pinned exactly as if the "
                             "person had picked it in the session's model dropdown: an id "
                             "from that same list, or 'auto'. If omitted: when YOU are a "
-                            "crewmate, the child gets a copy of your profile's worker model "
+                            "Bot, the child gets a copy of your profile's worker model "
                             "(or your own model when none is set), made at creation, so a "
                             "later profile change does not reach it; otherwise it uses the "
                             "agent's or the global default. A well-formed id the account "
@@ -125,10 +132,28 @@ def _session_tools() -> tuple[Tool, ...]:
                         "description": (
                             "Reasoning effort the new session starts at, one of the five "
                             "standard levels: 'low', 'medium', 'high', 'xhigh', 'max'. "
-                            "If omitted, it is filled the same way as `model`: a crewmate's "
+                            "If omitted, it is filled the same way as `model`: a Bot's "
                             "child gets a copy of the profile's worker effort (or the "
-                            "crewmate's own), made at creation; anyone else's child keeps "
+                            "Bot's own), made at creation; anyone else's child keeps "
                             "the model's default."
+                        ),
+                    },
+                    "backend": {
+                        "type": "string",
+                        "description": (
+                            "Harness (agent backend) the new session runs on, spelled as "
+                            "spawn_run's `backend` takes it, e.g. 'kiro', 'claude', 'codex'. "
+                            "Kept for the session's whole life: every turn, restart, reset "
+                            "and compaction runs on it, and a spawn_run from that session "
+                            "with no `backend` of its own starts its child on it too. It "
+                            "outranks a Bot's own harness setting, as spawn_run's does. A "
+                            "backend that is unknown, not allowed by policy or not installed "
+                            "here is refused with nothing created (`unknown_backend`, "
+                            "`backend_not_installed`, `backend_restart_required`), and the "
+                            "refusal lists the ones that can start. `model`, when given, "
+                            "must be an id THAT backend serves (`model_rejected` otherwise). "
+                            "Omit to run on the default harness, as today. Not taken with "
+                            "`crew`."
                         ),
                     },
                     "autocompact_pct": {
@@ -143,6 +168,18 @@ def _session_tools() -> tuple[Tool, ...]:
                             "other session, including yours, are unchanged. Omit to follow "
                             "the agent's own default, else the global value. The person can "
                             "still change or reset it later."
+                        ),
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": (
+                            "First message for the new session, delivered through "
+                            "session_send's own path (same authorization, size limit and "
+                            "'sent by' line), so its first turn starts on it. A message "
+                            "session_send would refuse is refused here before any session "
+                            "is opened. If the session opens but delivery fails, the reply "
+                            "still gives the key plus the delivery error; the session is "
+                            "kept, so you can session_send to it."
                         ),
                     },
                 },
@@ -192,8 +229,8 @@ def _session_tools() -> tuple[Tool, ...]:
                         "type": "string",
                         "description": (
                             "Short name for the new session, shown in the sidebar. Omit to "
-                            "start from `Fork of <source title>`, which is then renamed "
-                            "automatically after the latest question the copy holds."
+                            "start from `Fork of <source title>`, which is renamed "
+                            "automatically after the first message a person sends the fork."
                         ),
                     },
                     "folder": {
@@ -353,7 +390,7 @@ def _session_tools() -> tuple[Tool, ...]:
                 "check runs again; if the target has become channel-linked or otherwise "
                 "out of reach by then, the change is dropped. A model or effort the "
                 "user picks in the meantime wins. The conversation is kept. 'auto', "
-                "'Auto (Jev)' and sessions bound to a remote crew are refused."
+                "'Auto (decision model)' and sessions bound to a remote crew are refused."
             ),
             schema={
                 "type": "object",
@@ -447,6 +484,38 @@ def _session_tools() -> tuple[Tool, ...]:
             routes=("POST /api/session-control/set-color",),
         ),
         Tool(
+            name="session_set_note",
+            description=(
+                "Leave a note in a session you created without starting a turn there: "
+                "a note line in its transcript, which its next turn also reads once as "
+                'background context labelled "session_set_note". A session that is '
+                "running a turn gets the note when that turn ends. State facts, do not "
+                "ask questions: a question rides along and may be answered on an "
+                "unrelated turn. This session itself and sessions you did not create "
+                "are refused, including the person's own tabs."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": (
+                            "Session key from list_sessions or session_status, or its "
+                            "exact title."
+                        ),
+                    },
+                    "note": {
+                        "type": "string",
+                        "description": "The note text, a short declarative statement.",
+                    },
+                },
+                "required": ["target", "note"],
+            },
+            run=_run_session_set_note,
+            identity="strict",
+            routes=("POST /api/session-control/set-note",),
+        ),
+        Tool(
             name="session_rename",
             description=(
                 "Rename a live session's sidebar title: your own session, or one you "
@@ -454,7 +523,7 @@ def _session_tools() -> tuple[Tool, ...]:
                 "workers it created as their work changes. The new title is final, the "
                 "same as a manual rename: the automatic titler stops refreshing that "
                 "session. Metadata only; the transcript, model and any running turn "
-                "are untouched. A crew member or an agent-created session may rename "
+                "are untouched. A Bot or an agent-created session may rename "
                 "only itself and sessions it created; a scheduled run may rename only "
                 "sessions it created, never its own session. ARCHIVED (history) "
                 "sessions are not addressable."
@@ -551,7 +620,7 @@ def _session_tools() -> tuple[Tool, ...]:
                 "session_send, session_read_message, chat_folder_move_session and "
                 "chat_tag_assign all work on it afterwards. A session that is already "
                 "open is refused with its live key — just use that. Only dashboard "
-                "sessions in the caller's own workspace are addressable; a crew member "
+                "sessions in the caller's own workspace are addressable; a Bot "
                 "or agent-created session may revive only a session it created itself, verified against "
                 "the gateway's crew-log lineage (on by default; refused ownership_unverified "
                 "when the log is off, unseeded, or predates the session)."
@@ -602,7 +671,7 @@ def _session_tools() -> tuple[Tool, ...]:
                 "reviving, e.g. when asked to reopen last week's investigation in a "
                 "folder. Only sessions session_revive would accept for this caller "
                 "are listed: same workspace, not incognito or temporary, not "
-                "app-scoped or channel-linked; a crew member or agent-created "
+                "app-scoped or channel-linked; a Bot or agent-created "
                 "session sees only sessions it created itself (the same crew-log "
                 "lineage check session_revive applies). Live sessions are not here; "
                 "chat_folder_tree lists those."
@@ -708,8 +777,9 @@ def _session_tools() -> tuple[Tool, ...]:
                     "acceptance": {
                         "type": "object",
                         "description": (
-                            "The accept_eval.py condition object, stored verbatim, as "
-                            "action=create takes it."
+                            "The condition object, stored verbatim, as "
+                            "work_ledger_record action=create takes it: its "
+                            "acceptance argument lists the object for each kind."
                         ),
                     },
                     "agent": {
@@ -740,6 +810,14 @@ def _session_tools() -> tuple[Tool, ...]:
                     "reasoning_effort": {
                         "type": "string",
                         "description": "As session_create takes it.",
+                    },
+                    "backend": {
+                        "type": "string",
+                        "description": (
+                            "The harness the worker runs on, as session_create takes it. "
+                            "A backend that cannot start here refuses the dispatch at "
+                            "session_create, and the item is closed."
+                        ),
                     },
                 },
                 "required": ["title", "acceptance", "agent", "seed"],
@@ -833,8 +911,12 @@ def _session_tools() -> tuple[Tool, ...]:
             name="session_status",
             description=(
                 "List the sessions YOU stood up and what each one is doing right "
-                "now — the roster a conductor patrols. Each row is `working` (a "
-                "turn is in flight, wait), `queued` (idle with messages waiting), "
+                "now — the roster a conductor patrols. Each live row's `activity` "
+                "names its turn, turn admission, running or queued sub-agents, workflow, "
+                "synthesis, "
+                "preparation, compaction or automation. Its status is `working` "
+                "when current execution is active, `queued` when an idle session "
+                "has messages or sub-agents that will start on their own, "
                 "`idle` (open and doing nothing — this is the one that needs a "
                 "decision), `closed` (the crew log recorded a DELIBERATE tab close "
                 "and the dashboard no longer holds it: a worker that FINISHED and "
@@ -924,7 +1006,7 @@ def _session_tools() -> tuple[Tool, ...]:
                 "`not_creator`. A fenced caller takes direct management back only "
                 "with the chain on, by handing the session to itself while it still "
                 "manages the new manager; with it off, no fenced caller can. "
-                "Fenced means a session an agent created, a crewmate, a scheduled "
+                "Fenced means a session an agent created, a Bot, a scheduled "
                 "run, a channel session, or the Conductor while "
                 "`agent.session_control` is off. An agent in a person's own tab is "
                 "not fenced for send, read, stop, close and adopt; "
@@ -1048,5 +1130,90 @@ def _session_tools() -> tuple[Tool, ...]:
             run=_run_session_summary,
             identity="strict",
             routes=("GET /api/session-control/summary",),
+        ),
+        Tool(
+            name="session_queue",
+            description=(
+                "See and reorder the messages waiting in the queue of a session YOU manage "
+                "(one you created, one handed to you with session_handoff, or, with "
+                "agent.session_manager_chain on, one managed by a session you manage). "
+                "session_send to a busy session queues the message (started: false); this is "
+                "how you see where it sits and reorder your entries by priority. A correction to "
+                "an earlier message should stay AFTER it, so the target reads it last. "
+                "action=list returns the first 50 queued entries in run order (the "
+                "rest are counted in `omitted`, not listed), each with its id, its position (0 "
+                "runs next), a redacted excerpt and whether YOU queued it. action=move puts one "
+                "entry at `position`; it applies ONLY to entries you queued with session_send: "
+                "a person's queued message, or another session's, is never movable here. A "
+                "move to an earlier position may pass only your own entries; a move later is "
+                "always allowed. Entries queued before a gateway restart lose their sender "
+                "stamp and list as not yours."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Session key from list_sessions, or its exact title.",
+                    },
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "move"],
+                        "description": "list (default) or move.",
+                        "default": "list",
+                    },
+                    "entry": {
+                        "type": "string",
+                        "description": "Queue entry id from action=list. Required for move.",
+                    },
+                    "position": {
+                        "type": "integer",
+                        "description": (
+                            "move only: the 0-based position to put the entry at (0 runs next). "
+                            "A position past the end moves it to the back."
+                        ),
+                    },
+                },
+                "required": ["target"],
+            },
+            run=_run_session_queue,
+            identity="strict",
+            routes=("POST /api/session-control/queue",),
+        ),
+        crew_list_tool(),
+        Tool(
+            name="session_run_queued",
+            description=(
+                "Run one of YOUR queued messages on a session you manage now, instead of "
+                "after the turn in front of it: the queue card's Run now button. On a "
+                "RUNNING target this STOPS the current turn, like session_stop: the turn's "
+                "work is discarded, your message runs next (ahead of the rest of the queue, "
+                "and even while the target's sub-agents are still out), and the rest of the "
+                "queue is kept. On an IDLE target (one held by attached sub-agents) your "
+                "message starts at once and nothing is stopped. `queue_id` is required: take "
+                "it from session_queue's listing. Only an entry you queued with session_send "
+                "qualifies; a person's queued message, or another session's, is refused. An "
+                "idle target where a person is editing a queued message or a conversation "
+                "reset is pending refuses it (queue_held); try again shortly. A "
+                "stop card appears in the target's transcript. Safe to re-send: a repeat "
+                "while the stop is still pending changes nothing and never hard-kills."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Session key from list_sessions, or its exact title.",
+                    },
+                    "queue_id": {
+                        "type": "string",
+                        "description": "Queue entry id from session_queue's listing.",
+                    },
+                },
+                "required": ["target", "queue_id"],
+            },
+            run=_run_session_run_queued,
+            identity="strict",
+            routes=("POST /api/session-control/run-queued",),
         ),
     )

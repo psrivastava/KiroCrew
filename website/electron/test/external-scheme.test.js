@@ -63,11 +63,61 @@ describe("classifyNavigation", () => {
     assert.equal(classifyNavigation("file:///Users/me/.ssh/id_rsa", ORIGIN), "block");
   });
 
+  it("asks before opening editor links that name a file", () => {
+    for (const url of [
+      "vscode://file/Users/me/repo/a.ts",
+      "vscode://file/Users/me/repo/a.ts:10:2",
+      "vscode://file/Users/me/My%20Repo/a.ts:3",
+      "vscode-insiders://file/etc/hosts",
+      "vscode://vscode-remote/ssh-remote+dev-box.example.com/home/me/a.ts:10",
+      "vscode://vscode-remote/ssh-remote+clouddesk/home/me",
+      "vscode://file/C:/Users/me/repo/a.ts",
+      "vscode://file/c:/Users/me/repo/a.ts:10",
+      "vscode://file/D:/work/x.py:3:2",
+      "vscode-insiders://file/C:/Users/me/a.ts",
+      "kiro://vscode-remote/ssh-remote+dev-box/home/me/a.ts:1",
+      "kiro://file/Users/me/repo/a.ts",
+    ]) {
+      assert.equal(classifyNavigation(url, ORIGIN), "confirm", url);
+    }
+  });
+
+  it("blocks editor links that are not a plain file path", () => {
+    for (const url of [
+      "kiro://some.extension/run",
+      "kiro://vscode-remote/ssh-remote+-oProxyCommand=x/a.ts",
+      "vscode://ms-vscode.some-extension/run",
+      "vscode://vscode-remote/wsl+Ubuntu/home/me/a.ts",
+      "vscode://vscode-remote/ssh-remote+-oProxyCommand=x/a.ts",
+      "vscode://vscode-remote/ssh-remote+me@dev-box/a.ts",
+      "vscode://vscode-remote/ssh-remote+dev-box",
+      "vscode://file/Users/me/../../etc/passwd",
+      "vscode://file/Users/me/%2e%2e/etc/passwd",
+      "vscode://file/Users/me/a.ts%00",
+      "vscode://file/Users/me/%E0%A4%A",
+      "vscode://file/Users/me/a.ts?x=1",
+      "vscode://file/Users/me/a.ts#x",
+      "vscode://file/Users/me/a b.ts",
+      "VSCODE://file/Users/me/a.ts",
+      " vscode://file/Users/me/a.ts",
+      "vscode://file/Users/me/a.ts\n",
+      "vscode://file/C:/Users/../../etc/x",
+      "vscode://file/C:/Users/%2e%2e/x",
+      "vscode://file/C:%5CUsers/a.ts",
+      "vscode://file/C:/Users%5Ca.ts",
+      "vscode://file/CC:/a.ts",
+      "vscode://file/C:",
+      "vscode://vscode-remote/ssh-remote+dev-box/C:/a.ts",
+    ]) {
+      assert.equal(classifyNavigation(url, ORIGIN), "block", url);
+    }
+  });
+
   it("blocks other non-web schemes rather than defaulting them open", () => {
     for (const url of [
       "javascript:alert(1)",
       "data:text/html,<script>alert(1)</script>",
-      "vscode://file/etc/hosts",
+      "vscode://ms-vscode.some-extension/run?cmd=x",
       "smb://attacker/share",
       "ftp://example.com/x",
       "chrome://settings",
@@ -216,6 +266,12 @@ describe("parity with the previous inline handler", () => {
     assert.equal(legacyVerdict(PANE_ACCESSIBILITY, ORIGIN), "deny");
     assert.equal(classifyNavigation(PANE_ACCESSIBILITY, ORIGIN), "external");
   });
+
+  it("moves editor file links from deny to confirm", () => {
+    const link = "vscode://file/Users/me/a.ts";
+    assert.equal(legacyVerdict(link, ORIGIN), "deny");
+    assert.equal(classifyNavigation(link, ORIGIN), "confirm");
+  });
 });
 
 describe("createWindowOpenHandler", () => {
@@ -254,6 +310,153 @@ describe("createWindowOpenHandler", () => {
     const { handler, opened } = harness();
     assert.deepEqual(handler({ url: PANE_ACCESSIBILITY }), { action: "deny" });
     assert.deepEqual(opened, [PANE_ACCESSIBILITY]);
+  });
+
+  describe("editor links", () => {
+    const LINK = "vscode://file/Users/me/a.ts:10";
+    const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+    it("opens the link only after the user confirms", async () => {
+      const asked = [];
+      const { handler, opened } = harness({
+        confirmOpen: async (url) => {
+          asked.push(url);
+          return { open: true };
+        },
+      });
+      assert.deepEqual(handler({ url: LINK }), { action: "deny" });
+      await settle();
+      assert.deepEqual(asked, [LINK]);
+      assert.deepEqual(opened, [LINK]);
+      handler({ url: LINK });
+      await settle();
+      assert.equal(asked.length, 2, "without remember, the next link asks again");
+    });
+
+    it("skips the prompt for the same editor and host after 'Don't ask again'", async () => {
+      const asked = [];
+      const remembered = new Set();
+      const { handler, opened } = harness({
+        confirmOpen: async (url) => {
+          asked.push(url);
+          return { open: true, remember: true };
+        },
+        rememberedEditorTargets: remembered,
+      });
+      const remote = (path) => `vscode://vscode-remote/ssh-remote+Dev-Box${path}`;
+      handler({ url: remote("/a.ts") });
+      await settle();
+      handler({ url: remote("/b.ts:4") });
+      handler({ url: "vscode://vscode-remote/ssh-remote+dev-box/c.ts" });
+      await settle();
+      assert.equal(asked.length, 1);
+      assert.equal(opened.length, 3);
+      // A different host, a local file, or the other editor still asks.
+      for (const url of [
+        "vscode://vscode-remote/ssh-remote+other-box/a.ts",
+        "vscode://file/Users/me/a.ts",
+        "vscode-insiders://vscode-remote/ssh-remote+dev-box/a.ts",
+      ]) {
+        handler({ url });
+        await settle();
+      }
+      assert.equal(asked.length, 4);
+    });
+
+    it("lets a remembered local-file choice cover a later drive-letter link", async () => {
+      const asked = [];
+      const { handler, opened } = harness({
+        confirmOpen: async (url) => {
+          asked.push(url);
+          return { open: true, remember: true };
+        },
+        rememberedEditorTargets: new Set(),
+      });
+      handler({ url: "vscode://file/Users/me/a.ts" });
+      await settle();
+      handler({ url: "vscode://file/C:/Users/me/b.ts:4" });
+      await settle();
+      assert.equal(asked.length, 1);
+      assert.deepEqual(opened, ["vscode://file/Users/me/a.ts", "vscode://file/C:/Users/me/b.ts:4"]);
+    });
+
+    it("asks for a link to another machine's share, even after a remembered local choice", async () => {
+      const asked = [];
+      const { handler, opened } = harness({
+        confirmOpen: async (url) => {
+          asked.push(url);
+          return { open: true, remember: true };
+        },
+        rememberedEditorTargets: new Set(),
+      });
+      const links = [
+        "vscode://file/C:/Users/me/a.ts",
+        // A drive letter keeps a doubled slash local, so the local choice covers it.
+        "vscode://file/C://files.example.test/share/a.ts",
+        "vscode://file//files.example.test/share/a.ts",
+        "vscode://file//files.example.test/share/a.ts:4",
+        // Decoded, this is another path on the same share, so it asks again.
+        "vscode://file/%2Ffiles.example.test/share/b.ts",
+      ];
+      for (const url of links) {
+        handler({ url });
+        await settle();
+      }
+      assert.deepEqual(asked, [links[0], links[2], links[4]]);
+      assert.deepEqual(opened, links);
+    });
+
+    it("does not remember a Cancel, even with the box checked", async () => {
+      const remembered = new Set();
+      const { handler, opened } = harness({
+        confirmOpen: async () => ({ open: false, remember: true }),
+        rememberedEditorTargets: remembered,
+      });
+      handler({ url: LINK });
+      await settle();
+      assert.equal(remembered.size, 0);
+      assert.deepEqual(opened, []);
+    });
+
+    it("opens nothing when the user cancels or the prompt fails", async () => {
+      for (const confirmOpen of [
+        async () => ({ open: false }),
+        async () => true,
+        async () => { throw new Error("x"); },
+      ]) {
+        const { handler, opened } = harness({ confirmOpen });
+        handler({ url: LINK });
+        await settle();
+        assert.deepEqual(opened, []);
+      }
+    });
+
+    it("denies without a prompt when no confirmOpen is wired", async () => {
+      const { handler, opened } = harness();
+      assert.deepEqual(handler({ url: LINK }), { action: "deny" });
+      await settle();
+      assert.deepEqual(opened, []);
+    });
+
+    it("shows one prompt at a time", async () => {
+      let release;
+      const asked = [];
+      const { handler } = harness({
+        confirmOpen: (url) => {
+          asked.push(url);
+          return new Promise((resolve) => { release = resolve; });
+        },
+      });
+      handler({ url: LINK });
+      handler({ url: LINK });
+      await settle();
+      assert.equal(asked.length, 1);
+      release({ open: false });
+      await settle();
+      handler({ url: LINK });
+      await settle();
+      assert.equal(asked.length, 2);
+    });
   });
 
   it("hands a cross-origin web URL to the OS and denies the popup", () => {

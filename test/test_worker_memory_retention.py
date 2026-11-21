@@ -1,28 +1,19 @@
 """What the rootdir conftest does to stop an xdist worker growing without bound.
 
-A worker's memory is the constraint that decides how many of them fit, and therefore
-how the suite behaves on a laptop: the xdist budget divides available RAM by a
-per-worker reservation, so anything a worker retains costs parallelism directly. A
-worker starts at ~750 MiB just from collecting every testpath, and then grows as
-it runs -- measured at 293 MiB per 1,000 tests in the worst region.
+The xdist budget divides RAM by a per-worker reservation, so what a worker retains
+costs parallelism. These guards are invisible in a passing run.
 
-Three mechanisms in the rootdir conftest bound that growth. Each is cheap, each is
-invisible in a passing run, and each would be silently reverted by anyone who did not
-know why it was there -- which is what these tests are for.
-
-They reach the ROOTDIR conftest through the plugin manager, keyed on its absolute
-path. That indirection is necessary, not stylistic: ``import conftest`` from a module
-in ``test/`` binds ``test/conftest.py``, because pytest's prepend import mode puts each
-test module's own directory on ``sys.path`` first. The plugin manager is also the only
-way to get the LIVE module object, which matters because two of these guards keep
-module-level state.
+The rootdir conftest is reached through the plugin manager: ``import conftest`` binds
+``test/conftest.py`` under prepend import mode, and two guards keep live module state.
 """
 
 from __future__ import annotations
 
+import array
 import gc
 import linecache
 import pathlib
+import types
 import warnings
 import weakref
 
@@ -53,19 +44,9 @@ def _warning_message(source: object) -> warnings.WarningMessage:
 class TestARecordedWarningDoesNotPinItsSubject:
     """``WarningMessage.source`` is the object the warning is ABOUT.
 
-    For ``RuntimeWarning: coroutine '...' was never awaited`` that object is the
-    coroutine, which holds its frame, which holds every local the test built. And every
-    recorded warning is retained for the whole run, because pytest records them with
-    ``call_historic`` and pluggy never clears a historic call's kwargs. So one
-    un-awaited coroutine pins a whole test's object graph, in every worker, until the
-    session ends.
-
-    A BACKSTOP, not a general win, and the difference is measured. Where un-awaited
-    coroutines cluster it is large: ``test_dashboard_chat.py`` emits 60 across 590
-    tests, and clearing ``source`` takes that file's peak from 284 to 219 MiB. On a
-    mixed slice it is worth nothing -- an AsyncMock-dense 3,401-test set emits 11 and
-    measures +1.7 MiB, i.e. noise. So the value here is removing a tail risk for one
-    attribute write per warning, not an average saving.
+    For an un-awaited coroutine that is the coroutine and its frame, and pluggy keeps
+    ``call_historic`` kwargs for the whole run, so one warning pins a test's objects.
+    A backstop for files dense in such warnings, not an average saving.
     """
 
     def test_the_source_reference_is_dropped(self, root_conftest) -> None:
@@ -79,12 +60,9 @@ class TestARecordedWarningDoesNotPinItsSubject:
     def test_it_runs_LAST_so_the_rendered_text_is_already_built(self, root_conftest) -> None:
         """The ordering is the whole reason this loses no diagnostics.
 
-        ``TerminalReporter.pytest_warning_recorded`` renders the warning to a plain
-        string immediately, and that string includes ``tracemalloc_message(source)`` --
-        the "Object allocated at:" traceback when tracemalloc is tracing, and the
-        "Enable tracemalloc" pointer when it is not. Running last means the text exists
-        before the reference goes. Running FIRST would silently truncate every warning
-        report, which no test failure would ever reveal.
+        ``TerminalReporter.pytest_warning_recorded`` renders
+        ``tracemalloc_message(source)`` first; running before it would silently truncate
+        every warning report.
         """
         opts = getattr(root_conftest.pytest_warning_recorded, "pytest_impl", None) or {}
         assert opts.get("trylast") is True, (
@@ -111,10 +89,8 @@ class TestARecordedWarningDoesNotPinItsSubject:
         Walks the historic-call kwargs pluggy is holding for this very session. Anything
         with a live ``source`` here is a retained object graph.
 
-        Skips unless the session has actually recorded a warning CARRYING a source --
-        which is the precondition the assertion needs, not merely "some warning was
-        recorded". Without that distinction this passed with the hook reverted, because a
-        small session records plenty of sourceless warnings and none with a subject.
+        Skips unless a warning carrying a source was recorded: sourceless warnings alone
+        would let this pass with the hook removed.
         """
         caller = request.config.hook.pytest_warning_recorded
         history = getattr(caller, "_call_history", None) or []
@@ -135,14 +111,8 @@ class TestARecordedWarningDoesNotPinItsSubject:
 class TestTheCollectedItemTreeIsFrozen:
     """Collection leaves ~3M objects alive for the session, and the GC rescans them.
 
-    Worse, on the interpreters this suite supports a full pass is scheduled from how
-    much long-lived material exists, so that static population also DELAYS collection
-    -- a test's own cyclic garbage waits longer to be reclaimed. (3.13 replaced the
-    generational threshold with an incremental collector; the static set is unscanned
-    either way, which is the part this depends on.)
-
-    ``gc.freeze()`` moves the static set out of reach. Measured over 3,798 executions:
-    full passes 1 -> 3, objects they reclaimed 61,604 -> 423,380.
+    That static set also delays full passes. ``gc.freeze()`` moves it out of reach;
+    over 3,798 executions full passes went 1 -> 3, reclaimed 61,604 -> 423,380.
     """
 
     def test_collection_froze_the_static_object_population(self, root_conftest) -> None:
@@ -164,17 +134,10 @@ class TestTheCollectedItemTreeIsFrozen:
     def test_a_cycle_a_test_allocates_is_still_collected(self) -> None:
         """The collector must still reclaim what a test creates, after the freeze.
 
-        Named for what it checks. It does NOT prove that freezing cannot hide a leak
-        -- freezing happens between tests, so a cycle created inside a test body is
-        never frozen whichever way the hook is written, and a mutation that freezes
-        mid-run does not fail this. What it does catch is the collector being disabled
-        or broken outright, which is the way this guard could go wrong in practice.
+        It catches a disabled or broken collector, not a leak hidden by freezing.
 
-        Asserted through a weakref rather than by comparing ``gc.get_freeze_count()``
-        before and after. That count is NOT stable during a run -- frozen objects are
-        still reclaimed by refcounting when they die, so it drifts downward on its own.
-        An equality assertion on it passed in a short session and failed in the full
-        suite, which is the order-dependence flake class these conventions warn about.
+        Checked through a weakref: ``gc.get_freeze_count()`` drifts down as frozen
+        objects die, so an equality check on it is order-dependent.
         """
 
         class _Node:  # a plain object, because dicts are not weak-referenceable
@@ -244,3 +207,225 @@ class TestLinecacheIsBounded:
             root_conftest.pytest_runtest_logfinish("nodeid", None)
 
         assert calls == [1, 1, 1]
+
+
+class TestCollectedFixtureBookkeepingIsShared:
+    """Every item resolves ~130 fixtures, and pytest stores that resolution per item.
+
+    Measured over a full collection (283,605 items), the per-item request copies and
+    per-function lookup tuples and dicts were 2,971 MiB of a 5,295 MiB worker; sharing
+    them took the collection peak to 2,957 MiB.
+    """
+
+    @pytest.fixture
+    def fresh_tables(self, root_conftest, monkeypatch: pytest.MonkeyPatch):
+        """Empty interning tables, so a direct call cannot reach the session's own."""
+        for name in (
+            "_SHARED_FIXTUREDEF_TUPLES",
+            "_SHARED_INITIALNAMES",
+            "_SHARED_NAME2FIXTUREDEFS",
+            "_SHARED_NAMES_CLOSURES",
+        ):
+            monkeypatch.setattr(root_conftest, name, {})
+        monkeypatch.setattr(root_conftest, "_COMPACTED_FIXTUREINFO", set())
+        return root_conftest
+
+    @staticmethod
+    def _item(defs: dict[str, tuple], *, asyncio: bool = False):
+        from types import SimpleNamespace
+
+        from _pytest.fixtures import FuncFixtureInfo
+
+        info = FuncFixtureInfo(
+            argnames=(),
+            initialnames=tuple(defs),
+            names_closure=list(defs),
+            name2fixturedefs=dict(defs),
+        )
+        mark = pytest.mark.asyncio.mark if asyncio else None
+        return SimpleNamespace(
+            _request=object(),
+            _fixtureinfo=info,
+            # pytest makes ``fixturenames`` the very list ``names_closure`` is.
+            fixturenames=info.names_closure,
+            obj=lambda: None,
+            get_closest_marker=lambda name: mark if name == "asyncio" else None,
+        )
+
+    def test_two_functions_with_the_same_fixtures_share_one_lookup(self, fresh_tables) -> None:
+        floor, home = object(), object()
+        first = self._item({"floor": (floor,), "home": (home,)})
+        # Equal content in DIFFERENT containers: what two test functions get from pytest.
+        second = self._item({"floor": (floor,), "home": (home,)})
+
+        fresh_tables.compact_collected_item(first)
+        fresh_tables.compact_collected_item(second)
+
+        a, b = first._fixtureinfo, second._fixtureinfo
+        assert b.name2fixturedefs is a.name2fixturedefs
+        assert b.initialnames is a.initialnames
+        assert b.name2fixturedefs == {"floor": (floor,), "home": (home,)}
+
+    def test_a_shared_lookup_is_keyed_by_one_packed_id_per_name(self, fresh_tables) -> None:
+        """8 bytes per name: a ``(name, id)`` tuple per name cost 347 MiB of a collection.
+
+        One value is a list, as pytest's direct parametrization leaves it.
+        """
+        item = self._item({"floor": (object(),), "home": [object()]})
+
+        fresh_tables.compact_collected_item(item)
+
+        (key,) = fresh_tables._SHARED_NAME2FIXTUREDEFS
+        values = item._fixtureinfo.name2fixturedefs.values()
+        assert key == array.array("Q", map(id, values)).tobytes()
+
+    def test_a_different_resolution_keeps_its_own_lookup(self, fresh_tables) -> None:
+        """Sharing is by identity of the FixtureDefs, so an override is never merged away."""
+        floor = object()
+        base = self._item({"floor": (floor,)})
+        overridden = self._item({"floor": (floor, object())})
+
+        fresh_tables.compact_collected_item(base)
+        fresh_tables.compact_collected_item(overridden)
+
+        assert overridden._fixtureinfo.name2fixturedefs is not base._fixtureinfo.name2fixturedefs
+        assert len(overridden._fixtureinfo.name2fixturedefs["floor"]) == 2
+
+    def test_two_functions_with_the_same_closure_share_one_list(self, fresh_tables) -> None:
+        floor = object()
+        first, second = self._item({"floor": (floor,)}), self._item({"floor": (floor,)})
+
+        fresh_tables.compact_collected_item(first)
+        fresh_tables.compact_collected_item(second)
+
+        assert second._fixtureinfo.names_closure is first._fixtureinfo.names_closure
+        assert second.fixturenames is first.fixturenames is first._fixtureinfo.names_closure
+
+    def test_an_asyncio_test_keeps_its_own_closure_list(self, fresh_tables) -> None:
+        """pytest-asyncio inserts ``event_loop`` into such a test's ``fixturenames``."""
+        floor = object()
+        plain = self._item({"floor": (floor,)})
+        marked = self._item({"floor": (floor,)}, asyncio=True)
+
+        fresh_tables.compact_collected_item(plain)
+        fresh_tables.compact_collected_item(marked)
+
+        assert marked.fixturenames is not plain.fixturenames
+        assert marked.fixturenames is marked._fixtureinfo.names_closure
+
+    def test_a_parametrized_sibling_follows_the_shared_list(self, fresh_tables) -> None:
+        """Siblings share one ``FuncFixtureInfo``; each item's own attribute must move too."""
+        floor = object()
+        first = self._item({"floor": (floor,)})
+        other_function = self._item({"floor": (floor,)})
+        sibling = types.SimpleNamespace(
+            _request=object(),
+            _fixtureinfo=other_function._fixtureinfo,
+            fixturenames=other_function._fixtureinfo.names_closure,
+        )
+
+        fresh_tables.compact_collected_item(first)
+        fresh_tables.compact_collected_item(other_function)
+        fresh_tables.compact_collected_item(sibling)
+
+        assert sibling.fixturenames is first.fixturenames
+
+    def test_the_request_is_dropped_to_the_state_pytest_rebuilds_from(self, fresh_tables) -> None:
+        item = self._item({"floor": (object(),)})
+
+        fresh_tables.compact_collected_item(item)
+
+        assert item._request is False
+
+    def test_no_collected_item_waits_with_a_request_built(self, request) -> None:
+        """The hook is wired: only the running test holds a request.
+
+        pytest itself sets ``_request = False`` after each test, so every OTHER item
+        in this worker, run or not, must hold none; one that does means collection
+        kept the copy.
+        """
+        holding = [
+            item.nodeid
+            for item in request.session.items
+            if item is not request.node and getattr(item, "_request", False)
+        ]
+
+        assert holding == []
+
+    def test_this_items_lookup_is_the_shared_one(self, request, root_conftest) -> None:
+        """End to end on the running item, which a pytest upgrade renaming a field would break.
+
+        Checked against the hook's own tables, so it holds however the run was selected.
+        """
+        info = request.node._fixtureinfo
+        lookup = info.name2fixturedefs
+        shared = root_conftest._SHARED_NAME2FIXTUREDEFS
+        tuples = root_conftest._SHARED_FIXTUREDEF_TUPLES
+
+        assert any(candidate is lookup for candidate in shared.values())
+        assert all(tuples.get((name, *map(id, defs))) is defs for name, defs in lookup.items())
+        closures = root_conftest._SHARED_NAMES_CLOSURES.values()
+        assert any(closure is request.node.fixturenames for closure in closures)
+
+
+class TestCollectionCostPerItem:
+    """Every xdist worker collects its whole share before it runs a test, so the cost of one
+    collected item is multiplied by every item and every worker.
+
+    Budgeted per item rather than in total, so adding tests never fails it; a change that
+    makes every item heavier does. Measured on the full Linux suite (283,605 items) at
+    ~11 KiB per item once fixture bookkeeping is shared, and ~19 KiB before. The fixed
+    part covers importing ``kiro_crew`` and the conftests, which a file shard pays too.
+    """
+
+    FIXED_MIB = 600
+    PER_ITEM_KIB = 16
+    MIN_ITEMS = 5_000
+
+    def test_collection_stays_inside_its_per_item_budget(self, root_conftest) -> None:
+        start = root_conftest._RSS_AT_CONFIGURE_KIB
+        peak = root_conftest._HWM_AT_COLLECTION_KIB
+        items = root_conftest._ITEMS_AT_COLLECTION
+        if start is None or peak is None:
+            pytest.skip("needs /proc/self/status")
+        if items < self.MIN_ITEMS:
+            pytest.skip(f"only {items} items collected; the budget is about large runs")
+
+        spent_kib = peak - start
+        budget_kib = self.FIXED_MIB * 1024 + self.PER_ITEM_KIB * items
+        assert spent_kib <= budget_kib, (
+            f"collecting {items} items took {spent_kib / 1024:.0f} MiB, over the "
+            f"{budget_kib / 1024:.0f} MiB budget ({self.FIXED_MIB} MiB + "
+            f"{self.PER_ITEM_KIB} KiB per item). Look for a new autouse fixture, a "
+            "module-level payload, or lost fixture sharing (testing-conventions.md, "
+            "Running on a machine with little RAM)."
+        )
+
+    def test_items_are_counted_as_collected_not_as_selected(
+        self, root_conftest, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``-k``/``-m`` drop items after collection, but VmHWM already paid for them.
+
+        A count taken from ``session.items`` would shrink the budget under ``-k`` and fail
+        a healthy run, so each collected item counts once, in ``pytest_itemcollected``.
+        """
+        monkeypatch.setattr(root_conftest, "_ITEMS_AT_COLLECTION", 0)
+        monkeypatch.setattr(root_conftest, "compact_collected_item", lambda _item: None)
+
+        for _ in range(3):
+            root_conftest.pytest_itemcollected(object())
+
+        assert root_conftest._ITEMS_AT_COLLECTION == 3
+
+    def test_the_hooks_recorded_what_the_budget_reads(self, root_conftest, request) -> None:
+        if root_conftest._RSS_AT_CONFIGURE_KIB is None:
+            pytest.skip("needs /proc/self/status")
+        assert root_conftest._HWM_AT_COLLECTION_KIB >= root_conftest._RSS_AT_CONFIGURE_KIB
+        # Counted before ``-k``/``-m`` deselection: every collected item is either still
+        # selected or was deselected. A count overwritten from ``session.items`` after
+        # deselection fails here under any ``-k``.
+        selected = len(request.session.items)
+        assert selected > 0
+        assert root_conftest._ITEMS_AT_COLLECTION == (
+            selected + root_conftest._DESELECTED_AT_COLLECTION
+        )

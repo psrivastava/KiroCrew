@@ -54,6 +54,20 @@ the `internal-content-scan` check.
 > `blocking: true` rule there outranks a reviewer's own prompt. Read it before
 > changing frontend code; never treat it as historical.
 
+## No built-in app pages
+
+Kiro Crew accepts no new built-in app, so the frontend gets no new per-app code:
+never add a per-app directory under `src/apps/<app>/`, a per-app entry in
+`src/apps/builtinRegistry.ts`, `overlayRegistry.ts` or `builtinIcons.tsx`, a
+per-app asset directory under `public/app-assets/`, or an `app.json` outside a
+test fixture. A new app's UI, first-party included, is its own ESM bundle
+(`ui.entry`) shipped from a dedicated GitHub repository listed in the official
+registry (`kirodotdev/KiroCrewApps`). The built-in pages
+that still ship belong to apps being moved out; fixing one in place until it
+leaves is fine. A host surface an app cannot reach is an App Kit seam gap: fix the
+seam. Rule: `no-new-builtin-apps` in `../AUTOSDE.yaml`; the backend half:
+[`../AGENTS.md` § No built-in apps](../AGENTS.md#no-built-in-apps).
+
 ## Rules that must not wait for a pointer
 
 - **Settings primitives: pass `configKey` on every new `SettingsToggle`/`SettingsField`**
@@ -64,6 +78,7 @@ the `internal-content-scan` check.
   inline with text.** Never use an emoji or hand-rolled SVG as an icon. Size props
   are valid for standalone glyphs. Enforced by `AUTOSDE.yaml`
   (`use-lucide-icons`, `no-emoji-as-icons`).
+  Scope: [the 2026-11-18 emoji decision](../docs/decisions/2026-11-18-emoji-are-replaced-only-in-the-web-ui.md).
 - **Errors shown to the user render through `ErrorNotice`**, never a hand-written
   `<div className="text-danger">{err}</div>`. Turn on `askAgent` wherever the
   hand-off cannot lose anything. Next to an unsaved draft, leave it off and name

@@ -56,6 +56,25 @@ class TestApiChatModePropagation:
         state.sessions.set_approval_policy.assert_called_with("dashboard:s1", "")
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["trust_reads", "trust"])
+    async def test_a_slot_pick_ends_gateway_approval_yolo(self, tmp_path, monkeypatch, mode):
+        """Narrowing one slot ends ``gateway --approval yolo``'s grant, as it ends a declared one."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        from kiro_crew.safety_override import safety_override
+
+        monkeypatch.setattr("kiro_crew.safety_override.sel", MagicMock())
+        safety_override().activate_declared("cli")
+        state = _make_state(tmp_path)
+        state.push_slots_update = MagicMock()
+        state.get_or_create_slot("s1")
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post("/api/chat/mode", json={"mode": mode, "slot": "s1"})
+            assert (await resp.json())["ok"] is True
+
+        assert safety_override().is_active() is False
+
+    @pytest.mark.asyncio
     async def test_trust_mode_scoped_to_slot_channel(self, tmp_path, monkeypatch):
         """Trust with slot_key only trusts that slot's linked channel."""
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
@@ -434,7 +453,8 @@ class TestApiChatModeGlobalOverrideScope:
         async with TestClient(TestServer(_make_app(state))) as client:
             resp = await client.post("/api/chat/mode", json={"mode": {}, "slot": "s1"})
 
-        assert resp.status == 200  # falls through to the normal branch, as before
+        # Not a mode id Crew knows, so it is refused as bad input (RFC LTS D9).
+        assert resp.status == 400
 
 
 class TestApproveYoloPropagation:
@@ -460,6 +480,92 @@ class TestApproveYoloPropagation:
         keys = [c.args[0] for c in calls]
         assert "dashboard:s1" in keys
         assert "dashboard:s2" in keys
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("settled", [False, True], ids=["missing", "settled"])
+    async def test_yolo_on_a_stale_card_leaves_yolo_off(self, tmp_path, monkeypatch, settled):
+        """The 404 a stale card gets is unchanged, and global auto-approval stays off."""
+        from kiro_crew.safety_override import safety_override
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        state.push_slots_update = MagicMock()
+        s1 = state.get_or_create_slot("s1")
+        state.get_or_create_slot("s2")
+        if settled:
+            fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+            fut.set_result("rejected")
+            s1._approval_futures["gone"] = fut
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots/s1/approve", json={"action": "yolo", "request_id": "gone"}
+            )
+            assert resp.status == 404
+
+        assert safety_override().is_active() is False
+        state.sessions.set_approval_policy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_yolo_on_a_stale_card_under_a_yolo_ban_keeps_main_audit(
+        self, tmp_path, monkeypatch
+    ):
+        """A policy that forbids YOLO answers a stale press with main's 403 and both
+        of main's audit entries: the override's own refusal and the route's denial."""
+        from kiro_crew.dashboard import chat_handlers
+        from kiro_crew.safety_override import safety_override
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        monkeypatch.setattr(chat_handlers, "yolo_policy_permits", lambda: False)
+        refusals: list[tuple] = []
+        override = safety_override()
+        monkeypatch.setattr(
+            override,
+            "_log_policy_refusal",
+            lambda source, *, scope: refusals.append((source, scope)),
+        )
+        denials: list[dict] = []
+        real_deny = chat_handlers._deny_approval_mode
+
+        def _spy_deny(**kwargs):
+            denials.append(kwargs)
+            return real_deny(**kwargs)
+
+        monkeypatch.setattr(chat_handlers, "_deny_approval_mode", _spy_deny)
+        state = _make_state(tmp_path)
+        state.push_slots_update = MagicMock()
+        state.get_or_create_slot("s1")
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots/s1/approve", json={"action": "yolo", "request_id": "gone"}
+            )
+            assert resp.status == 403
+
+        assert refusals == [("dashboard", "")]
+        assert [d["operation"] for d in denials] == ["tool_approval:yolo"]
+        assert override.is_active() is False
+        state.sessions.set_approval_policy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_yolo_on_a_live_card_still_turns_yolo_on(self, tmp_path, monkeypatch):
+        from kiro_crew.safety_override import safety_override
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        state.push_slots_update = MagicMock()
+        s1 = state.get_or_create_slot("s1")
+        fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        s1._approval_futures["live"] = fut
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots/s1/approve", json={"action": "yolo", "request_id": "live"}
+            )
+            assert resp.status == 200
+
+        assert safety_override().is_active() is True
+        assert fut.result() == "approved"
 
     @pytest.mark.asyncio
     async def test_trust_approve_propagates_to_slot(self, tmp_path, monkeypatch):
@@ -527,11 +633,8 @@ class TestBulkApproveBroadcast:
     async def test_slot_scoped_trust_leaves_other_slots_pending(self, tmp_path, monkeypatch):
         """A slot-scoped ``trust`` must NOT sweep other slots' pending approvals.
 
-        Regression: bulk auto-approve iterated EVERY slot regardless of scope, so
-        trusting one chat resolved the pending approval card in unrelated chats
-        (making them LOOK approved) while their ``_trust`` flag stayed False — so
-        their next tool call prompted again. Scope the sweep to the target
-        session; other slots keep their pending future AND their untrusted state.
+        Sweeping every slot would make other chats look approved while their ``_trust``
+        stays False. Other slots keep their pending future and their untrusted state.
         """
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         monkeypatch.setattr("kiro_crew.dashboard.chat.sel", lambda: MagicMock())

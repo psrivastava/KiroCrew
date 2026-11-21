@@ -75,6 +75,7 @@ about the same cell.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import logging
 import queue
 import sys
@@ -117,6 +118,9 @@ _WAKE_TYPES: Final[frozenset[str]] = frozenset(
         "dashboard/goal_recorded",
         "dashboard/waiting_changed",
         "dashboard/custom_value",
+        "dashboard/custom_failed",
+        # The ``objects`` fold: what gateway code last read about an outside object.
+        "object/observed",
         # The ``workers`` fold: a crewmate's creates, and each worker's own turns,
         # replies and end, which it reads from the worker's log and routes to the
         # crewmate's cell (:func:`_creator_slot`).
@@ -738,14 +742,17 @@ def _fold_batch(
             key = (creator, _WORKERS_FOLD)
             work[key] = max(work.get(key, 0), seq)
     for slot in closed_slots:
-        # The savepoint story for a slot fold is the memo, so dropping it costs the next
-        # read one cold fold of a unit that has stopped growing -- and holds nothing for
-        # a session that will never append again.
+        # The memo holds nothing for a session that will never append again, so it is
+        # dropped -- after its savepoint is brought up to the closer, so the next read
+        # resumes from disk instead of folding every unit cold.
         #
         # NAMED, one fold at a time. A bare ``slot=`` matches every ``(home, slot, *)``
         # memo, and a ``session/closed`` is not always the end of a board: a slot reset,
         # or one worker unit of a LIVE crew, would take that crew's other cells with it.
         for eager_name in projection.EAGER_SLOT_FOLD_NAMES:
+            # Sealed first: the savepoint written here is what the next read resumes
+            # from, so the drop costs a tail read rather than a cold fold.
+            projection.seal_slot_fold(slot, eager_name)
             projection.forget_slot_folds(slot=slot, name=eager_name)
         # The memo cell is gone, so the next value is a rebuild: publish it as
         # ``snapshot_needed`` rather than a delta against a board nobody will extend.
@@ -769,6 +776,9 @@ def _fold_batch(
     for unit_id, seq in newest.items():
         _advance_session(unit_id)
         if closed.get(unit_id, 0) >= seq > 0:
+            # Sealed first, as the slot cells above are: the unit will not append
+            # again, so its savepoint is brought to the closer before the cell goes.
+            projection.seal_session_folds(unit_id)
             projection.forget_session_folds(unit_id)
 
 
@@ -955,7 +965,7 @@ def _publish_fold(slot: str, name: str, folded: Any) -> None:
         if not bus.delta_wanted(slot):
             # No open tab that applies deltas watches this board, so nothing reads a
             # delta the carried value does not already replace. Hold no base (a whole
-            # board render) and publish the plain value, exactly as before deltas.
+            # board render) and publish the plain value.
             # When a watcher arrives, the first publish has no base and is
             # ``snapshot_needed``, which is what that tab starts from anyway.
             _published.pop((slot, name), None)
@@ -1152,14 +1162,16 @@ def _slot_of(unit_id: str) -> str:
 def drain(timeout: float = 5.0) -> bool:
     """Wait until every wake queued so far has been FOLDED. ``True`` when it has.
 
-    Two callers. A test that has just committed an entry and needs the fold to have
-    happened before it reads. And the shutdown barrier (``emit.drain_for_shutdown``),
-    which waits here so nothing is still folding into the data home once it returns. No
-    READ waits for this -- an eager fold is currency, and a reader that arrives first is
-    served by the lazy path. The wait
-    is on the counters rather than on the queue being empty: an empty queue means the
-    worker has TAKEN the last wake, which is not the same as having folded it, and a
-    waiter that stopped there would read a value the fold had not reached yet.
+    Three callers. A test that has just committed an entry and needs the fold to have
+    happened before it reads. The shutdown barrier (``emit.drain_for_shutdown``), which
+    waits here so nothing is still folding into the data home once it returns. And the
+    history-delete funnel, which waits here so the seal a ``session/closed`` woke has let
+    go of the unit's lease before the removal claims it sole. No READ waits for this --
+    an eager fold is currency, and a reader that arrives first is served by the lazy
+    path. The wait is on the counters rather than on the queue being empty: an empty
+    queue means the worker has TAKEN the last wake, which is not the same as having
+    folded it, and a waiter that stopped there would read a value the fold had not
+    reached yet.
     """
     deadline = time.monotonic() + max(timeout, 0.0)
     if _queue is not None:
@@ -1171,8 +1183,11 @@ def drain(timeout: float = 5.0) -> bool:
                 _progress.wait(min(remaining, _POLL_SECONDS))
     # A wake whose cell was cold handed its fold to a background prime, which also writes
     # into the data home: the barrier covers it too. Looked up rather than imported, so a
-    # process that never primed loads nothing here.
-    primes = sys.modules.get("kiro_crew.crew_log.slot_prime")
+    # process that never primed loads nothing here. Through ``import_module`` once it is
+    # listed: the worker that loads it may still be running its body, and only the import
+    # machinery waits for that.
+    name = "kiro_crew.crew_log.slot_prime"
+    primes = importlib.import_module(name) if name in sys.modules else None
     if primes is not None:
         return bool(primes.drain(max(deadline - time.monotonic(), 0.0)))
     return True

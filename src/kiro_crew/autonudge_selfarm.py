@@ -47,8 +47,10 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from kiro_crew import platform_compat
-from kiro_crew.atomic_write import atomic_write
+from kiro_crew.atomic_write import atomic_write, replace_with_retry
 from kiro_crew.config.paths import data_home
+from kiro_crew.owner_only_files import owner_only_opener
+from kiro_crew.sqlite_quarantine import reserve_quarantine_name
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +75,7 @@ def _record_lock() -> Iterator[None]:
     path = self_arm_record_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.parent / _LOCK_NAME
-    with open(lock_path, "a+", encoding="utf-8") as fh:
+    with open(lock_path, "a+", encoding="utf-8", opener=owner_only_opener) as fh:
         with platform_compat.file_lock(fh.fileno(), exclusive=True):
             yield
 
@@ -83,23 +85,51 @@ def self_arm_record_path() -> Path:
     return data_home() / "trust" / SELF_ARM_RECORD_NAME
 
 
-def _read_record() -> dict[str, dict[str, Any]]:
-    """Return the record's entries, or ``{}`` for absent/unreadable/malformed."""
+def _read_record(*, set_aside_damaged: bool = False) -> dict[str, dict[str, Any]]:
+    """Return the record's entries, or ``{}`` for absent/unreadable/malformed.
+
+    With *set_aside_damaged*, as :func:`record_self_arm` reads before its rewrite,
+    a record that opens but is cut off or has the wrong shape is first moved to a
+    ``.corrupt-<utc>`` file, so its bytes are kept and one damaged file does not
+    stop every later self-arm. A record that cannot be opened (a transient EACCES
+    or EIO) still reads as empty, and a set-aside that fails is logged, so neither
+    refuses an arm.
+    """
+    path = self_arm_record_path()
     try:
-        raw = json.loads(self_arm_record_path().read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return {}
-    except (OSError, ValueError):
+    except (OSError, ValueError) as exc:
         logger.warning("autonudge self-arm record unreadable; treating as empty", exc_info=True)
-        return {}
+        if isinstance(exc, OSError):
+            # There are no bytes to keep from a record that could not be opened.
+            return {}
+        raw = None
     entries = raw.get("loops") if isinstance(raw, dict) else None
     if not isinstance(entries, dict):
+        if set_aside_damaged:
+            _set_aside_damaged(path)
         return {}
     return {
         str(loop_id): entry
         for loop_id, entry in entries.items()
         if isinstance(entry, dict) and isinstance(entry.get("slot_key"), str)
     }
+
+
+def _set_aside_damaged(path: Path) -> None:
+    """Move a damaged record to a reserved ``.corrupt-<utc>`` name; a failure is logged."""
+    logger.warning("autonudge self-arm record is damaged; setting it aside")
+    target: Path | None = None
+    try:
+        target = reserve_quarantine_name(path)
+        replace_with_retry(path, target)
+    except OSError:
+        if target is not None:
+            with contextlib.suppress(OSError):
+                target.unlink(missing_ok=True)
+        logger.warning("autonudge self-arm record could not be set aside", exc_info=True)
 
 
 def _write_record(entries: dict[str, dict[str, Any]]) -> None:
@@ -119,7 +149,7 @@ def _write_record(entries: dict[str, dict[str, Any]]) -> None:
     )
 
 
-def record_self_arm(loop_id: str, slot_key: str) -> None:
+def record_self_arm(loop_id: str, slot_key: str, *, default_patrol: bool = False) -> None:
     """Record that *loop_id* on *slot_key* was armed by that session's own turn.
 
     A pure UPSERT of one entry: every other entry is preserved verbatim. The
@@ -136,10 +166,19 @@ def record_self_arm(loop_id: str, slot_key: str) -> None:
     failed write: the caller (the authorizer) treats that as fail-closed -- a
     self-armed loop that cannot be recorded would never be allowed to fire, so
     it must not be reported as armed.
+
+    *default_patrol* records the gateway's fixed default patrol on a crewmate's
+    own thread (``autonudge_authz.admits_member_default_patrol``) instead of a
+    genuine self-arm. Such an entry never answers :func:`is_recorded_self_arm`;
+    only :func:`is_recorded_default_patrol` reads it, and the fire-time guard then
+    also checks that the stored loop still carries the fixed patrol.
     """
+    entry: dict[str, Any] = {"slot_key": str(slot_key), "armed_ts": time.time()}
+    if default_patrol:
+        entry["default_patrol"] = True
     with _record_lock():
-        entries = _read_record()
-        entries[str(loop_id)] = {"slot_key": str(slot_key), "armed_ts": time.time()}
+        entries = _read_record(set_aside_damaged=True)
+        entries[str(loop_id)] = entry
         _write_record(entries)
 
 
@@ -161,6 +200,27 @@ def is_recorded_self_arm(loop_id: str, slot_key: str) -> bool:
     Total: any failure to read is ``False`` (refuse). Both the id AND the slot
     must match, so a forged loop that reuses a recorded id on a different slot
     does not inherit the authorization.
+
+    A default-patrol grant (:func:`record_self_arm` with ``default_patrol``) is
+    not a self-arm and answers False here, so it vouches for nothing a self-arm
+    does beyond the patrol's own wake.
     """
     entry = _read_record().get(str(loop_id))
-    return entry is not None and entry.get("slot_key") == str(slot_key)
+    return (
+        entry is not None
+        and entry.get("slot_key") == str(slot_key)
+        and entry.get("default_patrol") is not True
+    )
+
+
+def is_recorded_default_patrol(loop_id: str, slot_key: str) -> bool:
+    """Whether the trust record holds a default-patrol grant for *loop_id* on *slot_key*.
+
+    Total like :func:`is_recorded_self_arm`: any failure to read is False.
+    """
+    entry = _read_record().get(str(loop_id))
+    return (
+        entry is not None
+        and entry.get("slot_key") == str(slot_key)
+        and entry.get("default_patrol") is True
+    )

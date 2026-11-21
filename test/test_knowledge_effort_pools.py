@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -11,8 +12,11 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.dashboard.handlers import knowledge as kh
+from kiro_crew.knowledge.llm_pool import LLMPool
 from kiro_crew.knowledge.store import KnowledgeStore
 from kiro_crew.testing.wait import await_until
+
+_HANDLER_LOGGER = "kiro_crew.dashboard.handlers.knowledge"
 
 
 @pytest.fixture(autouse=True)
@@ -35,8 +39,10 @@ class _FakePool:
         effort_key: str | None = None,
         fallback_effort: str = "",
         config_pool_size_key: str | None = None,
+        sessions=None,
     ) -> None:
         self.pool_size = pool_size
+        self.sessions = sessions
         self.effort = effort
         self.effort_key = effort_key
         self.fallback_effort = fallback_effort
@@ -93,7 +99,8 @@ class TestKnowledgePoolSetup:
         expected_extraction,
     ):
         app = web.Application()
-        app["state"] = SimpleNamespace(knowledge_store=object())
+        session_manager = object()
+        app["state"] = SimpleNamespace(knowledge_store=object(), sessions=session_manager)
         pools: list[_FakePool] = []
         extractor_calls: list[dict[str, object]] = []
         extractor = object()
@@ -134,6 +141,8 @@ class TestKnowledgePoolSetup:
         assert extraction.effort_key == "extraction_effort"
         assert extraction.fallback_effort == "high"
         assert extraction.config_pool_size_key == "extraction_pool_size"
+        # The pool reaches the gateway's session manager, so KAS can run extraction.
+        assert extraction.sessions() is session_manager
         assert extractor_calls[0]["pool"] is extraction
         assert app["knowledge_extraction_pool"] is extraction
         assert "knowledge_fetch_pool" not in app
@@ -198,24 +207,30 @@ class TestUrlSyncNeedsNoPool:
 class TestKnowledgePoolCleanup:
     @pytest.mark.asyncio
     async def test_shuts_down_the_extraction_pool(self):
-        extraction = _FakePool(pool_size=3)
+        extraction = LLMPool(pool_size=1)
+        # Started with no worker spawned: shutdown has only the state to clear.
+        extraction._started = True
         app = web.Application()
         app["knowledge_extraction_pool"] = extraction
 
         await kh._shutdown_knowledge_pools(app)
 
-        extraction.shutdown.assert_awaited_once()
+        assert extraction._started is False
 
     @pytest.mark.asyncio
-    async def test_a_failing_shutdown_is_logged_not_raised(self):
+    async def test_a_failing_shutdown_is_logged_not_raised(self, caplog):
         extraction = _FakePool(pool_size=3)
         extraction.shutdown.side_effect = RuntimeError("worker hung")
         app = web.Application()
         app["knowledge_extraction_pool"] = extraction
 
-        await kh._shutdown_knowledge_pools(app)
+        with caplog.at_level(logging.ERROR, logger=_HANDLER_LOGGER):
+            await kh._shutdown_knowledge_pools(app)
 
         assert extraction.shutdown.await_count == 1
+        assert [r.getMessage() for r in caplog.records if r.name == _HANDLER_LOGGER] == [
+            "Knowledge pool shutdown failed: knowledge_extraction_pool"
+        ]
 
     @pytest.mark.asyncio
     async def test_no_pool_is_a_no_op(self):

@@ -1,11 +1,9 @@
 """Tests for sub-agent cap sizing (``subagent.compute/resolve_max_subagents``)
 and the memory-sized TaskRunner figure (``compute_memory_sized_parallel_cap``).
 
-The subagent auto cap is ``agent.subagent_auto_max`` as written -- memory bounds
-each start through the spawn floor, not the count -- so the memory arithmetic and
-its worked examples now pin the TaskRunner's auto parallel-step figure, whose
-steps no per-start floor prices. Costs are fallback costs; effective memory is
-fed directly via the patched ``_available_memory_gb``.
+The subagent auto cap is ``agent.subagent_auto_max`` as written (memory bounds each start
+through the spawn floor), so the memory arithmetic pins the TaskRunner's figure. Memory is
+fed via the patched ``_available_memory_gb``.
 """
 
 from __future__ import annotations
@@ -84,7 +82,7 @@ def patch_host(monkeypatch):
     return _apply
 
 
-# --- memory is the only host term ------------------------------------------
+# memory is the only host term
 
 
 class TestTheSubagentAutoCapIsACountCeiling:
@@ -141,11 +139,8 @@ class TestTheSubagentAutoCapIsACountCeiling:
 class TestMemoryIsTheOnlyHostTerm:
     """``compute_memory_sized_parallel_cap`` sizes from memory alone.
 
-    Over-committing memory ends in the OOM killer, an unrecoverable hard
-    failure, so it is sized up front. Over-committing CPU only slows work down,
-    and the adaptive controller already backs off on the pressure that slowness
-    produces; a static CPU term stacked on that loop priced every slot at the
-    busiest agent's one-minute burst and pinned a 32-core host at 4.
+    Over-committing memory ends in the OOM killer; over-committing CPU only slows work, and
+    the adaptive controller backs off on that. A static CPU term pinned a 32-core host at 4.
     """
 
     def test_cpu_count_and_cpu_cost_do_not_bind(self, patch_host) -> None:
@@ -250,7 +245,7 @@ def test_memory_sized_parallel_cap(patch_host, avail_gb, cpu_count, cfg_kwargs, 
     assert compute_memory_sized_parallel_cap(_cfg(**cfg_kwargs)) == expected
 
 
-# --- Edge cases ------------------------------------------------------------
+# Edge cases
 
 
 def test_pool_reservation_reduces_memory_budget(patch_host) -> None:
@@ -273,7 +268,7 @@ def test_unreadable_memory_fails_open_to_legacy_default(patch_host) -> None:
     assert compute_memory_sized_parallel_cap(cfg) == 3
 
 
-# --- Sentinel routing ------------------------------------------------------
+# Sentinel routing
 
 
 def test_resolve_explicit_value_bypasses_compute(patch_host) -> None:
@@ -299,7 +294,7 @@ def test_resolve_floors_explicit_pin_below_three(patch_host) -> None:
     assert resolve_max_subagents(_cfg(max_subagents=5, hard_cap=16)) == 5
 
 
-# --- Gateway wiring contract (Stage 3) -------------------------------------
+# Gateway wiring contract (Stage 3)
 
 
 def test_manager_reports_resolved_cap_for_auto_sentinel(patch_host) -> None:
@@ -339,9 +334,7 @@ def test_manager_effective_cap_sits_under_the_resolved_ceiling(patch_host) -> No
     assert mgr.set_effective_cap(None) == 16
 
 
-# ---------------------------------------------------------------------------
 # Unified spawn staggering (Stage 4, dynamic-subagent-sizing.md §5.3)
-# ---------------------------------------------------------------------------
 
 
 def _mgr(*, running: int, max_concurrent: int, last_ts: float, stagger: float = 2.0):
@@ -379,11 +372,8 @@ class _PinnedClock:
 def _pin_pump_clock(monkeypatch, now: float) -> None:
     """Freeze the clock the spawn gate and the drain pump read at ``now``.
 
-    Both read ``time.monotonic()`` through ``kiro_crew.subagent``'s globals (the
-    admission ``*_impl`` functions are rebound onto that namespace), so swapping
-    that one ``time`` name pins them. The process-wide module stays untouched:
-    ``asyncio.run()`` keeps reading it for its own scheduling, and ``_mgr()`` may
-    take seconds of real I/O on a loaded runner without moving this clock.
+    Both read ``time.monotonic()`` through ``kiro_crew.subagent``'s globals, so only that
+    ``time`` name is swapped; the real module stays for ``asyncio.run()``'s own scheduling.
     """
     monkeypatch.setattr(subagent, "time", _PinnedClock(now))
 
@@ -527,9 +517,7 @@ class TestDrainPump:
         asyncio.run(run())
 
 
-# ---------------------------------------------------------------------------
 # Learned-cost sampling (Stage 6, dynamic-subagent-sizing.md §4.1)
-# ---------------------------------------------------------------------------
 
 
 class TestQueuedDepthEmission:
@@ -771,14 +759,9 @@ class TestQueuedReasonOnTheEvent:
 class TestQueuedIdentityRoundTrip:
     """A queued member must START under the id its caller was handed.
 
-    Without this, spawn() returns a throwaway ``q<n>`` sentinel for any
-    spawn that hits the stagger/concurrency gate, and _drain_queue mints a FRESH
-    uuid when it actually starts the agent. With the default 2s stagger that is
-    every wave member after the first, so ``spawn_run``'s printed wave roster
-    listed one real id plus N placeholders no agent ever had — the inline
-    SubagentRunCard, which resolves a wave by matching those ids against live
-    per-agent events, could never observe more than one member and reported
-    "1 agent running" for a 2-agent wave the sidebar counted correctly.
+    With the default 2s stagger every wave member after the first is queued. A fresh id at
+    drain time would leave ``spawn_run``'s roster naming ids no agent has, so the inline
+    SubagentRunCard would see only one member.
     """
 
     def test_drained_spawn_reuses_the_announced_id(self, monkeypatch) -> None:
@@ -834,14 +817,10 @@ class TestQueuedIdentityRoundTrip:
         assert m._queue[0]["_preassigned_id"] == first.id
 
     def test_rejection_on_drain_uses_the_announced_id(self, monkeypatch) -> None:
-        """A member REJECTED when its queued spawn drains is announced under the
-        id its caller was handed, not a fresh one.
+        """A member rejected when its queued spawn drains is announced under its handed id.
 
-        The guards that refuse a spawn (empty task, low memory, bad cwd,
-        governance, bad agent name) re-run on the drain pass, so a spawn accepted
-        at queue time can still be refused when it starts. Minting a fresh uuid
-        there would announce the failure under an id the caller never saw — the
-        same identity break this class of bug is about, just on the error path.
+        The spawn guards (empty task, low memory, bad cwd, governance, bad agent name) re-run
+        at drain time, so a queued spawn can still be refused.
         """
         import time as _t
 
@@ -1006,11 +985,9 @@ class TestSampleLiveCosts:
         assert a.peak_rss_gb == pytest.approx(3.0, abs=0.01)
 
 
-# ---------------------------------------------------------------------------
 # Settled-runtime reading: what a dedicated runtime holds once it is up, which
 # the admission gate's dedicated start projection learns from; the cap divisor
 # is unchanged.
-# ---------------------------------------------------------------------------
 
 
 class TestSettledRuntimeReading:
@@ -1319,9 +1296,7 @@ class TestSettledRuntimeReading:
         assert m._learned_settled_gb == {}, "a failed read keeps nothing past the horizon"
 
 
-# ---------------------------------------------------------------------------
 # Container / cgroup hardening (Stage 8, dynamic-subagent-sizing.md §9)
-# ---------------------------------------------------------------------------
 
 
 class TestReadIntFile:
@@ -1435,6 +1410,35 @@ class TestCgroupAvailable:
         )
         # 8 - (7 - (3 + 2 - 1))
         assert sub._cgroup_available_gb() == pytest.approx(5.0, abs=0.01)
+
+    def test_reading_pairs_the_limit_with_the_headroom_admission_uses(self, monkeypatch) -> None:
+        """The dashboard's total and free figure come from the walk admission sizes on."""
+        import kiro_crew.subagent as sub
+
+        gib = 1024**3
+        vals = {
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes": 8 * gib,
+            "/sys/fs/cgroup/memory/memory.usage_in_bytes": 3 * gib,
+        }
+        monkeypatch.setattr(sub, "_read_int_file", lambda p: vals.get(p))
+        limit, headroom = sub._container_cgroup_reading()
+        assert limit == 8 * gib
+        assert headroom == pytest.approx(5.0, abs=0.01)
+        assert headroom == sub._container_cgroup_available_gb()
+
+    def test_reading_keeps_a_limit_whose_usage_is_unreadable(self, monkeypatch) -> None:
+        import kiro_crew.subagent as sub
+
+        vals = {"/sys/fs/cgroup/memory/memory.limit_in_bytes": 8 * 1024**3}
+        monkeypatch.setattr(sub, "_read_int_file", lambda p: vals.get(p))
+        assert sub._container_cgroup_reading() == (8 * 1024**3, 0.0)
+        assert sub._container_cgroup_reading(measured_only=True) == (8 * 1024**3, -1.0)
+
+    def test_reading_without_a_finite_limit_is_empty(self, monkeypatch) -> None:
+        import kiro_crew.subagent as sub
+
+        monkeypatch.setattr(sub, "_read_int_file", lambda p: None)
+        assert sub._container_cgroup_reading() == (None, -1.0)
 
     @pytest.mark.parametrize("used_gb", [2, 3])
     def test_nested_exhaustion_blocks_admission(self, monkeypatch, cgroup_files, used_gb):
@@ -1649,7 +1653,7 @@ class TestAvailableMemoryClamp:
         # mem_term = floor(4*0.8/0.315)=10 ; cpu_term=48 → min 10, clamp(10,3,16)=10
         assert compute_memory_sized_parallel_cap(cfg) == 10
 
-    # --- platform dispatch -------------------------------------------------
+    # platform dispatch
 
     def test_macos_branch_uses_macos_probe(self, monkeypatch) -> None:
         """On macOS, dispatch delegates to the vm_stat probe (not /proc)."""
@@ -1680,9 +1684,7 @@ class TestAvailableMemoryClamp:
         assert sub._available_memory_gb() == -1.0
 
 
-# ---------------------------------------------------------------------------
 # Queued-spawn parameter preservation + reap-drains-queue (round-2 bugfix)
-# ---------------------------------------------------------------------------
 
 
 class TestMacosMemoryProbe:
@@ -1701,6 +1703,7 @@ class TestMacosMemoryProbe:
             sub.os,
             "sysconf",
             lambda n: 16384 if n == "SC_PAGE_SIZE" else real_sysconf(n),  # 16 KiB pages
+            raising=False,
         )
         monkeypatch.setattr(sub, "_macos_vm_reclaimable_pages", lambda: 200000)
         expected = round(200000 * 16384 / (1024**3), 2)
@@ -1718,7 +1721,10 @@ class TestMacosMemoryProbe:
 
         real_sysconf = getattr(sub.os, "sysconf", absent_sysconf)
         monkeypatch.setattr(
-            sub.os, "sysconf", lambda n: 16384 if n == "SC_PAGE_SIZE" else real_sysconf(n)
+            sub.os,
+            "sysconf",
+            lambda n: 16384 if n == "SC_PAGE_SIZE" else real_sysconf(n),
+            raising=False,
         )
         monkeypatch.setattr(sub, "_macos_vm_reclaimable_pages", lambda: pages)
         assert sub._macos_available_memory_gb() == -1.0
@@ -1733,7 +1739,7 @@ class TestMacosMemoryProbe:
                 raise ValueError("SC_PAGE_SIZE unavailable")
             return real_sysconf(n)
 
-        monkeypatch.setattr(sub.os, "sysconf", _boom)
+        monkeypatch.setattr(sub.os, "sysconf", _boom, raising=False)
         assert sub._macos_available_memory_gb() == -1.0
 
     def test_nonpositive_page_size_fails_open(self, monkeypatch) -> None:
@@ -1741,7 +1747,10 @@ class TestMacosMemoryProbe:
 
         real_sysconf = getattr(sub.os, "sysconf", absent_sysconf)
         monkeypatch.setattr(
-            sub.os, "sysconf", lambda n: 0 if n == "SC_PAGE_SIZE" else real_sysconf(n)
+            sub.os,
+            "sysconf",
+            lambda n: 0 if n == "SC_PAGE_SIZE" else real_sysconf(n),
+            raising=False,
         )
         # _macos_vm_reclaimable_pages must not even be consulted
         monkeypatch.setattr(

@@ -32,14 +32,16 @@ from pathlib import Path
 from types import ModuleType as _ModuleType
 from typing import Any
 
-from kiro_crew import md_notebook_state as _md_notebook_state
 from kiro_crew import platform_compat
+from kiro_crew.apps import builtin_host_grants as _host_grants
 from kiro_crew.apps import deps_boot as _deps_boot_module
+from kiro_crew.apps import legacy_state_moves as _legacy_state_moves
 from kiro_crew.apps.execution import (
     app_execution_denied,
     is_builtin_app,
     shipped_builtin_module_path,
 )
+from kiro_crew.apps.gateway_origin import loopback_gateway_origin as _loopback_gateway_origin
 from kiro_crew.apps.interpreter import app_deps_dir, path_command_is_abi_matched, resolve_app_python
 from kiro_crew.apps.manager import app_dir, get_app_manifest
 from kiro_crew.apps.manifest import file_entry_point_refusal, is_module_style_entry_point
@@ -53,13 +55,17 @@ from kiro_crew.constants import (
 from kiro_crew.env import nvm_dirs as _nvm_dirs
 from kiro_crew.jsonl_util import rotate_jsonl_at as _rotate_jsonl_at
 from kiro_crew.owner_only_files import ensure_directory as _ensure_directory
-from kiro_crew.owner_only_files import owner_only_opener_for as _owner_only_opener_for
+from kiro_crew.owner_only_files import (
+    open_log_for_append_owner_only as _open_log_for_append_owner_only,
+)
 from kiro_crew.sandbox import (
     MD_NOTEBOOK_APP_NAME,
     RLIMIT_PROFILE_BUILD,
     RLIMIT_PROFILE_TOOL,
-    _md_notebook_degraded_mask_dirs,
+    app_backend_secret_mask_targets,
     app_backend_visible_targets,
+    app_declared_mask_targets,
+    app_declared_readonly_targets,
     carveout_shadowed_by_foreign_mask,
     cgroup_scope_argv,
     popen_limited,
@@ -79,11 +85,15 @@ if "_PART_MODULES" in globals():
         _importlib.reload(_sys.modules[_reloaded])
     del _reloaded
 
-from kiro_crew.apps.backend_runtime.pidfile import _proc_start_time, _record_app_pid  # noqa: E402
+from kiro_crew.apps.backend_runtime.pidfile import (  # noqa: E402
+    _proc_start_time,
+    _record_app_pid,
+)
 from kiro_crew.apps.backend_runtime.ports import (  # noqa: E402
     _MAX_PORT,
     _MIN_PORT,
     PortUnavailableError,
+    _adoption_allowed,
     _allocated_ports,
     _capture_adopted_owners,
     _claim_port,
@@ -97,7 +107,6 @@ from kiro_crew.apps.backend_runtime.provisioning import (  # noqa: E402
     provision_app_deps,
 )
 from kiro_crew.apps.backend_runtime.registration import _set_backend_health  # noqa: E402
-from kiro_crew.apps.backend_runtime.startup import DEV_FLEET_APP_NAME  # noqa: E402
 from kiro_crew.apps.backend_runtime.supervision import (  # noqa: E402
     _start_adopted_health_watch,
     _start_health_supervisor,
@@ -112,6 +121,7 @@ from kiro_crew.apps.backend_runtime.tracking import (  # noqa: E402
     _advance_lifecycle_locked,
     _await_inflight_spawn,
     _health_reconcile_lock,
+    _lifecycle_generation,
     _lock,
     _processes,
     _spawn_publication_owner,
@@ -123,12 +133,6 @@ logger = logging.getLogger(__name__)
 
 #: Said once per process: a centrally governed host with no OS confinement (see the spawn).
 _warned_unconfined_cache = False
-
-
-# Apps whose backends spawn real build workloads (vite/pip) and need the
-# elevated-but-finite NOFILE ceiling as the workload's ANCESTOR. Every other
-# app backend keeps the standard (operator-configurable) resource policy.
-_BUILD_CAPABLE_APPS = frozenset({"dev-fleet"})
 
 
 # backend.log durability bound. The log is opened in APPEND mode so a crash
@@ -263,6 +267,48 @@ def _is_shell_entry(entry: Path) -> bool:
     return first_line.startswith(b"#!") and b"python" not in first_line
 
 
+def _exec_backend_windows_refusal_text(app_name: str, entry_str: str) -> str:
+    """The one wording of the native-Windows exec backend refusal: the spawn body logs it
+    and :func:`exec_backend_platform_refusal` hands it to the enable and install routes."""
+    return (
+        f"App {app_name} declares an exec (shell launcher) backend ({entry_str}) which "
+        "is not supported on native Windows. Use a Python or Node entry point instead."
+    )
+
+
+def exec_backend_platform_refusal(app_name: str) -> str | None:
+    """Why *app_name*'s backend cannot start on this host, or None when nothing refuses it.
+
+    Answers only the native-Windows exec (shell launcher) refusal in
+    :func:`_start_app_backend_body`, with the same branch order: a module-style entry
+    point and a Node entry are never exec backends. ``start_app_backend`` returns the
+    None that also means "no backend declared", so the enable, install and update routes
+    call this after a None to put the reason in their response. On POSIX it is always
+    None.
+    """
+    if platform_compat.IS_POSIX:
+        return None
+    manifest = get_app_manifest(app_name)
+    if not manifest or not manifest.backend.entryPoint:
+        return None
+    root = app_dir(app_name)
+    entry_point = manifest.backend.entryPoint
+    # The spawn's own file-entry screen runs before anything touches the path, so
+    # nothing below follows an entry the spawn refuses (an absolute or UNC path, a
+    # '..' escape, a link out of the root). A module-style entry names no file under
+    # the root, so the screen answers "not found" for it too: it is never exec.
+    if file_entry_point_refusal(entry_point, root):
+        return None
+    entry = root / entry_point
+    entry_str = str(entry)
+    backend_type = manifest.backend.type
+    if backend_type == "node" or (not backend_type and entry_str.endswith((".js", ".mjs", ".cjs"))):
+        return None
+    if backend_type == "exec" or (not backend_type and _is_shell_entry(entry)):
+        return _exec_backend_windows_refusal_text(app_name, entry_str)
+    return None
+
+
 def _shebang_argv(entry: Path) -> list[str]:
     """Interpreter argv from a script's shebang, or ``["/bin/sh"]`` fallback.
 
@@ -316,8 +362,14 @@ def start_app_backend(app_name: str) -> AppProcess | None:
     return _start_app_backend(app_name)
 
 
-def _start_app_backend(app_name: str) -> AppProcess | None:
-    """Single-flight spawn implementation without an external lifecycle transition."""
+def _start_app_backend(
+    app_name: str, *, _untracked_at: tuple[int, str] | None = None
+) -> AppProcess | None:
+    """Single-flight spawn implementation without an external lifecycle transition.
+
+    ``_untracked_at`` (the backstop's snapshot) spawns only while the app is still
+    untracked at that lifecycle generation, checked under the reservation's own lock.
+    """
     manifest = get_app_manifest(app_name)
     if not manifest or not manifest.backend.entryPoint:
         return None
@@ -325,6 +377,11 @@ def _start_app_backend(app_name: str) -> AppProcess | None:
     await_inflight = False
     spawn_placeholder: AppProcess | None = None
     with _lock:
+        if _untracked_at is not None and (
+            app_name in _processes
+            or _lifecycle_generation.get(app_name, (0, _LIFECYCLE_START)) != _untracked_at
+        ):
+            return None
         if app_name in _processes:
             existing = _processes[app_name]
             # Already running (spawned proc alive, OR an adopted external instance) — reuse.
@@ -548,13 +605,25 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
             healthy = _probe_adoption_health(port, manifest.backend.healthCheck)
 
             if healthy:
+                # With apps_never_adopt_backend_listener on, a listener this run did not
+                # start is never adopted.
+                allowed = _adoption_allowed()
                 try:
                     sel().log_api_access(
                         caller="gateway", operation="app_backend_adopt",
-                        outcome="adopted", resources=f"{app_name} port={port}",
+                        outcome="adopted" if allowed else "refused_not_spawned_this_run",
+                        resources=f"{app_name} port={port}",
                     )
                 except Exception as exc:
                     logger.debug("SEL audit failed for app %s backend adopt: %s", app_name, exc)
+                if not allowed:
+                    logger.warning(
+                        "App %s: not adopting the instance on port %d: "
+                        "apps_never_adopt_backend_listener is on, so a listener this run did "
+                        "not start is not adopted. Stop that process, or free the port.",
+                        app_name, port,
+                    )
+                    return None
                 # Record owning PIDs at adoption time, scoped to the listener
                 # the health probe actually reached. The probe above only ever
                 # talks to 127.0.0.1:<port>; loopback_owner_pids mirrors the
@@ -654,7 +723,7 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
     if os.environ.get("KIROCREW_PROJECT_DIR"):
         # Platform var (same class as KIROCREW_HOME): the resolved project
         # checkout. minimal_env() strips it; backends need it to locate the
-        # gateway's source checkout (e.g. dev-fleet worktree discovery).
+        # gateway's source checkout (e.g. to discover its worktrees).
         _platform_extra["KIROCREW_PROJECT_DIR"] = os.environ["KIROCREW_PROJECT_DIR"]
     if os.environ.get("KIROCREW_EDITION_DIR"):
         # Platform var, same class as the above: whether this gateway is an
@@ -669,15 +738,6 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
         # backend can detect an edition but never manufacture consent to compile
         # one.
         _platform_extra["KIROCREW_EDITION_DIR"] = os.environ["KIROCREW_EDITION_DIR"]
-    if os.environ.get("KIROCREW_DEVFLEET_REPO"):
-        # Operator-declared main-checkout override (same trust class as the
-        # KIROCREW_DEVFLEET_BIN_* overrides below). dev-fleet reads it as the
-        # highest-priority repo discovery hint, ahead of KIROCREW_PROJECT_DIR
-        # — which packaged installs point at the app bundle (no .git), leaving
-        # only the ~/kirocrew fallback. minimal_env() strips the var, so
-        # without this forward the documented override silently never reaches
-        # the backend and the fleet renders empty. A path, not a secret.
-        _platform_extra["KIROCREW_DEVFLEET_REPO"] = os.environ["KIROCREW_DEVFLEET_REPO"]
     if os.environ.get("KIROCREW_PROFILE"):
         # Forward the edition-profile override to the backend subprocess.
         # minimal_env() strips it otherwise, so a gateway launched with an
@@ -740,7 +800,7 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
     # start an app on a host that is running perfectly well.
     if central_ceiling_installed():
         _platform_extra[POLICY_CACHE_ONLY_ENV] = "1"
-        # An enterprise child adopts only the cache for the profile this gateway is
+        # An LTS child adopts only the cache for the profile this gateway is
         # pinned to; minimal_env() would otherwise drop the pin it inherits.
         from kiro_crew.platform.enterprise_policy_fetch import PROFILE_PIN_ENV
 
@@ -753,26 +813,15 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
         _max_age = effective_max_cache_age()
         if _max_age:
             _platform_extra[POLICY_MAX_AGE_ENV] = str(_max_age)
+    # Operator-declared variables a built-in app's host grants name (a repo override,
+    # trusted-binary overrides): minimal_env() would otherwise strip them. Forwarded
+    # to every backend, by exact name or by prefix; the seam admits only
+    # ``KIROCREW_*`` names, so it cannot forward an arbitrary host credential.
+    _grant_env_names = _host_grants.backend_env_names()
+    _grant_env_prefixes = _host_grants.backend_env_prefixes()
     for _k, _v in os.environ.items():
-        # Operator-declared trusted-binary overrides (unit-file owned):
-        # backends resolve credential-bearing tools through these instead of
-        # the inherited PATH; minimal_env() would otherwise strip them.
-        if _k.startswith("KIROCREW_DEVFLEET_BIN_"):
+        if (_k in _grant_env_names and _v) or (_grant_env_prefixes and _k.startswith(_grant_env_prefixes)):
             _platform_extra[_k] = _v
-    # The port the gateway ACTUALLY bound (``dashboard.server._export_bound_port``),
-    # handed to the ONE backend that calls back into the gateway: Dev Fleet reads
-    # live-target pointer state through an in-gateway route, because the pointer
-    # itself is masked from its namespace. Scoped by app name exactly as the
-    # ``KIROCREW_DEVFLEET_BIN_`` loop above is — no other backend has a consumer, and
-    # ``pod/runtime.py`` deliberately scrubs this variable from spawns that must not
-    # aim at the live gateway. Not a secret: it is the port every dashboard client
-    # already connects to, and the gateway's own auth governs what a caller may do
-    # there. Absent (a foreground gateway before its site is up, or a test) it is not
-    # passed and the backend degrades as documented.
-    if app_name == DEV_FLEET_APP_NAME:
-        _bound = os.environ.get("KIROCREW_BOUND_PORT", "")
-        if _bound.isdigit():
-            _platform_extra["KIROCREW_BOUND_PORT"] = _bound
     env = minimal_env(
         PORT=str(port),
         KIROCREW_APP_NAME=app_name,
@@ -808,32 +857,13 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
     # gateway or at a port nothing is listening on. Absent or invalid evidence
     # => omit the origin entirely, so a backend that needs a callback base fails
     # closed (dormant) rather than trusting a guessed address. Generic name
-    # only; no app-specific env is set here.
-    bound_port = os.environ.get("KIROCREW_BOUND_PORT", "").strip()
-    bound_host_env = os.environ.get("KIROCREW_BOUND_HOST", "").strip()
-    gateway_origin = ""
-    if (
-        bound_port.isdigit()
-        and 1 <= int(bound_port) <= 65535
-        and bound_host_env in ("", "::1")
-    ):
-        # Host evidence: absent means loopback (the default bind shapes —
-        # loopback itself, or a wildcard bind loopback reaches); "::1" is the
-        # v6-loopback family marker. Only these two shapes are injected: a
-        # backend's callback arrives with no Origin header, and the gateway's
-        # CSRF barrier (origin.check_origin) trusts an Origin-less mutating
-        # request ONLY from a loopback peer. A gateway bound to a SPECIFIC
-        # interface exports that address, but injecting it would mint an
-        # origin whose every mutating callback is refused at the barrier —
-        # a half-alive backend, worse than designed dormancy — so that shape
-        # is omitted (fail closed, warned below) until such a request path is
-        # admitted. IPv6 literals are bracketed per RFC 3986.
-        bound_host = bound_host_env or "127.0.0.1"
-        if ":" in bound_host and not bound_host.startswith("["):
-            bound_host = f"[{bound_host}]"
-        gateway_origin = f"http://{bound_host}:{int(bound_port)}"
+    # only; no app-specific env is set here. The host rules are
+    # ``gateway_origin.loopback_gateway_origin``'s, shared with ``AppContext``.
+    gateway_origin = _loopback_gateway_origin()
+    if gateway_origin:
         env["KIROCREW_GATEWAY_ORIGIN"] = gateway_origin
     else:
+        bound_host_env = os.environ.get("KIROCREW_BOUND_HOST", "").strip()
         # Dormancy is the DESIGNED outcome here, so the operator must be able
         # to see it: an app that declares notification channels but gets no
         # origin will silently never push. Warn for those; stay at debug for
@@ -858,6 +888,10 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
                 else ""
             ),
         )
+    # The npm install below runs third-party lifecycle scripts, so it takes the env as it
+    # is HERE: before the per-app proxy secret and its origin proof, which are meant for
+    # the backend process alone, are added.
+    install_env = dict(env)
     # Inject the per-app proxy secret so the backend can verify the
     # X-KiroCrew-Proxy HMAC the gateway signs on every forwarded request
     # (CWE-306). Without it the loopback backend would trust any local caller.
@@ -867,19 +901,23 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
     # an inherited or spoofed env value. The proof is injected ONLY when the
     # secret is readable AND the origin was injected above; a missing
     # .app_secret is tolerated as before and yields neither the secret nor the
-    # proof (a secret-less legacy backend gets the origin only).
-    try:
-        _proxy_secret = (root / ".app_secret").read_text().strip()
-        if _proxy_secret:
-            env["KIROCREW_PROXY_SECRET"] = _proxy_secret
-            if gateway_origin:
-                env["KIROCREW_GATEWAY_ORIGIN_PROOF"] = hmac.new(
-                    _proxy_secret.encode("utf-8"),
-                    gateway_origin.encode("utf-8"),
-                    hashlib.sha256,
-                ).hexdigest()
-    except OSError:
-        pass
+    # proof (a secret-less legacy backend gets the origin only). This env var is the
+    # backend's ONLY channel for its secret: the gateway keeps it where no sandbox,
+    # the backend's own included, can read it (``token_auth.read_app_secret``).
+    # circular import: token_auth -> app_secret_store -> manager -> backend
+    # An app an older version left a folder secret gets a new one here, the one place
+    # it is handed over (``token_auth.replace_legacy_app_secret``).
+    from kiro_crew.dashboard.token_auth import replace_legacy_app_secret
+
+    _proxy_secret = replace_legacy_app_secret(app_name)
+    if _proxy_secret:
+        env["KIROCREW_PROXY_SECRET"] = _proxy_secret
+        if gateway_origin:
+            env["KIROCREW_GATEWAY_ORIGIN_PROOF"] = hmac.new(
+                _proxy_secret.encode("utf-8"),
+                gateway_origin.encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
     # Expose the provisioned deps dir (pip --target, above) to the child.
     # PYTHONPATH rather than an interpreter switch: it is honored identically
     # by the app's own venv interpreter and the gateway fallback, on every
@@ -927,32 +965,52 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
         # Pass PORT as env var — Node.js apps typically read process.env.PORT
         env["NODE_ENV"] = "production"
 
-        # Install npm dependencies if package.json exists and node_modules is missing
-        pkg_json = root / "package.json"
-        node_modules = root / "node_modules"
-        if pkg_json.is_file() and not node_modules.is_dir():
+        # Node looks the entry's imports up in the node_modules of every directory
+        # above it, so a backend/package.json needs installing as much as the root's.
+        # Install in each such directory, from the app root down, that has a
+        # package.json and no node_modules. The resolved paths Node itself uses keep
+        # every candidate inside the app root.
+        real_root = root.resolve()
+        pkg_dirs = [d for d in entry.resolve().parents if d == real_root or real_root in d.parents]
+        for pkg_dir in reversed(pkg_dirs):
+            if not (pkg_dir / "package.json").is_file() or (pkg_dir / "node_modules").is_dir():
+                continue
             npm_bin = _find_npm_binary()
-            if npm_bin:
-                logger.info("Installing npm deps for app %s", app_name)
-                try:
-                    sel().log_api_access(
-                        caller="gateway", operation="app_backend_npm_install",
-                        outcome="started", resources=f"{app_name}",
-                    )
-                except Exception as exc:
-                    logger.debug("SEL audit failed for npm install %s: %s", app_name, exc)
-                try:
-                    sandboxed_npm, _ = wrap_argv(
-                        [npm_bin, "install", "--production", "--no-audit", "--no-fund"],
-                        mode="standard",
-                    )
-                    sandboxed_npm = cgroup_scope_argv(sandboxed_npm)  # cgroup DoS ceiling
-                    run_limited(
-                        sandboxed_npm,
-                        cwd=str(root), env=env, capture_output=True, timeout=120,
-                    )
-                except Exception as exc:
-                    logger.warning("Failed to install npm deps for app %s: %s", app_name, exc)
+            if not npm_bin:
+                break
+            logger.info("Installing npm deps for app %s in %s", app_name, pkg_dir)
+            try:
+                sel().log_api_access(
+                    caller="gateway", operation="app_backend_npm_install",
+                    outcome="started", resources=f"{app_name}",
+                )
+            except Exception as exc:
+                logger.debug("SEL audit failed for npm install %s: %s", app_name, exc)
+            try:
+                sandboxed_npm, _ = wrap_argv(
+                    [npm_bin, "install", "--production", "--no-audit", "--no-fund"],
+                    mode="standard",
+                    # Lifecycle scripts (postinstall) are third-party code.
+                    extra_hidden_dirs=app_backend_secret_mask_targets(),
+                )
+                sandboxed_npm = cgroup_scope_argv(sandboxed_npm)  # cgroup DoS ceiling
+                npm_run = run_limited(
+                    sandboxed_npm,
+                    cwd=str(pkg_dir),
+                    env={**install_env, "NODE_ENV": "production"},
+                    capture_output=True,
+                    timeout=120,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to install npm deps for app %s in %s: %s", app_name, pkg_dir, exc
+                )
+                continue
+            if npm_run.returncode != 0:
+                logger.warning(
+                    "Failed to install npm deps for app %s in %s: npm exited %s",
+                    app_name, pkg_dir, npm_run.returncode,
+                )
 
     # --- Module-style Python builtin (e.g. kiro_crew.apps.builtins.<name>) ---
     # Module-style entries have no file path — the module runs under the gateway's own
@@ -1006,14 +1064,9 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
         if not platform_compat.IS_POSIX:
             # Exec backends rely on POSIX shebang exec and /bin/sh — neither
             # exists on native Windows. Fail fast with a clear message instead
-            # of an undefined Popen crash.
-            logger.error(
-                "App %s declares an exec (shell launcher) backend (%s) which "
-                "is not supported on native Windows. Use a Python or Node "
-                "entry point instead.",
-                app_name,
-                entry_str,
-            )
+            # of an undefined Popen crash. The enable, install and update routes
+            # return the same text as ``backend_refused`` (exec_backend_platform_refusal).
+            logger.error("%s", _exec_backend_windows_refusal_text(app_name, entry_str))
             return None
         if os.access(entry, os.X_OK):
             cmd = [entry_str]
@@ -1167,8 +1220,9 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
     # control available. What still bounds a forged cache there is provenance rather than
     # permissions: with ``require_policy_signature`` set in the admission policy, a document
     # nobody trusted is refused however it got onto disk.
-    # The app's OWN hidden state leaves (e.g. md-notebook's vault registry, PAT, and
-    # sync settings) are unmasked for exactly this spawn: the mask fences agent
+    # The app's OWN hidden state leaves core names in ``_APP_BACKEND_OWNED_LEAVES`` (none
+    # today: Notes declares its state in its manifest) are unmasked for exactly this
+    # spawn: the mask fences agent
     # subprocesses, but this backend is each leaf's only legitimate reader/writer, and
     # leaving the mask on breaks the app outright. Unlike the governance cache
     # these are the app's own read-write state, so the blanket "visible" meaning is the
@@ -1183,37 +1237,24 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
     _visible: tuple[str, ...] = ()
     if is_builtin_app(app_root=execution_path, app_name=app_name):
         _visible = app_backend_visible_targets(app_name)
-    if _shipped_md_notebook:
-        # Move legacy Notes state into the state directory before the backend reads it.
-        # Spawn prep runs the same move on sandboxed hosts; this call covers a host with no
-        # sandbox wrap (Windows). Marker-gated, so a second call is one stat. Until it is
-        # sealed the backend does not start, so no backend write can race the move.
-        if not _md_notebook_state.sealed_default_legacy_state():
-            logger.error(
-                "App %s: not starting until its one-time state move finishes (see the "
-                "warning above); the next start retries it",
-                app_name,
-            )
-            return None
-        _active_home = str(config_dir())
-
-        def _under_active_home(path: str) -> bool:
-            try:
-                return os.path.commonpath([_active_home, path]) == _active_home
-            except ValueError:  # another drive on Windows: not under this home
-                return False
-
-        if any(_under_active_home(d) for d in _md_notebook_degraded_mask_dirs()):
-            # A link under ``workspace/md-notebook`` makes every spawn mask that whole
-            # directory with a writable, namespace-only stand-in, and without its carve-out
-            # the state directory is one too. Any attach, clone or PAT save would then
-            # succeed and vanish on restart, so the backend does not start at all.
-            logger.error(
-                "App %s: not starting: workspace/md-notebook is reached through a link, so "
-                "its writes would be lost on restart; replace the link with a real directory",
-                app_name,
-            )
-            return None
+    # The masks this app declares in ``credentialMasks`` hide its own files, under its own
+    # data directory, from every other spawn; its backend is their reader. Only the
+    # declaration of the code this spawn executes is lifted, on the same provenance.
+    _visible = _visible + app_declared_mask_targets(app_name, builtin=_admitted_builtin)
+    # The directories it declares in ``agentReadOnlyDirs`` are sealed read-only for every
+    # other spawn; its backend is their writer, so their exact spellings lift those seals
+    # for this spawn only, on the same provenance.
+    _visible = _visible + app_declared_readonly_targets(app_name, builtin=_admitted_builtin)
+    # A former built-in whose state core still moves out of a layout core owned (a row
+    # in ``legacy_state_moves``) does not start until that move has sealed, nor while its
+    # legacy layout would swallow its writes. Asked for the shipped built-in (the
+    # provenance the carve-outs above use) and for a record adopted from the wheel's pin;
+    # every other app starts as before. Marker-gated, so once sealed it is a stat and one
+    # directory sync.
+    _legacy_refusal = _legacy_state_moves.backend_start_refusal(app_name, builtin=_admitted_builtin)
+    if _legacy_refusal is not None:
+        logger.error("App %s: %s", app_name, _legacy_refusal)
+        return None
     if _cache_visible:
         # SECURITY: refuse rather than carve when the cache sits beneath an
         # independently masked directory (a data home relocated under a credential
@@ -1281,13 +1322,7 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
         # aside with the shared ``rotate_jsonl_at`` primitive when it is full,
         # so append does not grow it without bound.
         _rotate_jsonl_at(log_path, _BACKEND_LOG_MAX_BYTES)
-        log_fh = open(
-            log_path,
-            "a",
-            encoding="utf-8",
-            errors="replace",
-            opener=_owner_only_opener_for(log_path),  # 0600 inside the data home
-        )
+        log_fh = _open_log_for_append_owner_only(log_path)  # owner-only on Windows too
         # Where THIS session's output begins. backend.log is opened in append
         # mode, so it may already hold prior sessions' lines; the immediate-exit
         # diagnostic below must read only from here, or a stale "errno 98" from a
@@ -1317,12 +1352,14 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
                 env=env,
                 start_new_session=platform_compat.IS_POSIX,
                 creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
-                # Build-capable apps get the elevated-but-finite NOFILE
-                # ceiling: the backend is the ANCESTOR of its build workloads
-                # (vite/pip) and a 1024 hard cap starves every descendant.
-                # All other apps keep the standard configured policy.
+                # An app whose host grants ask for it (``build_rlimit``) gets the
+                # elevated-but-finite NOFILE ceiling: the backend is the ANCESTOR
+                # of its build workloads (vite/pip) and a 1024 hard cap starves
+                # every descendant. All other apps keep the standard policy.
                 profile=(
-                    RLIMIT_PROFILE_BUILD if app_name in _BUILD_CAPABLE_APPS else RLIMIT_PROFILE_TOOL
+                    RLIMIT_PROFILE_BUILD
+                    if app_name in _host_grants.build_rlimit_apps()
+                    else RLIMIT_PROFILE_TOOL
                 ),
             )
         except OSError:
@@ -1470,8 +1507,8 @@ def _pid_alive(pid: int) -> bool:
 # The mutable state (``_processes``, ``_allocated_ports``, the locks, the lifecycle
 # generations) is ONE object per name, defined once in its owner and imported by the
 # owners that act on it, so a ``.clear()`` through the facade empties the table every
-# owner reads. The two flags rebound with ``global`` each have one holder: the spawn
-# body's ``_warned_unconfined_cache`` here, and ``startup._DEV_FLEET_DEFERRED``.
+# owner reads. The one flag rebound with ``global`` has one holder: the spawn
+# body's ``_warned_unconfined_cache`` here.
 #
 # Every owner is imported here, at the facade's own import. An owner's
 # ``from ... import`` bindings are therefore taken once, as the one-module backend
@@ -1586,6 +1623,7 @@ if _typing.TYPE_CHECKING:
         _pidfile_lock,
         _pidfile_path,
         _read_pidfile,
+        _read_pidfile_for_update,
         _write_pidfile,
         atomic_write,
         json,
@@ -1634,6 +1672,7 @@ if _typing.TYPE_CHECKING:
         _DEPS_STAMP_NAME,
         REQUIREMENTS_TXT_MAX_BYTES,
         _audit_provision_failure,
+        _bundled_pip_wheel,
         _capped_spill,
         _default_marker_environment,
         _deps_abi_tag,
@@ -1678,10 +1717,13 @@ if _typing.TYPE_CHECKING:
         _app_activation_denied,
         _BackendShutdownEvent,
         _gateway_shutdown_event,
+        _keep_down,
         _read_installed,
         _restart_exited_backend,
         _settle_superseding_start,
         app_admission_denied,
+        revive_lost_app_backends,
+        shipped_builtin_app_root,
         shutdown_event,
     )
     from kiro_crew.apps.backend_runtime.stale_reap import (  # noqa: F401
@@ -1690,13 +1732,10 @@ if _typing.TYPE_CHECKING:
     )
     from kiro_crew.apps.backend_runtime.startup import (  # noqa: F401
         _BOOT_SPAWN_MAX_WORKERS,
-        _DEV_FLEET_DEFERRED,
         _preclaim_fixed_ports,
         _start_backends_concurrently,
         concurrent,
         list_apps,
-        shipped_builtin_app_root,
-        start_deferred_app_backends,
         start_enabled_app_backends,
     )
     from kiro_crew.apps.backend_runtime.supervision import (  # noqa: F401
@@ -1728,7 +1767,6 @@ if _typing.TYPE_CHECKING:
         _LIFECYCLE_STOP,
         ContextVar,
         Iterator,
-        _lifecycle_generation,
         _restart_attempts,
         contextlib,
         dataclass,

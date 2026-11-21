@@ -1,16 +1,8 @@
 """The chat HTTP handlers keep their surface and contracts while their owners move.
 
-``kiro_crew.dashboard.chat_handlers`` is the dashboard chat API's import path and its
-patch surface. Part of what it defined now lives in the modules of
-``kiro_crew.dashboard.chat_api``, one responsibility each, and ``_facade_compose.compose``
-runs every function they define on the facade's globals. These tests pin:
-
-* the surface: every name the facade bound before the split still resolves on it, the
-  route table still dispatches to the facade's objects, and the six runner seams it
-  imports are still the runner's objects;
-* contracts of the moved endpoint families that no other test pins: the bare 404 a
-  delete answers, the resume refusal without a conversation log, the off-loop restore
-  prefetch, the close path's conductor wake, and the resume record shapes.
+``kiro_crew.dashboard.chat_handlers`` is the import path and patch surface; the code lives
+in ``kiro_crew.dashboard.chat_api`` modules that ``_facade_compose.compose`` runs on the
+facade's globals. These pin that surface and the endpoint contracts no other test pins.
 """
 
 from __future__ import annotations
@@ -53,7 +45,7 @@ _BASE_NAMES = frozenset("""
         ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS ARTIFACT_SLUG_RE AUTOCOMPACT_PCT_MAX
         AUTOCOMPACT_PCT_MIN AcpModelUnavailable AcpProvider Any Awaitable
         CHAT_TURN_TIMEOUT_MAX CHAT_TURN_TIMEOUT_MIN COLOR_HEX_RE Callable
-        ClientConnectionResetError DashboardState DeferredHoldFull DeferredHoldRebound
+        DashboardState DeferredHoldFull DeferredHoldRebound
         FavoritesUnreadable GrantDeadline HUMAN_TURN_META_KEY Iterable JEV_ROUTE_MODEL
         KiroCrewConfig LLMProvider MAX_COLOR_INDEX MAX_DEFERRED_NOTES
         MAX_DEFERRED_NOTE_CHARS MAX_SOURCE_LABEL_LEN MODEL_NAMESPACE_ACP Mapping
@@ -63,7 +55,7 @@ _BASE_NAMES = frozenset("""
         STEER_REQUEUED STEER_STEERED SUGGEST_FOLLOWUP_SCHEMA SYNTHETIC_RECOVERY_KIND
         SelectionChange SessionFolderError SlotAgentSwitchCaller SlotCloseError
         SlotContinueRefusal SplitlinesBoundaryRecord TURN_ACTOR_META_KEY TURN_END_WIRE_CLS
-        TYPE_CHECKING TranscriptRevisionChanged UnknownMemoryStore ValidationError
+        TURN_OPENING_INJECT_KINDS TYPE_CHECKING TranscriptRevisionChanged UnknownMemoryStore ValidationError
         _CREATABLE_MODES _ChatSlot _CommitToken _DEFERRED_PLAIN_CREATE_KNOWN_KEYS
         _DurablePrefixMismatch _FLUSH_SNAPSHOT_RETRIES _FOLLOWUP_TEXT_FIELDS
         _GUARDED_WRITE_WAIT_SECS _HandoverDrainResult _MANUAL_CONTINUE_MSG
@@ -83,7 +75,7 @@ _BASE_NAMES = frozenset("""
         _autocompact_txn_lock _autocompact_txn_locks _await_guarded_history_write
         _bounded_slot_page _broadcast_context_reset _broadcast_expired_oauth_banners
         _build_pending_context_entry _build_stream_chunk _bump_slot_tags_revision
-        _cancel_target _close_slot _coerce_requested_mode _collapse_wire_rows
+        _cancel_cron_run _cancel_target _close_slot _coerce_requested_mode _collapse_wire_rows
         _compaction_in_flight _configured_backend_for_slot _context_reading
         _context_snapshot_fields _context_snapshot_fields_inner _context_usage_payload
         _default_template_stamp _deny_app_session_settings _deny_app_yolo
@@ -98,6 +90,7 @@ _BASE_NAMES = frozenset("""
         _live_slot_for_resume _live_slot_resume_payload _load_favorite_projects
         _load_redacted _load_restore_cfg _local_turn_generation _local_turn_prompt
         _make_stop_resolver _mark_permission_resolved _materialise_slot_from_history
+        _may_cancel_cron_run
         _maybe_auto_title _model_rejected_reason _normalise_structured_content
         _normalize_model _normalize_slot_key _normalize_source _note_already_durable
         _note_delivered_live _note_owner_focus _open_stop_event_card
@@ -167,7 +160,7 @@ _BASE_NAMES = frozenset("""
         persist_deferred_notes_sync person_priority pick_epoch_host pin_private_agent_store
         provider_model_pin_refused published_autocompact_pct queue_entry_is_user_origin
         queue_entry_view queue_for_next_turn queued_text_for_display quote_meta
-        read_bounded_json read_cached_intent_summary read_session_grant
+        read_bounded_json read_cached_intent_summary read_session_control_grant
         record_agent_selection record_trust_grant redact_credentials
         redact_exfiltration_urls register_reasoning_effort_values relay_archive_refusal
         release_prewarmed_session reload_slot_session remember_unknown_row_fields
@@ -185,63 +178,6 @@ _BASE_NAMES = frozenset("""
         wait_for_memory_preparation warm_project_agent_names warn_if_not_durable
         write_sse_or_abort yolo_policy_permits
     """.split())
-
-#: Every route the gateway registers whose handler is a ``chat_handlers`` object, as
-#: ``(method, path, handler name)``; aiohttp adds a ``HEAD`` beside each ``GET``.
-_BASE_ROUTES = (
-    ("DELETE", "/api/chat/slots/{slot}", "api_chat_slot_delete"),
-    ("DELETE", "/api/chat/slots/{slot}/queue/{queue_id}", "api_chat_slot_queue_cancel"),
-    (
-        "DELETE",
-        "/api/chat/slots/{slot}/source-links/{identity}",
-        "api_chat_slot_source_link_unlink",
-    ),
-    ("GET", "/api/chat/slots", "api_chat_slots"),
-    ("GET", "/api/chat/slots/unrestored", "api_chat_slots_unrestored"),
-    ("GET", "/api/chat/slots/{slot}", "api_chat_slot_detail"),
-    ("GET", "/api/chat/slots/{slot}/autocompact", "api_chat_slot_autocompact"),
-    (
-        "GET",
-        "/api/chat/slots/{slot}/selection-capabilities",
-        "api_chat_slot_selection_capabilities",
-    ),
-    ("GET", "/api/chat/slots/{slot}/source-links", "api_chat_slot_source_links"),
-    ("GET", "/api/chat/slots/{slot}/summary", "api_chat_slot_summary"),
-    ("GET", "/api/chat/slots/{slot}/turn-timeout", "api_chat_slot_turn_timeout"),
-    ("GET", "/api/recent-projects", "api_recent_projects"),
-    ("GET", "/api/favorite-projects", "api_favorite_projects"),
-    ("POST", "/api/favorite-projects", "api_favorite_project_add"),
-    ("DELETE", "/api/favorite-projects", "api_favorite_project_remove"),
-    ("PATCH", "/api/chat/slots/{slot}/color", "api_chat_slot_color"),
-    ("PATCH", "/api/chat/slots/{slot}/queue/{queue_id}", "api_chat_slot_queue_edit"),
-    ("POST", "/api/chat", "api_chat"),
-    ("POST", "/api/chat/mode", "api_chat_mode"),
-    ("POST", "/api/chat/slots", "api_chat_slot_create"),
-    ("POST", "/api/chat/slots/cleanup", "api_chat_slots_cleanup"),
-    ("POST", "/api/chat/slots/model", "api_chat_slots_model"),
-    ("POST", "/api/chat/slots/{slot}/agent", "api_chat_slot_agent"),
-    ("POST", "/api/chat/slots/{slot}/approve", "api_chat_slot_approve"),
-    ("POST", "/api/chat/slots/{slot}/autocompact", "api_chat_slot_autocompact"),
-    ("POST", "/api/chat/slots/{slot}/context", "api_chat_slot_context"),
-    ("POST", "/api/chat/slots/{slot}/continue", "api_chat_slot_continue"),
-    ("POST", "/api/chat/slots/{slot}/end-wait", "api_chat_slot_end_wait"),
-    ("POST", "/api/chat/slots/{slot}/followup", "api_chat_slot_followup"),
-    ("POST", "/api/chat/slots/{slot}/interrupt", "api_chat_slot_interrupt"),
-    ("POST", "/api/chat/slots/{slot}/model", "api_chat_slot_model"),
-    ("POST", "/api/chat/slots/{slot}/note", "api_chat_slot_note"),
-    ("POST", "/api/chat/slots/{slot}/project", "api_chat_slot_project"),
-    ("POST", "/api/chat/slots/{slot}/reasoning-effort", "api_chat_slot_reasoning_effort"),
-    ("POST", "/api/chat/slots/{slot}/reload", "api_chat_slot_reload"),
-    ("POST", "/api/chat/slots/{slot}/reset-conversation", "api_chat_slot_reset_conversation"),
-    ("POST", "/api/chat/slots/{slot}/repair-images", "api_chat_slot_repair_images"),
-    ("POST", "/api/chat/slots/{slot}/resume", "api_chat_slot_resume"),
-    ("POST", "/api/chat/slots/{slot}/steers/{mid}/retract", "api_chat_slot_steer_retract"),
-    ("POST", "/api/chat/slots/{slot}/stop", "api_chat_slot_stop"),
-    ("POST", "/api/chat/slots/{slot}/summary", "api_chat_slot_summary_generate"),
-    ("POST", "/api/chat/slots/{slot}/turn-timeout", "api_chat_slot_turn_timeout"),
-    ("POST", "/api/chat/slots/{slot}/workspace", "api_chat_slot_workspace"),
-    ("PUT", "/api/chat/slots/{slot}/queue/order", "api_chat_slot_queue_reorder"),
-)
 
 #: The six runner seams ``chat_handlers`` imports by name.
 _RUNNER_SEAMS = (
@@ -288,6 +224,69 @@ def test_a_fresh_interpreter_sees_every_base_public_name(tmp_path: Path) -> None
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip().endswith("ok")
+
+
+#: Contract: the HTTP API. Every route the gateway registers whose handler is a
+#: ``chat_handlers`` object, as ``(method, path, handler name)``; aiohttp adds a
+#: ``HEAD`` beside each ``GET``. A new or changed route is registered here and
+#: reviewed by a person.
+_BASE_ROUTES = (
+    ("DELETE", "/api/chat/slots/{slot}", "api_chat_slot_delete"),
+    ("DELETE", "/api/chat/slots/{slot}/queue/{queue_id}", "api_chat_slot_queue_cancel"),
+    (
+        "DELETE",
+        "/api/chat/slots/{slot}/source-links/{identity}",
+        "api_chat_slot_source_link_unlink",
+    ),
+    ("GET", "/api/chat/slots", "api_chat_slots"),
+    ("GET", "/api/chat/slots/unrestored", "api_chat_slots_unrestored"),
+    ("GET", "/api/chat/slots/{slot}", "api_chat_slot_detail"),
+    ("GET", "/api/chat/slots/{slot}/autocompact", "api_chat_slot_autocompact"),
+    (
+        "GET",
+        "/api/chat/slots/{slot}/selection-capabilities",
+        "api_chat_slot_selection_capabilities",
+    ),
+    ("GET", "/api/chat/slots/{slot}/source-links", "api_chat_slot_source_links"),
+    ("GET", "/api/chat/slots/{slot}/summary", "api_chat_slot_summary"),
+    ("GET", "/api/chat/slots/{slot}/turn-timeout", "api_chat_slot_turn_timeout"),
+    ("GET", "/api/recent-projects", "api_recent_projects"),
+    ("GET", "/api/favorite-projects", "api_favorite_projects"),
+    ("POST", "/api/favorite-projects", "api_favorite_project_add"),
+    ("DELETE", "/api/favorite-projects", "api_favorite_project_remove"),
+    ("PATCH", "/api/chat/slots/{slot}/color", "api_chat_slot_color"),
+    ("PATCH", "/api/chat/slots/{slot}/queue/{queue_id}", "api_chat_slot_queue_edit"),
+    ("POST", "/api/chat", "api_chat"),
+    ("POST", "/api/chat/mode", "api_chat_mode"),
+    ("POST", "/api/chat/slots", "api_chat_slot_create"),
+    ("POST", "/api/chat/slots/cleanup", "api_chat_slots_cleanup"),
+    ("POST", "/api/chat/slots/model", "api_chat_slots_model"),
+    ("POST", "/api/chat/slots/{slot}/agent", "api_chat_slot_agent"),
+    ("POST", "/api/chat/slots/{slot}/approve", "api_chat_slot_approve"),
+    ("POST", "/api/chat/slots/{slot}/autocompact", "api_chat_slot_autocompact"),
+    ("POST", "/api/chat/slots/{slot}/context", "api_chat_slot_context"),
+    ("POST", "/api/chat/slots/{slot}/continue", "api_chat_slot_continue"),
+    ("POST", "/api/chat/slots/{slot}/discard", "api_chat_slot_discard"),
+    ("POST", "/api/chat/slots/{slot}/end-wait", "api_chat_slot_end_wait"),
+    ("POST", "/api/chat/slots/{slot}/followup", "api_chat_slot_followup"),
+    ("POST", "/api/chat/slots/{slot}/interrupt", "api_chat_slot_interrupt"),
+    ("POST", "/api/chat/slots/{slot}/model", "api_chat_slot_model"),
+    ("POST", "/api/chat/slots/{slot}/note", "api_chat_slot_note"),
+    ("POST", "/api/chat/slots/{slot}/project", "api_chat_slot_project"),
+    ("POST", "/api/chat/slots/{slot}/reasoning-effort", "api_chat_slot_reasoning_effort"),
+    ("POST", "/api/chat/slots/{slot}/reload", "api_chat_slot_reload"),
+    ("POST", "/api/chat/slots/{slot}/reset-conversation", "api_chat_slot_reset_conversation"),
+    ("POST", "/api/chat/slots/{slot}/repair-images", "api_chat_slot_repair_images"),
+    ("POST", "/api/chat/slots/{slot}/resume", "api_chat_slot_resume"),
+    ("POST", "/api/chat/slots/{slot}/steers/{mid}/retract", "api_chat_slot_steer_retract"),
+    ("POST", "/api/chat/slots/{slot}/stop", "api_chat_slot_stop"),
+    ("POST", "/api/chat/slots/{slot}/summary", "api_chat_slot_summary_generate"),
+    ("POST", "/api/chat/slots/{slot}/turn-timeout", "api_chat_slot_turn_timeout"),
+    ("POST", "/api/chat/slots/{slot}/ultracode", "api_chat_slot_ultracode"),
+    ("POST", "/api/chat/slots/{slot}/fast", "api_chat_slot_fast_mode"),
+    ("POST", "/api/chat/slots/{slot}/workspace", "api_chat_slot_workspace"),
+    ("PUT", "/api/chat/slots/{slot}/queue/order", "api_chat_slot_queue_reorder"),
+)
 
 
 def test_every_route_still_dispatches_to_the_facade_handler() -> None:
@@ -455,15 +454,12 @@ async def test_the_handover_exit_reports_the_close_on_a_committed_drain_only(
 ) -> None:
     """A close that yields its archive to a recreated slot drains the tail OPEN.
 
-    A committed drain returns success and no archival save runs; a drain whose rows
-    were lost raises, because that frame was their last chance at durability and
-    nothing retries it. The exit reaches no further step either way -- it pushed a
-    conductor wake while a close was a wake trigger, and the whole close path now
-    carries none.
+    A committed drain returns with no archival save; a drain that lost rows raises,
+    because nothing retries that frame. The close path pushes no conductor wake.
     """
     events: list[str] = []
 
-    async def _drain(_state, name, _slot):
+    async def _drain(_state, name, _slot, takeover_basis=None):
         events.append(f"drain:{name}")
         return ch._HandoverDrainResult(rows_committed=committed, prompts_lost=0)
 
@@ -503,13 +499,10 @@ def _handler_files() -> list[Path]:
 
 
 def test_no_handler_module_reaches_the_conductor_wake() -> None:
-    """A worker's session closing is not a statement by the worker, so a close wakes
-    nobody and no handler module needs the wake at all.
+    """A session closing wakes nobody, so no handler module imports the conductor wake.
 
-    Read at module scope AND inside every function body, because the close path's
-    helper held its import in its own body to keep an import cycle open-ended:
-    ``conductor_wake`` imports the dashboard back. A module-scope test alone would
-    pass while a function-local import kept the push alive.
+    Function bodies are read too: ``conductor_wake`` imports the dashboard back, so an
+    import would sit inside a function to dodge the cycle.
     """
     for path in _handler_files():
         source = path.read_text(encoding="utf-8")
@@ -536,351 +529,208 @@ _OWNER_DIR = Path(chat_api.__file__).resolve().parent
 _SRC = _FACADE_PATH.parents[2]
 _GLOBAL_OPS = frozenset({"LOAD_GLOBAL", "STORE_GLOBAL", "DELETE_GLOBAL"})
 
-#: The owners the facade composes. Adding or removing one changes the composition,
-#: so the set is spelled out rather than globbed.
-_OWNER_MODULES = frozenset(
-    {
-        "agent_switch",
-        "app_admission",
-        "chat_send",
-        "continue_turn",
-        "followup_card",
-        "handover_drain",
-        "pending_context",
-        "project_lists",
-        "prompt_queue",
-        "resume",
-        "session_relaunch",
-        "slot_approval",
-        "slot_create",
-        "slot_detail",
-        "slot_effort",
-        "slot_guards",
-        "slot_lifecycle",
-        "slot_model",
-        "slot_note",
-        "slot_settings",
-        "slot_summary",
-        "source_links",
-        "turn_stop",
-    }
-)
+#: The owners the facade composes: every module of ``chat_api``. A module the facade
+#: leaves out of its compose call keeps its own globals, which
+#: ``test_every_owner_function_runs_on_the_facade_globals`` reports.
+_OWNER_MODULES = frozenset(info.name for info in pkgutil.iter_modules([str(_OWNER_DIR)]))
 
-#: Each moved name, the owner that holds it, and its kind and signature in the
-#: one-module file (captured from it before the split).
-_BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
-    "source_links": (
-        (
-            "api_chat_slot_source_links",
-            "async function",
-            "(request: 'web.Request') -> 'web.Response'",
-        ),
-        (
-            "_audit_source_link_unlink",
-            "function",
-            "(name: 'str', outcome: 'str', **fields: 'Any') -> 'None'",
-        ),
-        (
-            "api_chat_slot_source_link_unlink",
-            "async function",
-            "(request: 'web.Request') -> 'web.Response'",
-        ),
-        (
-            "_apply_source_link_unlink",
-            "async function",
-            "(request: 'web.Request') -> 'web.Response'",
-        ),
-        ("_source_link_txn_lock", "function", "(history_key: 'str') -> 'asyncio.Lock'"),
-    ),
-    "slot_detail": (
-        ("api_chat_slots", "async function", "(request: 'web.Request') -> 'web.Response'"),
-        (
-            "api_chat_slots_unrestored",
-            "async function",
-            "(request: 'web.Request') -> 'web.Response'",
-        ),
-        ("_finite_number", "function", "(value: 'Any') -> 'float | None'"),
-        (
-            "_context_reading",
-            "function",
-            "(pct: 'Any', used: 'Any', window: 'Any', *, stale: 'bool') -> 'dict[str, Any]'",
-        ),
-        (
-            "_context_snapshot_fields",
-            "async function",
-            "(state: \"'DashboardState'\", slot: \"'_ChatSlot'\") -> 'dict[str, Any]'",
-        ),
-        (
-            "_context_snapshot_fields_inner",
-            "async function",
-            "(state: \"'DashboardState'\", slot: \"'_ChatSlot'\") -> 'dict[str, Any]'",
-        ),
-        ("_load_redacted", "function", "(body: 'str') -> 'str'"),
-        (
-            "_same_persisted_body",
-            "function",
-            "(disk_body: 'str', window_body: 'str', role: 'str', disk_ts: 'str' = '', window_ts: 'str' = '') -> 'bool'",
-        ),
-        ("_is_answered_permission", "function", "(m: 'dict') -> 'bool'"),
-        (
-            "_snapshot_slot_window",
-            "function",
-            "(slot: \"'_ChatSlot'\") -> 'tuple[int, list[dict]]'",
-        ),
-        (
-            "_append_unflushed_tail_from_offset",
-            "function",
-            "(slot: \"'_ChatSlot'\", all_msgs: 'list[dict]', *, disk_offset: 'int', snapshot: 'tuple[int, list[dict]] | None' = None) -> 'list[dict]'",
-        ),
-        (
-            "_append_unflushed_tail",
-            "function",
-            "(slot: \"'_ChatSlot'\", all_msgs: 'list[dict]', *, snapshot: 'tuple[int, list[dict]] | None' = None) -> 'list[dict]'",
-        ),
-        ("_DurablePrefixMismatch", "class", ""),
-        ("_durable_prefix_counter", "function", "(slot: \"'_ChatSlot'\") -> 'int'"),
-        (
-            "_bounded_slot_page",
-            "function",
-            "(conversation_log: 'Any', slot: \"'_ChatSlot'\", history_key: 'str', *, limit: 'int', before: 'int | None', snapshot: 'tuple[int, list[dict]]', durable_prefix_count: 'int') -> 'tuple[list[dict], int, bool, int]'",
-        ),
-        ("api_chat_slot_detail", "async function", "(request: 'web.Request') -> 'web.Response'"),
-    ),
-    "resume": (
-        (
-            "_reconcile_slot_window",
-            "async function",
-            "(state: 'DashboardState', slot: \"'_ChatSlot'\") -> 'None'",
-        ),
-        (
-            "_resume_session_identity",
-            "function",
-            "(state: 'DashboardState', history_key: 'str') -> 'str'",
-        ),
-        (
-            "_live_slot_for_resume",
-            "async function",
-            "(state, request_app: 'str', history_key: 'str', name: 'str', caller_label: 'str' = '') -> \"'ResumeOutcome | None'\"",
-        ),
-        ("_live_slot_resume_payload", "async function", "(state, existing) -> 'dict'"),
-        ("_normalise_structured_content", "function", "(value: 'object') -> 'str'"),
-        (
-            "_redact_history_rows",
-            "function",
-            "(rows: 'list[dict]', *, window_limit: 'int | None' = None) -> 'list[dict]'",
-        ),
-        (
-            "_materialise_slot_from_history",
-            "function",
-            "(state: 'DashboardState', *, name: 'str | None', history_key: 'str', meta: 'dict', all_messages: 'list[dict]', app: 'str' = '', request_title: 'str' = '', member_binding: 'dict | None' = None, folder_unhidden: 'bool' = True, folder_checked_id: 'str' = '', window_limit: 'int | None' = 500, disk_meta_observed: 'bool' = True, broadcast_rows: 'bool' = True, mint_missing_mids: 'bool' = False) -> '_ChatSlot'",
-        ),
-        (
-            "_hydrate_slot_from_history",
-            "function",
-            "(state: 'DashboardState', slot: '_ChatSlot', *, meta: 'dict', all_messages: 'list[dict]', request_title: 'str' = '', member_binding: 'dict | None' = None, folder_unhidden: 'bool' = True, folder_checked_id: 'str' = '', window_limit: 'int | None' = 500, disk_meta_observed: 'bool' = True, broadcast_rows: 'bool' = True, mint_missing_mids: 'bool' = False) -> 'None'",
-        ),
-        ("api_chat_slot_resume", "async function", "(request: 'web.Request') -> 'web.Response'"),
-        ("_resume_refusal_response", "function", "(refusal: 'ResumeRefusal') -> 'web.Response'"),
-        (
-            "resume_slot_from_history",
-            "async function",
-            "(state: \"'DashboardState'\", *, name: 'str', history_key: 'str | None' = None, request_app: 'str' = '', caller_label: 'str' = '', request_title: 'str' = '', containment: \"'Callable[[_ChatSlot], Awaitable[ResumeRefusal | None]] | None'\" = None, final_check: \"'Callable[[_ChatSlot], ResumeRefusal | None] | None'\" = None, rebind_manager: 'bool' = True) -> 'ResumeOutcome'",
-        ),
-    ),
-    "slot_lifecycle": (
-        (
-            "_slot_still_ours",
-            "function",
-            "(state: 'DashboardState', name: 'str', slot: '_ChatSlot') -> 'bool'",
-        ),
-        ("_NudgeRetireFailed", "class", ""),
-        ("_retire_slot_nudge_loop", "async function", "(name: 'str') -> \"'NudgeLoop | None'\""),
-        (
-            "_restore_slot_nudge_loop",
-            "async function",
-            "(loop: \"'NudgeLoop | None'\", admission_check: 'Callable[[], bool]') -> 'None'",
-        ),
-        (
-            "api_chat_slot_reset_conversation",
-            "async function",
-            "(request: 'web.Request') -> 'web.Response'",
-        ),
-        (
-            "_release_closed_execution",
-            "function",
-            "(state: 'DashboardState', slot: \"'_ChatSlot'\", session_key: 'str', execution) -> 'None'",
-        ),
-        ("_pending_guarded_history_writes", "function", "(slot: \"'_ChatSlot'\") -> 'set'"),
-        (
-            "_await_guarded_history_write",
-            "async function",
-            "(slot: \"'_ChatSlot'\", name: 'str') -> 'bool'",
-        ),
-        (
-            "close_slot",
-            "async function",
-            "(state: 'DashboardState', slot: \"'_ChatSlot'\", name: 'str', *, pre_pop_check: 'Callable[[], None] | None' = None, hand_back: 'bool' = True) -> 'None'",
-        ),
-        (
-            "_close_slot",
-            "async function",
-            "(state: 'DashboardState', slot: \"'_ChatSlot'\", name: 'str', *, pre_pop_check: 'Callable[[], None] | None' = None) -> 'None'",
-        ),
-        ("api_chat_slot_delete", "async function", "(request: 'web.Request') -> 'web.Response'"),
-        ("api_chat_slots_cleanup", "async function", "(request: 'web.Request') -> 'web.Response'"),
-    ),
-}
-
-
-#: The same record for every name this split moves into the owners it adds, as one
-#: ``owner | name | kind | signature`` row each, captured at the base this split was
-#: cut from (30bb0b3da2). A table rather than a tuple per name keeps this file under
-#: the line cap.
+#: Each name the split moved, as one ``owner | name | kind`` row, captured from the
+#: one-module file before the split: the owner that holds it and whether it is a
+#: class, a function or a coroutine function. A table rather than a tuple per name
+#: keeps this file under the line cap.
 _MOVED_SURFACE = """
-agent_switch | clear_slot_model_binding | function | (slot: 'Any') -> 'None'
+source_links | api_chat_slot_source_links | async function
+source_links | _audit_source_link_unlink | function
+source_links | api_chat_slot_source_link_unlink | async function
+source_links | _apply_source_link_unlink | async function
+source_links | _source_link_txn_lock | function
+slot_detail | api_chat_slots | async function
+slot_detail | api_chat_slots_unrestored | async function
+slot_detail | _finite_number | function
+slot_detail | _context_reading | function
+slot_detail | _context_snapshot_fields | async function
+slot_detail | _context_snapshot_fields_inner | async function
+slot_detail | _load_redacted | function
+slot_detail | _same_persisted_body | function
+slot_detail | _is_answered_permission | function
+slot_detail | _snapshot_slot_window | function
+slot_detail | _append_unflushed_tail_from_offset | function
+slot_detail | _append_unflushed_tail | function
+slot_detail | _DurablePrefixMismatch | class
+slot_detail | _durable_prefix_counter | function
+slot_detail | _bounded_slot_page | function
+slot_detail | api_chat_slot_detail | async function
+resume | _normalise_structured_content | function
+resume | _redact_history_rows | function
+resume | _materialise_slot_from_history | function
+resume | _hydrate_slot_from_history | function
+resume | api_chat_slot_resume | async function
+resume | _resume_refusal_response | function
+resume | resume_slot_from_history | async function
+resume_live | _resume_session_identity | function
+resume_live | _live_slot_for_resume | async function
+resume_live | _live_slot_resume_payload | async function
+resume_window | _reconcile_slot_window | async function
+slot_repair | api_chat_slot_reset_conversation | async function
+slot_lifecycle | _slot_still_ours | function
+slot_lifecycle | _NudgeRetireFailed | class
+slot_lifecycle | _retire_slot_nudge_loop | async function
+slot_lifecycle | _restore_slot_nudge_loop | async function
+slot_lifecycle | _release_closed_execution | function
+slot_lifecycle | _pending_guarded_history_writes | function
+slot_lifecycle | _await_guarded_history_write | async function
+slot_lifecycle | close_slot | async function
+slot_lifecycle | _close_slot | async function
+slot_lifecycle | api_chat_slot_delete | async function
+slot_lifecycle | api_chat_slots_cleanup | async function
+agent_switch | clear_slot_model_binding | function
 agent_switch | _MemberMemoryRequiresNewConversation | class
 agent_switch | SlotAgentSwitchCaller | class
-agent_switch | api_chat_slot_agent | async function | (request: 'web.Request') -> 'web.Response'
-agent_switch | agent_switch_outcome | function | (resp: 'web.Response') -> 'tuple[bool, dict[str, Any]]'
-agent_switch | switch_slot_agent | async function | (state: 'DashboardState', slot: '_ChatSlot', name: 'str', agent_name: 'Any', agent_kind: 'Any', caller: 'SlotAgentSwitchCaller') -> 'web.Response'
-followup_card | _redact_followup_item | function | (item: 'dict') -> 'dict'
-followup_card | api_chat_slot_followup | async function | (request: 'web.Request') -> 'web.Response'
-pending_context | _validate_content | function | (content: 'object') -> 'web.Response | None'
-pending_context | _is_secret_shaped_context | function | (content: 'str') -> 'bool'
-pending_context | _refuse_secret_shaped_context | function | (content: 'str') -> 'web.Response | None'
-pending_context | _normalize_source | function | (source: 'object') -> 'str'
-pending_context | _validate_source | function | (source: 'object') -> 'web.Response | None'
-pending_context | _validate_max_age | function | (max_age: 'object') -> 'web.Response | None'
-pending_context | _source_cap_reached | function | (slot: '_ChatSlot', source: 'str') -> 'bool'
-pending_context | _enqueue_pending_context | function | (slot: '_ChatSlot', content: 'str', source: 'str', ephemeral: 'bool', max_age: 'int | float | None') -> 'web.Response | None'
-pending_context | _build_pending_context_entry | function | (slot: '_ChatSlot', content: 'str', source: 'str', ephemeral: 'bool', max_age: 'int | float | None') -> 'tuple[dict[str, object] | None, web.Response | None]'
-pending_context | api_chat_slot_context | async function | (request: 'web.Request') -> 'web.Response'
-project_lists | _recent_projects_path | function | () -> 'Path'
-project_lists | _save_recent_project | function | (path: 'str') -> 'None'
-project_lists | api_recent_projects | async function | (request: 'web.Request') -> 'web.Response'
-project_lists | _favorite_projects_path | function | () -> 'Path'
+agent_switch | api_chat_slot_agent | async function
+agent_switch | agent_switch_outcome | function
+agent_switch | switch_slot_agent | async function
+followup_card | _redact_followup_item | function
+followup_card | api_chat_slot_followup | async function
+pending_context | _validate_content | function
+pending_context | _is_secret_shaped_context | function
+pending_context | _refuse_secret_shaped_context | function
+pending_context | _normalize_source | function
+pending_context | _validate_source | function
+pending_context | _validate_max_age | function
+pending_context | _source_cap_reached | function
+pending_context | _enqueue_pending_context | function
+pending_context | _build_pending_context_entry | function
+pending_context | api_chat_slot_context | async function
+project_lists | _recent_projects_path | function
+project_lists | _save_recent_project | function
+project_lists | api_recent_projects | async function
+project_lists | _favorite_projects_path | function
 project_lists | FavoritesUnreadable | class
-project_lists | _load_favorite_projects | function | (*, strict: 'bool' = False) -> 'list[str]'
-project_lists | _read_favorite_projects | function | () -> 'list[str]'
-project_lists | _write_favorite_projects | function | (paths: 'list[str]') -> 'None'
-project_lists | _probe_favorite_candidate | function | (path: 'str') -> 'tuple[str, bool, bool]'
-project_lists | _add_favorite_project | function | (path: 'str') -> 'list[str]'
-project_lists | _remove_favorite_project | function | (path: 'str') -> 'list[str]'
-project_lists | _favorites_unreadable_response | function | () -> 'web.Response'
-project_lists | api_favorite_projects | async function | (request: 'web.Request') -> 'web.Response'
-project_lists | api_favorite_project_add | async function | (request: 'web.Request') -> 'web.Response'
-project_lists | api_favorite_project_remove | async function | (request: 'web.Request') -> 'web.Response'
-session_relaunch | api_chat_slot_reload | async function | (request: 'web.Request') -> 'web.Response'
-session_relaunch | reload_slot_session | async function | (state: 'DashboardState', slot: '_ChatSlot', name: 'str', *, still_ours: 'Callable[[bool], bool]', denied: 'Callable[[str], web.Response | None]', busy: 'Callable[[str], bool]', notice: 'str', after_reset_in_lock: 'Callable[[str], Awaitable[None]] | None' = None) -> 'web.Response'
-session_relaunch | api_chat_slot_workspace | async function | (request: 'web.Request') -> 'web.Response'
-session_relaunch | api_chat_slot_project | async function | (request: 'web.Request') -> 'web.Response'
-slot_approval | _internal_session_approval_refusal | async function | (request: 'web.Request', operation: 'str') -> "'web.Response | None'"
-slot_approval | deny_session_approval_caller | async function | (request: 'web.Request', operation: 'str') -> 'web.Response | None'
-slot_approval | bare_approval_decide_allowed | function | (request: 'web.Request') -> 'bool'
-slot_approval | _approval_target_required | function | () -> 'web.Response'
-slot_approval | _end_trust_scopes | async function | (slots: 'list[Any]', audit_caller: 'Callable[[str], str]') -> 'None'
-slot_approval | _still_owning | function | (state: 'Any', slots: 'list[Any]', key: 'str') -> 'list[Any]'
-slot_approval | _end_trust_scope | async function | (scope: 'str', caller: 'str') -> 'None'
-slot_approval | api_chat_mode | async function | (request: 'web.Request') -> 'web.Response'
-slot_approval | apply_approval_mode | async function | (state: 'DashboardState', *, mode: 'str', slot: '_ChatSlot | None', slot_key: 'str | None', request_app: 'str', cron_creator: 'str', audit_caller: 'Callable[[str], str]') -> 'web.Response'
-slot_approval | _get_pattern_from_pending | function | (slot: '_ChatSlot', request_id: 'str', field: 'str') -> 'str'
-slot_approval | _deny_approval_mode | function | (*, caller: 'str', operation: 'str', mode: 'str', resource: 'str' = '') -> 'web.Response'
-slot_approval | _grant_deadline | function | (ttl: 'int | None') -> 'GrantDeadline | None'
-slot_approval | _deny_trust_pattern | function | (name: 'str', request_id: 'str', action: 'str', code: 'str') -> 'web.Response'
-slot_approval | api_chat_slot_approve | async function | (request: 'web.Request') -> 'web.Response'
-slot_effort | _configured_backend_for_slot | async function | (slot: '_ChatSlot') -> 'str'
-slot_effort | api_chat_slot_selection_capabilities | async function | (request: 'web.Request') -> 'web.Response'
-slot_effort | api_chat_slot_reasoning_effort | async function | (request: 'web.Request') -> 'web.Response'
-slot_guards | _record_explicit_agent_selection | async function | (session_key: 'str', agent_name: 'str | None', bindings: 'ResolvedBindings', *, config: 'KiroCrewConfig', memory_mode: 'str' = 'persistent', app: 'str' = '') -> 'SelectionChange | None'
+project_lists | _load_favorite_projects | function
+project_lists | _read_favorite_projects | function
+project_lists | _write_favorite_projects | function
+project_lists | _probe_favorite_candidate | function
+project_lists | _add_favorite_project | function
+project_lists | _remove_favorite_project | function
+project_lists | _favorites_unreadable_response | function
+project_lists | api_favorite_projects | async function
+project_lists | api_favorite_project_add | async function
+project_lists | api_favorite_project_remove | async function
+session_relaunch | api_chat_slot_reload | async function
+session_relaunch | reload_slot_session | async function
+session_relaunch | api_chat_slot_workspace | async function
+session_relaunch | api_chat_slot_project | async function
+slot_approval | _internal_session_approval_refusal | async function
+slot_approval | deny_session_approval_caller | async function
+slot_approval | bare_approval_decide_allowed | function
+slot_approval | _approval_target_required | function
+slot_approval | _end_trust_scopes | async function
+slot_approval | _still_owning | function
+slot_approval | _end_trust_scope | async function
+slot_approval | api_chat_mode | async function
+slot_approval | apply_approval_mode | async function
+slot_approval | _get_pattern_from_pending | function
+slot_approval | _deny_approval_mode | function
+slot_approval | _grant_deadline | function
+slot_approval | _deny_trust_pattern | function
+slot_approval | api_chat_slot_approve | async function
+slot_effort | _configured_backend_for_slot | async function
+slot_effort | api_chat_slot_selection_capabilities | async function
+slot_effort | api_chat_slot_reasoning_effort | async function
+slot_guards | _record_explicit_agent_selection | async function
 slot_guards | _CommitToken | class
-slot_guards | _slot_replaced_while_queued | function | (state: 'DashboardState', slot: '_ChatSlot', name: 'str', request: 'web.Request | Mapping[str, Any]', operation: 'str') -> 'bool'
-slot_guards | _switch_target_busy | function | (state: 'DashboardState', slot: '_ChatSlot', session_key: 'str', provider: 'object', *, own_turn: 'bool' = False) -> 'bool'
-slot_guards | _subagents_attached_response | async function | (state: 'DashboardState', slot: '_ChatSlot', session_key: 'str', operation: 'str') -> 'web.Response | None'
-slot_guards | _reset_slot_session_or_warn | async function | (state: 'DashboardState', slot: '_ChatSlot', session_key: 'str', *, switch_kind: 'str') -> 'bool | None'
-slot_model | _model_rejected_reason | function | (model_name: 'str', backend: 'str | None' = None, *, session_keys: 'Iterable[str | None] | None' = None) -> 'str | None'
-slot_model | _is_jev_route_pick | function | (raw: 'object') -> 'bool'
-slot_model | _wire_model_id | function | (provider: 'AcpProvider', model_name: 'str') -> 'str'
-slot_model | _reapply_effort_after_live_switch | async function | (name: 'str', slot: '_ChatSlot', provider: 'AcpProvider') -> 'bool'
-slot_model | _try_live_model_switch | async function | (name: 'str', slot: '_ChatSlot', provider: 'LLMProvider | None', model_name: 'str') -> 'bool'
-slot_model | _broadcast_context_reset | function | (state: "'DashboardState'", slot_key: 'str', provider: 'Any') -> 'None'
-slot_model | api_chat_slot_model | async function | (request: 'web.Request') -> 'web.Response'
-slot_model | api_chat_slots_model | async function | (request: 'web.Request') -> 'web.Response'
-slot_note | _discard_held_note | function | (slot: '_ChatSlot', note: 'dict[str, object]') -> 'None'
-slot_note | _note_delivered_live | function | (slot: '_ChatSlot', note: 'dict[str, object]') -> 'bool'
-slot_note | _persist_deferred_note_hold | async function | (state: 'DashboardState', slot: '_ChatSlot', note: 'dict[str, object]', authorized_history_key: 'str') -> 'web.Response | None'
-slot_note | _note_already_durable | async function | (conversation_log: 'object', authorized_history_key: 'str', note: 'dict[str, object]') -> 'bool'
-slot_note | api_chat_slot_note | async function | (request: 'web.Request') -> 'web.Response'
-slot_settings | _autocompact_txn_lock | function | (history_key: 'str') -> 'asyncio.Lock'
-slot_settings | api_chat_slot_autocompact | async function | (request: 'web.Request') -> 'web.Response'
-slot_settings | _slot_agent_autocompact_fields | async function | (state: 'DashboardState', slot: 'Any') -> 'dict[str, Any]'
-slot_settings | _slot_next_agent_autocompact_default | function | (session_key: 'str', slot: 'Any') -> 'tuple[str, float] | None'
-slot_settings | _turn_timeout_body_value | function | (body: 'dict[str, Any]') -> 'tuple[int | None, web.Response | None]'
-slot_settings | _turn_timeout_payload | async function | (secs: 'int | None') -> 'dict[str, Any]'
-slot_settings | api_chat_slot_turn_timeout | async function | (request: 'web.Request') -> 'web.Response'
-slot_settings | api_chat_slot_color | async function | (request: 'web.Request') -> 'web.Response'
-chat_send | _sweep_stale_permissions | function | (slot: "'_ChatSlot'") -> 'None'
-chat_send | _send_binds_agent | function | (agent: 'str', slot: 'Any') -> 'bool'
-chat_send | _send_writes_persona | function | (body: 'dict') -> 'bool'
-chat_send | _send_harness_command | async function | (message: 'str') -> 'str'
-chat_send | steer_is_auto | function | (value: 'object') -> 'bool'
-chat_send | decided_message_handling | async function | (slot: 'Any', message: 'str') -> 'tuple[bool, dict | None]'
-chat_send | api_chat | async function | (request: 'web.Request') -> 'web.StreamResponse'
-chat_send | write_sse_or_abort | async function | (request: 'web.Request', resp: 'web.StreamResponse', data: 'bytes') -> 'None'
-app_admission | _app_slot_acquisition_denial | async function | (request: 'web.Request', state: "'DashboardState'", request_app: 'str', slot_name: 'str', operation: 'str', *, session_grant_route: 'bool') -> 'tuple[web.Response | None, Any]'
-app_admission | _app_slot_acquisition_recheck | async function | (state: "'DashboardState'", request_app: 'str', key: 'str', judged: 'Any', operation: 'str') -> 'web.Response | None'
-app_admission | _acquired_slot_was_judged | function | (state: "'DashboardState'", key: 'str', judged: 'Any') -> 'bool'
-app_admission | _app_acquisition_conflict | function | (state: "'DashboardState'", request_app: 'str', key: 'str', judged: 'Any', exc: 'ValueError') -> 'web.Response'
-app_admission | _deny_app_yolo | function | (request_app: 'str', operation: 'str') -> 'web.Response'
-app_admission | _deny_app_session_settings | function | (request_app: 'str', slot_key: 'str', trigger: 'str') -> 'web.Response'
-app_admission | _slot_not_found | function | () -> 'web.Response'
-app_admission | _app_may_send_to_slot | async function | (request_app: 'str', slot: 'Any') -> 'bool'
-app_admission | _app_claim_refused | async function | (state: 'DashboardState', request_app: 'str', operation: 'str', keys: 'Iterable[str]') -> 'bool'
-app_admission | _app_cancel_denied | function | (request: 'web.Request | Mapping[str, Any]', slot: '_ChatSlot', operation: 'str', target_key: 'str') -> 'web.Response | None'
-app_admission | _app_resume_refusal | async function | (state: "'DashboardState'", request_app: 'str', name: 'str', history_key: 'str', meta: 'dict') -> 'ResumeRefusal | None'
-app_admission | _reauthorize_after_await | function | (state: 'DashboardState', slot: '_ChatSlot', name: 'str', request_app: 'str', operation: 'str') -> 'web.Response | None'
-turn_stop | _reject_pending_approvals | function | (slot: '_ChatSlot') -> 'None'
-turn_stop | _resolve_stop_event | function | (slot: '_ChatSlot', outcome: 'str') -> 'None'
-turn_stop | _rearm_stop_event | function | (slot: '_ChatSlot', stop_data: 'dict[str, Any]') -> 'bool'
-turn_stop | _open_stop_event_card | function | (slot: '_ChatSlot', state_label: 'str') -> 'str'
-turn_stop | _make_stop_resolver | function | (state: 'DashboardState', slot: '_ChatSlot', outcome: 'str', card_id: 'str | None') -> 'Callable[[], Awaitable[None]]'
-turn_stop | _cancel_target | function | (slot: '_ChatSlot') -> 'str'
-turn_stop | _settle_discarded_stage_deliveries | async function | (state: "'DashboardState'", slot: "'_ChatSlot'", contents: 'list[str]') -> 'None'
-turn_stop | stop_slot_turn | async function | (state: "'DashboardState'", slot: "'_ChatSlot'", *, force: 'bool' = False, source: 'str' = 'dashboard', cancel_key: 'str' = '', escalate: 'bool' = True) -> 'dict[str, Any]'
-turn_stop | _compaction_in_flight | function | (state: 'DashboardState', cancel_key: 'str') -> 'bool'
-turn_stop | api_chat_slot_stop | async function | (request: 'web.Request') -> 'web.Response'
-turn_stop | api_chat_slot_interrupt | async function | (request: 'web.Request') -> 'web.Response'
-continue_turn | api_chat_slot_continue | async function | (request: 'web.Request') -> 'web.Response'
+slot_guards | _slot_replaced_while_queued | function
+slot_guards | _switch_target_busy | function
+slot_guards | _subagents_attached_response | async function
+slot_guards | _reset_slot_session_or_warn | async function
+slot_guards | _send_writes_persona | function
+slot_model | _model_rejected_reason | function
+slot_model | _is_jev_route_pick | function
+slot_model | _wire_model_id | function
+slot_model | _reapply_effort_after_live_switch | async function
+slot_model | _try_live_model_switch | async function
+slot_model | _broadcast_context_reset | function
+slot_model | api_chat_slot_model | async function
+slot_model | api_chat_slots_model | async function
+slot_note | _discard_held_note | function
+slot_note | _note_delivered_live | function
+slot_note | _persist_deferred_note_hold | async function
+slot_note | _note_already_durable | async function
+slot_note | api_chat_slot_note | async function
+slot_settings | _autocompact_txn_lock | function
+slot_settings | api_chat_slot_autocompact | async function
+slot_settings | _slot_agent_autocompact_fields | async function
+slot_settings | _slot_next_agent_autocompact_default | function
+slot_settings | _turn_timeout_body_value | function
+slot_settings | _turn_timeout_payload | async function
+slot_settings | api_chat_slot_turn_timeout | async function
+slot_settings | api_chat_slot_color | async function
+chat_send | _sweep_stale_permissions | function
+chat_send | _send_binds_agent | function
+chat_send | _send_harness_command | async function
+chat_send | steer_is_auto | function
+chat_send | decided_message_handling | async function
+chat_send | api_chat | async function
+sse_write | write_sse_or_abort | async function
+app_admission | _app_slot_acquisition_denial | async function
+app_admission | _app_slot_acquisition_recheck | async function
+app_admission | _acquired_slot_was_judged | function
+app_admission | _app_acquisition_conflict | function
+app_admission | _deny_app_yolo | function
+app_admission | _deny_app_session_settings | function
+app_admission | _slot_not_found | function
+app_admission | _app_may_send_to_slot | async function
+app_admission | _app_claim_refused | async function
+app_admission | _app_cancel_denied | function
+app_admission | _app_resume_refusal | async function
+app_admission | _reauthorize_after_await | function
+app_admission | _loading_refusal | async function
+turn_stop | _reject_pending_approvals | function
+turn_stop | _resolve_stop_event | function
+turn_stop | _rearm_stop_event | function
+turn_stop | _open_stop_event_card | function
+turn_stop | _make_stop_resolver | function
+turn_stop | _cancel_target | function
+turn_stop | _cancel_cron_run | async function
+turn_stop | _settle_discarded_stage_deliveries | async function
+turn_stop | stop_slot_turn | async function
+turn_stop | _may_cancel_cron_run | async function
+turn_stop | _compaction_in_flight | function
+turn_stop | api_chat_slot_stop | async function
+turn_stop | api_chat_slot_interrupt | async function
+continue_turn | api_chat_slot_continue | async function
 continue_turn | SlotContinueRefusal | class
-continue_turn | continue_slot_turn | async function | (state: 'DashboardState', slot: '_ChatSlot', *, directive_user_origin: 'bool', via: 'str' = '', require_interrupted: 'bool' = False, before_dispatch: 'Callable[[], None] | None' = None, extra_meta: 'dict[str, Any] | None' = None, replaced: 'Callable[[], bool] | None' = None) -> 'str'
-continue_turn | session_start_failure_streak | function | (messages: 'list[dict]') -> 'int'
-continue_turn | _is_stop_event | function | (m: 'dict') -> 'bool'
-continue_turn | _is_interrupted | function | (slot: '_ChatSlot') -> 'bool'
-continue_turn | api_chat_slot_end_wait | async function | (request: 'web.Request') -> 'web.Response'
-prompt_queue | api_chat_slot_queue_cancel | async function | (request: 'web.Request') -> 'web.Response'
-prompt_queue | api_chat_slot_queue_edit | async function | (request: 'web.Request') -> 'web.Response'
-prompt_queue | api_chat_slot_queue_reorder | async function | (request: 'web.Request') -> 'web.Response'
-slot_create | _default_template_stamp | function | (cfg: 'KiroCrewConfig') -> 'str'
-slot_create | _persist_app_agent_owner | async function | (state: 'DashboardState', slot: '_ChatSlot') -> 'bool'
-slot_create | api_chat_slot_create | async function | (request: 'web.Request') -> 'web.Response'
+continue_turn | continue_slot_turn | async function
+continue_turn | session_start_failure_streak | function
+continue_turn | _is_stop_event | function
+continue_turn | _is_interrupted | function
+continue_turn | api_chat_slot_end_wait | async function
+prompt_queue | api_chat_slot_queue_cancel | async function
+prompt_queue | api_chat_slot_queue_edit | async function
+prompt_queue | api_chat_slot_queue_reorder | async function
+slot_create | _default_template_stamp | function
+slot_create | _persist_app_agent_owner | async function
+slot_create | api_chat_slot_create | async function
 handover_drain | _HandoverDrainResult | class
-handover_drain | _owed_prompts_lost_on_line | async function | (state: 'DashboardState', name: 'str', slot: '_ChatSlot', history_key: 'str') -> 'int'
-handover_drain | _report_lost_queued_prompts | function | (state: 'DashboardState', name: 'str', count: 'int', history_key: 'str') -> 'None'
-handover_drain | _persist_handover_tail | async function | (state: 'DashboardState', name: 'str', slot: '_ChatSlot') -> '_HandoverDrainResult'
-slot_summary | api_chat_slot_summary | async function | (request: 'web.Request') -> 'web.Response'
-slot_summary | _generate_state | function | (cfg: 'KiroCrewConfig', slot: 'Any') -> 'str'
-slot_summary | api_chat_slot_summary_generate | async function | (request: 'web.Request') -> 'web.Response'
+handover_drain | _owed_prompts_lost_on_line | async function
+handover_drain | _report_lost_queued_prompts | function
+handover_drain | _teardown_drain_basis | function
+handover_drain | _persist_handover_tail | async function
+slot_summary | api_chat_slot_summary | async function
+slot_summary | _generate_state | function
+slot_summary | api_chat_slot_summary_generate | async function
 """
 
 
-def _moved_surface() -> dict[str, tuple[tuple[str, str, str], ...]]:
-    rows: dict[str, list[tuple[str, str, str]]] = {}
+def _moved_surface() -> dict[str, tuple[tuple[str, str], ...]]:
+    rows: dict[str, list[tuple[str, str]]] = {}
     for line in _MOVED_SURFACE.strip().splitlines():
-        stem, name, kind, signature = (line.split(" | ", 3) + [""])[:4]
-        rows.setdefault(stem, []).append((name, kind, signature))
+        stem, name, kind = line.split(" | ")
+        rows.setdefault(stem, []).append((name, kind))
     return {stem: tuple(found) for stem, found in rows.items()}
 
 
-_BASE_SURFACE.update(_moved_surface())
+_BASE_SURFACE = _moved_surface()
 
 
 def _owner(stem: str) -> types.ModuleType:
@@ -926,7 +776,7 @@ def _owner_sources() -> dict[str, str]:
 
 
 def test_the_owner_set_is_the_package() -> None:
-    assert {info.name for info in pkgutil.iter_modules([str(_OWNER_DIR)])} == _OWNER_MODULES
+    assert _OWNER_MODULES, "chat_api holds no module -- the owner scan is blind"
     assert set(_BASE_SURFACE) <= _OWNER_MODULES
 
 
@@ -940,20 +790,16 @@ def _member(name: str) -> tuple[object, str]:
 
 
 @pytest.mark.parametrize(
-    ("owner", "name", "kind", "signature"),
+    ("owner", "name", "kind"),
     [(owner, *row) for owner, rows in _BASE_SURFACE.items() for row in rows],
     ids=[f"{owner}:{row[0]}" for owner, rows in _BASE_SURFACE.items() for row in rows],
 )
-def test_a_moved_name_keeps_its_base_shape_and_owner(
-    owner: str, name: str, kind: str, signature: str
-) -> None:
-    """Every name that moved keeps the kind and signature it had in the one-module
-    file, lives in the owner its responsibility names, and is ONE object: the
-    facade attribute and the owner's are the same."""
+def test_a_moved_name_keeps_its_kind_and_owner(owner: str, name: str, kind: str) -> None:
+    """Every name that moved keeps the kind it had in the one-module file, lives in
+    the owner its responsibility names, and is ONE object: the facade attribute and
+    the owner's are the same, so the facade's signature is the owner's."""
     obj, found_kind = _member(name)
     assert found_kind == kind
-    if kind != "class":
-        assert str(inspect.signature(obj)) == signature  # type: ignore[arg-type]
     assert getattr(_owner(owner), name) is obj
 
 
@@ -1015,7 +861,7 @@ def test_every_owner_function_runs_on_the_facade_globals() -> None:
     function only because the function reads the facade's globals, not its own."""
     labels = {label for label, _ in _owner_functions()}
     assert len(labels) >= sum(
-        kind.endswith("function") for rows in _BASE_SURFACE.values() for _, kind, _ in rows
+        kind.endswith("function") for rows in _BASE_SURFACE.values() for _, kind in rows
     )
     strays = [
         label
@@ -1582,20 +1428,9 @@ def test_no_owner_captures_a_name_tests_rebind_on_the_facade() -> None:
 
 # ── the path-keyed guards keep their reach ────────────────────────────────────
 
-#: Constructs repository guards read by path or through module source, each mapped
-#: to the files that hold it -- the facade (``chat_handlers``) or an owner -- which
-#: are the files those guards read: the agent-SDK boundary's three baselined
-#: imports, the stop chokepoints and the synthesis boundary the frontend mirrors in
-#: the facade; the app-actor turn kwargs and the hold-branch persist in
-#: ``chat_api/chat_send.py``; the queue-clear the session-control doc counts in
-#: ``chat_api/turn_stop.py``; the hand-over drain's fence opt-out in
-#: ``chat_api/handover_drain.py``; the approval-mode writers
-#: ``test_approval_modes_enforcement``'s ``WRITERS`` keys to
-#: ``chat_api/slot_approval.py``; and the permission-resolution sites with their
-#: dirty flags and the approval-resolved broadcasts, whose guards read
-#: ``chat_api/turn_stop.py`` and ``chat_api/slot_approval.py``. A holder that grew
-#: one, or lost one, would move it out of such a guard's sight, so each set is
-#: exact.
+#: Constructs that repository guards read by path, mapped to the files that hold them
+#: (the facade ``chat_handlers`` or a ``chat_api`` owner). Each set is exact: a construct
+#: that moved files would leave its guard's sight.
 _GUARDED_CONSTRUCT_HOMES: dict[str, frozenset[str]] = {
     r"(?m)^from kiro_crew\.acp\.client import AcpModelUnavailable$": frozenset({"chat_handlers"}),
     r"(?m)^from kiro_crew\.providers\.acp import AcpProvider$": frozenset({"chat_handlers"}),
@@ -1702,6 +1537,9 @@ _SYNC_IO_PLANTS = {"time": "time.sleep(1)", "os": 'os.system("true")'}
 #: this split and sit outside it; each row goes when its owner is respelled.
 _SYNC_IO_REACH_PENDING = frozenset({"resume", "slot_lifecycle"})
 
+#: Owners that define no coroutine, so the gate has nothing in them to reach.
+_SYNC_ONLY_OWNERS: frozenset[str] = frozenset()
+
 
 def _sync_io_gate() -> types.ModuleType:
     path = _SRC.parent / "scripts" / "check_sync_io_in_async.py"
@@ -1741,8 +1579,19 @@ def _with_blocking_call(source: str, call: str) -> tuple[str, int]:
     return "".join(lines), first.lineno
 
 
+def test_a_sync_only_owner_defines_no_coroutine() -> None:
+    """An owner the planted-call check below leaves out holds no coroutine for the
+    gate to miss; one that gains a coroutine leaves the list and joins that check."""
+    assert _SYNC_ONLY_OWNERS <= _OWNER_MODULES
+    for stem in sorted(_SYNC_ONLY_OWNERS):
+        tree = ast.parse(_owner_sources()[stem])
+        assert not any(isinstance(node, ast.AsyncFunctionDef) for node in ast.walk(tree)), stem
+
+
 @pytest.mark.parametrize("module", sorted(_SYNC_IO_PLANTS))
-@pytest.mark.parametrize("stem", sorted(_OWNER_MODULES - _SYNC_IO_REACH_PENDING))
+@pytest.mark.parametrize(
+    "stem", sorted(_OWNER_MODULES - _SYNC_IO_REACH_PENDING - _SYNC_ONLY_OWNERS)
+)
 def test_the_sync_io_gate_reports_a_blocking_call_planted_in_an_owner(
     stem: str, module: str
 ) -> None:

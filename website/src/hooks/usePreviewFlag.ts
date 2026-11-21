@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react'
 
 import {
-  PREVIEW_FLAG_EVENT, PREVIEW_FLAG_PREFIX, PREVIEW_INSTANCE_SESSIONS, PREVIEW_REMOTE_CREW_CHAT, readPreviewFlag,
+  PREVIEW_EXPLORE, PREVIEW_FLAG_EVENT, PREVIEW_FLAG_PREFIX, PREVIEW_INSTANCE_SESSIONS, PREVIEW_REMOTE_CREW_CHAT, previewFlagsLocked, readPreviewFlag,
 } from '../utils/previewFlags'
 import type { PreviewFlagChange } from '../utils/previewFlags'
+import { LOCKED_FEATURE_PREVIEWS, useControlLocked, useFeaturePreviewLockKnown } from '../utils/editionLocks'
 
 /**
  * Reactive read of a preview flag (see `utils/previewFlags.ts`).
@@ -24,10 +25,11 @@ export function usePreviewFlag(flag: string): boolean {
     setOn(readPreviewFlag(flag))
     const onEvent = (e: Event) => {
       const detail = (e as CustomEvent<PreviewFlagChange>).detail
-      if (detail?.key === flag) setOn(detail.on)
+      if (detail?.key === flag) setOn(detail.on && !previewFlagsLocked())
     }
     const onStorage = (e: StorageEvent) => {
-      if (e.key === flag) setOn(e.newValue === '1')
+      // A locked build (LTS) stays off whatever another tab wrote.
+      if (e.key === flag) setOn(e.newValue === '1' && !previewFlagsLocked())
     }
     window.addEventListener(PREVIEW_FLAG_EVENT, onEvent)
     window.addEventListener('storage', onStorage)
@@ -44,6 +46,25 @@ export function useRemoteCrewChat(): boolean {
   const current = usePreviewFlag(PREVIEW_REMOTE_CREW_CHAT)
   const legacy = usePreviewFlag(PREVIEW_INSTANCE_SESSIONS)
   return current || legacy
+}
+
+/**
+ * Whether this build offers conductor mode, reactively: the same answer
+ * `crewModeEnabled()` gives (`lib/crewMode.ts`), redrawn when the gateway's
+ * edition lock arrives. Off in an LTS build, and until the lock is known.
+ */
+export function useCrewMode(): boolean {
+  const known = useFeaturePreviewLockKnown()
+  return !useControlLocked(LOCKED_FEATURE_PREVIEWS) && known
+}
+
+/**
+ * The Explore preview, reactively: every Explore surface (the top-bar pill and
+ * its phone twins, the sheet, the milestone notice, the Try today card and the
+ * Display switch) mounts only while this is on.
+ */
+export function useExplorePreview(): boolean {
+  return usePreviewFlag(PREVIEW_EXPLORE)
 }
 
 /**

@@ -392,6 +392,7 @@ async def wrap_argv_async(
     *,
     strip_python_env: bool = False,
     forward_ssh_auth_sock: bool = False,
+    forward_ssh_auth_sock_out: list[bool] | None = None,
     extra_hidden_dirs: tuple[str, ...] = (),
     extra_visible_dirs: tuple[str, ...] = (),
     extra_private_dirs: tuple[str, ...] = (),
@@ -418,6 +419,8 @@ async def wrap_argv_async(
         options["strip_python_env"] = True
     if forward_ssh_auth_sock:
         options["forward_ssh_auth_sock"] = True
+    if forward_ssh_auth_sock_out is not None:
+        options["forward_ssh_auth_sock_out"] = forward_ssh_auth_sock_out
     if extra_hidden_dirs:
         options["extra_hidden_dirs"] = extra_hidden_dirs
     if extra_visible_dirs:
@@ -477,7 +480,15 @@ def scrub_env(
     """
     prefixes = _SPAWN_SCRUB_ENV_PREFIXES + (extra_prefixes or [])
     src = os.environ if env is None else env
-    return {k: v for k, v in src.items() if not any(k.startswith(p) for p in prefixes)}
+    # Windows env names are case-insensitive: a lower-case spelling there IS the
+    # upper-case variable, so the (all upper-case) prefixes judge the folded name.
+    # POSIX keeps the raw spelling: there the two spellings are different variables.
+    fold = os.name == "nt"
+    return {
+        k: v
+        for k, v in src.items()
+        if not any((k.upper() if fold else k).startswith(p) for p in prefixes)
+    }
 
 
 def without_python_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -545,8 +556,11 @@ def scrub_agent_denied_env(env: dict[str, str]) -> dict[str, str]:
     vars must survive the parent scrub. Prefix match via ``startswith`` mirrors
     the launcher's env_prefixes check.
     """
+    fold = os.name == "nt"  # Windows env names are case-insensitive (see scrub_env)
     return {
-        k: v for k, v in env.items() if not any(k.startswith(p) for p in _AGENT_DENIED_ENV_KEYS)
+        k: v
+        for k, v in env.items()
+        if not any((k.upper() if fold else k).startswith(p) for p in _AGENT_DENIED_ENV_KEYS)
     }
 
 
@@ -574,11 +588,15 @@ def scrub_agent_subprocess_env(
     """
     scrubbed = scrub_env(env, extra_prefixes=_PYTHON_ENV_PREFIXES)
     src = os.environ if env is None else env
-    if forward_ssh_auth_sock and "SSH_AUTH_SOCK" in src:
+    if forward_ssh_auth_sock:
         # scrub_env removed it unconditionally; re-add the socket for the agent
-        # child only. Restricted to the exact key, so nothing else the generic
-        # scrub dropped is reintroduced.
-        scrubbed["SSH_AUTH_SOCK"] = src["SSH_AUTH_SOCK"]
+        # child only. Restricted to the exact key, matched in the spelling the
+        # scrub folds (a Windows case variant is forwarded too), so nothing else
+        # the generic scrub dropped is reintroduced.
+        fold = os.name == "nt"
+        for key, value in src.items():
+            if (key.upper() if fold else key) == "SSH_AUTH_SOCK":
+                scrubbed[key] = value
     return scrubbed
 
 
@@ -637,7 +655,8 @@ def sandboxed_spawn_argv(
             spawn gets). ``None`` keeps ``wrap_argv``'s own classification.
         first_party_fixed_argv: Threaded to :func:`wrap_argv`. True ONLY for
             spawns whose full argv is derived inside this package with zero
-            agent/repo/user-config influence; every passing site must be
+            agent/repo/user-config influence, or that run the ACP kiro-cli
+            (``kiro_cli.find_kiro_cli_candidates``) with a fixed argv; every passing site must be
             allowlisted in ``test/test_spawn_audit.py::FIRST_PARTY_SPAWNS``.
             See :func:`wrap_argv` for the no-backend carve-out it gates.
 

@@ -32,6 +32,7 @@ from meetings_helpers import (  # noqa: F401 — fixtures are used by name
     reset_module_state_fixture,
     root_fixture,
 )
+from redaction_structured_cases import github_classic
 
 from kiro_crew.apps.builtins.meetings.backend import constants as k
 from kiro_crew.apps.builtins.meetings.backend import store
@@ -42,14 +43,16 @@ NOTE_TAKER = {"id": "note-taker", "widget_type": "markdown"}
 SKETCH = {"id": "sketch-artist", "widget_type": "html"}
 
 
+# A GitHub token with a valid checksum, which the redactor masks.
+_TOKEN = github_classic(seed=44)
+
+
 def _set_mtime(path: Path, when: float) -> None:
     """Pin *path*'s mtime, so ``stale`` is deterministic rather than filesystem-timed."""
     os.utime(path, (when, when))
 
 
-# ---------------------------------------------------------------------------
 # The two ownership properties
-# ---------------------------------------------------------------------------
 
 
 class TestOwnership:
@@ -102,7 +105,10 @@ class TestOwnership:
         """The generated document survives verbatim — that is what makes revert safe."""
         store.write_agent_output("m1", NOTE_TAKER, "# Generated\n", root)
         store.write_agent_edit("m1", NOTE_TAKER, "# Mine\n", root)
-        assert store.agent_output_path("m1", "note-taker.md", root).read_text() == "# Generated\n"
+        assert (
+            store.agent_output_path("m1", "note-taker.md", root).read_text(encoding="utf-8")
+            == "# Generated\n"
+        )
 
     def test_the_agent_rewriting_its_file_does_not_touch_the_edit(self, root: Path):
         """The other direction, which is the one the feature exists for."""
@@ -132,7 +138,7 @@ class TestOwnership:
         with pytest.raises(store.MeetingsPathError):
             store.revert_agent_edit("m1", NOTE_TAKER, root)
         # And the generated file behind the link never changed.
-        assert target.read_text() == "# Generated\n"
+        assert target.read_text(encoding="utf-8") == "# Generated\n"
 
     def test_a_symlinked_edits_directory_is_refused_not_followed(self, root: Path):
         """The DIRECTORY branch of the same family: ``edits/<id>`` as a link.
@@ -154,7 +160,7 @@ class TestOwnership:
         with pytest.raises(store.MeetingsPathError):
             store.read_agent_edit("m1", NOTE_TAKER, root)
         # The generated document was never touched through the link.
-        assert (meeting_dir / "note-taker.md").read_text() == "# Generated\n"
+        assert (meeting_dir / "note-taker.md").read_text(encoding="utf-8") == "# Generated\n"
 
     def test_a_symlinked_edits_root_is_refused_not_followed(self, root: Path):
         """The ROOT branch: ``edits/`` itself as a link is refused too.
@@ -193,9 +199,7 @@ class TestOwnership:
         assert path is not None and path.read_bytes() == content.encode()
 
 
-# ---------------------------------------------------------------------------
 # Store semantics
-# ---------------------------------------------------------------------------
 
 
 class TestStore:
@@ -266,9 +270,7 @@ class TestStore:
         assert set(edits) == {"note-taker"}
 
 
-# ---------------------------------------------------------------------------
 # The read overlay
-# ---------------------------------------------------------------------------
 
 
 class TestOutputsOverlay:
@@ -367,9 +369,7 @@ class TestOutputsOverlay:
         assert "# Mine" not in body["outputs"].get("note-taker", "")
 
 
-# ---------------------------------------------------------------------------
 # Redaction
-# ---------------------------------------------------------------------------
 
 
 class TestRedaction:
@@ -378,11 +378,9 @@ class TestRedaction:
         """Adding the overlay must not have dropped the pass that was already there."""
         async with client_for(app) as client:
             await client.post(f"{BASE}/meetings/standup/init", json={})
-            store.write_agent_output(
-                "standup", NOTE_TAKER, "# Notes\n\nkey AKIAIOSFODNN7EXAMPLE here", root
-            )
+            store.write_agent_output("standup", NOTE_TAKER, f"# Notes\n\nkey {_TOKEN} here", root)
             body = await (await client.get(f"{BASE}/meetings/standup/outputs")).json()
-        assert "AKIAIOSFODNN7EXAMPLE" not in body["outputs"]["note-taker"]
+        assert _TOKEN not in body["outputs"]["note-taker"]
 
     @pytest.mark.asyncio
     async def test_the_users_own_edit_is_returned_verbatim(self, app, root: Path):
@@ -399,9 +397,7 @@ class TestRedaction:
         assert body["outputs"]["note-taker"] == marker
 
 
-# ---------------------------------------------------------------------------
 # Request validation
-# ---------------------------------------------------------------------------
 
 
 class TestValidation:
@@ -513,9 +509,7 @@ class TestValidation:
             assert resp.status == 413
 
 
-# ---------------------------------------------------------------------------
 # The two caps have to agree
-# ---------------------------------------------------------------------------
 
 
 class TestBodyCaps:
@@ -566,9 +560,7 @@ class TestBodyCaps:
         assert body["outputs"]["note-taker"] == content
 
 
-# ---------------------------------------------------------------------------
 # Wiring
-# ---------------------------------------------------------------------------
 
 
 class TestWiring:

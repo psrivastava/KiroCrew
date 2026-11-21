@@ -11,6 +11,7 @@ which handler each command reaches and with what.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import importlib
 import sys
 import types
@@ -104,6 +105,7 @@ _NAMESPACE_HANDLERS = [
     (("agent", "list"), "kiro_crew.cli_commands", "_handle_agent"),
     (("workspace", "list"), "kiro_crew.cli_commands", "_handle_workspace"),
     (("app", "list"), "kiro_crew.cli_commands", "_handle_app"),
+    (("trace", "show", "some-turn"), "kiro_crew.tracing.render", "trace_show"),
     (("logs",), "kiro_crew.cli_server", "_logs_cmd"),
     (("token",), "kiro_crew.cli_server", "_token"),
     (("status",), "kiro_crew.cli_server", "_status"),
@@ -138,7 +140,6 @@ def test_a_command_hands_its_namespace_to_its_handler(
 
 # Commands whose handler the facade binds, and which take the parsed namespace.
 _FACADE_HANDLERS = [
-    (("knowledge", "stats"), "_knowledge"),
     (("consolidate",), "_consolidate_cmd"),
     (("config", "get"), "_config_cmd"),
 ]
@@ -198,6 +199,7 @@ _EXIT_HANDLERS = [
     (("sandbox", "status"), "kiro_crew.cli_server", "_sandbox_cmd"),
     (("kas", "status"), "kiro_crew.cli_kas", "kas_cmd"),
     (("cloud", "list"), None, "handle_cloud"),
+    (("knowledge", "stats"), None, "_knowledge"),
 ]
 
 
@@ -268,7 +270,9 @@ def test_doctor_runs_even_when_the_platform_cannot_compose(
     monkeypatch.setattr(cli, "boot_platform", refuse)
     monkeypatch.setattr(cli, "_doctor", _recorder(calls))
     _run(monkeypatch, "doctor", "--bundle")
-    assert calls == [((), {"platform_boot_error": failure, "bundle": True})]
+    assert calls == [
+        ((), {"platform_boot_error": failure, "bundle": True, "reconcile_memory": False})
+    ]
     assert "repair_legacy_member_stores" not in booted
 
 
@@ -282,7 +286,9 @@ def test_an_unexpected_boot_error_does_not_stop_a_standalone_command(
     monkeypatch.setattr(cli, "boot_platform", broken)
     monkeypatch.setattr(cli, "_doctor", _recorder(calls))
     _run(monkeypatch, "doctor")
-    assert calls == [((), {"platform_boot_error": None, "bundle": False})]
+    assert calls == [
+        ((), {"platform_boot_error": None, "bundle": False, "reconcile_memory": False})
+    ]
 
 
 def test_setup_and_manifest_get_their_flags_as_keywords(
@@ -337,9 +343,10 @@ def test_computer_forwards_its_remaining_arguments(
         (("update", "approve"), "_update_approve", ((), {})),
         (("stop", "--port", "7001"), "_stop", ((7001,), {"expect_pid": None})),
         (("restart", "--port", "7002"), "_restart", ((7002,), {})),
-        (("gateway-pid",), "_gateway_pid", ((), {})),
+        (("gateway-pid",), "_gateway_pid", ((None,), {})),
+        (("gateway-pid", "--port", "5476"), "_gateway_pid", ((5476,), {})),
     ],
-    ids=["update", "update-force", "update-approve", "stop", "restart", "pid"],
+    ids=["update", "update-force", "update-approve", "stop", "restart", "pid", "pid-port"],
 )
 def test_a_gateway_control_command_reaches_its_server_handler(
     booted: list[str],
@@ -441,3 +448,29 @@ def test_an_unusable_kirocrew_port_stops_every_command_before_it_starts(
     assert exited.value.code == 1
     assert f"KIROCREW_PORT={raw!r} {complaint}" in capsys.readouterr().err
     assert booted == []
+
+
+def test_acceptance_check_without_an_edition_exits_2_and_prints_no_report(
+    booted: list[str], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The public build knows no check, so the evaluator reads "no edition provides it"."""
+    with pytest.raises(SystemExit) as exited:
+        _run(monkeypatch, "acceptance-check", "--json", "ci-green", "ITEM-42")
+    assert exited.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "no installed edition provides the acceptance check 'ci-green'" in captured.err
+
+
+def test_acceptance_check_exits_with_the_composed_editions_answer(
+    booted: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A companion's adapter, composed like any other field, answers the core's command."""
+    calls: list[Call] = []
+    edition = types.SimpleNamespace(run_acceptance_check=_recorder(calls, result=8))
+    ctx = dataclasses.replace(cli.current_context(), acceptance_checks=edition)
+    monkeypatch.setattr(cli, "current_context", lambda: ctx)
+    with pytest.raises(SystemExit) as exited:
+        _run(monkeypatch, "acceptance-check", "--json", "ci-green", "ITEM-42")
+    assert exited.value.code == 8
+    assert calls == [(("ci-green", "ITEM-42"), {})]

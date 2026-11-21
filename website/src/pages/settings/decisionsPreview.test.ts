@@ -30,6 +30,7 @@ const OFF = {
   enabled: false,
   configuredEndpoint: '',
   endpointMoved: false,
+  withdrawn: false,
   // The tool-argument egress scope reads FALSE for an unreadable body, on the same
   // fail-closed terms as `enabled`: a body nobody could parse grants nothing.
   toolArgs: false,
@@ -39,6 +40,8 @@ const OFF = {
   memoryText: false,
   // And the wake-evidence scope.
   nudgeEvidence: false,
+  browser: false,
+  browserImages: false,
   // And the prior-conversation ceiling reads 0, which is the least that can leave.
   historyBudget: 0,
 }
@@ -57,6 +60,7 @@ describe('readConsent', () => {
         enabled: true,
         configuredEndpoint: ENDPOINT,
         endpointMoved: false,
+        withdrawn: false,
         // Consent to SEND is not consent to send tool arguments: a body that does
         // not mention the scope grants none of it.
         toolArgs: false,
@@ -67,6 +71,8 @@ describe('readConsent', () => {
         // Nor the evidence a waiting loop is watching, which comes from OTHER
         // sessions and so is not covered by any yes about this one.
         nudgeEvidence: false,
+        browser: false,
+        browserImages: false,
         // Nor does it consent to prior turns: an unmentioned ceiling is 0.
         historyBudget: 0,
       })
@@ -106,6 +112,14 @@ describe('readConsent', () => {
     // Off is off; a stale recorded address is not a warning.
     expect(readConsent({ enabled: false, configured_endpoint: ENDPOINT, permits: false }).endpointMoved)
       .toBe(false)
+  })
+
+  it('reads a policy refusal as withdrawn, never as a moved address', () => {
+    const view = readConsent({ enabled: true, configured_endpoint: ENDPOINT, endpoint: ENDPOINT, permits: false, withdrawn: true })
+    expect(view.withdrawn).toBe(true)
+    expect(view.endpointMoved).toBe(false)
+    // Only an exact `true` is a refusal; an older gateway omits it.
+    expect(readConsent({ enabled: true, configured_endpoint: ENDPOINT, permits: false, withdrawn: 1 }).withdrawn).toBe(false)
   })
 })
 
@@ -155,11 +169,14 @@ describe('readDecisions', () => {
         enabled: true,
         configuredEndpoint: ENDPOINT,
         endpointMoved: false,
+        withdrawn: false,
         bucket: 25,
         toolArgs: false,
         compaction: false,
         memoryText: false,
         nudgeEvidence: false,
+        browser: false,
+        browserImages: false,
         // Absent from this payload, so the ceiling reads as 0 — the shipped
         // default, and the least that can leave the machine.
         historyBudget: 0,

@@ -8,8 +8,16 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
+from redaction_structured_cases import github_classic
+from warm_brief_render_seam import route_render
 
 from kiro_crew.dashboard import slot_retention, warm_task_brief
+from kiro_crew.dashboard.slot_preparing import preparing_caption
+from kiro_crew.session_summary import TranscriptTurn
+
+# A GitHub token with a valid checksum, which the plan redacts. An AWS key ID
+# stays visible as an identifier, so it is not a secret here.
+_TOKEN = github_classic(seed=49)
 
 
 class _State:
@@ -125,12 +133,7 @@ def _thread(monkeypatch, *, user_ago: float | None, log: _Log | None = None):
     async def run_model(*args, **kwargs):
         return '{"message":"You asked me to fix the test. It is in progress."}'
 
-    monkeypatch.setattr(warm_task_brief, "run_bg_oneliner", run_model)
-    monkeypatch.setattr(
-        warm_task_brief.KiroCrewConfig,
-        "load",
-        lambda: SimpleNamespace(agent=SimpleNamespace(resolve_model=lambda role: "background")),
-    )
+    route_render(monkeypatch, run_model)
     return state, slot, log
 
 
@@ -151,7 +154,7 @@ def _brief_kinds(slot: _Slot) -> list[str]:
     ]
 
 
-_FULL_BRIEF = ["warm_task_brief_claim", "warm_task_brief_preparing", "warm_task_brief_result"]
+_FULL_BRIEF = ["warm_task_brief_claim", "warm_task_brief_result"]
 
 
 @pytest.mark.asyncio
@@ -259,8 +262,9 @@ async def test_closed_socket_stamps_the_thread_it_showed(monkeypatch):
 @pytest.mark.parametrize(("typed_ago", "briefs"), [(600, False), (2 * 3600, True)])
 async def test_old_naive_rows_read_as_local_time(monkeypatch, local_tz, typed_ago, briefs):
     # Older builds wrote naive local wall-clock. Read as UTC west of UTC, a
-    # message typed ten minutes ago would look seven hours old.
-    local_tz("America/Los_Angeles")
+    # message typed ten minutes ago would look seven hours old. The zone has no
+    # DST: in a fall-back hour a naive stamp is ambiguous and reads an hour off.
+    local_tz("America/Phoenix")
     state, slot, log = _thread(monkeypatch, user_ago=None)
     log.rows.insert(
         0,
@@ -356,18 +360,20 @@ async def _brief_in_model_call(monkeypatch, state: _State, slot: _Slot):
         await asyncio.wait_for(release.wait(), timeout=30)
         return '{"headline":"The fix is in review.","status":"on_track"}'
 
-    monkeypatch.setattr(warm_task_brief, "run_bg_oneliner", run_model)
+    route_render(monkeypatch, run_model)
     warm_task_brief.handle_focus_frame(state, 1, slot.key)
     slot_retention.note_foreground(state, 1, slot.key)
     task = state._warm_task_brief_tasks[slot.key]
     await asyncio.wait_for(entered.wait(), timeout=30)
-    assert _brief_kinds(slot) == ["warm_task_brief_claim", "warm_task_brief_preparing"]
+    # No separate opener: only the indicator shows while the model runs.
+    assert _brief_kinds(slot) == ["warm_task_brief_claim"]
+    assert slot._preparing_count == 1
     return task, release
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("leave", [None, "thread-y"], ids=["tab_hidden", "other_chat"])
-async def test_leaving_after_the_opener_still_publishes_the_card(monkeypatch, leave):
+async def test_leaving_once_preparing_still_publishes_the_card(monkeypatch, leave):
     state, slot, _ = _thread(monkeypatch, user_ago=2 * 3600)
     task, release = await _brief_in_model_call(monkeypatch, state, slot)
     try:
@@ -404,7 +410,7 @@ async def test_quick_leave_and_return_during_the_model_call_posts_one_card(monke
 
 
 @pytest.mark.asyncio
-async def test_typing_after_leaving_past_the_opener_still_drops_the_card(monkeypatch):
+async def test_typing_after_leaving_while_preparing_still_drops_the_card(monkeypatch):
     state, slot, _ = _thread(monkeypatch, user_ago=2 * 3600)
     task, release = await _brief_in_model_call(monkeypatch, state, slot)
     try:
@@ -414,10 +420,11 @@ async def test_typing_after_leaving_past_the_opener_still_drops_the_card(monkeyp
         warm_task_brief.cancel_for_live_user_row(state, slot.key, "Actually, stop that.")
     finally:
         release.set()
-    await asyncio.wait_for(task, timeout=30)
+    # No model call is in flight to protect: the typed row cancels the welcome.
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=30)
 
-    assert _brief_kinds(slot) == ["warm_task_brief_claim", "warm_task_brief_preparing"]
-    assert state._warm_task_brief_abandoned == set()
+    assert _brief_kinds(slot) == ["warm_task_brief_claim"]
 
 
 @pytest.mark.asyncio
@@ -431,7 +438,7 @@ async def test_one_window_leaving_keeps_the_other_windows_brief(monkeypatch):
         await asyncio.wait_for(release.wait(), timeout=30)
         return '{"message":"Here is where we are."}'
 
-    monkeypatch.setattr(warm_task_brief, "run_bg_oneliner", run_model)
+    route_render(monkeypatch, run_model)
     warm_task_brief.handle_focus_frame(state, 1, slot.key)
     slot_retention.note_foreground(state, 1, slot.key)
     task = state._warm_task_brief_tasks[slot.key]
@@ -478,7 +485,6 @@ def _snapshot(fingerprint: str = "fp", *, previous_claim: str = ""):
         history_key="dashboard:thread-x",
         original_request="Fix the failing test",
         fingerprint=fingerprint,
-        transcript="User: Fix the failing test",
         session_state={"phase": "implementing"},
         conductor={"goal": "Fix the test"},
         work_items=({"state": "open", "summary": "Failure reproduced"},),
@@ -486,6 +492,11 @@ def _snapshot(fingerprint: str = "fp", *, previous_claim: str = ""):
         previous_claim=previous_claim,
         # Hours before any test clock: the owner has been away.
         last_user_at=0.0,
+        # Something was said since, so the return is not a quiet one.
+        turns=(
+            TranscriptTurn(index=1, role="user", text="Fix the failing test", ts=_iso(0.0)),
+            TranscriptTurn(index=2, role="assistant", text="Reproduced it.", ts=_iso(60.0)),
+        ),
     )
 
 
@@ -495,106 +506,6 @@ def _claimed(snapshot: warm_task_brief.TaskSnapshot) -> warm_task_brief.TaskSnap
 
 def _posted(slot: _Slot) -> list[dict]:
     return [row for row in slot.rows if row["role"] == "assistant"]
-
-
-@pytest.mark.asyncio
-async def test_opener_precedes_the_single_model_call_and_result_is_a_structured_brief(
-    monkeypatch,
-):
-    state = _State()
-    slot = _Slot()
-    state.slots[slot.key] = slot
-    state._foreground_slots[1] = slot.key
-    snapshot = _snapshot()
-
-    async def read_snapshot(*args, **kwargs):
-        return _claimed(snapshot) if slot.flushed else snapshot
-
-    kinds_at_call = []
-    call_kwargs = {}
-
-    async def run_model(*args, **kwargs):
-        kinds_at_call.extend(row["meta"]["kind"] for row in slot.rows)
-        call_kwargs.update(kwargs)
-        call_kwargs["prompt"] = args[1]
-        # The model's own progress numbers are ignored: the card shows the
-        # gateway's count from the snapshot's work items.
-        return json.dumps(
-            {
-                "status": "needs_you",
-                "headline": "I reproduced the **failure**.",
-                "asked": "Fix the failing test",
-                "progress": {"accepted": 9, "total": 9},
-                "remaining": "Push the fix and rerun CI",
-                "done": ["Reproduced the failure"],
-                "needs_you": ["Approve the push so CI can run"],
-                "next": ["Apply the fix", "Rerun CI"],
-                "extra": [{"title": "Risk", "items": ["The fix touches a shared helper"]}],
-            }
-        )
-
-    monkeypatch.setattr(warm_task_brief, "_snapshot", read_snapshot)
-    monkeypatch.setattr(warm_task_brief, "run_bg_oneliner", run_model)
-    monkeypatch.setattr(
-        warm_task_brief.KiroCrewConfig,
-        "load",
-        lambda: SimpleNamespace(
-            agent=SimpleNamespace(resolve_model=lambda role: "background"),
-            dashboard=SimpleNamespace(verbosity="answer_only"),
-        ),
-    )
-
-    await warm_task_brief._prepare_warm_task_brief(state, slot)
-
-    assert kinds_at_call == ["warm_task_brief_claim", "warm_task_brief_preparing"]
-    preparing = slot.rows[1]
-    assert preparing["role"] == "assistant"
-    assert preparing["content"] == "Welcome back, let me catch you up on where we are."
-    assert preparing["meta"]["kind"] == "warm_task_brief_preparing"
-    # The claim flush, then the pre-publication flush.
-    assert slot.flushed == 2
-    assert call_kwargs["crew_log_kind"] == "warm_task_brief"
-    assert call_kwargs["crew_log_session_key"] == "dashboard:thread-x"
-    assert call_kwargs["timeout"] == 60.0
-    assert call_kwargs["retry_rejected_model"] is False
-    assert slot.rows[0]["meta"] == {"kind": "warm_task_brief_claim", "fingerprint": "fp"}
-    result = slot.rows[-1]
-    assert result["role"] == "assistant"
-    assert result["meta"] == {
-        "kind": "warm_task_brief_result",
-        "fingerprint": "fp",
-        "brief": {
-            "status": "needs_you",
-            "headline": "I reproduced the failure.",
-            "asked": "Fix the failing test",
-            "progress": {"accepted": 0, "total": 1},
-            "remaining": "Push the fix and rerun CI",
-            "done": ["Reproduced the failure"],
-            "needs_you": ["Approve the push so CI can run"],
-            "next": ["Apply the fix", "Rerun CI"],
-            "extra": [{"title": "Risk", "items": ["The fix touches a shared helper"]}],
-        },
-    }
-    # The stored content is the same brief as plain text, in the card's order,
-    # for every reader that does not draw the card.
-    assert result["content"] == (
-        "Waiting on you: I reproduced the failure.\n"
-        "Needs you:\n- Approve the push so CI can run\n"
-        "Progress: 0 of 1 done\n"
-        "Left: Push the fix and rerun CI\n"
-        "You asked: Fix the failing test\n"
-        "Done so far:\n- Reproduced the failure\n"
-        "Next:\n1. Apply the fix\n2. Rerun CI\n"
-        "Risk:\n- The fix touches a shared helper"
-    )
-    prompt = call_kwargs["prompt"]
-    assert '"original_request": "Fix the failing test"' in prompt
-    # The model sees the gateway's count so its text agrees with it.
-    assert '"progress": {"accepted": 0, "total": 1}' in prompt
-    assert "trusted teammate" in prompt and "Never invent numbers" in prompt
-    assert '"needs_you"' in prompt and "no\nmarkdown, HTML or links" in prompt
-    # The user's reply-style choice reaches the prompt.
-    assert warm_task_brief._STYLE_HINTS["answer_only"] in prompt
 
 
 @pytest.mark.asyncio
@@ -611,38 +522,10 @@ async def test_existing_claim_suppresses_status_and_model(monkeypatch):
         raise AssertionError("model must not run")
 
     monkeypatch.setattr(warm_task_brief, "_snapshot", read_snapshot)
-    monkeypatch.setattr(warm_task_brief, "run_bg_oneliner", unexpected)
+    route_render(monkeypatch, unexpected)
     await warm_task_brief._prepare_warm_task_brief(state, slot)
     assert state.frames == []
     assert slot.rows == []
-
-
-@pytest.mark.asyncio
-async def test_model_failure_posts_an_ordinary_failure_message(monkeypatch):
-    state = _State()
-    slot = _Slot()
-    state.slots[slot.key] = slot
-    state._foreground_slots[1] = slot.key
-    snapshot = _snapshot()
-
-    async def read_snapshot(*args, **kwargs):
-        return _claimed(snapshot) if slot.flushed else snapshot
-
-    async def fail(*args, **kwargs):
-        raise RuntimeError("provider failed")
-
-    monkeypatch.setattr(warm_task_brief, "_snapshot", read_snapshot)
-    monkeypatch.setattr(warm_task_brief, "run_bg_oneliner", fail)
-    monkeypatch.setattr(
-        warm_task_brief.KiroCrewConfig,
-        "load",
-        lambda: SimpleNamespace(agent=SimpleNamespace(resolve_model=lambda role: "background")),
-    )
-    await warm_task_brief._prepare_warm_task_brief(state, slot)
-    assert [row["content"] for row in _posted(slot)] == [
-        "Welcome back, let me catch you up on where we are.",
-        "Sorry, I couldn't pull that together just now. Ask me where things stand.",
-    ]
 
 
 @pytest.mark.asyncio
@@ -656,23 +539,16 @@ async def test_user_send_drops_stale_result_and_keeps_preparing(monkeypatch):
     snapshots = [base, _claimed(base), sent]
 
     async def read_snapshot(*args, **kwargs):
-        return snapshots.pop(0)
+        return snapshots.pop(0) if len(snapshots) > 1 else snapshots[0]
 
     async def run_model(*args, **kwargs):
         return '{"message":"Old state."}'
 
     monkeypatch.setattr(warm_task_brief, "_snapshot", read_snapshot)
-    monkeypatch.setattr(warm_task_brief, "run_bg_oneliner", run_model)
-    monkeypatch.setattr(
-        warm_task_brief.KiroCrewConfig,
-        "load",
-        lambda: SimpleNamespace(agent=SimpleNamespace(resolve_model=lambda role: "background")),
-    )
+    route_render(monkeypatch, run_model)
     await warm_task_brief._prepare_warm_task_brief(state, slot)
-    assert [row["content"] for row in _posted(slot)] == [
-        "Welcome back, let me catch you up on where we are."
-    ]
-    assert snapshots == []
+    assert _posted(slot) == []
+    assert snapshots == [sent]  # the stale read is the last one taken
     assert all(row.get("meta", {}).get("kind") != "warm_task_brief_result" for row in slot.rows)
 
 
@@ -688,7 +564,7 @@ async def test_live_derivation_withheld_slot_never_claims_or_calls_model(monkeyp
         raise AssertionError("restricted transcript must not be read or sent")
 
     monkeypatch.setattr(warm_task_brief, "_snapshot", unexpected)
-    monkeypatch.setattr(warm_task_brief, "run_bg_oneliner", unexpected)
+    route_render(monkeypatch, unexpected)
     await warm_task_brief._prepare_warm_task_brief(state, slot)
     assert slot.rows == []
     assert state.frames == []
@@ -878,7 +754,7 @@ async def test_unpersisted_claim_never_surfaces_status_or_spends(monkeypatch):
         raise AssertionError("model must not run without a durable claim")
 
     monkeypatch.setattr(warm_task_brief, "_snapshot", read_snapshot)
-    monkeypatch.setattr(warm_task_brief, "run_bg_oneliner", unexpected)
+    route_render(monkeypatch, unexpected)
     await warm_task_brief._prepare_warm_task_brief(state, slot)
 
     assert _posted(slot) == []
@@ -941,102 +817,6 @@ def test_long_original_request_has_an_explicit_omission_mark():
     assert result.endswith("characters omitted ...]")
 
 
-@pytest.mark.asyncio
-async def test_cancel_during_model_suppresses_result_without_cancelling_acquisition(monkeypatch):
-    state = _State()
-    slot = _Slot()
-    state.slots[slot.key] = slot
-    state._foreground_slots[1] = slot.key
-    snapshot = _snapshot()
-    entered = asyncio.Event()
-    release = asyncio.Event()
-    model_cancelled = False
-
-    async def read_snapshot(*args, **kwargs):
-        return _claimed(snapshot) if slot.rows else snapshot
-
-    async def run_model(*args, **kwargs):
-        nonlocal model_cancelled
-        entered.set()
-        try:
-            await asyncio.wait_for(release.wait(), timeout=30)
-        except asyncio.CancelledError:
-            model_cancelled = True
-            raise
-        return "not json"
-
-    monkeypatch.setattr(warm_task_brief, "_snapshot", read_snapshot)
-    monkeypatch.setattr(warm_task_brief, "run_bg_oneliner", run_model)
-    monkeypatch.setattr(
-        warm_task_brief.KiroCrewConfig,
-        "load",
-        lambda: SimpleNamespace(agent=SimpleNamespace(resolve_model=lambda role: "background")),
-    )
-    task = asyncio.create_task(warm_task_brief._prepare_warm_task_brief(state, slot))
-    state._warm_task_brief_tasks[slot.key] = task
-    try:
-        await asyncio.wait_for(entered.wait(), timeout=30)
-        # A real cancel (a typed row, a reset, a close) during the model call.
-        warm_task_brief.cancel_warm_task_brief(state, slot.key)
-
-        assert not task.done()
-        assert [row["meta"]["kind"] for row in _posted(slot)] == ["warm_task_brief_preparing"]
-        release.set()
-        await asyncio.wait_for(task, timeout=30)
-
-        assert model_cancelled is False
-        assert all(row.get("meta", {}).get("kind") != "warm_task_brief_result" for row in slot.rows)
-        assert all(
-            row.get("meta", {}).get("kind") != "warm_task_brief_failure" for row in slot.rows
-        )
-    finally:
-        release.set()
-        if not task.done():
-            task.cancel()
-            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=30)
-
-
-@pytest.mark.parametrize(
-    ("request_text", "language"),
-    [
-        ("Fix the failing test", "en"),
-        ("修复失败的测试", "zh"),
-        ("テストを直してください", "ja"),
-        ("테스트를 고쳐 주세요", "ko"),
-        ("Исправь тест", "ru"),
-        ("", "en"),
-    ],
-)
-def test_opener_follows_the_script_of_the_request(request_text, language):
-    assert warm_task_brief._language_of(request_text) == language
-    assert warm_task_brief._OPENER_TEXT[language]
-    assert warm_task_brief._FAILURE_TEXT[language]
-
-
-@pytest.mark.parametrize(
-    ("verbosity", "level"),
-    [
-        ("answer_only", "answer_only"),
-        ("concise", "concise"),
-        ("default", "default"),
-        ("bogus", "default"),
-        (None, "default"),
-    ],
-)
-def test_prompt_follows_the_reply_style_setting(verbosity, level):
-    prompt = warm_task_brief._build_prompt(_snapshot(), verbosity)
-    assert warm_task_brief._STYLE_HINTS[level] in prompt
-
-
-def test_every_text_label_language_has_every_label():
-    assert set(warm_task_brief._TEXT_LABELS) == set(warm_task_brief._OPENER_TEXT)
-    for labels in warm_task_brief._TEXT_LABELS.values():
-        assert set(labels) == set(warm_task_brief._TEXT_LABEL_KEYS)
-        assert set(warm_task_brief._STATUSES) <= set(labels)
-        assert all(labels.values())
-        assert labels["count"].format(accepted=1, total=2) != labels["count"]
-
-
 @pytest.mark.parametrize("kind", [[], {}, ["warm_task_brief_result"], None, 3])
 def test_non_string_meta_kind_is_not_a_brief_row_and_never_raises(kind):
     from kiro_crew.warm_task_brief_contract import is_warm_task_brief_message
@@ -1046,19 +826,14 @@ def test_non_string_meta_kind_is_not_a_brief_row_and_never_raises(kind):
 
 def _arm_model(monkeypatch, slot, snapshots, run_model=None):
     async def read_snapshot(*args, **kwargs):
-        return snapshots.pop(0)
+        return snapshots.pop(0) if len(snapshots) > 1 else snapshots[0]
 
     async def default_model(*args, **kwargs):
         return '{"message":"Here is where we are."}'
 
     monkeypatch.setattr(warm_task_brief, "_IDLE_POLL_SECS", 0)
     monkeypatch.setattr(warm_task_brief, "_snapshot", read_snapshot)
-    monkeypatch.setattr(warm_task_brief, "run_bg_oneliner", run_model or default_model)
-    monkeypatch.setattr(
-        warm_task_brief.KiroCrewConfig,
-        "load",
-        lambda: SimpleNamespace(agent=SimpleNamespace(resolve_model=lambda role: "background")),
-    )
+    route_render(monkeypatch, run_model or default_model)
 
 
 def _foreground_slot(state: _State) -> _Slot:
@@ -1296,11 +1071,12 @@ async def test_patrol_turn_at_publication_defers_and_still_publishes(monkeypatch
         slot.append("assistant", "Patrol: one PR went green.", "msg msg-a")
 
     async def run_model(*args, **kwargs):
-        # A patrol turn is admitted while the model runs.
-        slot.task = asyncio.create_task(patrol_turn())
+        # A patrol turn is admitted while the welcome is written, once.
+        if slot.task is None:
+            slot.task = asyncio.create_task(patrol_turn())
         return '{"message":"Here is where we are."}'
 
-    _arm_model(monkeypatch, slot, [base, _claimed(base), patrolled], run_model)
+    _arm_model(monkeypatch, slot, [base, _claimed(base), patrolled, patrolled], run_model)
     waiting = _spy_wait(monkeypatch)
     task = await _start_brief(state, slot)
     await asyncio.wait_for(task, timeout=30)
@@ -1368,14 +1144,16 @@ def _arm_indicator_probe(state: _State, slot: _Slot) -> list[tuple[str, bool]]:
 
 
 @pytest.mark.asyncio
-async def test_indicator_spans_the_opener_to_the_result(monkeypatch):
+async def test_indicator_spans_the_model_call_to_the_result(monkeypatch):
     state = _State()
     slot = _foreground_slot(state)
     base = _snapshot()
     running_during_model: list[bool] = []
+    captions: list[tuple[str, str]] = []
 
     async def run_model(*args, **kwargs):
         running_during_model.append(slot.running)
+        captions.append(preparing_caption(slot))
         return '{"message":"Here is where we are."}'
 
     _arm_model(monkeypatch, slot, [base, _claimed(base), _claimed(base)], run_model)
@@ -1383,33 +1161,61 @@ async def test_indicator_spans_the_opener_to_the_result(monkeypatch):
 
     await warm_task_brief._prepare_warm_task_brief(state, slot)
 
+    # The result replaces the indicator in place: it posts while the
+    # indicator shows, and nothing posts before it.
     assert seen == [
         ("warm_task_brief_claim", False),
-        ("warm_task_brief_preparing", True),
         ("warm_task_brief_result", True),
     ]
     # The indicator is not a turn: the brief's own deferral still sees idle.
     assert running_during_model == [False]
+    # The caption is built by the gateway from the brief's own inputs: the
+    # goal and the one open work item (no PR named, no worker running).
+    assert captions == [("Checking 1 task for “Fix the test”.", "en")]
+    assert preparing_caption(slot) == ("", "")
     assert state.preparing_pushes == [{slot.key: True}, {slot.key: False}]
 
 
 @pytest.mark.asyncio
-async def test_indicator_clears_after_the_failure_line(monkeypatch):
+async def test_a_credential_in_the_goal_never_reaches_the_caption(monkeypatch):
     state = _State()
     slot = _foreground_slot(state)
-    base = _snapshot()
+    base = replace(_snapshot(), conductor={"goal": f"Rotate {_TOKEN} then redeploy"})
+    captions: list[tuple[str, str]] = []
 
-    async def fail(*args, **kwargs):
-        raise RuntimeError("provider failed")
+    async def run_model(*args, **kwargs):
+        captions.append(preparing_caption(slot))
+        return '{"message":"Here is where we are."}'
 
-    _arm_model(monkeypatch, slot, [base, _claimed(base), _claimed(base)], fail)
-    seen = _arm_indicator_probe(state, slot)
+    _arm_model(monkeypatch, slot, [base, _claimed(base), _claimed(base)], run_model)
 
     await warm_task_brief._prepare_warm_task_brief(state, slot)
 
-    assert seen[-1] == ("warm_task_brief_failure", True)
-    assert slot._preparing_count == 0
-    assert state.preparing_pushes[-1] == {slot.key: False}
+    assert len(captions) == 1 and "Rotate" in captions[0][0]
+    assert _TOKEN not in captions[0][0]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_github_read_is_not_counted_in_the_caption(monkeypatch):
+    state = _State()
+    slot = _foreground_slot(state)
+    base = _snapshot()
+    captions: list[tuple[str, str]] = []
+
+    async def failed_reads(refs, *args, **kwargs):
+        return [{"pr": "#1", "checked": False}, {"pr": "#2", "checked": False}]
+
+    async def run_model(*args, **kwargs):
+        captions.append(preparing_caption(slot))
+        return '{"message":"Here is where we are."}'
+
+    _arm_model(monkeypatch, slot, [base, _claimed(base), _claimed(base)], run_model)
+    monkeypatch.setattr(warm_task_brief.inputs, "read_live_prs", failed_reads)
+
+    await warm_task_brief._prepare_warm_task_brief(state, slot)
+
+    # Both reads failed, so the caption names no PR, only the open task.
+    assert captions == [("Checking 1 task for “Fix the test”.", "en")]
 
 
 @pytest.mark.asyncio
@@ -1438,7 +1244,7 @@ async def test_indicator_clears_when_the_brief_task_is_cancelled(monkeypatch):
         entered.set()
         await asyncio.Event().wait()
 
-    _arm_model(monkeypatch, slot, [base, _claimed(base)], run_model)
+    _arm_model(monkeypatch, slot, [base, _claimed(base), _claimed(base)], run_model)
     task = await _start_brief(state, slot)
     await asyncio.wait_for(entered.wait(), timeout=30)
     assert slot._preparing_count == 1
@@ -1452,7 +1258,7 @@ async def test_indicator_clears_when_the_brief_task_is_cancelled(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_no_indicator_when_the_brief_skips_before_the_opener(monkeypatch):
+async def test_no_indicator_when_the_brief_skips_before_preparing(monkeypatch):
     state = _State()
     slot = _foreground_slot(state)
     _arm_model(monkeypatch, slot, [_snapshot(previous_claim="fp")])
@@ -1475,10 +1281,11 @@ async def test_a_turn_started_while_preparing_defers_and_the_indicator_holds(mon
         slot.append("assistant", "Patrol: nothing new.", "msg msg-a")
 
     async def run_model(*args, **kwargs):
-        slot.task = asyncio.create_task(patrol_turn())
+        if slot.task is None:
+            slot.task = asyncio.create_task(patrol_turn())
         return '{"message":"Here is where we are."}'
 
-    _arm_model(monkeypatch, slot, [base, _claimed(base), _claimed(base)], run_model)
+    _arm_model(monkeypatch, slot, [base, _claimed(base), _claimed(base), _claimed(base)], run_model)
     waiting = _spy_wait(monkeypatch)
     task = await _start_brief(state, slot)
     await asyncio.wait_for(task, timeout=30)
@@ -1486,32 +1293,6 @@ async def test_a_turn_started_while_preparing_defers_and_the_indicator_holds(mon
     assert held == [True]
     assert _live_kinds(slot)[-1] == "warm_task_brief_result"
     assert slot._preparing_count == 0
-
-
-def test_structured_brief_survives_a_transcript_round_trip(tmp_path):
-    from kiro_crew.history import ConversationLog
-
-    brief = warm_task_brief._parse_result(
-        '{"asked":"Fix it","headline":"Ready.","needs_you":[],"next":["Review"]}', "", (1, 1)
-    )
-    assert brief is not None
-    log = ConversationLog(base_dir=tmp_path / "sessions")
-    log.append(
-        "dashboard:thread-x",
-        "assistant",
-        warm_task_brief._brief_text(brief, "en"),
-        cls="msg msg-a",
-        extra_meta={
-            "kind": "warm_task_brief_result",
-            "fingerprint": "fp",
-            "brief": brief.as_meta(),
-        },
-    )
-    (row,) = log.derive_messages_chained("dashboard:thread-x")
-    assert row["meta"]["brief"] == brief.as_meta()
-    assert row["content"] == (
-        "On track: Ready.\nProgress: 1 of 1 done\nYou asked: Fix it\nNext:\n1. Review"
-    )
 
 
 class _CrewmateState(_State):
@@ -1566,36 +1347,6 @@ async def test_crewmate_with_open_worker_sessions_but_no_ledger_briefs(monkeypat
     state, slot = _ledgerless_crewmate(monkeypatch, workers=2)
     await _focus(state, 1, slot.key)
     assert _brief_kinds(slot) == _FULL_BRIEF
-
-
-@pytest.mark.asyncio
-async def test_open_worker_count_reaches_the_brief_prompt(monkeypatch):
-    state, slot = _ledgerless_crewmate(monkeypatch, workers=3)
-    prompts: list[str] = []
-
-    async def run_model(sessions, prompt, **kwargs):
-        prompts.append(prompt)
-        return '{"now":"Three workers are still going."}'
-
-    monkeypatch.setattr(warm_task_brief, "run_bg_oneliner", run_model)
-    await _focus(state, 1, slot.key)
-    assert len(prompts) == 1
-    assert '"running_worker_sessions": 3' in prompts[0]
-
-
-@pytest.mark.asyncio
-async def test_finished_worker_tabs_count_neither_as_work_nor_in_the_prompt(monkeypatch):
-    state, slot = _ledgerless_crewmate(monkeypatch, workers=1, finished_workers=2)
-    prompts: list[str] = []
-
-    async def run_model(sessions, prompt, **kwargs):
-        prompts.append(prompt)
-        return '{"now":"One worker is still going."}'
-
-    monkeypatch.setattr(warm_task_brief, "run_bg_oneliner", run_model)
-    await _focus(state, 1, slot.key)
-    assert len(prompts) == 1
-    assert '"running_worker_sessions": 1' in prompts[0]
 
 
 @pytest.mark.asyncio
@@ -1706,7 +1457,7 @@ async def test_last_worker_finishing_during_the_model_call_still_publishes(monke
         worker.running = False
         return '{"now":"The worker just finished."}'
 
-    monkeypatch.setattr(warm_task_brief, "run_bg_oneliner", run_model)
+    route_render(monkeypatch, run_model)
     await _focus(state, 1, slot.key)
 
     assert warm_task_brief._running_workers(state, slot.key) == 0
@@ -1724,8 +1475,84 @@ async def test_work_item_closing_during_the_model_call_still_publishes(monkeypat
         items[0] = _work_item("accepted")
         return '{"now":"The item was accepted."}'
 
-    monkeypatch.setattr(warm_task_brief, "run_bg_oneliner", run_model)
+    route_render(monkeypatch, run_model)
     await _focus(state, 1, slot.key)
 
     assert items[0].state == "accepted"
     assert _brief_kinds(slot) == _FULL_BRIEF
+
+
+_WAITING_ITEM = {
+    "item_id": "it_1",
+    "state": "open",
+    "status": "question",
+    "reason": "needs_human",
+    "title": "Pick a layout",
+    "summary": "Grid or list?",
+}
+
+
+def test_a_delivered_catch_up_still_sets_the_claim_digest():
+    rows = [
+        {"meta": {"kind": "warm_task_brief_claim", "ledger_digest": "d1"}},
+        {"meta": {"kind": "warm_task_brief_result"}},
+    ]
+    assert warm_task_brief._claim_digest(rows) == "d1"
+
+
+def _quiet_snapshot():
+    return warm_task_brief.TaskSnapshot(
+        slot_key="thread-x",
+        history_key="dashboard:thread-x",
+        original_request="Fix it",
+        fingerprint="fp2",
+        session_state={},
+        conductor=None,
+        work_items=(),
+        previous_claim="",
+        ledger_digest="d1",
+    )
+
+
+@pytest.mark.parametrize(
+    ("result_meta", "quiet"),
+    [
+        ({"kind": "warm_task_brief_result"}, True),
+        ({"kind": "warm_task_brief_result", "grounding_miss": "unknown_pr"}, False),
+        ({"kind": "warm_task_brief_result", "grounding_miss": "secret"}, False),
+        ({"kind": "warm_task_brief_result", "grounding_miss": "unbacked_fact"}, False),
+    ],
+)
+def test_only_a_delivered_catch_up_lets_the_next_unchanged_return_be_quiet(result_meta, quiet):
+    rows = [
+        {"meta": {"kind": "warm_task_brief_claim", "ledger_digest": "d1"}},
+        {"meta": result_meta},
+    ]
+    digest = warm_task_brief._claim_digest(rows)
+    assert warm_task_brief._is_quiet(_quiet_snapshot(), digest, 0.0) is quiet
+
+
+@pytest.mark.asyncio
+async def test_a_note_in_the_live_window_wins_over_the_settled_disk_read(monkeypatch):
+    state = _State()
+    slot = _Slot()
+    state.slots[slot.key] = slot
+    state._foreground_slots[1] = slot.key
+    snapshot = replace(_snapshot(), pending_options="[OPTIONS: Push | Hold]")
+
+    async def read_snapshot(*args, **kwargs):
+        return _claimed(snapshot) if slot.flushed else snapshot
+
+    async def run_model(*args, **kwargs):
+        # A note lands in memory during the call; the disk re-read misses it.
+        slot.rows.append(
+            {"role": "inject", "content": "[OPTIONS: New | Cancel]", "cls": "reconcile-note"}
+        )
+        return json.dumps(
+            {"status": "on_track", "headline": "Back.", "asked": "Fix the failing test"}
+        )
+
+    monkeypatch.setattr(warm_task_brief, "_snapshot", read_snapshot)
+    route_render(monkeypatch, run_model)
+    await warm_task_brief._prepare_warm_task_brief(state, slot)
+    assert _posted(slot)[-1]["content"].endswith("\n\n[OPTIONS: New | Cancel]")

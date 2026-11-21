@@ -43,8 +43,11 @@ def test_emit_swallows_a_raising_service(monkeypatch):
             raise NotImplementedError
 
     monkeypatch.setattr(svc_mod, "get_service", lambda: _Raiser())
-    # Must not raise despite ensure() blowing up.
-    eventlog_hooks.emit("some-slug", "Some Name", "member/message", {"ts": 1.0, "preview": "hi"})
+    # Must not raise despite ensure() blowing up, and must report the drop.
+    landed = eventlog_hooks.emit(
+        "some-slug", "Some Name", "member/message", {"ts": 1.0, "preview": "hi"}
+    )
+    assert landed is False
 
 
 def test_emit_calls_ensure_then_append(monkeypatch):
@@ -69,8 +72,8 @@ def test_emit_no_slug_is_noop(monkeypatch):
         raise AssertionError("get_service must not be called for an empty slug")
 
     monkeypatch.setattr(svc_mod, "get_service", _boom)
-    eventlog_hooks.emit("", "Name", "member/message", {})
-    eventlog_hooks.emit(None, "Name", "member/message", {})
+    assert eventlog_hooks.emit("", "Name", "member/message", {}) is False
+    assert eventlog_hooks.emit(None, "Name", "member/message", {}) is False
 
 
 # ---------------------------------------------------------------------------
@@ -1320,20 +1323,41 @@ class TestTheDrainWaitsForAReservationNotJustARegisteredFuture:
 
     def test_a_drain_with_nothing_outstanding_still_returns_at_once(self, monkeypatch):
         # CONTROL. Polling until the deadline whatever the state would satisfy the
-        # test above and add the full drain timeout to every clean shutdown.
-        import time
-
+        # test above and add the full drain timeout to every clean shutdown. "At
+        # once" is asserted as no wait at all: either way the drain can wait (a
+        # sleep between polls, a wait on the futures) is refused if it is taken.
         import kiro_crew.eventlog_hooks as hooks
 
         monkeypatch.setattr(hooks, "_reserved", 0)
         hooks._inflight.clear()
+        waits: list[str] = []
 
-        started = time.monotonic()
+        def _refuse(name: str):
+            def wait(*args: object, **kwargs: object) -> object:
+                waits.append(name)
+                raise AssertionError(f"a clean drain called {name}, so it waited")
+
+            return wait
+
+        class _With:
+            """*real*, except for the names given; every other name reads through."""
+
+            def __init__(self, real: object, **override: object) -> None:
+                self._real = real
+                self.__dict__.update(override)
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(self._real, name)
+
+        # Every other name the module reads stays the real one.
+        futures = _With(hooks.concurrent.futures, wait=_refuse("concurrent.futures.wait"))
+        monkeypatch.setattr(hooks, "time", _With(hooks.time, sleep=_refuse("time.sleep")))
+        monkeypatch.setattr(hooks, "concurrent", _With(hooks.concurrent, futures=futures))
+
         answer = hooks.drain_for_shutdown(timeout=5.0)
-        elapsed = time.monotonic() - started
 
         assert answer is True
-        assert elapsed < 0.5, f"a clean drain took {elapsed:.2f}s, so it polled needlessly"
+        assert waits == []
 
 
 class TestTheCeilingHoldsWhenTwoCallersInterleave:

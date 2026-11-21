@@ -38,6 +38,7 @@ from kiro_crew.mcp_gateway.backend import (
     has_recyclable_in_flight,
 )
 from kiro_crew.mcp_gateway.pool import BackendUnavailable, PoolAtCapacity, PoolKey
+from kiro_crew.mcp_gateway.prewarm import HotKeyStore
 from kiro_crew.testing.wait import async_wait_until, await_until
 
 pytestmark = pytest.mark.xdist_group("mcp_gateway")
@@ -515,23 +516,31 @@ class TestRegisterBookkeeping:
         assert seen[0].pid_start_ids == {}
 
     @pytest.mark.asyncio
-    async def test_hot_key_observation_records_the_pool_hit_outcome(self, peer_ok):
-        hot_keys = MagicMock()
+    async def test_hot_key_observation_records_the_pool_hit_outcome(self, peer_ok, tmp_path):
+        hot_keys = HotKeyStore(tmp_path / "hot-keys.json")
         pool = _fake_pool(get=AsyncMock(return_value=MagicMock()))
         register = _register_frame()
 
         await _handle(_ScriptedReader(register), _FakeWriter(), pool, hot_keys=hot_keys)
 
-        hot_keys.record.assert_called_once_with(register)
-        hot_keys.record_outcome.assert_called_once_with(hit=True)
+        assert hot_keys.top_register_payloads(5) == [register]
+        assert hot_keys.hit_stats() == {
+            "warm_pool_hits": 1,
+            "warm_pool_misses": 0,
+            "warm_pool_hit_rate_pct": 100,
+        }
 
     @pytest.mark.asyncio
-    async def test_hot_key_observation_records_a_miss_on_a_cold_key(self, peer_ok):
-        hot_keys = MagicMock()
+    async def test_hot_key_observation_records_a_miss_on_a_cold_key(self, peer_ok, tmp_path):
+        hot_keys = HotKeyStore(tmp_path / "hot-keys.json")
         await _handle(
             _ScriptedReader(_register_frame()), _FakeWriter(), _fake_pool(), hot_keys=hot_keys
         )
-        hot_keys.record_outcome.assert_called_once_with(hit=False)
+        assert hot_keys.hit_stats() == {
+            "warm_pool_hits": 0,
+            "warm_pool_misses": 1,
+            "warm_pool_hit_rate_pct": 0,
+        }
 
 
 # --- bridge-phase frame hygiene ---------------------------------------------
@@ -1044,7 +1053,44 @@ class TestDisconnectTeardown:
             "prompts/list",
             "resources/list",
             "resources/templates/list",
+            "server/discover",
+            "subscriptions/listen",
         }
+
+    def test_an_open_subscription_listen_does_not_count_as_tool_work(self):
+        backend = _fake_backend()
+        backend._pending_requests["f1"] = _PendingRequest(
+            stub_uuid=_STUB, original_id=2, method="subscriptions/listen"
+        )
+        assert not has_recyclable_in_flight(backend._pending_requests, _STUB)
+
+    @pytest.mark.asyncio
+    async def test_a_session_left_with_its_listen_open_keeps_the_backend(
+        self, peer_ok, monkeypatch
+    ):
+        """The reported shape: the session's discover was answered, its
+        listen is still open when it disconnects. The listen is cancelled
+        and the backend stays pooled for the next stub."""
+        backend = _fake_backend()
+        backend._pending_requests["gw-1-2"] = _PendingRequest(
+            stub_uuid=_STUB, original_id=2, method="subscriptions/listen"
+        )
+        recycle = AsyncMock(return_value=True)
+        backend.recycle_if_idle = recycle  # type: ignore[method-assign]
+        monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(return_value=(backend, True)))
+
+        await _handle(
+            _ScriptedReader(_register_frame(), {"type": "ensure_backend"}),
+            _FakeWriter(),
+            _fake_pool(),
+        )
+
+        sent = [call.args[0] for call in backend.stdin.write.call_args_list]
+        assert any(
+            b"notifications/cancelled" in payload and b"gw-1-2" in payload for payload in sent
+        )
+        assert backend.refcount == 0
+        recycle.assert_not_awaited()
 
     def test_tool_work_alongside_a_listing_still_counts(self):
         backend = _fake_backend()
@@ -1112,21 +1158,26 @@ class TestDisconnectTeardown:
 
     @pytest.mark.asyncio
     async def test_a_failing_private_backend_release_never_masks_teardown(
-        self, peer_ok, monkeypatch
+        self, peer_ok, monkeypatch, caplog
     ):
         backend = _fake_backend()
         monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(return_value=(backend, True)))
         pool = _fake_pool(release_exclusive=AsyncMock(side_effect=RuntimeError("pool wedged")))
+        from kiro_crew.mcp_gateway.daemon import connection as conn_mod
 
+        name = conn_mod.logger.name
         # The handler must return normally: a teardown-time failure here would
         # otherwise skip the writer-task cancel and mask the real cause.
-        await _handle(
-            _ScriptedReader(_register_frame(), {"type": "ensure_backend"}),
-            _FakeWriter(),
-            pool,
-        )
+        with caplog.at_level(logging.WARNING, logger=name):
+            await _handle(
+                _ScriptedReader(_register_frame(), {"type": "ensure_backend"}),
+                _FakeWriter(),
+                pool,
+            )
 
         pool.release_exclusive.assert_awaited_once_with(_STUB)
+        logged = [r.getMessage() for r in caplog.records if r.name == name]
+        assert f"releasing private backend for stub {_STUB} failed" in logged
 
 
 # --- daemon lifecycle --------------------------------------------------------

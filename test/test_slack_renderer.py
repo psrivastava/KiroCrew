@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from redaction_structured_cases import github_classic
 
 from kiro_crew.acp.types import (
     EVENT_COMPLETE,
@@ -25,6 +26,7 @@ from kiro_crew.messaging import APPROVAL_INTERACTIVE, TurnDriver
 from kiro_crew.slack.client import RealSlackClient
 from kiro_crew.slack.renderer import (
     _STATUS_WORKING,
+    _THINKING,
     TOOL_APPROVE_ACTION_PREFIX,
     TOOL_DENY_ACTION_PREFIX,
     TOOL_TRUST_ACTION_PREFIX,
@@ -34,6 +36,7 @@ from kiro_crew.slack.renderer import (
     is_wait_identity,
     split_approval_token,
 )
+from kiro_crew.testing.wait import async_wait_until
 
 
 class _RecSlack:
@@ -68,8 +71,8 @@ class _RecSlack:
     async def update_message(self, channel, ts, text="", blocks=None):
         self.calls.append(("update_message", {"text": text}))
 
-    async def stop_stream(self, channel, ts, final_text=None):
-        self.calls.append(("stop_stream", {"final_text": final_text}))
+    async def stop_stream(self, channel, ts, final_text=None, blocks=None):
+        self.calls.append(("stop_stream", {"final_text": final_text, "blocks": blocks}))
         return True
 
     async def append_task(self, channel, ts, task_id, title, status, details="", output=""):
@@ -80,7 +83,7 @@ class _RecSlack:
         self.calls.append(("set_thread_status", {"status": status}))
 
     async def post_blocks(self, channel, blocks, text, thread_ts=None, **kw):
-        self.calls.append(("post_blocks", {"blocks": blocks}))
+        self.calls.append(("post_blocks", {"blocks": blocks, "text": text}))
         return self._ts()
 
     def approval_token(self):
@@ -101,6 +104,13 @@ class _RecSlack:
     async def post_message(self, channel, text, thread_ts=None, **kw):
         self.calls.append(("post_message", {"text": text, "thread_ts": thread_ts}))
         return self._ts()
+
+
+async def _until(condition, what: str) -> None:
+    """Wait for *condition* on the clock, not for a count of loop yields: the
+    driver's PreToolUse gate reads the saved hooks off the loop before a prompt
+    is posted, so no fixed number of ``sleep(0)`` turns is enough."""
+    await async_wait_until(condition, describe=lambda: f"timed out waiting for {what}")
 
 
 class _Provider:
@@ -273,19 +283,20 @@ class TestSlackRendererMapping:
         )
         asyncio.run(TurnDriver(provider, renderer, approval_mode="auto").run("hi"))
         methods = [m for m, _ in rec.calls]
-        # The reply is held until the turn ends, then goes out in one append.
+        # The reply is held until the turn ends, then goes out in one append. The
+        # timing footer rides in the seal, so no separate footer post follows.
         assert methods == [
             "set_thread_status",
             "start_stream",
             "append_stream",
             "stop_stream",
             "set_thread_status",
-            "post_blocks",
         ]
         assert [kw["text"] for m, kw in rec.calls if m == "append_stream"] == ["Hello world"]
-        # stop_stream carries the clean final text
+        # stop_stream carries the clean final text and the footer
         stop = [kw for m, kw in rec.calls if m == "stop_stream"][0]
         assert stop["final_text"] == "Hello world"
+        assert "Finished in" in str(stop["blocks"])
 
     def test_shared_driver_strips_split_steering_marker(self):
         rec = _RecSlack()
@@ -389,10 +400,7 @@ class TestSlackRendererMapping:
 
         async def scenario():
             task = asyncio.create_task(driver.run("hi"))
-            for _ in range(1000):
-                if decider._futures:
-                    break
-                await asyncio.sleep(0)
+            await _until(lambda: bool(decider._futures), "the approval prompt")
             decider.resolve("rq1", True)
             await task
 
@@ -435,10 +443,7 @@ class TestSlackRendererMapping:
 
         async def scenario():
             task = asyncio.create_task(driver.run("hi"))
-            for _ in range(1000):
-                if decider._futures:
-                    break
-                await asyncio.sleep(0)
+            await _until(lambda: bool(decider._futures), "the approval prompt")
             decider.resolve("rq1", True)
             await task
 
@@ -497,10 +502,7 @@ class TestApprovalDecider:
 
         async def scenario():
             task = asyncio.create_task(driver.run("hi"))
-            for _ in range(1000):
-                if decider._futures:
-                    break
-                await asyncio.sleep(0)
+            await _until(lambda: bool(decider._futures), "the approval prompt")
             assert decider.resolve("rq1", True) is True
             await task
 
@@ -528,10 +530,9 @@ class TestApprovalDecider:
 
         async def scenario():
             task = asyncio.create_task(driver.run("hi"))
-            for _ in range(1000):
-                if decider._futures and rec.approval_token():
-                    break
-                await asyncio.sleep(0)
+            await _until(
+                lambda: bool(decider._futures and rec.approval_token()), "the approval prompt"
+            )
             token = rec.approval_token()
             assert token is not None
             key, nonce = token
@@ -560,10 +561,9 @@ class TestApprovalDecider:
 
         async def scenario():
             task = asyncio.create_task(driver.run("hi"))
-            for _ in range(1000):
-                if decider._futures and rec.approval_token():
-                    break
-                await asyncio.sleep(0)
+            await _until(
+                lambda: bool(decider._futures and rec.approval_token()), "the approval prompt"
+            )
             # Resolve WITHOUT a direct decider reference — as interactions.py does.
             token = rec.approval_token()
             assert token is not None
@@ -594,10 +594,9 @@ class TestApprovalDecider:
 
         async def scenario():
             task = asyncio.create_task(driver.run("hi"))
-            for _ in range(1000):
-                if decider._futures and rec.approval_token():
-                    break
-                await asyncio.sleep(0)
+            await _until(
+                lambda: bool(decider._futures and rec.approval_token()), "the approval prompt"
+            )
             token = rec.approval_token()
             assert token is not None
             key, nonce = token
@@ -632,7 +631,7 @@ class TestApprovalDecider:
         assert "rqT" not in SlackApprovalDecider._REGISTRY
 
     def test_concurrent_sessions_same_rid_do_not_collide(self):
-        # Regression: kiro-cli request ids restart at 1 per session, so two
+        # kiro-cli request ids restart at 1 per session, so two
         # concurrent threads both produce request_id == "1". The registry must
         # be namespaced by session_key so a click on thread B's button resolves
         # ONLY thread B's pending tool — never thread A's.
@@ -648,10 +647,7 @@ class TestApprovalDecider:
             assert nonce_a and nonce_b and nonce_a != nonce_b
             task_a = _asyncio.create_task(dec_a(ev))
             task_b = _asyncio.create_task(dec_b(ev))
-            for _ in range(1000):
-                if dec_a._futures and dec_b._futures:
-                    break
-                await _asyncio.sleep(0)
+            await _until(lambda: bool(dec_a._futures and dec_b._futures), "the approval prompt")
             # Both deciders are registered under DISTINCT namespaced keys.
             assert SlackApprovalDecider._REGISTRY.get("thread-A:1") is dec_a
             assert SlackApprovalDecider._REGISTRY.get("thread-B:1") is dec_b
@@ -707,11 +703,9 @@ class _FlakyTaskSlack(_RecSlack):
 class TestTaskCardNeverAbandonsTheStream:
     """A refused task card must not cost the reader their in-progress message.
 
-    Rotating on a task-card failure stops the stream the reader is watching and
-    continues the answer in a NEW message, so the thread reads as a reply that
-    failed followed minutes later by an unexplained second reply.
-    The card is decoration; skipping it withholds no answer text, and
-    ``_append_stream`` still rotates when real text is refused.
+    Rotating would continue the answer in a NEW message, which reads as a failed
+    reply then an unexplained second one. ``_append_stream`` still rotates when
+    real text is refused.
     """
 
     def test_refused_task_card_does_not_rotate(self):
@@ -830,6 +824,23 @@ class TestStreamMachinery:
         assert _append_pieces("x" * 120, limit=50) == ["x" * 50, "x" * 50, "x" * 20]
         assert _append_pieces("") == []
 
+    def test_append_pieces_skip_a_break_too_early_in_the_piece(self):
+        from kiro_crew.slack.renderer import _append_pieces
+
+        assert _append_pieces("Hi\n" + "x" * 150, limit=100) == ["Hi\n" + "x" * 97, "x" * 53]
+        text = "Title\n" + "w" * 40 + " " + "z" * 80
+        assert _append_pieces(text, limit=100) == ["Title\n" + "w" * 40 + " ", "z" * 80]
+
+    def test_append_pieces_keep_a_break_a_quarter_in(self):
+        from kiro_crew.slack.renderer import _append_pieces
+
+        assert _append_pieces("a" * 30 + "\n" + "b" * 100, limit=100) == [
+            "a" * 30 + "\n",
+            "b" * 100,
+        ]
+        url = "https://example.com/" + "u" * 75
+        assert _append_pieces("Open:\n" + url + " tail", limit=100) == ["Open:\n", url + " tail"]
+
     def test_an_over_limit_reply_streams_whole_across_appends(self):
         """Slack caps one markdown_text append at 12,000 characters.
 
@@ -907,7 +918,7 @@ class TestStreamMachinery:
         # chat.update (update_message), never append_stream.
         assert "update_message" in methods, methods
         assert "append_stream" not in methods, methods
-        assert "post_message" in methods, methods  # the _THINKING placeholder
+        assert any(m == "post_blocks" and kw["text"] == _THINKING for m, kw in rec.calls), rec.calls
 
     def test_no_stream_keeps_the_text_before_a_tool_call_in_the_reply(self):
         """The fallback has no plan block to hold narration, so the text before
@@ -1002,7 +1013,7 @@ class _StepClock:
 
 
 class TestNoStreamOptionsFiltering:
-    """Regression: [OPTIONS:...] markup must never leak into no-stream
+    """[OPTIONS:...] markup must never leak into no-stream
     chat.update calls (the streaming path already filters via bracket-hold)."""
 
     def test_options_markup_not_leaked_in_no_stream_updates(self):
@@ -1050,7 +1061,7 @@ class TestNoStreamOptionsFiltering:
 
 
 class TestShowThinking:
-    """slack.show_thinking gates surfacing the model's reasoning as a 💭 thread
+    """slack.show_thinking gates surfacing the model's reasoning as a Thinking thread
     reply above the answer (matches native). Off => reasoning stays private."""
 
     def _events(self):
@@ -1066,29 +1077,34 @@ class TestShowThinking:
         renderer = SlackRenderer(rec, "C1", "t1", reactions_enabled=False, show_thinking=True)
         asyncio.run(TurnDriver(_Provider(self._events()), renderer, approval_mode="auto").run("hi"))
         posts = [kw["text"] for m, kw in rec.calls if m == "post_message"]
-        assert any(p.startswith("💭") and "let me think about it" in p for p in posts), posts
+        assert any(
+            p.startswith("*Thinking*") and "let me think about it" in p for p in posts
+        ), posts
 
     def test_show_thinking_off_suppresses_reasoning(self):
         rec = _RecSlack()
         renderer = SlackRenderer(rec, "C1", "t1", reactions_enabled=False, show_thinking=False)
         asyncio.run(TurnDriver(_Provider(self._events()), renderer, approval_mode="auto").run("hi"))
         posts = [kw["text"] for m, kw in rec.calls if m == "post_message"]
-        assert not any(p.startswith("💭") for p in posts), posts
+        assert not any(p.startswith("*Thinking*") for p in posts), posts
 
     def test_thinking_reply_is_redacted(self):
         rec = _RecSlack()
         renderer = SlackRenderer(rec, "C1", "t1", reactions_enabled=False, show_thinking=True)
+        secret = github_classic(seed=43)
         events = [
-            AcpEvent(kind=EVENT_THINKING_CHUNK, text="key AKIA1234567890ABCDEX here"),
+            AcpEvent(kind=EVENT_THINKING_CHUNK, text=f"key {secret} here"),
             AcpEvent(kind=EVENT_TEXT_CHUNK, text="done"),
             AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn"),
         ]
         asyncio.run(TurnDriver(_Provider(events), renderer, approval_mode="auto").run("hi"))
         thinking = [
-            kw["text"] for m, kw in rec.calls if m == "post_message" and kw["text"].startswith("💭")
+            kw["text"]
+            for m, kw in rec.calls
+            if m == "post_message" and kw["text"].startswith("*Thinking*")
         ]
         assert thinking, rec.calls
-        assert "AKIA1234567890ABCDEX" not in thinking[0]
+        assert secret not in thinking[0]
         assert "[REDACTED: credential]" in thinking[0]
 
 
@@ -1123,11 +1139,9 @@ def _start_stream_bodies(web):
 class TestStreamRecipientRouting:
     """chat.startStream needs recipient routing, and the renderer holds it.
 
-    Slack rejects the call with ``missing_recipient_user_id`` when the field is
-    absent; the renderer then demotes to the non-streaming chat.update surface,
-    which still produces a correct reply. That is why these assertions read the
-    OUTGOING request body rather than the rendered text -- a test that only
-    checks the reply text passes either way.
+    Without it Slack answers ``missing_recipient_user_id`` and the renderer falls
+    back to chat.update, which still replies correctly, so these tests read the
+    OUTGOING request body rather than the reply text.
     """
 
     def test_open_stream_sends_recipient_user_id(self):
@@ -1318,7 +1332,8 @@ class TestAppendTaskRaiseIsSwallowed:
         final_texts = [
             str(kw.get("final_text") or kw.get("text") or "")
             for m, kw in rec.calls
-            if m in ("stop_stream", "post_message", "update_message", "append_stream")
+            if m
+            in ("stop_stream", "post_message", "post_blocks", "update_message", "append_stream")
         ]
         joined = " ".join(final_texts)
         assert "The answer is 42" in joined, rec.calls
@@ -1347,7 +1362,8 @@ class TestRendererPresentationGuards:
         return " ".join(
             str(kw.get("final_text") or kw.get("text") or "")
             for m, kw in rec.calls
-            if m in ("stop_stream", "post_message", "update_message", "append_stream")
+            if m
+            in ("stop_stream", "post_message", "post_blocks", "update_message", "append_stream")
         )
 
     def test_raising_set_thread_status_does_not_escape(self):
@@ -1432,16 +1448,16 @@ class TestRendererPresentationGuards:
                 self.start_raises += 1
                 raise RuntimeError("fatal_error: chat.startStream")
 
-            async def post_message(self, channel, text, thread_ts=None, **kw):
+            async def post_blocks(self, channel, blocks, text, thread_ts=None, **kw):
                 if "Thinking" in text:
                     raise RuntimeError("channel_not_found: chat.postMessage")
-                return await super().post_message(channel, text, thread_ts=thread_ts, **kw)
+                return await super().post_blocks(channel, blocks, text, thread_ts=thread_ts, **kw)
 
         rec = RaisingStartSlack()
         renderer = SlackRenderer(rec, "C1", "t1", reactions_enabled=False)
         asyncio.run(TurnDriver(_Provider(self._events()), renderer, approval_mode="auto").run("hi"))
         assert rec.start_raises >= 1, rec.calls
-        posts = [str(kw.get("text") or "") for m, kw in rec.calls if m == "post_message"]
+        posts = [str(kw.get("text") or "") for m, kw in rec.calls if m == "post_blocks"]
         assert any("The answer is 42" in p for p in posts), rec.calls
         assert "Something went wrong" not in self._joined(rec), rec.calls
 
@@ -1457,6 +1473,9 @@ class TestRendererPresentationGuards:
                 raise RuntimeError("fatal_error: chat.startStream")
 
             async def post_message(self, channel, text, thread_ts=None, **kw):
+                raise RuntimeError("channel_not_found: chat.postMessage")
+
+            async def post_blocks(self, channel, blocks, text, thread_ts=None, **kw):
                 raise RuntimeError("channel_not_found: chat.postMessage")
 
         rec = TotalFailureSlack()
@@ -1593,11 +1612,9 @@ class TestOptionsFooterCancellationDefersFinalize:
 class TestTransportRedactionNotice:
     """The DEFAULT Slack path posts a redaction notice below a rewritten answer.
 
-    Driven through the real TurnDriver so the StreamRedactor writes the
-    placeholder exactly as production does. The tally counts the final
-    display-safe body plus the posted 💭 reasoning, mirroring the native
-    handler's per-turn count; shared wording is pinned in
-    ``test_credential_redaction_notice.py``.
+    Driven through the real TurnDriver so the StreamRedactor writes the placeholder.
+    The tally counts the final body plus the posted Thinking reasoning; shared wording is
+    pinned in ``test_credential_redaction_notice.py``.
     """
 
     _SECRET_URI = "postgresql://user:SuperSecret123@db.example.com:5432/prod"

@@ -10,6 +10,9 @@ CONTEXT_EVENT_COMPACTION = "compaction_status"
 CONTEXT_EVENT_COMPLETED = "complete"
 CONTEXT_EVENT_TEXT = "text_chunk"
 CONTEXT_EVENT_TOOL = "tool_call"
+CONTEXT_EVENT_TOOL_RESULT = "tool_result"
+#: The ``tool_status`` values of a tool call that has not ended yet.
+CONTEXT_TOOL_OPEN_STATUSES = frozenset({"pending", "in_progress"})
 
 
 class ContextStreamEvent(Protocol):
@@ -58,7 +61,16 @@ class ContextPromptProvider(Protocol):
     def member_dispatch_mounted(self) -> bool | None: ...
 
     @property
+    def session_head_started(self) -> bool: ...
+
+    @property
+    def session_head_held(self) -> bool: ...
+
+    @property
     def native_steering(self) -> bool: ...
+
+    @property
+    def reports_compaction(self) -> bool: ...
 
     @property
     def cwd(self) -> str: ...

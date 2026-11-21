@@ -3,8 +3,8 @@ title: Arrival provenance filing — file every arriving session under Imported 
 status: implemented
 author: chenmingwei23
 created: 2026-09-20
-last-audited: 2026-09-20
-audited-at: f31f25a8a2
+last-audited: 2026-11-20
+audited-at: c157748343
 doc-pr:
 implementation-prs: [12196]
 tracking-issues: [11468]
@@ -130,7 +130,7 @@ them.
    `src/kiro_crew/dashboard/token_auth_callers.py`, never from the request body.
 
 2. **Placement is resolved only after the slot exists.** The import handler
-   re-checks the live-slot cap after its last `await` and can answer `429` there.
+   re-checks the live-slot cap after its last `await` and can answer `409` there.
    A folder write standing in front of that re-check is left behind when it
    fires, which is the same store exhaustion with a narrower trigger. So the
    folder work happens after the slot has been materialised, where a refusal is

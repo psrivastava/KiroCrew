@@ -24,6 +24,8 @@ import { describe, it, expect, vi, beforeEach, beforeAll } from 'vitest'
 vi.mock('@radix-ui/react-dropdown-menu', async () => await import('./__mocks__/@radix-ui/react-dropdown-menu'))
 
 import { screen, waitFor, fireEvent, act, within } from '@testing-library/react'
+import { i18nT } from '../i18n/t'
+import { confirmAction } from './confirmAction'
 import userEvent from '@testing-library/user-event'
 import ChannelPage from '../pages/ChannelPage'
 import { renderWithProviders } from './helpers'
@@ -173,7 +175,7 @@ describe('ChannelPage — message list', () => {
       messages: [message({ from_id: 'human', from_role: 'You', mention: ['a1', 'ghost'] })],
     })])
     await renderPage()
-    expect(screen.getByText('→ @Researcher, @ghost')).toBeInTheDocument()
+    expect(screen.getByText('→ @Researcher and @ghost')).toBeInTheDocument()
   })
 
   it('renders an approval message as an approval card and posts the decision', async () => {
@@ -317,6 +319,24 @@ describe('ChannelPage — message list', () => {
     mockApi([channelOf({ messages: [message({ reply_count: 2 })] })])
     await renderPage()
     expect(screen.getByRole('button', { name: '2 replies' })).toBeInTheDocument()
+  })
+
+  it('counts a thread reply that arrives live on its parent, once', async () => {
+    mockApi([channelOf({ messages: [message({ id: 'p1', content: 'Root finding' })] })])
+    await renderPage()
+    // Let the channel's own read land first, so it cannot overwrite the live reply.
+    await waitFor(() => expect(vi.mocked(api).channelGet).toHaveBeenCalledWith('ch1'))
+    await act(async () => { await vi.mocked(api).channelGet.mock.results[0].value })
+    expect(screen.queryByRole('button', { name: /repl(y|ies)$/ })).not.toBeInTheDocument()
+
+    const reply = message({ id: 'r1', thread_id: 'p1', content: 'Follow-up detail' })
+    wsEvent('channel_message', { channel_id: 'ch1', message: reply })
+    expect(await screen.findByRole('button', { name: '1 reply' })).toBeInTheDocument()
+
+    // The same event again (a channel read that already held it) adds nothing.
+    wsEvent('channel_message', { channel_id: 'ch1', message: reply })
+    wsEvent('channel_message', { channel_id: 'ch1', message: message({ id: 'r2', thread_id: 'p1', content: 'More' }) })
+    expect(await screen.findByRole('button', { name: '2 replies' })).toBeInTheDocument()
   })
 })
 
@@ -562,9 +582,9 @@ describe('ChannelPage — Add Agent form', () => {
     await userEvent.click(screen.getByRole('button', { name: '+ Add Agent' }))
     fireEvent.change(await screen.findByLabelText('Role'), { target: { value: 'Extra' } })
     await userEvent.click(screen.getByRole('button', { name: 'Add' }))
-    // In-page ErrorNotice, titled with the failed action; the inputs were
-    // already submitted so it carries the agent hand-off.
-    const notice = await screen.findByTestId('channel-error')
+    // ErrorNotice inside the still-open form, titled with the failed action.
+    // The typed role is not saved yet, so it offers no agent hand-off.
+    const notice = await screen.findByTestId('add-agent-error')
     expect(notice).toHaveTextContent('Failed to add agent')
     expect(notice).toHaveTextContent('agent cap reached')
     expect(screen.queryByText('Limit Reached')).not.toBeInTheDocument()
@@ -572,7 +592,7 @@ describe('ChannelPage — Add Agent form', () => {
     // dialog or the old raw `fixed inset-0 bg-black/50` backdrop.
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
     expect(document.querySelector('.bg-black\\/50')).toBeNull()
-    expect(within(notice).getByRole('button', { name: /ask the agent/i })).toBeInTheDocument()
+    expect(within(notice).queryByRole('button', { name: /ask the agent/i })).not.toBeInTheDocument()
   })
 
   it('falls back to the raw message when the api error is not JSON', async () => {
@@ -582,7 +602,7 @@ describe('ChannelPage — Add Agent form', () => {
     await userEvent.click(screen.getByRole('button', { name: '+ Add Agent' }))
     fireEvent.change(await screen.findByLabelText('Role'), { target: { value: 'Extra' } })
     await userEvent.click(screen.getByRole('button', { name: 'Add' }))
-    const notice = await screen.findByTestId('channel-error')
+    const notice = await screen.findByTestId('add-agent-error')
     expect(notice).toHaveTextContent('Failed to add agent')
     expect(notice).toHaveTextContent('gateway timeout')
     expect(screen.queryByText('Limit Reached')).not.toBeInTheDocument()
@@ -717,7 +737,7 @@ describe('ChannelPage — New Channel dialog', () => {
     await waitFor(() => expect(screen.queryByRole('dialog', { name: 'New channel' })).not.toBeInTheDocument())
   })
 
-  it('labels a create failure with its action in the shared in-page notice and dismisses it', async () => {
+  it('labels a create failure with its action inside the open dialog and dismisses it', async () => {
     vi.mocked(api).channelCreate = vi.fn()
       .mockRejectedValue(new Error(JSON.stringify({ error: 'channel cap reached' })))
     await renderPage()
@@ -725,16 +745,17 @@ describe('ChannelPage — New Channel dialog', () => {
     const dialog = await screen.findByRole('dialog', { name: 'New channel' })
     fireEvent.change(within(dialog).getByLabelText('Topic'), { target: { value: 'One too many' } })
     await userEvent.click(within(dialog).getByRole('button', { name: 'Create' }))
-    // The failure is the shared ErrorNotice (role="alert" + agent hand-off), not
-    // a blocking modal: the inputs were already submitted, so nothing is lost.
-    const notice = await screen.findByTestId('channel-error')
+    // The failure is the shared ErrorNotice (role="alert") inside the dialog,
+    // which stays open with the typed topic, so it offers no agent hand-off.
+    const notice = await within(dialog).findByTestId('new-channel-error')
     expect(notice).toHaveAttribute('role', 'alert')
     expect(notice.textContent).toContain('Failed to create channel')
     expect(notice.textContent).toContain('channel cap reached')
     expect(screen.queryByText('Limit Reached')).not.toBeInTheDocument()
-    expect(within(notice).getByRole('button', { name: /ask the agent/i })).toBeInTheDocument()
+    expect(within(notice).queryByRole('button', { name: /ask the agent/i })).not.toBeInTheDocument()
     await userEvent.click(within(notice).getByRole('button', { name: 'Dismiss' }))
-    await waitFor(() => expect(screen.queryByTestId('channel-error')).not.toBeInTheDocument())
+    await waitFor(() => expect(screen.queryByTestId('new-channel-error')).not.toBeInTheDocument())
+    expect(within(dialog).getByLabelText('Topic')).toHaveValue('One too many')
   })
 
   it('ignores a create response that carries no channel', async () => {
@@ -761,20 +782,116 @@ describe('ChannelPage — New Channel dialog', () => {
 
 describe('ChannelPage — close channel', () => {
   it('closes the channel on confirm and clears the selection', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
     await renderPage()
     await userEvent.click(screen.getByTitle('Close channel'))
+    const dialog = await screen.findByRole('dialog', { name: 'Close channel' })
+    expect(within(dialog).getByText(i18nT('pages.channelPage.close_this_channel_all_agents_will_be_dismissed'), { selector: 'p' })).toBeInTheDocument()
+    await confirmAction('Close')
     await waitFor(() => expect(vi.mocked(api).channelClose).toHaveBeenCalledWith('ch1'))
     await waitFor(() => expect(screen.getByText('Create a channel to get started')).toBeInTheDocument())
+  })
+
+  it('returns to the narrow channel list after confirming the selected channel close', async () => {
+    const originalMatchMedia = window.matchMedia.bind(window)
+    const media = vi.spyOn(window, 'matchMedia').mockImplementation(query => query === '(max-width: 767px)'
+      ? { matches: true, media: query, addEventListener: vi.fn(), removeEventListener: vi.fn() } as unknown as MediaQueryList
+      : originalMatchMedia(query))
+    try {
+      await renderPage()
+      const list = screen.getByText('+ New').parentElement!.parentElement!
+      fireEvent.click(screen.getAllByText('Gamma rollout').find(node => node.tagName !== 'H2')!)
+      expect(list).toHaveClass('hidden')
+      await userEvent.click(screen.getByTitle('Close channel'))
+      await confirmAction('Close')
+      await waitFor(() => expect(vi.mocked(api).channelClose).toHaveBeenCalledWith('ch1'))
+      await waitFor(() => expect(list).not.toHaveClass('hidden'))
+      expect(screen.getByText('+ New')).toBeInTheDocument()
+      expect(screen.getByText('No channels yet')).toBeInTheDocument()
+    } finally {
+      media.mockRestore()
+    }
+  })
+
+  it('returns to the narrow list when channel_closed arrives before the close response', async () => {
+    const originalMatchMedia = window.matchMedia.bind(window)
+    const media = vi.spyOn(window, 'matchMedia').mockImplementation(query => query === '(max-width: 767px)'
+      ? { matches: true, media: query, addEventListener: vi.fn(), removeEventListener: vi.fn() } as unknown as MediaQueryList
+      : originalMatchMedia(query))
+    let finishClose: () => void = () => {}
+    vi.mocked(api).channelClose = vi.fn().mockReturnValue(new Promise<void>(resolve => { finishClose = resolve }))
+    try {
+      await renderPage()
+      const list = screen.getByText('+ New').parentElement!.parentElement!
+      fireEvent.click(screen.getAllByText('Gamma rollout').find(node => node.tagName !== 'H2')!)
+      expect(list).toHaveClass('hidden')
+      await userEvent.click(screen.getByTitle('Close channel'))
+      await confirmAction('Close')
+      await waitFor(() => expect(vi.mocked(api).channelClose).toHaveBeenCalledWith('ch1'))
+      wsEvent('channel_closed', { channel_id: 'ch1' })
+      await screen.findByText('No channels yet')
+      expect(list).toHaveClass('hidden')
+      await act(async () => { finishClose() })
+      await waitFor(() => expect(list).not.toHaveClass('hidden'))
+    } finally {
+      media.mockRestore()
+    }
+  })
+
+  it('returns to the narrow list, not to a fallback channel, when channel_closed beats the close response', async () => {
+    mockApi([channelOf(), channelOf({ id: 'ch2', topic: 'Other rollout' })])
+    const originalMatchMedia = window.matchMedia.bind(window)
+    const media = vi.spyOn(window, 'matchMedia').mockImplementation(query => query === '(max-width: 767px)'
+      ? { matches: true, media: query, addEventListener: vi.fn(), removeEventListener: vi.fn() } as unknown as MediaQueryList
+      : originalMatchMedia(query))
+    let finishClose: () => void = () => {}
+    vi.mocked(api).channelClose = vi.fn().mockReturnValue(new Promise<void>(resolve => { finishClose = resolve }))
+    try {
+      await renderPage()
+      const list = screen.getByText('+ New').parentElement!.parentElement!
+      fireEvent.click(screen.getAllByText('Gamma rollout').find(node => node.tagName !== 'H2')!)
+      expect(list).toHaveClass('hidden')
+      await userEvent.click(screen.getByTitle('Close channel'))
+      await confirmAction('Close')
+      await waitFor(() => expect(vi.mocked(api).channelClose).toHaveBeenCalledWith('ch1'))
+      wsEvent('channel_closed', { channel_id: 'ch1' })
+      await screen.findByRole('heading', { name: 'Other rollout' })
+      await act(async () => { finishClose() })
+      await waitFor(() => expect(list).not.toHaveClass('hidden'))
+    } finally {
+      media.mockRestore()
+    }
+  })
+
+  it('returns to the narrow list when the closed channel was a fallback shown after the selected one was closed elsewhere', async () => {
+    mockApi([channelOf(), channelOf({ id: 'ch2', topic: 'Other rollout' })])
+    const originalMatchMedia = window.matchMedia.bind(window)
+    const media = vi.spyOn(window, 'matchMedia').mockImplementation(query => query === '(max-width: 767px)'
+      ? { matches: true, media: query, addEventListener: vi.fn(), removeEventListener: vi.fn() } as unknown as MediaQueryList
+      : originalMatchMedia(query))
+    try {
+      await renderPage()
+      const list = screen.getByText('+ New').parentElement!.parentElement!
+      fireEvent.click(screen.getAllByText('Gamma rollout').find(node => node.tagName !== 'H2')!)
+      wsEvent('channel_closed', { channel_id: 'ch1' })
+      await screen.findByRole('heading', { name: 'Other rollout' })
+      expect(list).toHaveClass('hidden')
+      await userEvent.click(screen.getByTitle('Close channel'))
+      await confirmAction('Close')
+      await waitFor(() => expect(vi.mocked(api).channelClose).toHaveBeenCalledWith('ch2'))
+      await waitFor(() => expect(list).not.toHaveClass('hidden'))
+      expect(screen.getByText('No channels yet')).toBeInTheDocument()
+    } finally {
+      media.mockRestore()
+    }
   })
 
   it('keeps the channel and reports it when the close request fails', async () => {
     // Removing the channel under a "Failed to close channel" notice would show
     // the action as done; a refused close leaves the list as it was.
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
     vi.mocked(api).channelClose = vi.fn().mockRejectedValue(new Error('already gone'))
     await renderPage()
     await userEvent.click(screen.getByTitle('Close channel'))
+    await confirmAction('Close')
     const notice = await screen.findByTestId('channel-error')
     expect(notice).toHaveTextContent('Failed to close channel')
     expect(notice).toHaveTextContent('already gone')
@@ -782,10 +899,23 @@ describe('ChannelPage — close channel', () => {
     expect(screen.queryByText('No channels yet')).not.toBeInTheDocument()
   })
 
-  it('does nothing when the confirm is cancelled', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(false)
+  it('closes the channel the dialog was raised for and keeps showing the channel opened while the dialog was up', async () => {
+    mockApi([channelOf(), channelOf({ id: 'ch2', topic: 'Other rollout' }), channelOf({ id: 'ch3', topic: 'Third rollout' })])
     await renderPage()
     await userEvent.click(screen.getByTitle('Close channel'))
+    await screen.findByRole('dialog')
+    fireEvent.click(screen.getByText('Third rollout'))
+    await screen.findByRole('heading', { name: 'Third rollout' })
+    await confirmAction('Close')
+    await waitFor(() => expect(vi.mocked(api).channelClose).toHaveBeenCalledWith('ch1'))
+    expect(screen.getByRole('heading', { name: 'Third rollout' })).toBeInTheDocument()
+  })
+
+  it('does nothing when the confirm is cancelled', async () => {
+    await renderPage()
+    await userEvent.click(screen.getByTitle('Close channel'))
+    const dialog = await screen.findByRole('dialog')
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
     expect(vi.mocked(api).channelClose).not.toHaveBeenCalled()
     expect(screen.getByRole('heading', { name: 'Gamma rollout' })).toBeInTheDocument()
   })

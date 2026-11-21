@@ -8,7 +8,7 @@
  * filter keeps its row while it is on, so it can always be turned off.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { render, fireEvent, screen, waitFor } from '@testing-library/react'
+import { render, fireEvent, screen, waitFor, act } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Provider } from 'react-redux'
 import { MemoryRouter } from 'react-router-dom'
@@ -34,7 +34,14 @@ vi.mock('framer-motion', async () => {
       }
       return React.createElement(tag, { ...clean, ref }, props.children as React.ReactNode)
     })
-  const motion = new Proxy({}, { get: (_t, tag: string) => make(tag) })
+  // One component per tag: a fresh type on every read would remount the subtree.
+  const byTag = new Map<string, ReturnType<typeof make>>()
+  const motion = new Proxy({}, {
+    get: (_t, tag: string) => {
+      if (!byTag.has(tag)) byTag.set(tag, make(tag))
+      return byTag.get(tag)
+    },
+  })
   return {
     motion,
     AnimatePresence: ({ children }: { children?: React.ReactNode }) => React.createElement(React.Fragment, null, children),
@@ -64,8 +71,12 @@ Object.defineProperty(window, 'matchMedia', {
 
 import ChatSidebar from '../pages/ChatSidebar'
 import type { RootState } from '../store'
+import { RECENT_WINDOW_PRESETS } from '../pages/recentWindow'
+import { turnOffCrewModeAsLts } from './crewModeOff'
+import { __setFeaturePreviewLockKnownForTests, applyLockedControls } from '../utils/editionLocks'
 
 const CREW_ONLY = 'mc-session-crew-only'
+const RUNNING_ONLY = 'mc-session-running-only'
 
 /** Rows as a gateway without Crew Mode sends them: no `crew_mode_root`, no `crew_root`. */
 const PLAIN_SLOTS = [
@@ -117,7 +128,7 @@ async function openFilterMenu() {
   await screen.findByRole('menu')
 }
 
-const crewRow = () => screen.getAllByRole('menuitem').find(el => el.textContent?.startsWith('Crew Mode'))
+const crewRow = () => screen.getAllByRole('menuitem').find(el => el.textContent?.startsWith('Conductor mode'))
 
 beforeEach(() => localStorage.clear())
 afterEach(() => vi.clearAllMocks())
@@ -127,7 +138,7 @@ const WITH_CREW_MEMBER = [
   { key: 'k-worker', title: 'the crew member', running: true, messages: 3, crew_root: 'k-root' },
 ]
 
-describe('a Crew Mode root\'s crew members', () => {
+describe('a conductor mode root\'s crew members', () => {
   it('stay out of the list and out of the Broadcast dialog', async () => {
     renderSidebar(WITH_CREW_MEMBER)
     await waitFor(() => expect(screen.queryByText('the crew chat')).not.toBeNull())
@@ -145,7 +156,18 @@ describe('a Crew Mode root\'s crew members', () => {
   })
 })
 
-describe('the Crew Mode filter offer', () => {
+describe('the conductor mode filter offer', () => {
+  it('builds the filter menu only once it opens', async () => {
+    // The menu sits closed on every render of the sidebar, including the first
+    // render of the chat page, so its rows must cost nothing until it opens.
+    const label = vi.spyOn(RECENT_WINDOW_PRESETS[0], 'label', 'get')
+    renderSidebar(PLAIN_SLOTS)
+    await waitFor(() => expect(screen.queryByText('plain a')).not.toBeNull())
+    expect(label).not.toHaveBeenCalled()
+    await openFilterMenu()
+    expect(screen.getAllByRole('menuitem').some(el => el.textContent?.startsWith('In progress'))).toBe(true)
+    label.mockRestore()
+  })
   it('is absent, hint included, while no chat runs on the conductor', async () => {
     renderSidebar(PLAIN_SLOTS)
     await waitFor(() => expect(screen.queryByText('plain a')).not.toBeNull())
@@ -157,7 +179,7 @@ describe('the Crew Mode filter offer', () => {
     expect(screen.queryByTestId('filter-chip-crew')).toBeNull()
   })
 
-  it('appears with its hint once a Crew Mode chat is in the list', async () => {
+  it('appears with its hint once a conductor mode chat is in the list', async () => {
     renderSidebar(WITH_ROOT)
     await waitFor(() => expect(screen.queryByText('the crew chat')).not.toBeNull())
     await openFilterMenu()
@@ -178,15 +200,17 @@ describe('the Crew Mode filter offer', () => {
     renderSidebar(WITH_ROOT)
     const crewChip = await screen.findByTestId('filter-chip-crew')
     const runningChip = await screen.findByTestId('filter-chip-running')
-    // Two visual groups: the status row keeps its base-branch button count
+    // Two visual groups: the status row keeps its base-branch chip count
     // (AUTOSDE max-two-buttons-per-row), the Crew Mode chip is not one of its children.
     expect(crewChip.parentElement).not.toBe(runningChip.parentElement)
-    expect(runningChip.parentElement!.querySelectorAll('button')).toHaveLength(1)
-    expect(crewChip.parentElement!.querySelectorAll('button')).toHaveLength(1)
+    expect(runningChip.parentElement!.children).toHaveLength(1)
+    expect(crewChip.parentElement!.children).toHaveLength(1)
+    expect(runningChip.querySelectorAll('button')).toHaveLength(2)
+    expect(crewChip.querySelectorAll('button')).toHaveLength(2)
     expect(crewChip.className).toContain('crew-grad')
   })
 
-  it('keeps the row while the filter is stored on, so it can be turned off with no Crew Mode chat left', async () => {
+  it('keeps the row while the filter is stored on, so it can be turned off with no conductor mode chat left', async () => {
     localStorage.setItem(CREW_ONLY, '1')
     renderSidebar(PLAIN_SLOTS)
     // The filter chip is drawn for the active filter, as for any other.
@@ -197,5 +221,74 @@ describe('the Crew Mode filter offer', () => {
     fireEvent.click(row!)
     await waitFor(() => expect(localStorage.getItem(CREW_ONLY)).toBe('0'))
     await waitFor(() => expect(screen.queryByText('plain a')).not.toBeNull())
+  })
+})
+
+describe('before the edition lock is known', () => {
+  it.each(['1', '2'])('keeps a stored conductor mode filter (%s) and brings it back once a standard build answers', async (stored) => {
+    localStorage.setItem(CREW_ONLY, stored)
+    __setFeaturePreviewLockKnownForTests(false)
+    renderSidebar(WITH_ROOT)
+    await waitFor(() => expect(screen.queryByText('plain a')).not.toBeNull())
+    expect(screen.queryByTestId('filter-chip-crew')).toBeNull()
+    expect(localStorage.getItem(CREW_ONLY)).toBe(stored)
+    act(() => { __setFeaturePreviewLockKnownForTests(true) })
+    await waitFor(() => expect(screen.queryByTestId('filter-chip-crew')).not.toBeNull())
+    expect(localStorage.getItem(CREW_ONLY)).toBe(stored)
+  })
+})
+
+describe('in a build without conductor mode (LTS)', () => {
+  beforeEach(() => { turnOffCrewModeAsLts() })
+
+  it('lists a crew member as an ordinary row and draws no crew card', async () => {
+    renderSidebar(WITH_CREW_MEMBER)
+    await waitFor(() => expect(screen.queryByText('the crew member')).not.toBeNull())
+    expect(screen.queryByText('the crew chat')).not.toBeNull()
+    expect(screen.queryByTestId('conductor-mode-title-mark')).toBeNull()
+    expect(screen.queryByTestId('crew-ghost-badge')).toBeNull()
+  })
+
+  it.each(['1', '2'])('turns a stored conductor mode filter (%s) off: nothing narrowed, no chip, stored 0', async (stored) => {
+    localStorage.setItem(CREW_ONLY, stored)
+    renderSidebar(WITH_ROOT)
+    await waitFor(() => expect(screen.queryByText('plain a')).not.toBeNull())
+    expect(screen.queryByText('plain b')).not.toBeNull()
+    expect(screen.queryByText('the crew chat')).not.toBeNull()
+    expect(screen.queryByTestId('filter-chip-crew')).toBeNull()
+    expect(localStorage.getItem(CREW_ONLY)).toBe('0')
+    await openFilterMenu()
+    expect(crewRow()).toBeUndefined()
+    expect(screen.queryByTestId('filter-crew-hint')).toBeNull()
+
+    // Lifting the lock does not bring it back: it was turned off.
+    act(() => { applyLockedControls([]) })
+    await waitFor(() => expect(screen.queryByText('plain b')).not.toBeNull())
+    expect(screen.queryByTestId('filter-chip-crew')).toBeNull()
+    expect(localStorage.getItem(CREW_ONLY)).toBe('0')
+  })
+
+  it('leaves another filter\'s stored pause as is', async () => {
+    localStorage.setItem(CREW_ONLY, '1')
+    localStorage.setItem(RUNNING_ONLY, '2')
+    renderSidebar(WITH_ROOT)
+    // In progress alone is stored paused: it reads paused, the idle row stays.
+    const runningChip = await screen.findByTestId('filter-chip-running')
+    expect(runningChip.className.split(/\s+/)).toContain('border-dashed')
+    expect(screen.queryByText('plain b')).not.toBeNull()
+    expect(localStorage.getItem(RUNNING_ONLY)).toBe('2')
+    expect(localStorage.getItem(CREW_ONLY)).toBe('0')
+  })
+
+  it('does not count a stored paused conductor mode filter in a mix: another filter stored on narrows', async () => {
+    localStorage.setItem(CREW_ONLY, '2')
+    localStorage.setItem(RUNNING_ONLY, '1')
+    renderSidebar(WITH_ROOT)
+    const runningChip = await screen.findByTestId('filter-chip-running')
+    expect(runningChip.className.split(/\s+/)).not.toContain('border-dashed')
+    await waitFor(() => expect(screen.queryByText('plain b')).toBeNull())
+    expect(screen.queryByText('plain a')).not.toBeNull()
+    expect(localStorage.getItem(RUNNING_ONLY)).toBe('1')
+    expect(localStorage.getItem(CREW_ONLY)).toBe('0')
   })
 })

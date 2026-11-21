@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef, type ReactNode } from 'react'
+import { useReducedMotion } from '../hooks/useReducedMotion'
 import { Hourglass, ClipboardList, ClipboardCheck, RefreshCw, CheckCircle, XCircle, Square, Sparkles, FileText, Settings, X, MessageSquare, Pencil, Clock, Pause, Play, RotateCcw, Plus, PanelLeftOpen, Zap } from 'lucide-react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useAppSelector, useAppDispatch } from '../store'
@@ -19,8 +20,12 @@ import {
 } from './projectsLayout'
 
 import { i18nT } from '../i18n/t'
+import { Trans } from 'react-i18next'
 import { useImeGuard } from '../hooks/useImeGuard'
 import ErrorNotice from '../components/ErrorNotice'
+import StatusNotice from '../components/StatusNotice'
+import { RadioChipGroup, radioChip } from '../components/RadioChipGroup'
+import { pollWhileVisible } from '../lib/pollWhileVisible'
 type Mode = 'compose' | 'spec' | 'yaml'
 
 /** Human text for a caught failure: the `ApiError` / `Error` message, else the value itself. */
@@ -63,14 +68,35 @@ function TextInputPanel({ text, setText, rows, placeholder, accept, onUpload, on
   )
 }
 
+/** The run's state in the app language. A status the runner adds later still
+ *  shows, verbatim, rather than disappearing. */
+export function runStatusLabel(run: Pick<ProjectRun, 'running' | 'status'>): string {
+  if (run.running) return i18nT('pages.projectsPage.running')
+  switch (run.status) {
+    case 'completed': return i18nT('pages.projectsPage.status_completed')
+    case 'failed': return i18nT('pages.projectsPage.status_failed')
+    case 'cancelled': return i18nT('pages.projectsPage.status_cancelled')
+    case 'planned': return i18nT('pages.projectsPage.status_planned')
+    case 'planning': return i18nT('pages.projectsPage.planning')
+    case 'running': return i18nT('pages.projectsPage.running')
+    case 'paused': return i18nT('pages.projectsPage.status_paused')
+    case 'pausing': return i18nT('pages.projectsPage.status_pausing')
+    default: return run.status
+  }
+}
+
 export default function ProjectsPage() {
   const ime = useImeGuard()
   const refreshTrigger = useAppSelector(s => s.dashboard.refreshTrigger)
+  const catalogRefreshTrigger = useAppSelector(s => s.dashboard.catalogRefreshTrigger)
   const navigate = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
   const dispatch = useAppDispatch()
   const [data, setData] = useState<TaskRunnerStatus | null>(null)
   const [selectedRun, setSelectedRun] = useState<ProjectRun | null>(null)
+  // The run a header action is for, read by `runAction` after its await.
+  const selectedRunIdRef = useRef<string | null>(null)
+  useEffect(() => { selectedRunIdRef.current = selectedRun?.task_id ?? null }, [selectedRun?.task_id])
   const [mode, setMode] = useState<Mode>(() => (sessionStorage.getItem('tr-mode') as Mode) || 'compose')
   const [userInput, setUserInput] = useState(() => sessionStorage.getItem('tr-input') || '')
   const [specText, setSpecText] = useState(() => sessionStorage.getItem('tr-spec') || '')
@@ -79,12 +105,12 @@ export default function ProjectsPage() {
   // The shared roster hook, not a direct `/api/agents` fetch: the hook is where
   // a failed fetch becomes readable state (`error`) instead of a silently empty
   // list, which #5990 showed is indistinguishable from a one-agent install.
-  // `refreshTrigger` keeps the existing behaviour of re-fetching the roster
-  // whenever the dashboard-wide refresh fires.
+  // `catalogRefreshTrigger` keeps the existing behaviour of re-fetching the roster
+  // whenever the dashboard-wide refresh fires for something that can change it.
   const {
     agents, defaultAgent: defaultAgentName,
     error: rosterError, reload: reloadRoster, reloading: rosterReloading,
-  } = useAgents(refreshTrigger)
+  } = useAgents(catalogRefreshTrigger)
   // A recovered roster must not be recovered for this page alone. `useAgents`
   // holds per-instance state and the app shell keeps its own copy, so the retry
   // bumps the shared refresh trigger — the same shape SchedulePage ships — and
@@ -134,6 +160,7 @@ export default function ProjectsPage() {
   // drop its rejection or its `{ ok: false }` body on the floor, so a refused
   // action was indistinguishable from a slow one.
   const [actionError, setActionError] = useState('')
+  const [statusNotice, setStatusNotice] = useState<{ message: string; tone: 'warn' | 'info'; runId: string | null } | null>(null)
   const mountedRef = useRef(true)
   const loadingRef = useRef(false)
   const appliedRef = useRef<string | null>(null)
@@ -213,19 +240,37 @@ export default function ProjectsPage() {
    * `{ ok: false }` envelope both land in `actionError`; `onOk` (usually the
    * reload) runs only when the action actually took.
    */
-  const runAction = useCallback(async (request: () => Promise<ActionResult>, onOk?: () => void) => {
+  // One action per run at a time: a fast second click on Execute, Restart or
+  // Schedule would otherwise start a second run or a second cron job, and a
+  // second Discard would report the first one's success as a failure. `key`
+  // names the run the action is for (the selected run by default); `null`
+  // leaves the call unguarded, for a rename that must never be dropped.
+  const busyRunsRef = useRef<Set<string>>(new Set())
+  const [busyRuns, setBusyRuns] = useState<ReadonlySet<string>>(() => new Set())
+  const runAction = useCallback(async (request: () => Promise<ActionResult>, onOk?: () => void, key?: string | null) => {
+    const guard = key === undefined ? selectedRunIdRef.current : key
+    if (guard !== null) {
+      if (busyRunsRef.current.has(guard)) return
+      busyRunsRef.current.add(guard)
+      setBusyRuns(new Set(busyRunsRef.current))
+    }
     setActionError('')
+    setStatusNotice(null)
     try {
       const r = await request()
       if (r && r.ok === false) { setActionError(r.error || i18nT('pages.projectsPage.action_failed')); return }
       onOk?.()
-    } catch (e) { setActionError(errText(e)) }
+    } catch (e) { setActionError(errText(e)) } finally {
+      if (guard !== null) {
+        busyRunsRef.current.delete(guard)
+        if (mountedRef.current) setBusyRuns(new Set(busyRunsRef.current))
+      }
+    }
   }, [])
 
   useEffect(() => {
     load()
-    const iv = setInterval(load, 3000)
-    return () => clearInterval(iv)
+    return pollWhileVisible(load, 3000)
   }, [load, refreshTrigger])
 
   // Recovery: poll for planned run if isPlanning was restored from sessionStorage
@@ -356,7 +401,12 @@ export default function ProjectsPage() {
   }
 
   const cancelPlan = async () => {
-    try { await api.cancelPlan() } finally { setIsPlanning(false); sessionStorage.removeItem('tr-planning') }
+    // A refused cancel leaves the plan running, so the banner stays and says why.
+    setPlanError('')
+    let r: ActionResult
+    try { r = await api.cancelPlan() } catch (e) { setPlanError(errText(e)); return }
+    if (r && r.ok === false) { setPlanError(r.error || i18nT('pages.projectsPage.action_failed')); return }
+    setIsPlanning(false); sessionStorage.removeItem('tr-planning')
   }
 
   const handleRun = (input: string, source: string) => {
@@ -376,7 +426,8 @@ export default function ProjectsPage() {
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (!file) return
-    if (/\.ya?ml$/i.test(file.name)) { alert(i18nT('pages.projectsPage.yaml_files_should_be_uploaded_via_the_from_yaml')); e.target.value = ''; return }
+    setStatusNotice(null)
+    if (/\.ya?ml$/i.test(file.name)) { setStatusNotice({ message: i18nT('pages.projectsPage.yaml_files_should_be_uploaded_via_the_from_yaml'), tone: 'warn', runId: null }); e.target.value = ''; return }
     const reader = new FileReader()
     reader.onload = () => setSpecText(reader.result as string)
     reader.readAsText(file)
@@ -386,7 +437,8 @@ export default function ProjectsPage() {
   const handleYamlUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (!file) return
-    if (!/\.ya?ml$/i.test(file.name)) { alert(i18nT('pages.projectsPage.only_yaml_yml_files_are_accepted_here_use_the_fr')); e.target.value = ''; return }
+    setStatusNotice(null)
+    if (!/\.ya?ml$/i.test(file.name)) { setStatusNotice({ message: i18nT('pages.projectsPage.only_yaml_yml_files_are_accepted_here_use_the_fr'), tone: 'warn', runId: null }); e.target.value = ''; return }
     const reader = new FileReader()
     reader.onload = () => setYamlText(reader.result as string)
     reader.readAsText(file)
@@ -449,7 +501,13 @@ export default function ProjectsPage() {
             <span className="text-[14px]">{icon}</span>
             <div className="flex-1 min-w-0">
               <div className="text-[13px] font-semibold text-text-strong truncate">{name}</div>
-              <div className="text-[11px] text-muted">{r.task_id} · {r.completed}/{r.tasks} · {r.running ? 'running' : r.status}</div>
+              {/* Count and state first and never truncated: they wrap (before the
+                  "·", which stays with the state) where a long label cannot fit
+                  the rail. The id after them gives way first and drops out. */}
+              <div className="flex min-w-0 text-[11px] text-muted" title={`${r.task_id} · ${r.completed}/${r.tasks} · ${runStatusLabel(r)}`}>
+                <span className="min-w-0 break-words">{r.completed}/{r.tasks} {'·\u00a0'}{runStatusLabel(r)}</span>
+                <span className="truncate whitespace-pre basis-0 grow"> · {r.task_id}</span>
+              </div>
             </div>
             {/* Auto-approve indicator. Gated on the LIVE grant (matches the
                 run-detail toggle sync effect at line 225: "Reflect only a
@@ -478,7 +536,10 @@ export default function ProjectsPage() {
             <div className="w-10 h-1 bg-bg-elevated rounded-full overflow-hidden shrink-0">
               <div className={`h-full rounded-full ${r.status === 'failed' ? 'bg-danger' : 'bg-accent'}`} style={{ width: `${pct}%` }} />
             </div>
-            <button aria-label={r.running ? i18nT('pages.projectsPage.cancel') : i18nT('pages.projectsPage.delete')} className="px-1 text-muted text-[11px] cursor-pointer hover:text-danger transition-all shrink-0 bg-transparent border-none" onClick={e => { e.stopPropagation(); void runAction(() => (r.running ? api.cancelTaskRunner(r.task_id) : api.deleteTaskRun(r.task_id)), load) }}>{r.running ? <Square className="lucide-inline" /> : <X className="lucide-inline" />}</button>
+            {/* `aria-disabled` while the request runs, not `disabled`: the press
+                that started it holds focus here, and a native disabled button
+                would drop it to <body>. `runAction` ignores a second press. */}
+            <button aria-label={r.running ? i18nT('pages.projectsPage.cancel') : i18nT('pages.projectsPage.delete')} aria-disabled={busyRuns.has(r.task_id)} aria-busy={busyRuns.has(r.task_id)} className="px-1 text-muted text-[11px] cursor-pointer hover:text-danger transition-all shrink-0 bg-transparent border-none aria-disabled:opacity-50 aria-disabled:cursor-default" onClick={e => { e.stopPropagation(); void runAction(() => (r.running ? api.cancelTaskRunner(r.task_id) : api.deleteTaskRun(r.task_id)), load, r.task_id) }}>{r.running ? <Square className="lucide-inline" /> : <X className="lucide-inline" />}</button>
           </div>
         )
       })}
@@ -514,11 +575,11 @@ export default function ProjectsPage() {
 
   const composePanel = (
     <div className="px-4 md:px-6 py-4">
-      <div className="flex flex-col sm:flex-row items-stretch gap-1.5 sm:gap-1 mb-4">
-        <button onClick={() => setMode('compose')} disabled={anyPlanning} aria-pressed={mode === 'compose'} className={modeRowClass(mode === 'compose')}><ModeDot on={mode === 'compose'} /><Sparkles className="lucide-inline" /> {i18nT('pages.projectsPage.compose')}</button>
-        <button onClick={() => setMode('spec')} disabled={anyPlanning} aria-pressed={mode === 'spec'} className={modeRowClass(mode === 'spec')}><ModeDot on={mode === 'spec'} /><FileText className="lucide-inline" /> {i18nT('pages.projectsPage.from_spec')}</button>
-        <button onClick={() => setMode('yaml')} disabled={anyPlanning} aria-pressed={mode === 'yaml'} className={modeRowClass(mode === 'yaml')}><ModeDot on={mode === 'yaml'} /><Settings className="lucide-inline" /> {i18nT('pages.projectsPage.from_yaml')}</button>
-      </div>
+      <RadioChipGroup className="flex flex-col sm:flex-row items-stretch gap-1.5 sm:gap-1 mb-4" ariaLabel={i18nT('pages.projectsPage.plan_mode_label')}>
+        <button type="button" onClick={() => setMode('compose')} disabled={anyPlanning} {...radioChip(mode === 'compose')} className={modeRowClass(mode === 'compose')}><ModeDot on={mode === 'compose'} /><Sparkles className="lucide-inline" /> {i18nT('pages.projectsPage.compose')}</button>
+        <button type="button" onClick={() => setMode('spec')} disabled={anyPlanning} {...radioChip(mode === 'spec')} className={modeRowClass(mode === 'spec')}><ModeDot on={mode === 'spec'} /><FileText className="lucide-inline" /> {i18nT('pages.projectsPage.from_spec')}</button>
+        <button type="button" onClick={() => setMode('yaml')} disabled={anyPlanning} {...radioChip(mode === 'yaml')} className={modeRowClass(mode === 'yaml')}><ModeDot on={mode === 'yaml'} /><Settings className="lucide-inline" /> {i18nT('pages.projectsPage.from_yaml')}</button>
+      </RadioChipGroup>
       {/* Wraps at phone width: two labelled controls on one line push the
           workspace field off the right edge otherwise. */}
       <div className="flex flex-wrap gap-2 items-center mb-3">
@@ -531,14 +592,15 @@ export default function ProjectsPage() {
           value={workspaceDir}
           onChange={e => setWorkspaceDir(e.target.value)}
           placeholder={defaultWorkspaceDir || i18nT('pages.projectsPage.default_workspace_folder')}
-          title={i18nT('pages.projectsPage.root_folder_for_a_new_plan_leave_blank_to_use_th')}
+          // The full path first: the field is too narrow to show a long one.
+          title={[workspaceDir || defaultWorkspaceDir, i18nT('pages.projectsPage.root_folder_for_a_new_plan_leave_blank_to_use_th')].filter(Boolean).join('\n\n')}
           disabled={anyPlanning}
           // Keeps its 200px floor at every width so a row that cannot fit it
           // WRAPS the field onto its own line, where `flex-1` gives it the full
           // width. Letting it shrink instead would keep it on the line as an
-          // unusable sliver. From `sm` up the row has the room, so the field
-          // returns to its natural size.
-          className={`min-w-[200px] flex-1 sm:flex-initial px-2.5 py-1.5 text-[13px] font-mono ${anyPlanning ? 'opacity-50 cursor-not-allowed' : ''}`}
+          // unusable sliver. From `sm` up it takes the rest of the row, so a
+          // long path stays readable.
+          className={`min-w-[200px] flex-1 px-2.5 py-1.5 text-[13px] font-mono ${anyPlanning ? 'opacity-50 cursor-not-allowed' : ''}`}
         />
       </div>
       {mode === 'compose' ? (
@@ -589,7 +651,7 @@ export default function ProjectsPage() {
         <TextInputPanel text={specText} setText={setSpecText} rows={6} placeholder={i18nT('pages.projectsPage.paste_spec_content_or_upload_a_file')} accept=".md,.txt" onUpload={handleFileUpload} onRun={() => handleRun(specText, 'spec')} onPlan={() => generatePlan(specText, 'spec')} disabled={anyPlanning} isPlanning={isPlanning} onCancel={cancelPlan} planError={planError} />
       ) : (
         <TextInputPanel text={yamlText} setText={setYamlText} rows={8} placeholder={i18nT('pages.projectsPage.paste_yaml_workflow_or_upload_a_yaml_file')} accept=".yaml,.yml" onUpload={handleYamlUpload} onRun={() => handleRun(yamlText, 'yaml')} onPlan={() => generatePlan(yamlText, 'yaml')} disabled={anyPlanning} isPlanning={isPlanning} onCancel={cancelPlan} planError={planError}
-          banner={<div className="rounded-md border bg-bg-elevated px-3 py-2 text-[12px] text-text" style={{ borderColor: 'color-mix(in srgb, var(--accent) 40%, transparent)' }}><Settings className="lucide-inline" /> {i18nT('pages.projectsPage.yaml_workflows_bypass_the_llm_decomposer')} <code>{i18nT('pages.projectsPage.depends_on')}</code> {i18nT('pages.projectsPage.is_enforced_as_a_hard_dag_constraint')}</div>} />
+          banner={<div className="rounded-md border bg-bg-elevated px-3 py-2 text-[12px] text-text" style={{ borderColor: 'color-mix(in srgb, var(--accent) 40%, transparent)' }}><Settings className="lucide-inline" /> <Trans i18nKey="pages.projectsPage.yaml_workflows_hard_dag" components={{ field: <code>{i18nT('pages.projectsPage.depends_on')}</code> }} /></div>} />
       )}
     </div>
   )
@@ -599,6 +661,7 @@ export default function ProjectsPage() {
   // every state (including "no runs yet") so the page never reflows out from
   // under the pointer the moment the first run appears, and the main column owns
   // its own padding rather than inheriting page gutters.
+  const runBusy = !!selectedRun && busyRuns.has(selectedRun.task_id)
   return (
     <div className={`flex h-full bg-bg text-text ${railBar ? 'flex-col' : ''}`}>
       {rail.collapsed ? (
@@ -648,6 +711,7 @@ export default function ProjectsPage() {
             edits (compose) or the run's task-edit drafts (`pendingEdits` in the
             detail pane) — unsaved local state the hand-off would unmount. */}
         <ErrorNotice message={actionError} onDismiss={() => setActionError('')} className="mx-4 mt-2 shrink-0" testId="projects-action-error" />
+        <StatusNotice message={statusNotice?.runId === (selectedRun?.task_id ?? null) ? statusNotice?.message : undefined} tone={statusNotice?.tone} onDismiss={() => setStatusNotice(null)} className="mx-4 mt-2 shrink-0" testId="projects-status-notice" />
         {/* Project rename announcement — always mounted so it is present before any run is selected. */}
         <span className="sr-only" role="status" aria-live="polite" aria-atomic="true" data-testid="project-rename-status">{projectRenameAnnouncement}</span>
         {selectedRun ? (
@@ -672,6 +736,7 @@ export default function ProjectsPage() {
                         void runAction(
                           () => api.renameTaskRun(selectedRun.task_id, v),
                           () => { load(); setProjectRenameAnnouncement(i18nT('pages.projectsPage.project_renamed_to', { name: v })) },
+                          null,
                         )
                       }
                     }
@@ -717,15 +782,15 @@ export default function ProjectsPage() {
                 onClick={() => { setEditingName(true); setEditNameValue(selectedRun.name || selectedRun.spec_name || 'Project') }}
                 onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setEditingName(true); setEditNameValue(selectedRun.name || selectedRun.spec_name || 'Project') } }}
               ><Pencil className="lucide-inline" /></span>}
-              <span className="text-[12px] text-muted">{selectedRun.status === 'planning' ? <><Hourglass className="lucide-inline" /> {i18nT('pages.projectsPage.planning')}</> : selectedRun.running ? <><RefreshCw className="lucide-inline" /> {i18nT('pages.projectsPage.running')}</> : selectedRun.status}</span>
+              <span className="text-[12px] text-muted">{selectedRun.status === 'planning' ? <><Hourglass className="lucide-inline" /> {i18nT('pages.projectsPage.planning')}</> : selectedRun.running ? <><RefreshCw className="lucide-inline" /> {i18nT('pages.projectsPage.running')}</> : runStatusLabel(selectedRun)}</span>
               <div className="flex-1" />
               {selectedRun.status === 'planned' && <>
                 <label className="flex items-center gap-1.5 text-[12px] text-muted cursor-pointer select-none" title={i18nT('pages.projectsPage.run_unattended_auto_approve_this_run_s_tool_call')}>
                   <Checkbox checked={autoApprove} onChange={e => setAutoApprove(e.target.checked)} />
                   {i18nT('pages.projectsPage.auto_approve_tool_calls')}
                 </label>
-                <button className="btn-sweep bg-accent text-accent-fg border-none rounded-lg px-4 h-8 text-[13px] font-semibold cursor-pointer hover:bg-accent-hover transition-all" onClick={() => runAction(() => api.executePlan(selectedRun.task_id, agent, autoApprove), load)}><Play className="lucide-inline" /> {i18nT('pages.projectsPage.execute')}</button>
-                <button className="px-3 h-8 rounded-md border border-border text-muted text-[13px] cursor-pointer hover:text-accent hover:border-accent transition-all" onClick={() => runAction(async () => {
+                <button className="btn-sweep bg-accent text-accent-fg border-none rounded-lg px-4 h-8 text-[13px] font-semibold cursor-pointer hover:bg-accent-hover transition-all disabled:opacity-50 disabled:cursor-default" disabled={runBusy} onClick={() => runAction(() => api.executePlan(selectedRun.task_id, agent, autoApprove), load)}><Play className="lucide-inline" /> {i18nT('pages.projectsPage.execute')}</button>
+                <button className="px-3 h-8 rounded-md border border-border text-muted text-[13px] cursor-pointer hover:text-accent hover:border-accent transition-all disabled:opacity-50 disabled:cursor-default" disabled={runBusy} onClick={() => runAction(async () => {
                   const res = await api.planContext(selectedRun.task_id)
                   // A body without the context is a failed hand-off, not a
                   // different kind of success — there is nothing to open chat with.
@@ -733,11 +798,11 @@ export default function ProjectsPage() {
                   dispatch(setPendingInput("Let's optimize this plan:\n\n" + res.context)); navigate('/chat?autoSend=1&newSession=1')
                   return res
                 })}><MessageSquare className="lucide-inline" /> {i18nT('pages.projectsPage.chat')}</button>
-                <button className="px-3 h-8 rounded-md border border-border text-muted text-[13px] cursor-pointer hover:text-danger hover:border-danger transition-all" onClick={() => runAction(() => api.deleteTaskRun(selectedRun.task_id), () => { setSelectedRun(null); load() })}><X className="lucide-inline" /> {i18nT('pages.projectsPage.discard')}</button>
+                <button className="px-3 h-8 rounded-md border border-border text-muted text-[13px] cursor-pointer hover:text-danger hover:border-danger transition-all disabled:opacity-50 disabled:cursor-default" disabled={runBusy} onClick={() => runAction(() => api.deleteTaskRun(selectedRun.task_id), () => { setSelectedRun(null); load() })}><X className="lucide-inline" /> {i18nT('pages.projectsPage.discard')}</button>
               </>}
-              {selectedRun.status === 'planning' && <button className="px-3 h-8 rounded-md border border-border text-muted text-[13px] cursor-pointer hover:text-danger hover:border-danger transition-all" onClick={() => runAction(() => api.cancelPlan(), () => setSelectedRun(null))}><X className="lucide-inline" /> {i18nT('pages.projectsPage.cancel')}</button>}
-              {selectedRun.running && <button className="px-3 h-8 rounded-md border border-border text-muted text-[13px] cursor-pointer hover:text-warn hover:border-warn transition-all" onClick={() => runAction(() => api.pauseTaskRun(selectedRun.task_id), load)}><Pause className="lucide-inline" /> {i18nT('pages.projectsPage.pause')}</button>}
-              {selectedRun.running && <button className="px-3 h-8 rounded-md border border-border text-muted text-[13px] cursor-pointer hover:text-danger hover:border-danger transition-all" onClick={() => runAction(() => api.cancelTaskRunner(selectedRun.task_id), load)}><Square className="lucide-inline" /> {i18nT('pages.projectsPage.cancel')}</button>}
+              {selectedRun.status === 'planning' && <button className="px-3 h-8 rounded-md border border-border text-muted text-[13px] cursor-pointer hover:text-danger hover:border-danger transition-all disabled:opacity-50 disabled:cursor-default" disabled={runBusy} onClick={() => runAction(() => api.cancelPlan(), () => setSelectedRun(null))}><X className="lucide-inline" /> {i18nT('pages.projectsPage.cancel')}</button>}
+              {selectedRun.running && <button className="px-3 h-8 rounded-md border border-border text-muted text-[13px] cursor-pointer hover:text-warn hover:border-warn transition-all disabled:opacity-50 disabled:cursor-default" disabled={runBusy} onClick={() => runAction(() => api.pauseTaskRun(selectedRun.task_id), load)}><Pause className="lucide-inline" /> {i18nT('pages.projectsPage.pause')}</button>}
+              {selectedRun.running && <button className="px-3 h-8 rounded-md border border-border text-muted text-[13px] cursor-pointer hover:text-danger hover:border-danger transition-all disabled:opacity-50 disabled:cursor-default" disabled={runBusy} onClick={() => runAction(() => api.cancelTaskRunner(selectedRun.task_id), load)}><Square className="lucide-inline" /> {i18nT('pages.projectsPage.cancel')}</button>}
               {!selectedRun.running && selectedRun.status !== 'planned' && selectedRun.status !== 'planning' && <>
                 {selectedRun.status === 'paused' && (
                   <>
@@ -745,11 +810,11 @@ export default function ProjectsPage() {
                       <Checkbox checked={autoApprove} onChange={e => setAutoApprove(e.target.checked)} />
                       {i18nT('pages.projectsPage.auto_approve_tool_calls')}
                     </label>
-                    <button className="btn-sweep bg-accent text-accent-fg border-none rounded-lg px-4 h-8 text-[13px] font-semibold cursor-pointer hover:bg-accent-hover transition-all" onClick={() => runAction(() => api.executePlan(selectedRun.task_id, agent, autoApprove), load)}><Play className="lucide-inline" /> {i18nT('pages.projectsPage.resume')}</button>
+                    <button className="btn-sweep bg-accent text-accent-fg border-none rounded-lg px-4 h-8 text-[13px] font-semibold cursor-pointer hover:bg-accent-hover transition-all disabled:opacity-50 disabled:cursor-default" disabled={runBusy} onClick={() => runAction(() => api.executePlan(selectedRun.task_id, agent, autoApprove), load)}><Play className="lucide-inline" /> {i18nT('pages.projectsPage.resume')}</button>
                   </>
                 )}
                 {(selectedRun.status === 'completed' || selectedRun.status === 'cancelled') && (
-                  <button className="px-3 h-8 rounded-md border border-accent bg-transparent text-accent text-[13px] font-semibold cursor-pointer hover:bg-accent hover:text-accent-fg transition-all" onClick={() => runAction(async () => {
+                  <button className="px-3 h-8 rounded-md border border-accent bg-transparent text-accent text-[13px] font-semibold cursor-pointer hover:bg-accent hover:text-accent-fg transition-all disabled:opacity-50 disabled:cursor-default" disabled={runBusy} onClick={() => runAction(async () => {
                     const res = await api.taskRunToChat(selectedRun.task_id)
                     // No slot means the run was NOT moved — the user clicked and
                     // nothing happened, which is a failure, not a quiet no-op.
@@ -758,14 +823,19 @@ export default function ProjectsPage() {
                     return res
                   })}><MessageSquare className="lucide-inline" /> {i18nT('pages.projectsPage.chat')}</button>
                 )}
-                {selectedRun.status !== 'paused' && <button className="px-3 h-8 rounded-md border border-accent bg-transparent text-accent text-[13px] font-semibold cursor-pointer hover:bg-accent hover:text-accent-fg transition-all" onClick={() => runAction(() => api.retryTaskRun(selectedRun.task_id, 1), load)}><RotateCcw className="lucide-inline" /> {i18nT('pages.projectsPage.restart')}</button>}
-                <button className="px-3 h-8 rounded-md border border-border text-muted text-[13px] cursor-pointer hover:text-accent hover:border-accent transition-all" onClick={() => {
+                {selectedRun.status !== 'paused' && <button className="px-3 h-8 rounded-md border border-accent bg-transparent text-accent text-[13px] font-semibold cursor-pointer hover:bg-accent hover:text-accent-fg transition-all disabled:opacity-50 disabled:cursor-default" disabled={runBusy} onClick={() => runAction(() => api.retryTaskRun(selectedRun.task_id, 1), load)}><RotateCcw className="lucide-inline" /> {i18nT('pages.projectsPage.restart')}</button>}
+                <button className="px-3 h-8 rounded-md border border-border text-muted text-[13px] cursor-pointer hover:text-accent hover:border-accent transition-all disabled:opacity-50 disabled:cursor-default" disabled={runBusy} onClick={() => {
                   const name = selectedRun.name || selectedRun.spec_name || selectedRun.task_id
                   const spec = selectedRun.spec_content || selectedRun.original_input || ''
-                  if (!spec) { alert(i18nT('pages.projectsPage.no_spec_idea_to_schedule')); return }
+                  const runId = selectedRun.task_id
+                  if (!spec) { setStatusNotice({ message: i18nT('pages.projectsPage.no_spec_idea_to_schedule'), tone: 'warn', runId }); return }
                   void runAction(
                     () => api.createCron({ name: `Project: ${name}`, message: `run __inline__:${spec}`, every: 86400 }),
-                    () => alert(i18nT('pages.projectsPage.scheduled_as_daily_cron_job')),
+                    () => {
+                      if (mountedRef.current && selectedRunIdRef.current === runId) {
+                        setStatusNotice({ message: i18nT('pages.projectsPage.scheduled_as_daily_cron_job'), tone: 'info', runId })
+                      }
+                    },
                   )
                 }}><Clock className="lucide-inline" /> {i18nT('pages.projectsPage.schedule')}</button>
               </>}
@@ -843,10 +913,14 @@ function CollapsedRail({ width, onExpand, horizontal = false }: {
 
 function PlanningBanner({ onCancel }: { onCancel: () => void }) {
   const [dots, setDots] = useState('')
+  // Ticking text is motion too: under reduced motion the line holds still,
+  // and the static copy below it still says the plan is being built.
+  const reduceMotion = useReducedMotion()
   useEffect(() => {
+    if (reduceMotion) return
     const iv = setInterval(() => setDots(d => d.length >= 3 ? '' : d + '.'), 500)
     return () => clearInterval(iv)
-  }, [])
+  }, [reduceMotion])
   return (
     <div className="relative overflow-hidden rounded-lg border border-accent/50 bg-accent/10 px-4 py-3 mt-2">
       <div className="absolute inset-0 bg-gradient-to-r from-transparent via-accent/10 to-transparent animate-shimmer" />
@@ -855,7 +929,7 @@ function PlanningBanner({ onCancel }: { onCancel: () => void }) {
             "work in flight" signal, so nothing here needs to spin. */}
         <Hourglass size={18} className="text-accent shrink-0" />
         <div className="flex-1">
-          <div className="text-accent text-[14px] font-semibold">{i18nT('pages.projectsPage.generating_execution_plan')}{dots}</div>
+          <div className="text-accent text-[14px] font-semibold">{i18nT('pages.projectsPage.generating_execution_plan')}{reduceMotion ? '' : dots}</div>
           <div className="text-muted text-[12px] mt-0.5">{i18nT('pages.projectsPage.analyzing_task_and_building_step_by_step_plan')}</div>
         </div>
         <button className="px-3 h-7 rounded-md border border-border bg-transparent text-muted text-[12px] cursor-pointer font-body hover:text-danger hover:border-danger transition-all shrink-0" onClick={onCancel}><X className="lucide-inline" /> {i18nT('pages.projectsPage.cancel')}</button>

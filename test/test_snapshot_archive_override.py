@@ -144,10 +144,16 @@ class TestTheDecompressionGuardStillHolds:
         fresh = tmp_path / "fresh"
         fresh.mkdir()
         monkeypatch.setenv("KIROCREW_HOME", str(fresh))
-        rc = snap.restore_main([str(bomb), "--force"] + extra + unpinnable_argv())
+        rc = snap.restore_main(
+            [str(bomb), "--mode", "replace", "--force"] + extra + unpinnable_argv()
+        )
         printed = capsys.readouterr().out
         assert rc == 1, printed
         assert "declares more than" in printed and "Nothing was restored" in printed, printed
+        # A full snapshot of a large home trips this too, so the refusal must not speak
+        # as if only memory bundles reached it.
+        assert "memory bundle" not in printed, printed
+        assert "over the bound `kirocrew restore` holds it to" in printed, printed
         assert list(fresh.iterdir()) == []
 
     def test_a_raised_bound_is_still_held_to_the_free_space(self, tmp_path, monkeypatch, capsys):
@@ -167,7 +173,10 @@ class TestTheDecompressionGuardStillHolds:
             return usage._replace(free=1024**2)
 
         monkeypatch.setattr(snap.shutil, "disk_usage", _nearly_full)
-        rc = snap.restore_main([str(bomb), "--force", "--max-archive-gib", "1"] + unpinnable_argv())
+        rc = snap.restore_main(
+            [str(bomb), "--mode", "replace", "--force", "--max-archive-gib", "1"]
+            + unpinnable_argv()
+        )
         printed = capsys.readouterr().out
         assert rc == 1, printed
         assert "GiB free where it would be extracted" in printed, printed

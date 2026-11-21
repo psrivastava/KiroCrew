@@ -131,11 +131,8 @@ class TestCharacterBudget:
     ) -> None:
         """An oversized lesson is skipped, not treated as the end of the budget.
 
-        Stopping at the first lesson that does not fit would throw away every
-        shorter lesson ranked behind it, wasting the remaining budget. The
-        oversized rule is written second of three so it lands in the MIDDLE of
-        the recency order, which is the only arrangement where skipping and
-        stopping differ.
+        The oversized rule is written second of three so it lands in the MIDDLE of
+        the recency order, the only arrangement where skipping and stopping differ.
         """
         oversized = "Avoid " + "verbosity " * 60
         store.write_lesson(MIGRATION)  # ranked last
@@ -254,11 +251,11 @@ class TestRecallLessonShare:
         assert "omitted" not in result["lessons_context"]
         assert LESSON_TRUNCATION_MARKER not in result["lessons_context"]
 
-    @pytest.mark.parametrize(("cap", "kept"), [(483, True), (480, False)])
+    @pytest.mark.parametrize(("cap", "kept"), [(477, True), (474, False)])
     def test_a_lone_lesson_is_kept_only_from_the_stated_cap(
         self, store: VectorMemoryStore, cap: int, kept: bool
     ) -> None:
-        """The spec's 483 is the smallest cap whose share fits one in-scope lesson's frame."""
+        """The spec's 477 is the smallest cap whose share fits one in-scope lesson's frame."""
         store.write_lesson(long_lesson(1200))
 
         result = store.recall(CERTIFICATE, cap=cap)
@@ -268,16 +265,16 @@ class TestRecallLessonShare:
     @pytest.mark.parametrize(
         ("query", "order", "cap", "kept"),
         [
-            (CERTIFICATE, "most relevant", 651, True),
-            (CERTIFICATE, "most relevant", 648, False),
-            ("what is the status of", "most recent", 645, True),
-            ("what is the status of", "most recent", 642, False),
+            (CERTIFICATE, "most relevant", 645, True),
+            (CERTIFICATE, "most relevant", 642, False),
+            ("what is the status of", "most recent", 639, True),
+            ("what is the status of", "most recent", 636, False),
         ],
     )
     def test_with_a_second_lesson_counted_it_is_kept_only_from_the_stated_cap(
         self, store: VectorMemoryStore, query: str, order: str, cap: int, kept: bool
     ) -> None:
-        """The spec's 651, or 645 for a query with no recall terms, is the
+        """The spec's 645, or 639 for a query with no recall terms, is the
         smallest cap whose share also fits the counts line."""
         store.write_lesson(long_lesson(1200))
         other = TABS + " " + " ".join(f"padding{index}" for index in range(1200))
@@ -343,17 +340,11 @@ class TestStoredVectorComparability:
     ) -> None:
         """A vector of another dimensionality is incomparable, not a match.
 
-        Rows written under a previous embedding model keep that model's
-        dimensionality. Comparing one against a query from the current model used
-        to score only the leading elements while each norm still used its own
-        full vector, so the shorter row could reach a perfect 1.0 and outrank the
-        row that genuinely matches.
+        Rows written under an older embedding model keep its dimensionality. Scoring
+        only the leading elements would let the shorter row reach a perfect 1.0.
 
-        The blob is rewritten directly because that is the only way the mismatch
-        arises: ``write_lesson`` embeds every row with whatever ``embed_fn`` is
-        bound at the time, and handing it a short vector up front instead trips
-        the dedup comparison — which truncates the same way — so the row is
-        treated as a duplicate and never stored at all.
+        The blob is rewritten directly: a short vector from ``embed_fn`` would trip
+        the dedup comparison, which truncates the same way, and never be stored.
         """
         probe = "unrelated probe phrasing"
         vectors = {

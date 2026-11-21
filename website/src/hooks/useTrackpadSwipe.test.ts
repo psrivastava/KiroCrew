@@ -5,12 +5,15 @@
  * pinch, a sideways scroller, a direction with nothing to do) are never taken.
  */
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { renderHook } from '@testing-library/react'
+import { act, renderHook } from '@testing-library/react'
 import {
   createTrackpadSwipeReader, isClearSwipe, SWIPE_GESTURE_IDLE_MS, swipeTiming, useTrackpadSwipe, canScrollX,
   relayedWheelTime, FRAME_WHEEL_MAX_AGE_MS, FINGER_HOLD_MAX_MS,
   type TrackpadSwipeDir, type WheelSample, type WheelVerdict,
 } from './useTrackpadSwipe'
+import { fingerSign } from '../lib/trackpadGesture'
+import { REVERSE_TRACKPAD_SWIPE_KEY } from '../lib/scrollTouch'
+import { usePersistedBool } from './usePersistedBool'
 
 /** A run of `n` wheel events 16ms apart, starting at `at`. */
 function run(dx: number, dy: number, n: number, at: number, extra: Partial<WheelSample> = {}): WheelSample[] {
@@ -24,8 +27,11 @@ function tail(dx: number, n: number, at: number): WheelSample[] {
 
 const yes = () => true
 
-function feedAll(samples: WheelSample[], wants: (d: TrackpadSwipeDir, f: boolean) => boolean = yes) {
-  const reader = createTrackpadSwipeReader(wants)
+function feedAll(
+  samples: WheelSample[], wants: (d: TrackpadSwipeDir, f: boolean) => boolean = yes,
+  reveals?: (d: TrackpadSwipeDir) => boolean,
+) {
+  const reader = createTrackpadSwipeReader(wants, undefined, reveals)
   const verdicts: WheelVerdict[] = samples.map((s) => reader.feed(s))
   return {
     reader,
@@ -61,6 +67,58 @@ describe('createTrackpadSwipeReader', () => {
     expect(moves).toEqual([20, 40, 60, 80, 100, 120])
     // Every later tail event is still the page's (held), and moves nothing.
     expect(consumed).toBe(samples.length)
+  })
+
+  it('a held tail ends at a turn back: the reversed swipe is a new drag at once, with no gap', () => {
+    const samples = [...run(20, 0, 6, 0), ...tail(20, 4, 5 * 16)]
+    const at = 5 * 16 + 4 * 16
+    samples.push(...run(-15, 0, 3, at + 16))
+    const { starts, verdicts } = feedAll(samples)
+    expect(verdicts.findIndex((v) => v.end)).toBe(8)
+    expect(starts).toEqual(['left', 'right'])
+  })
+
+  it('a held tail ends when the deltas grow again: two steps each 1.3x or more', () => {
+    // The tail decays 20 -> 6.6; then 8, 11, 15: new fingers, same way.
+    const samples = [...run(20, 0, 6, 0), ...tail(20, 5, 5 * 16)]
+    const at = 5 * 16 + 5 * 16
+    ;[8, 11, 15, 15].forEach((dx, i) => samples.push({ dx, dy: 0, mode: 0, ctrl: false, owned: false, at: at + (i + 1) * 16 }))
+    const { starts, verdicts } = feedAll(samples)
+    expect(starts).toEqual(['left', 'left'])
+    // The new drag starts at the second rise.
+    expect(verdicts.findIndex((v, i) => i > 8 && v.start)).toBe(samples.length - 2)
+  })
+
+  it('a pure decaying tail, however long, never starts a drag again; nor does one spike in it', () => {
+    const samples = [...run(20, 0, 6, 0), ...tail(20, 30, 5 * 16)]
+    expect(feedAll(samples).starts).toEqual(['left'])
+    const spiked = [...run(20, 0, 6, 0), ...tail(20, 6, 5 * 16)]
+    spiked.push({ dx: 12, dy: 0, mode: 0, ctrl: false, owned: false, at: 5 * 16 + 7 * 16 })
+    spiked.push({ dx: 4, dy: 0, mode: 0, ctrl: false, owned: false, at: 5 * 16 + 8 * 16 })
+    spiked.push({ dx: 3, dy: 0, mode: 0, ctrl: false, owned: false, at: 5 * 16 + 9 * 16 })
+    expect(feedAll(spiked).starts).toEqual(['left'])
+  })
+
+  it('a drag the page committed (rule C) holds the rest of its run, and a turn back starts a new one', () => {
+    const reader = createTrackpadSwipeReader(yes)
+    const starts: string[] = []
+    let moves = 0
+    const feed = (dx: number, at: number) => {
+      const v = reader.feed({ dx, dy: 0, mode: 0, ctrl: false, owned: false, at })
+      if (v.start) starts.push(v.start)
+      if (v.move !== undefined) moves += 1
+      return v
+    }
+    feed(20, 0)
+    feed(20, 16)
+    reader.commit()
+    // The same fingers, then their momentum: held, nothing moves.
+    feed(20, 32)
+    feed(16, 48)
+    expect(moves).toBe(2)
+    expect(starts).toEqual(['left'])
+    // Fingers back the other way, 16ms later: a new drag at once.
+    expect(feed(-10, 64).start).toBe('right')
   })
 
   it('a single smaller delta mid-swipe is the fingers, not the tail', () => {
@@ -101,6 +159,44 @@ describe('createTrackpadSwipeReader', () => {
     expect(ends).toBe(0)
     // Nothing is dropped: the drag ends at the fingers' full travel.
     expect(moves[moves.length - 1]).toBeCloseTo(deltas.reduce((x, y) => x + y, 0), 6)
+  })
+
+  it('a creeping tail after a fast run ends the drag at its third tiny step, and moves nothing', () => {
+    // The shape measured in a recording of a small swipe: a fast stroke, then
+    // momentum that creeps 2px, 1px, 0, 2px... for a third of a second.
+    const deltas = [6, 20, 28, 30, 2, 1, 0, 2, 1, 1, 1]
+    const samples = deltas.map((dx, i) => ({ dx, dy: 0, mode: 0, ctrl: false, owned: false, at: i * 16 }))
+    const { verdicts, moves, consumed } = feedAll(samples)
+    // The third non-zero tiny step (the zero between does not break the streak).
+    expect(verdicts.findIndex((v) => v.end)).toBe(7)
+    expect(moves).toEqual([6, 26, 54, 84])
+    expect(consumed).toBe(samples.length)
+  })
+
+  it('a slow, uneven drag (a burst, then 1-2px steps) is never read as its tail: it follows every pixel', () => {
+    const deltas = [2, 6, 9, 2, 1, 1, 2, 1, 7, 1, 1, 1, 2, 5, 1, 1, 1, 1]
+    const samples = deltas.map((dx, i) => ({ dx, dy: 0, mode: 0, ctrl: false, owned: false, at: i * 16 }))
+    const { reader, ends } = feedAll(samples)
+    expect(ends).toBe(0)
+    reader.finish()
+    const applied = reader.takeFlush()
+    expect(applied ?? reader.summary().sumX).toBe(deltas.reduce((x, y) => x + y, 0))
+  })
+
+  it('a drag that is slow all along is never cut: it follows every pixel', () => {
+    const deltas = [2, 3, 4, 3, 2, 3, 4, 3, 2, 1, 3, 4]
+    const samples = deltas.map((dx, i) => ({ dx, dy: 0, mode: 0, ctrl: false, owned: false, at: i * 16 }))
+    const { moves, ends } = feedAll(samples)
+    expect(ends).toBe(0)
+    expect(moves[moves.length - 1]).toBe(deltas.reduce((x, y) => x + y, 0))
+  })
+
+  it('tiny steps followed by a bigger one were the fingers: they are applied with it', () => {
+    const deltas = [20, 24, 3, 2, 12]
+    const samples = deltas.map((dx, i) => ({ dx, dy: 0, mode: 0, ctrl: false, owned: false, at: i * 16 }))
+    const { moves, ends } = feedAll(samples)
+    expect(ends).toBe(0)
+    expect(moves).toEqual([20, 44, 61])
   })
 
   it('a gap release applies held-back deltas that never proved to be a tail', () => {
@@ -218,6 +314,49 @@ describe('createTrackpadSwipeReader', () => {
     expect(asked).toEqual([['right', true]])
   })
 
+  it('a reveal moves nothing until its run has gone SWIPE_THRESHOLD_PX its way, then follows from there', () => {
+    const reveals = (d: TrackpadSwipeDir) => d === 'left'
+    // A mouse's thumb wheel turning on its own: fine steps, about 28px in all.
+    const creep = [1.67, 0.83, 1.67, 6.67, 1.67, 1.67, 1.67, ...Array<number>(15).fill(0.83)]
+    const stray = feedAll(creep.map((dx, i) => ({ dx, dy: 0, mode: 0, ctrl: false, owned: false, at: i * 45 })), yes, reveals)
+    expect(stray.starts).toEqual([])
+    expect(stray.moves).toEqual([])
+    // Still the page's run, so the browser's own swipe does not start under it.
+    expect(stray.consumed).toBe(creep.length)
+    // A swipe starts at the event that reaches 80px, moves from that point, and
+    // hands over the fingers' sums before it, relative to it, for the release.
+    const swipe = feedAll(run(10, 0, 12, 0), yes, reveals)
+    expect(swipe.verdicts.findIndex((v) => v.start)).toBe(7)
+    expect(swipe.verdicts[7].move).toBe(0)
+    expect(swipe.verdicts[7].lead).toEqual([-70, -60, -50, -40, -30, -20, -10].map((sum, i) => ({ sum, at: i * 16 })))
+    expect(swipe.moves).toEqual([0, 10, 20, 30, 40])
+    // A step that crosses 80px moves the drag by what lies past it.
+    expect(feedAll([...run(30, 0, 2, 0), ...run(30, 0, 1, 32)], yes, reveals).verdicts[2]).toMatchObject({ start: 'left', move: 10 })
+    // The other way is no reveal: it starts at its first event, with no lead.
+    const back = feedAll(run(-12, 0, 2, 0), yes, reveals)
+    expect(back.moves).toEqual([-12, -24])
+    expect(back.verdicts[0].lead).toBeUndefined()
+  })
+
+  it("a reveal whose fingers stop short of SWIPE_THRESHOLD_PX is never started by what follows them", () => {
+    const reveals = () => true
+    const at = (dx: number[], t0 = 0) => dx.map((d, i) => ({ dx: d, dy: 0, mode: 0, ctrl: false, owned: false, at: t0 + i * 16 }))
+    // 65px of fingers, then a geometric momentum tail that would sum past 80.
+    const flick = feedAll([...at([20, 25, 20]), ...tail(20, 12, 2 * 16)], yes, reveals)
+    expect(flick.starts).toEqual([])
+    expect(flick.moves).toEqual([])
+    // 60px fast, then the creeping tail of a light lift (2, 2, 1, 0, 1...).
+    const creeping = feedAll(at([30, 30, 2, 2, 1, 0, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1]), yes, reveals)
+    expect(creeping.starts).toEqual([])
+    // The desktop shell's lift-off at 65px: the momentum after it is held.
+    let down = true
+    const reader = createTrackpadSwipeReader(yes, () => down, reveals)
+    at([20, 25, 20]).forEach((s) => reader.feed(s))
+    down = false
+    expect(reader.lift()).toBe(false)
+    expect(at([22, 20, 18, 30, 30], 48).map((s) => reader.feed(s)).filter((v) => v.start || v.move !== undefined)).toEqual([])
+  })
+
   it('a gap ends a drag left open and decides the next run afresh', () => {
     const reader = createTrackpadSwipeReader(yes)
     run(20, 0, 3, 0).forEach((s) => reader.feed(s))
@@ -303,14 +442,35 @@ describe('createTrackpadSwipeReader with the finger phases', () => {
     expect(reader.lift()).toBe(false)
   })
 
-  it('a lift keeps what was held back as a possible tail: it was the fingers', () => {
+  it('fingers down: small or decaying steps are the fingers, never an inferred tail', () => {
     const reader = createTrackpadSwipeReader(yes, () => true)
+    // A 16px step, then three 3px steps (the creeping-tail shape), then a
+    // geometric decay (the momentum shape), all with the fingers on the pad.
+    const deltas = [16, 3, 3, 3, 3, 12, 9.6, 7.68, 6.14]
+    const vs = deltas.map((dx, i) => reader.feed({ dx, dy: 0, mode: 0, ctrl: false, owned: false, at: i * 16 }))
+    expect(vs.some((v) => v.end)).toBe(false)
+    expect(vs[vs.length - 1].move).toBeCloseTo(deltas.reduce((x, y) => x + y, 0), 6)
+    // The real lift ends it.
+    expect(reader.lift()).toBe(true)
+  })
+
+  it('a lift keeps what was held back as a possible tail: it was the fingers', () => {
+    // Without the phases: two shrinking steps are held back as a possible tail,
+    // and the shell's lift (heard late) applies them.
+    let down = false
+    const reader = createTrackpadSwipeReader(yes, () => down)
     for (const s of run(20, 0, 3, 0)) reader.feed(s)
-    // Two shrinking steps: held back, they might be a tail.
     reader.feed({ dx: 16, dy: 0, mode: 0, ctrl: false, owned: false, at: 48 })
     reader.feed({ dx: 12.8, dy: 0, mode: 0, ctrl: false, owned: false, at: 64 })
     expect(reader.lift()).toBe(true)
     expect(reader.takeFlush()).toBeCloseTo(88.8)
+    // With the fingers known down, the same steps are applied as they come.
+    down = true
+    const r2 = createTrackpadSwipeReader(yes, () => down)
+    for (const s of run(20, 0, 3, 0)) r2.feed(s)
+    r2.feed({ dx: 16, dy: 0, mode: 0, ctrl: false, owned: false, at: 48 })
+    expect(r2.feed({ dx: 12.8, dy: 0, mode: 0, ctrl: false, owned: false, at: 64 }).move).toBeCloseTo(88.8)
+    expect(r2.lift()).toBe(true)
   })
 
   it('fingers down still ends the drag past the hold cap', () => {
@@ -357,7 +517,7 @@ describe('useTrackpadSwipe: the shell\'s finger phases', () => {
     document.body.replaceChildren()
   })
 
-  function mount() {
+  function mount(reveals?: (d: TrackpadSwipeDir) => boolean) {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'requestAnimationFrame', 'cancelAnimationFrame', 'performance'] })
     const root = document.createElement('div')
     document.body.appendChild(root)
@@ -365,7 +525,7 @@ describe('useTrackpadSwipe: the shell\'s finger phases', () => {
     const onDragMove = vi.fn()
     const onDragEnd = vi.fn()
     const hook = renderHook(() => useTrackpadSwipe({ current: root }, {
-      enabled: true, wants: () => true, onDragStart, onDragMove, onDragEnd, onSwipe: () => {},
+      enabled: true, wants: () => true, reveals, onDragStart, onDragMove, onDragEnd, onSwipe: () => {},
     }))
     /** One wheel now, on the (fake) event clock. */
     const wheel = (dx: number) => {
@@ -386,7 +546,7 @@ describe('useTrackpadSwipe: the shell\'s finger phases', () => {
     const { swipe, wheel, onDragStart, onDragMove, onDragEnd } = mount()
     bridge.emit!('begin')
     swipe(20, 4)
-    expect(onDragStart).toHaveBeenCalledWith('left')
+    expect(onDragStart).toHaveBeenCalledWith('left', undefined)
     // The fingers rest for 400ms: far past the gap, still one drag.
     vi.advanceTimersByTime(400)
     vi.advanceTimersToNextFrame()
@@ -411,7 +571,45 @@ describe('useTrackpadSwipe: the shell\'s finger phases', () => {
     expect(document.documentElement.style.overscrollBehaviorX).toBe('')
     wheel(-20)
     expect(onDragStart).toHaveBeenCalledTimes(2)
-    expect(onDragStart).toHaveBeenLastCalledWith('right')
+    expect(onDragStart).toHaveBeenLastCalledWith('right', undefined)
+  })
+
+  it('a reveal short of its distance survives a pause with the fingers down, and starts at 80px in all', () => {
+    const bridge = installBridge()
+    const { swipe, wheel, onDragStart, onDragMove, onDragEnd } = mount((d) => d === 'left')
+    bridge.emit!('begin')
+    swipe(10, 5)
+    // The fingers rest past the gap but inside the hold cap; the quiet check runs.
+    vi.advanceTimersByTime(300)
+    vi.advanceTimersToNextFrame()
+    expect(onDragStart).not.toHaveBeenCalled()
+    expect(onDragEnd).not.toHaveBeenCalled()
+    swipe(10, 2)
+    expect(onDragStart).not.toHaveBeenCalled()
+    wheel(10)
+    expect(onDragStart).toHaveBeenCalledTimes(1)
+    // It starts at 80px, with the moves before it (the pause included) handed over.
+    const [dir, lead] = onDragStart.mock.calls[0] as [TrackpadSwipeDir, { sum: number; at: number }[]]
+    expect(dir).toBe('left')
+    expect(lead.map((l) => l.sum)).toEqual([-70, -60, -50, -40, -30, -20, -10])
+    expect(lead[5].at - lead[4].at).toBeGreaterThan(300)
+    expect(onDragMove.mock.calls).toEqual([[0, expect.any(Number)]])
+    vi.advanceTimersByTime(16)
+    wheel(10)
+    expect(onDragMove.mock.calls).toEqual([[0, expect.any(Number)], [10, expect.any(Number)]])
+  })
+
+  it('a reveal lifted short of its distance never starts: the momentum after the lift is held', () => {
+    const bridge = installBridge()
+    const { wheel, onDragStart, onDragEnd } = mount((d) => d === 'left')
+    bridge.emit!('begin')
+    for (const dx of [20, 25, 20]) { wheel(dx); vi.advanceTimersByTime(16) }
+    bridge.emit!('end')
+    vi.advanceTimersToNextFrame()
+    // Momentum-like wheels that would take the run past 80px.
+    for (const dx of [22, 20, 18, 30, 30]) { expect(wheel(dx)).toBe(true); vi.advanceTimersByTime(16) }
+    expect(onDragStart).not.toHaveBeenCalled()
+    expect(onDragEnd).not.toHaveBeenCalled()
   })
 
   it('a lost end still releases at the hold cap', () => {
@@ -473,6 +671,170 @@ describe('relayedWheelTime', () => {
   })
   it('never reads a time past now, though two origins may differ by a fraction of a ms', () => {
     expect(relayedWheelTime(epoch(now + 0.5), 4999, now)).toBe(now)
+  })
+})
+
+describe('fingerSign', () => {
+  it("reads the event's WebKit flag first, then the shell's, and defaults to Natural scrolling on", () => {
+    expect(fingerSign(true, false)).toBe(1)
+    expect(fingerSign(false, true)).toBe(-1)
+    expect(fingerSign(undefined, false)).toBe(-1)
+    expect(fingerSign(undefined, true)).toBe(1)
+    expect(fingerSign(undefined, null)).toBe(1)
+    expect(fingerSign('false', null)).toBe(1)
+  })
+})
+
+describe('useTrackpadSwipe: macOS Natural scrolling off', () => {
+  afterEach(() => {
+    delete (window as Window & { electronAPI?: unknown }).electronAPI
+    document.documentElement.style.overscrollBehaviorX = ''
+    document.body.replaceChildren()
+  })
+
+  function mount(acceptFrame?: (f: HTMLIFrameElement) => boolean) {
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    const onDragStart = vi.fn()
+    const onDragMove = vi.fn()
+    const wants = vi.fn(() => true)
+    renderHook(() => useTrackpadSwipe({ current: root }, {
+      enabled: true, wants, onDragStart, onDragMove, onDragEnd: () => {}, onSwipe: () => {}, acceptFrame,
+    }))
+    let at = 0
+    /** `n` wheels 16ms apart over `target`; `inverted` is WebKit's flag. */
+    const swipe = (dx: number, n: number, inverted?: boolean, target: Element = root) => {
+      at += 1000
+      for (let i = 0; i < n; i++) {
+        const ev = new WheelEvent('wheel', { deltaX: dx, deltaY: 0, bubbles: true, cancelable: true })
+        Object.defineProperty(ev, 'timeStamp', { value: (at += 16) })
+        if (inverted !== undefined) Object.defineProperty(ev, 'webkitDirectionInvertedFromDevice', { value: inverted })
+        target.dispatchEvent(ev)
+      }
+    }
+    return { root, swipe, wants, onDragStart, onDragMove }
+  }
+
+  it("follows the fingers when the event's WebKit flag says Natural scrolling is off", () => {
+    const { swipe, onDragStart, onDragMove } = mount()
+    // Fingers moving left report a NEGATIVE deltaX with Natural scrolling off.
+    swipe(-20, 3, false)
+    expect(onDragStart).toHaveBeenLastCalledWith('left', undefined)
+    expect(onDragMove.mock.calls.map(([sum]) => sum)).toEqual([20, 40, 60])
+    onDragStart.mockClear()
+    swipe(20, 3, false)
+    expect(onDragStart).toHaveBeenLastCalledWith('right', undefined)
+  })
+
+  it("follows the desktop shell's report when the event does not say, and the event's flag wins over it", () => {
+    ;(window as Window & { electronAPI?: unknown }).electronAPI = { getNaturalScrolling: () => false }
+    const { swipe, onDragStart } = mount()
+    swipe(-20, 3)
+    expect(onDragStart).toHaveBeenLastCalledWith('left', undefined)
+    swipe(-20, 3, true)
+    expect(onDragStart).toHaveBeenLastCalledWith('right', undefined)
+  })
+
+  it('with Natural scrolling on or unknown, reads deltaX as before', () => {
+    const { swipe, onDragStart } = mount()
+    swipe(20, 3)
+    expect(onDragStart).toHaveBeenLastCalledWith('left', undefined)
+    swipe(20, 3, true)
+    expect(onDragStart).toHaveBeenLastCalledWith('left', undefined)
+  })
+
+  it('asks a sideways scroller about the raw deltaX: the way the browser will scroll it', () => {
+    const { root, swipe, onDragStart } = mount()
+    // At its left edge: it can scroll only toward a positive deltaX.
+    const scroller = document.createElement('div')
+    scroller.style.overflowX = 'auto'
+    Object.defineProperty(scroller, 'scrollWidth', { value: 800 })
+    Object.defineProperty(scroller, 'clientWidth', { value: 300 })
+    Object.defineProperty(scroller, 'scrollLeft', { value: 0 })
+    root.appendChild(scroller)
+    // Natural off, fingers right: deltaX > 0 scrolls it, so the run is its own.
+    swipe(20, 3, false, scroller)
+    expect(onDragStart).not.toHaveBeenCalled()
+    // Fingers left: deltaX < 0, no room that way, so the page takes the swipe.
+    swipe(-20, 3, false, scroller)
+    expect(onDragStart).toHaveBeenLastCalledWith('left', undefined)
+  })
+
+  it("reads a frame's relayed wheel with the frame's own flag", () => {
+    const { root, wants } = mount(() => true)
+    const frame = document.createElement('iframe')
+    // The test DOM gives every frame a null `contentWindow`: stand one in.
+    Object.defineProperty(frame, 'contentWindow', { value: { postMessage: () => {} } })
+    root.appendChild(frame)
+    const post = (dx: number, inv: unknown) => {
+      const ev = new MessageEvent('message', { data: { type: 'mc-frame-wheel', dx, dy: 0, mode: 0, inv } })
+      Object.defineProperty(ev, 'source', { value: frame.contentWindow })
+      window.dispatchEvent(ev)
+    }
+    post(20, false)
+    expect(wants).toHaveBeenLastCalledWith('right', true)
+  })
+
+  describe('the "Reverse trackpad swipe" switch', () => {
+    afterEach(() => { localStorage.removeItem(REVERSE_TRACKPAD_SWIPE_KEY) })
+
+    it('reads a wheel with no WebKit flag (Chrome, Firefox) as Natural scrolling off', () => {
+      localStorage.setItem(REVERSE_TRACKPAD_SWIPE_KEY, '1')
+      const { swipe, onDragStart, onDragMove } = mount()
+      swipe(-20, 3)
+      expect(onDragStart).toHaveBeenLastCalledWith('left', undefined)
+      expect(onDragMove.mock.calls.map(([sum]) => sum)).toEqual([20, 40, 60])
+    })
+
+    it("changes nothing where the wheel's flag or the desktop shell says", () => {
+      localStorage.setItem(REVERSE_TRACKPAD_SWIPE_KEY, '1')
+      const { swipe, onDragStart } = mount()
+      swipe(20, 3, true)
+      expect(onDragStart).toHaveBeenLastCalledWith('left', undefined)
+      ;(window as Window & { electronAPI?: unknown }).electronAPI = { getNaturalScrolling: () => true }
+      swipe(20, 3)
+      expect(onDragStart).toHaveBeenLastCalledWith('left', undefined)
+    })
+
+    it('reads a relayed frame wheel with no flag through the switch too', () => {
+      localStorage.setItem(REVERSE_TRACKPAD_SWIPE_KEY, '1')
+      const { root, wants } = mount(() => true)
+      const frame = document.createElement('iframe')
+      Object.defineProperty(frame, 'contentWindow', { value: { postMessage: () => {} } })
+      root.appendChild(frame)
+      const ev = new MessageEvent('message', { data: { type: 'mc-frame-wheel', dx: 20, dy: 0, mode: 0, inv: null } })
+      Object.defineProperty(ev, 'source', { value: frame.contentWindow })
+      window.dispatchEvent(ev)
+      expect(wants).toHaveBeenLastCalledWith('right', true)
+    })
+
+    it('off (the default) keeps reading an unflagged deltaX as Natural scrolling on', () => {
+      localStorage.setItem(REVERSE_TRACKPAD_SWIPE_KEY, '0')
+      const { swipe, onDragStart } = mount()
+      swipe(20, 3)
+      expect(onDragStart).toHaveBeenLastCalledWith('left', undefined)
+    })
+
+    it('re-arms an armed frame with the new value when the switch changes, in this tab or another', () => {
+      const { root } = mount(() => true)
+      const post = vi.fn()
+      const frame = document.createElement('iframe')
+      frame.setAttribute('data-wheel-relay', '')
+      Object.defineProperty(frame, 'contentWindow', { value: { postMessage: post } })
+      root.appendChild(frame)
+      const hello = new MessageEvent('message', { data: { type: 'mc-frame-wheel-hello' } })
+      Object.defineProperty(hello, 'source', { value: frame.contentWindow })
+      window.dispatchEvent(hello)
+      expect(post).toHaveBeenLastCalledWith({ type: 'mc-frame-wheel-armed', on: true, natural: null }, '*')
+      // This tab: the Settings switch writes through usePersistedBool.
+      const { result } = renderHook(() => usePersistedBool(REVERSE_TRACKPAD_SWIPE_KEY, false))
+      act(() => { result.current[1](true) })
+      expect(post).toHaveBeenLastCalledWith({ type: 'mc-frame-wheel-armed', on: true, natural: false }, '*')
+      // Another tab: only the `storage` event arrives here.
+      localStorage.setItem(REVERSE_TRACKPAD_SWIPE_KEY, '0')
+      window.dispatchEvent(new StorageEvent('storage', { key: REVERSE_TRACKPAD_SWIPE_KEY, newValue: '0', storageArea: localStorage }))
+      expect(post).toHaveBeenLastCalledWith({ type: 'mc-frame-wheel-armed', on: true, natural: null }, '*')
+    })
   })
 })
 

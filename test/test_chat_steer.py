@@ -15,6 +15,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from chat_test_helpers import _make_app, _make_state
+from redaction_structured_cases import github_classic
 
 
 @pytest.fixture
@@ -69,14 +70,9 @@ class TestApiChatSteer:
     ):
         """The composer stamps the containment its own request was admitted under.
 
-        Its requeue runs in the turn's teardown, past the RPC's suspension, so
-        without the stamp a mirror linked during that suspension would be folded
-        into the entry's baseline and survive the drain. The LINKED exemption does
-        not save it: a new outbound mirror is never exempt, because the author does
-        not control mirror links.
-
-        Read from INSIDE the RPC, the only vantage point where "before the
-        suspension" is observable.
+        The requeue runs after the RPC's suspension, so without the stamp a mirror linked
+        meanwhile would join the baseline. Read from INSIDE the RPC, the only place
+        "before the suspension" is observable.
         """
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         state = _make_state(tmp_path)
@@ -359,16 +355,10 @@ class TestApiChatSteer:
     async def test_raced_steer_persists_send_id_on_new_turn_row(
         self, tmp_path, monkeypatch, _patch_sel
     ):
-        """A steer POST that lands on an IDLE slot (the POST raced chat_done)
-        falls onto the new-turn path, whose generic client-meta persistence must
-        carry the sendId onto the plain user row — with NO steer flag. That
-        non-steer row is exactly what the client reads as proof of the new-turn
-        path, so this pins the pass-through property the frontend half
-        of the fix rests on: an allowlist that later drops sendId from persisted
-        user meta would reopen the issue with every other test green.
+        """A steer that races chat_done lands as a plain user row carrying its sendId.
 
-        ``?ws=1`` requests the JSON receipt instead of the SSE stream; the row
-        persistence under test happens before that response-shape fork.
+        The client reads that non-steer row as proof of the new-turn path. ``?ws=1`` asks
+        for the JSON receipt; the row is persisted before that fork.
         """
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         state = _make_state(tmp_path)
@@ -407,7 +397,7 @@ class TestApiChatSteer:
             {"id": "s-1"},
             "has spaces",
             "a/b+c=",
-            "AKIAIOSFODNN7EXAMPLE",
+            github_classic(seed=91),
         ],
         ids=[
             "non-string",
@@ -426,8 +416,8 @@ class TestApiChatSteer:
         """sendId is raw client input that reaches slot history and the
         steer_push broadcast WITHOUT the outbound redaction message text goes
         through, so the sink refuses anything but the id alphabet — and, since
-        a bare alphanumeric key shape fits that alphabet, anything the
-        canonical credential scanner would redact (the AWS access-key-id case).
+        a bare alphanumeric token shape fits that alphabet, anything the
+        canonical credential scanner would redact (the GitHub token case).
         Every refused value is treated as absent (the old-client shape), never
         persisted or echoed."""
         state, slot = self._steer_capable_state(tmp_path, monkeypatch)

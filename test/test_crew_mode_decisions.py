@@ -91,7 +91,7 @@ def test_crew_mode_turns_off_before_the_first_user_message_and_locks_after(_sel)
     )
     assert _refusal(fresh, "kirocrew") is None
     # Not onto another conductor, and not onto a crewmate.
-    assert _refusal(fresh, "kirocrew-team-lead").status == 409
+    assert _refusal(fresh, "kirocrew-security-conductor").status == 409
     assert _refusal(fresh, "kirocrew", kind="member").status == 409
     # From the first user message on, it is locked, in the window or trimmed to disk.
     sent = _slot("r", "kirocrew-conductor")
@@ -187,14 +187,14 @@ async def test_the_provider_side_switch_is_vetoed_on_a_crew_mode_root(monkeypatc
     # cannot reach: the phase keeps the slot's agent, audits the denial, shows it,
     # and ends the turn so the session resets onto the conductor.
     root = _slot("r", "kirocrew-conductor")
-    root.append = lambda role, text, cls: notices.append((role, text))
+    root.append = lambda role, text, cls, **_kw: notices.append((role, text))
     notices: list = []
     turn = _turn(root)
     event = SimpleNamespace(text="kirocrew")
     assert await chat_runner._on_agent_switched(turn, event) is _Flow.BREAK
     assert root.agent == "kirocrew-conductor"
     assert turn.needs_session_reset and turn._produced_visible_output
-    assert notices and notices[0][0] == "notice" and "Crew Mode" in notices[0][1]
+    assert notices and notices[0][0] == "notice" and "conductor mode" in notices[0][1]
     assert audit.log_api_access.call_args.kwargs["source"] == "crew_mode_locked"
 
 
@@ -245,7 +245,7 @@ def _switch(monkeypatch, tmp_path):
 async def test_a_first_start_records_the_conductor_and_moves_nothing(_switch):
     state = _State(_slot("r", "kirocrew-team-lead"))
     assert await _switch.mig.reconcile(state) is None
-    assert _switch.mig.read_applied() == "kirocrew-conductor"
+    assert _switch.mig.read_applied() == crew_mode.DEFAULT_CREW_MODE_AGENT
     assert _switch.calls == []
     assert state._slots["r"].agent == "kirocrew-team-lead"
 
@@ -291,7 +291,50 @@ async def test_an_update_shipping_a_new_default_moves_the_roots(_switch):
     root = _slot("r", "kirocrew-old-default", crew_mode_agent="kirocrew-old-default")
     state = _State(root)
     await _switch.mig.reconcile(state)
-    assert root.agent == "kirocrew-conductor"
+    assert root.agent == crew_mode.DEFAULT_CREW_MODE_AGENT
+
+
+def _live_key(monkeypatch, value: str) -> None:
+    """The live config snapshot with ``agent.crew_mode_agent`` spelled *value* ("" = unset)."""
+    cfg = SimpleNamespace(agent=SimpleNamespace(crew_mode_agent=value))
+    monkeypatch.setattr(crew_mode, "_live_cfg", lambda: cfg)
+
+
+@pytest.mark.asyncio
+async def test_the_team_lead_default_moves_back_to_the_conductor_at_each_idle_point(
+    _switch, monkeypatch
+):
+    """An update that ships the conductor as the default again: a chat with the key
+    unset moves off the team lead, an idle root now and a busy one at its next idle
+    point; the worker tree and its workers stay as they are."""
+    _switch.mig.write_applied("kirocrew-team-lead")
+    _live_key(monkeypatch, "")
+    idle = _slot("r1", "kirocrew-team-lead", crew_mode_agent="kirocrew-team-lead")
+    busy = _slot(
+        "r2", "kirocrew-team-lead", crew_mode_agent="kirocrew-team-lead", turn_running=True
+    )
+    worker = _slot("w", "kirocrew-worker", _created_by="r1")
+    state = _State(idle, busy, worker)
+    out = await _switch.mig.reconcile(state)
+    assert out == {"moved": ["r1"], "pending": ["r2"]}
+    assert idle.agent == "kirocrew-conductor" and busy.agent == "kirocrew-team-lead"
+    assert worker.agent == "kirocrew-worker"
+    assert _switch.mig.read_applied() == "kirocrew-team-lead"
+    busy.turn_running = False
+    out = await _switch.mig.migrate(state)
+    assert out == {"moved": ["r2"], "pending": []}
+    assert busy.agent == "kirocrew-conductor"
+    assert _switch.mig.read_applied() == "kirocrew-conductor"
+
+
+@pytest.mark.asyncio
+async def test_a_set_team_lead_key_keeps_its_chats_on_the_team_lead(_switch, monkeypatch):
+    _switch.mig.write_applied("kirocrew-team-lead")
+    _live_key(monkeypatch, "kirocrew-team-lead")
+    root = _slot("r", "kirocrew-team-lead", crew_mode_agent="kirocrew-team-lead")
+    state = _State(root)
+    assert await _switch.mig.reconcile(state) is None
+    assert root.agent == "kirocrew-team-lead" and _switch.calls == []
 
 
 @pytest.mark.asyncio

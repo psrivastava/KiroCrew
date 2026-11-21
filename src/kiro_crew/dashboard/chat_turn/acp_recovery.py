@@ -23,9 +23,15 @@ from kiro_crew.dashboard.chat_utils import (
     TRANSIENT_NOTICE_META_KEY,
     TRANSIENT_NOTICE_RESUMING,
     TRANSIENT_NOTICE_RETRYING,
+    TRANSIENT_NOTICE_THROTTLE_GIVE_UP,
+    TRANSIENT_NOTICE_THROTTLE_RESUMING,
+    TRANSIENT_NOTICE_THROTTLE_RETRYING,
     TRANSIENT_RESUMING_TEXT,
     TRANSIENT_RETRY_KIND,
     TRANSIENT_RETRYING_TEXT,
+    TRANSIENT_THROTTLE_GIVE_UP_TEXT,
+    TRANSIENT_THROTTLE_RESUMING_TEXT,
+    TRANSIENT_THROTTLE_RETRYING_TEXT,
     RecoveryPayload,
     ResetCause,
     build_recovery_requeue,
@@ -36,6 +42,8 @@ from kiro_crew.dashboard.state import _TURN_CONTINUING_INJECT_KINDS
 from kiro_crew.llm_helpers import (
     CREDENTIAL_RELOAD_RETRY_NOTICE,
     acp_error_is_connection_failure,
+    acp_error_is_pipe_death,
+    acp_error_is_server_error,
     acp_error_is_throttle,
     acp_error_needs_fresh_credentials,
     connection_retry_delay,
@@ -54,6 +62,7 @@ if TYPE_CHECKING:
         DashboardState,
         ReplayFamily,
         _ChatSlot,
+        _fallback_swap_for_turn,
         _has_user_queued_followup,
         _should_suppress_requeue,
         crew_log_emit,
@@ -74,6 +83,7 @@ if TYPE_CHECKING:
         _shared_dependency_delay,
     )
     from kiro_crew.dashboard.chat_turn.turn_entry import _session_stop_generation, _stop_pressed
+    from kiro_crew.dashboard.chat_turn.turn_failures import _on_acp_error_card
     from kiro_crew.dashboard.chat_turn.turn_ledgers import (
         _queue_recovery,
         _replay_owes_delivery,
@@ -93,6 +103,7 @@ async def _recover_posttoken_transient(
     _prompt_depth: int,
     _queue_recovery: Callable[..., str],
     _stop_pressed: Callable[[], bool],
+    throttled: bool = False,
 ) -> None:
     """Resume a turn whose stream died on a transient backend error after output.
 
@@ -128,22 +139,19 @@ async def _recover_posttoken_transient(
     # reading "resuming…" forever.
     _will_recover = not _should_suppress_requeue(slot) and _prompt_depth == 0
     if _will_recover:
+        # A throttle is the provider's answer, not a dropped connection.
+        if throttled:
+            _notice, _text = TRANSIENT_NOTICE_THROTTLE_RESUMING, TRANSIENT_THROTTLE_RESUMING_TEXT
+        else:
+            _notice, _text = TRANSIENT_NOTICE_RESUMING, TRANSIENT_RESUMING_TEXT
         slot.append(
             "error",
-            TRANSIENT_RESUMING_TEXT,
+            _text,
             "msg msg-err",
-            meta={
-                "kind": TRANSIENT_RETRY_KIND,
-                TRANSIENT_NOTICE_META_KEY: TRANSIENT_NOTICE_RESUMING,
-            },
+            meta={"kind": TRANSIENT_RETRY_KIND, TRANSIENT_NOTICE_META_KEY: _notice},
         )
     else:
-        slot.append(
-            "error",
-            TRANSIENT_GIVE_UP_TEXT,
-            "msg msg-err",
-            meta={TRANSIENT_NOTICE_META_KEY: TRANSIENT_NOTICE_GIVE_UP},
-        )
+        _append_transient_give_up(slot, throttled)
     if _will_recover:
         _delay = transient_retry_delay(1)  # single short backoff (one-shot)
         logger.info(
@@ -191,12 +199,7 @@ async def _recover_posttoken_transient(
             # correct it with the give-up token the nested-turn and
             # Stop-already-active paths use — the ErrorCard keeps its
             # Continue affordance instead of reading "resuming…" forever.
-            slot.append(
-                "error",
-                TRANSIENT_GIVE_UP_TEXT,
-                "msg msg-err",
-                meta={TRANSIENT_NOTICE_META_KEY: TRANSIENT_NOTICE_GIVE_UP},
-            )
+            _append_transient_give_up(slot, throttled)
             # Nothing to hand back: this arm counts no attempt, and the
             # one-shot is consumed BELOW the wait precisely so a retry
             # that never runs cannot spend it — an allowance burned here
@@ -264,12 +267,15 @@ async def _binding_rebuild_allowed(turn) -> bool:
 
 async def _on_process_died(turn: _ChatTurn, exc) -> None:
     """The session's process died under the turn."""
+    from kiro_crew.dashboard import gateway_notice as gn
+
     _prompt_depth = turn._prompt_depth
     slot = turn.slot
     _is_synthetic = turn._is_synthetic
+    _message_without_merge_cards = turn._message_without_merge_cards
     _turn_emitted = turn._turn_emitted
     client = turn.client
-    message = turn.message
+
     logger.warning("ACP process died in slot %s: %s — resetting session", slot.key, exc)
     # The class this handler caught is a fact only this site holds, and the
     # closer in `_turn_close_crew_log` (chat_turn/crew_log_attribution.py), from `_run_chat`'s
@@ -279,6 +285,10 @@ async def _on_process_died(turn: _ChatTurn, exc) -> None:
     turn._crew_log_error = _crew_log_error
     needs_session_reset = True
     turn.needs_session_reset = needs_session_reset
+    # The process died mid-answer, so kiro-cli never wrote this prompt to
+    # its log and the ``session/load`` the next claim runs lacks it: the
+    # reset returns a drained merge card to the queue whether or not a
+    # recovery is queued below (``_native_session_lacks_the_prompt``).
     if getattr(exc, "ambiguous_delivery", False) is True:
         # Every steer written into this turn sits in the same stalled pipe as
         # its prompt, so the teardown requeues each as possibly delivered.
@@ -295,7 +305,7 @@ async def _on_process_died(turn: _ChatTurn, exc) -> None:
     # -- against this slot when the runtime was its own, against the
     # shared-death streak when it was not, under the SAME ladder limit. A
     # single-tenant runtime, which is every runtime at cap 1 with no
-    # sub-agent on it, takes the first branch and behaves exactly as before.
+    # sub-agent on it, takes the first branch.
     _own_fault = runtime_death.caused_by_this_session(client)
     if _own_fault:
         slot._acp_pipe_death_retries += 1
@@ -316,17 +326,29 @@ async def _on_process_died(turn: _ChatTurn, exc) -> None:
     # only this gate can see it (the same pairing as _on_acp_session_not_found).
     if _should_suppress_requeue(slot) or _stop_pressed(turn):
         pass
-    elif _prompt_depth == 0 and _death_attempts <= SESSION_RECOVERY_MAX_ATTEMPTS:
+    elif (
+        _prompt_depth == 0
+        # A turn the agent started has no prompt to replay: it gives up below.
+        and not turn._agent_started
+        and _death_attempts <= SESSION_RECOVERY_MAX_ATTEMPTS
+    ):
         # Persisted card: reliably visible at turn-teardown (an ephemeral
         # chat_status is dropped by the frontend once the streaming turn ends).
         # slot.append already emits ONE chat_message (via _on_message /
         # _broadcast_chat_message in ws_mode) AND persists the card — do NOT
         # also broadcast_ws("chat_message") or the UI renders a duplicate card
         # until the post-turn history refresh reconciles it.
-        _retry_msg = "⟳ Connection lost — retrying…"
-        slot.append("error", _retry_msg, "msg msg-err", meta={"kind": TRANSIENT_RETRY_KIND})
+        slot.append(
+            "error",
+            gn.GATEWAY_CONNECTION_LOST_RETRYING_TEXT,
+            "msg msg-err",
+            meta={
+                "kind": TRANSIENT_RETRY_KIND,
+                **gn.gateway_notice_meta(gn.GATEWAY_NOTICE_CONNECTION_LOST_RETRYING),
+            },
+        )
         _requeue_text, _requeue_payload = build_recovery_requeue(
-            message,
+            _message_without_merge_cards,
             _turn_emitted,
             cause=ResetCause.CONNECTION_LOST,
             message_is_synthetic=_is_synthetic,
@@ -349,26 +371,42 @@ async def _on_process_died(turn: _ChatTurn, exc) -> None:
         # not stuck at all, and telling that user to start over would discard
         # a healthy conversation over someone else's fault.
         if _own_fault:
-            slot.append("error", "Session stuck — please start a new chat.", "msg msg-err")
+            slot.append(
+                "error",
+                gn.GATEWAY_SESSION_STUCK_TEXT,
+                "msg msg-err",
+                meta=gn.gateway_notice_meta(gn.GATEWAY_NOTICE_SESSION_STUCK),
+            )
+            turn.died_notice = "chat_stopped_connection_dropped"
         else:
             slot.append(
                 "error",
-                "The agent process this chat shares kept restarting — please retry.",
+                gn.GATEWAY_SHARED_RUNTIME_RESTARTING_TEXT,
                 "msg msg-err",
+                meta=gn.gateway_notice_meta(gn.GATEWAY_NOTICE_SHARED_RUNTIME_RESTARTING),
             )
+            turn.died_notice = "chat_stopped_agent_restarting"
     else:
-        slot.append("error", "⟳ Connection lost — please retry.", "msg msg-err")
+        slot.append(
+            "error",
+            gn.GATEWAY_CONNECTION_LOST_GIVE_UP_TEXT,
+            "msg msg-err",
+            meta=gn.gateway_notice_meta(gn.GATEWAY_NOTICE_CONNECTION_LOST_GIVE_UP),
+        )
 
 
 async def _on_acp_retryable(turn: _ChatTurn, exc) -> None:
     """An ACP error the turn retries on a fresh session."""
+    from kiro_crew.dashboard import gateway_notice as gn
+
     _is_synthetic = turn._is_synthetic
+    _message_without_merge_cards = turn._message_without_merge_cards
     _msg = turn._msg
     _prompt_depth = turn._prompt_depth
     _turn_emitted = turn._turn_emitted
     client = turn.client
-    message = turn.message
     slot = turn.slot
+
     logger.info(
         "ACP transient (%s) in slot %s — resetting session",
         _msg[:80],
@@ -387,7 +425,7 @@ async def _on_acp_retryable(turn: _ChatTurn, exc) -> None:
     # Option Y: pipe-death ("process exited"/"not running") shares the
     # _acp_pipe_death_retries counter with the AcpProcessDied handler;
     # genuine "already in progress" busy uses _prompt_busy_retries.
-    _is_pipe_death = "process exited" in _msg or "not running" in _msg
+    _is_pipe_death = acp_error_is_pipe_death(exc)
     # Bound BEFORE the branch, not inside it. Both arms below fall
     # through to the same `elif _exhausted:` reporting, which reads this
     # flag -- so binding it only where a death is involved leaves the
@@ -399,6 +437,12 @@ async def _on_acp_retryable(turn: _ChatTurn, exc) -> None:
     # verdict is the correct one and stays unchanged.
     _own_fault = True
     if _is_pipe_death:
+        # The pipe death that arrives as a plain AcpError is the same
+        # mid-answer death the typed arm handles: the reloaded native
+        # session lacks this prompt, so the reset returns a drained
+        # merge card to the queue (``_native_session_lacks_the_prompt``).
+        # A busy session refused the prompt before any output, so there
+        # the restore follows from nothing having streamed.
         # Same attribution question as `_on_process_died`,
         # and the same answer: this arm catches the pipe-death that
         # arrives as an AcpError instead of a typed one, so a shared
@@ -414,13 +458,15 @@ async def _on_acp_retryable(turn: _ChatTurn, exc) -> None:
             max(slot._acp_pipe_death_retries, runtime_death.shared_deaths(slot.key))
             > SESSION_RECOVERY_MAX_ATTEMPTS
         )
-        _status = "⟳ Connection lost — retrying…"
+        _status = gn.GATEWAY_CONNECTION_LOST_RETRYING_TEXT
         turn._status = _status
+        _retry_notice = gn.GATEWAY_NOTICE_CONNECTION_LOST_RETRYING
     else:
         slot._prompt_busy_retries += 1
         _exhausted = slot._prompt_busy_retries > 3
-        _status = "⟳ Session busy — retrying…"
+        _status = gn.GATEWAY_SESSION_BUSY_RETRYING_TEXT
         turn._status = _status
+        _retry_notice = gn.GATEWAY_NOTICE_SESSION_BUSY_RETRYING
     # Resolved Stop: see the same gate in _on_process_died.
     if _should_suppress_requeue(slot) or _stop_pressed(turn):
         pass
@@ -432,13 +478,23 @@ async def _on_acp_retryable(turn: _ChatTurn, exc) -> None:
         # -- and this arm reaches the same users, just via a plain
         # AcpError rather than the typed death.
         if _own_fault:
-            slot.append("error", "Session stuck — please start a new chat.", "msg msg-err")
+            slot.append(
+                "error",
+                gn.GATEWAY_SESSION_STUCK_TEXT,
+                "msg msg-err",
+                meta=gn.gateway_notice_meta(gn.GATEWAY_NOTICE_SESSION_STUCK),
+            )
+            turn.died_notice = (
+                "chat_stopped_connection_dropped" if _is_pipe_death else "chat_stopped_unrecovered"
+            )
         else:
             slot.append(
                 "error",
-                "The agent process this chat shares kept restarting — please retry.",
+                gn.GATEWAY_SHARED_RUNTIME_RESTARTING_TEXT,
                 "msg msg-err",
+                meta=gn.gateway_notice_meta(gn.GATEWAY_NOTICE_SHARED_RUNTIME_RESTARTING),
             )
+            turn.died_notice = "chat_stopped_agent_restarting"
     elif _prompt_depth == 0:
         # Single emit (see the _on_process_died note): slot.append persists +
         # broadcasts one chat_message via _on_message; no explicit broadcast_ws.
@@ -452,9 +508,14 @@ async def _on_acp_retryable(turn: _ChatTurn, exc) -> None:
                 else slot._prompt_busy_retries
             ),
         )
-        slot.append("error", turn._status, "msg msg-err", meta={"kind": TRANSIENT_RETRY_KIND})
+        slot.append(
+            "error",
+            turn._status,
+            "msg msg-err",
+            meta={"kind": TRANSIENT_RETRY_KIND, **gn.gateway_notice_meta(_retry_notice)},
+        )
         _requeue_text, _requeue_payload = build_recovery_requeue(
-            message,
+            _message_without_merge_cards,
             _turn_emitted,
             # Shared branch: `_status` above already told the user
             # which of the two happened, so the continuation must
@@ -474,20 +535,23 @@ async def _on_acp_retryable(turn: _ChatTurn, exc) -> None:
         # counted above; do NOT re-queue (mirrors AcpProcessDied /
         # PromptBusyExhaustedError) — surface feedback so the nested turn
         # doesn't fail silently against the now-dead process.
-        _retry_msg = (
-            "⟳ Connection lost — please retry."
-            if _is_pipe_death
-            else "⟳ Session busy — please retry."
-        )
-        slot.append("error", _retry_msg, "msg msg-err")
+        if _is_pipe_death:
+            _retry_msg = gn.GATEWAY_CONNECTION_LOST_GIVE_UP_TEXT
+            _give_up = gn.GATEWAY_NOTICE_CONNECTION_LOST_GIVE_UP
+        else:
+            _retry_msg = gn.GATEWAY_SESSION_BUSY_GIVE_UP_TEXT
+            _give_up = gn.GATEWAY_NOTICE_SESSION_BUSY_GIVE_UP
+        slot.append("error", _retry_msg, "msg msg-err", meta=gn.gateway_notice_meta(_give_up))
 
 
 async def _on_acp_session_not_found(turn: _ChatTurn, exc) -> None:
     """The session the turn spoke to is gone."""
+    from kiro_crew.dashboard import gateway_notice as gn
+
     _is_synthetic = turn._is_synthetic
+    _message_without_merge_cards = turn._message_without_merge_cards
     _prompt_depth = turn._prompt_depth
     _turn_emitted = turn._turn_emitted
-    message = turn.message
     session_key = turn.session_key
     slot = turn.slot
     # The backend process is alive but holds no session under the id this
@@ -506,6 +570,9 @@ async def _on_acp_session_not_found(turn: _ChatTurn, exc) -> None:
     )
     needs_session_reset = True  # checked in _turn_release_session (chat_turn/session_reset.py)
     turn.needs_session_reset = needs_session_reset
+    # Either cause replaces the process before the model answered, so
+    # nothing it reloads holds this prompt: the reset returns a drained
+    # merge card to the queue (``_native_session_lacks_the_prompt``).
     await _persist_partial_reply(
         turn,
         "error: cloud credentials not loaded" if _creds else "error: session not found",
@@ -521,10 +588,17 @@ async def _on_acp_session_not_found(turn: _ChatTurn, exc) -> None:
             "error",
             CREDENTIAL_RELOAD_RETRY_NOTICE if _creds else SESSION_NOT_FOUND_RETRY_TEXT,
             "msg msg-err",
-            meta={"kind": TRANSIENT_RETRY_KIND},
+            meta={
+                "kind": TRANSIENT_RETRY_KIND,
+                **gn.gateway_notice_meta(
+                    gn.GATEWAY_NOTICE_CREDENTIALS_RELOADING
+                    if _creds
+                    else gn.GATEWAY_NOTICE_SESSION_RECONNECTING
+                ),
+            },
         )
         _requeue_text, _requeue_payload = build_recovery_requeue(
-            message,
+            _message_without_merge_cards,
             _turn_emitted,
             cause=ResetCause.CONNECTION_LOST,
             message_is_synthetic=_is_synthetic,
@@ -551,17 +625,28 @@ async def _on_acp_session_not_found(turn: _ChatTurn, exc) -> None:
         # The fresh process failed too, so the helper itself is broken
         # and a new chat would fail the same way: the provider's own
         # instruction is the only actionable line.
+        # Stays English: ``credential_give_up_text(exc)`` is the provider
+        # helper's own instruction, carried verbatim; a token would localize
+        # only the surrounding "Then send your message again." fragment and
+        # drop that instruction.
         slot.append(
             "error",
-            f"❌ {credential_give_up_text(exc)} Then send your message again.",
+            f"Error: {credential_give_up_text(exc)} Then send your message again.",
             "msg msg-err",
         )
     else:
-        slot.append("error", SESSION_NOT_FOUND_GIVE_UP_TEXT, "msg msg-err")
+        slot.append(
+            "error",
+            SESSION_NOT_FOUND_GIVE_UP_TEXT,
+            "msg msg-err",
+            meta=gn.gateway_notice_meta(gn.GATEWAY_NOTICE_SESSION_RECONNECT_GIVE_UP),
+        )
 
 
 async def _on_acp_binding_mismatch(turn: _ChatTurn, exc) -> None:
     """The conversation is bound to another session."""
+    from kiro_crew.dashboard import gateway_notice as gn
+
     _attachment_meta = turn._attachment_meta
     _attachments = turn._attachments
     _escalation = turn._escalation
@@ -591,7 +676,10 @@ async def _on_acp_binding_mismatch(turn: _ChatTurn, exc) -> None:
         "⟳ Preserved model reasoning no longer matches this conversation — "
         "rebuilding the model session from this chat and retrying once…",
         "msg msg-err",
-        meta={"kind": TRANSIENT_RETRY_KIND},
+        meta={
+            "kind": TRANSIENT_RETRY_KIND,
+            **gn.gateway_notice_meta(gn.GATEWAY_NOTICE_REASONING_MISMATCH_REBUILDING),
+        },
     )
     if _replay_owes_delivery(turn):
         # An owed sub-agent completion is queued as the completion it
@@ -627,10 +715,12 @@ async def _on_acp_binding_mismatch(turn: _ChatTurn, exc) -> None:
 
 async def _on_acp_image_unsupported(turn: _ChatTurn, exc, _image_replay_owed) -> None:
     """The model refused the turn's image format."""
+    from kiro_crew.dashboard import gateway_notice as gn
+
     _escalation = turn._escalation
     _is_synthetic = turn._is_synthetic
+    _message_without_merge_cards = turn._message_without_merge_cards
     _turn_emitted = turn._turn_emitted
-    message = turn.message
     session_key = turn.session_key
     slot = turn.slot
     # Kiro accepted this turn with no new attachment, then rejected an
@@ -665,7 +755,9 @@ async def _on_acp_image_unsupported(turn: _ChatTurn, exc, _image_replay_owed) ->
     else:
         # No model activity landed, so the current text is safe to
         # replay verbatim after removing the poisoned native history.
-        _image_recovery_text = message
+        # Without its merge-card frames: the finally puts the cards'
+        # contexts back on the queue and the replay turn drains them.
+        _image_recovery_text = _message_without_merge_cards
         _image_recovery_payload = payload_for_replay(_is_synthetic)
     slot.append(
         "error",
@@ -673,7 +765,10 @@ async def _on_acp_image_unsupported(turn: _ChatTurn, exc, _image_replay_owed) ->
         "restarting the model session without binary image history and "
         "continuing…",
         "msg msg-err",
-        meta={"kind": TRANSIENT_RETRY_KIND},
+        meta={
+            "kind": TRANSIENT_RETRY_KIND,
+            **gn.gateway_notice_meta(gn.GATEWAY_NOTICE_IMAGE_HISTORY_RESTARTING),
+        },
     )
     if _image_replay_owed:
         # An owed completion is queued as the completion it is: no
@@ -710,10 +805,10 @@ async def _on_acp_image_unsupported(turn: _ChatTurn, exc, _image_replay_owed) ->
 async def _on_acp_transient_retry(turn: _ChatTurn, exc) -> None:
     """A transient error before the first token: retry the turn."""
     _is_synthetic = turn._is_synthetic
+    _message_without_merge_cards = turn._message_without_merge_cards
     _msg = turn._msg
     _prompt_depth = turn._prompt_depth
     client = turn.client
-    message = turn.message
     slot = turn.slot
     # Transient backend 5xx (InternalServerError / DispatchFailure /
     # ConnectionReset, JSON-RPC -32603): the kiro-cli process is ALIVE —
@@ -807,19 +902,27 @@ async def _on_acp_transient_retry(turn: _ChatTurn, exc) -> None:
                 continue
             _tail = _row
             break
+        # A throttle is the provider's answer, not a dropped connection, so
+        # its row says so.
+        if _throttled:
+            _notice, _notice_text = (
+                TRANSIENT_NOTICE_THROTTLE_RETRYING,
+                TRANSIENT_THROTTLE_RETRYING_TEXT,
+            )
+        else:
+            _notice, _notice_text = TRANSIENT_NOTICE_RETRYING, TRANSIENT_RETRYING_TEXT
         if not (
             _in_recovery_window
             and _tail.get("role") == "error"
-            and (_tail.get("meta") or {}).get(TRANSIENT_NOTICE_META_KEY)
-            == TRANSIENT_NOTICE_RETRYING
+            and (_tail.get("meta") or {}).get(TRANSIENT_NOTICE_META_KEY) == _notice
         ):
             slot.append(
                 "error",
-                TRANSIENT_RETRYING_TEXT,
+                _notice_text,
                 "msg msg-err",
                 meta={
                     "kind": TRANSIENT_RETRY_KIND,
-                    TRANSIENT_NOTICE_META_KEY: TRANSIENT_NOTICE_RETRYING,
+                    TRANSIENT_NOTICE_META_KEY: _notice,
                 },
             )
         await _recovery_delay(_delay)
@@ -857,12 +960,7 @@ async def _on_acp_transient_retry(turn: _ChatTurn, exc) -> None:
                 slot.key,
                 _delay,
             )
-            slot.append(
-                "error",
-                TRANSIENT_GIVE_UP_TEXT,
-                "msg msg-err",
-                meta={TRANSIENT_NOTICE_META_KEY: TRANSIENT_NOTICE_GIVE_UP},
-            )
+            _append_transient_give_up(slot, _throttled)
             # A NO-REQUEUE exit ENDS the turn, so this arm owes the same
             # per-turn budget refresh as `_on_acp_error_card` and the landed arm in
             # _turn_persist_and_settle — the refresh the requeue chain would otherwise have reached.
@@ -881,7 +979,7 @@ async def _on_acp_transient_retry(turn: _ChatTurn, exc) -> None:
             _queue_recovery(
                 turn,
                 0,
-                message,
+                _message_without_merge_cards,
                 kind=SYNTHETIC_RECOVERY_KIND,
                 # Verbatim replay: ORIGINAL only if the incoming text was
                 # the user's. On a recovery turn it is the runner's
@@ -891,21 +989,30 @@ async def _on_acp_transient_retry(turn: _ChatTurn, exc) -> None:
     else:
         # depth>0 (nested turn): don't re-queue — surface a clean
         # transient status; the live session stays resumable.
-        slot.append(
-            "error",
-            TRANSIENT_GIVE_UP_TEXT,
-            "msg msg-err",
-            meta={TRANSIENT_NOTICE_META_KEY: TRANSIENT_NOTICE_GIVE_UP},
-        )
+        _append_transient_give_up(slot, _throttled)
 
 
-async def _on_acp_transient_exhausted(turn: _ChatTurn, exc, _fb_candidate) -> None:
-    """A transient error before the first token, with the retries spent."""
-    _crew_log_sid = turn._crew_log_sid
-    _crew_log_turn_no = turn._crew_log_turn_no
-    _is_synthetic = turn._is_synthetic
-    client = turn.client
-    message = turn.message
+def _append_transient_give_up(slot, throttled: bool) -> None:
+    """Append the terminal row of a pre-token retry ladder.
+
+    A throttle ladder names the throttle, not the connection, so the row a
+    reader sees last agrees with the retrying rows above it.
+    """
+    if throttled:
+        notice, text = TRANSIENT_NOTICE_THROTTLE_GIVE_UP, TRANSIENT_THROTTLE_GIVE_UP_TEXT
+    else:
+        notice, text = TRANSIENT_NOTICE_GIVE_UP, TRANSIENT_GIVE_UP_TEXT
+    slot.append("error", text, "msg msg-err", meta={TRANSIENT_NOTICE_META_KEY: notice})
+
+
+def _announce_fallback_swap(turn: _ChatTurn, exc, _fb_candidate: str) -> None:
+    """Record and announce that ``_fallback_swap_for_turn`` moved the turn onto a fallback.
+
+    Both swap arms call it: before the first token (``_on_acp_transient_exhausted``) and
+    after output streamed (``_on_acp_posttoken_transient``).
+    """
+    from kiro_crew.dashboard import gateway_notice as gn
+
     slot = turn.slot
     # Append-only the session's log (flag-gated, fail-soft). Emitted HERE,
     # in the branch body, so it runs after _fallback_swap_for_turn has
@@ -913,8 +1020,63 @@ async def _on_acp_transient_exhausted(turn: _ChatTurn, exc, _fb_candidate) -> No
     # is the one model decision a transcript cannot answer afterwards:
     # the user picked the primary and the turn ran somewhere else.
     crew_log_emit.on_model_selected(
-        _crew_log_sid, _fb_candidate, "fallback", turn=_crew_log_turn_no
+        turn._crew_log_sid, _fb_candidate, "fallback", turn=turn._crew_log_turn_no
     )
+    if len(slot._fallback_walked) == 1:
+        # The walk's first swap: `exc` is the SELECTED model's own error. Record
+        # whether it was a capacity/rollout refusal, so a card the walk ends on
+        # is judged by that model (a Resume returns to it) and not by the last
+        # candidate's error (see `_on_acp_error_card`).
+        slot._fallback_walk_refused = getattr(exc, "model_unavailable", False) is True
+        slot._fallback_walk_server_error = acp_error_is_server_error(exc)
+    _fb_primary_safe, _ = redact_exfiltration_urls(
+        slot._fallback_primary_model or "the selected model"
+    )
+    _fb_primary_safe, _ = redact_credentials(_fb_primary_safe)
+    _fb_cand_safe = redact(_fb_candidate)
+    # Persisted notice card (withheld-pin pattern): the explanation has
+    # to survive a reload because the state it explains does (the
+    # session stays on the fallback until the restore probe succeeds).
+
+    # Name the selected model's own failure (recorded at the walk's first swap): a
+    # provider 5xx throttled nothing, so its row says so. Every other transient keeps
+    # the "throttled" row it had.
+    def _fb_meta(token: str) -> dict | None:
+        # No primary name to show: the row keeps its English wording.
+        if not slot._fallback_primary_model:
+            return None
+        return gn.gateway_notice_meta(token, primary=_fb_primary_safe, fallback=_fb_cand_safe)
+
+    if slot._fallback_walk_server_error:
+        slot.append(
+            "notice",
+            f"⚠️ {_fb_primary_safe} keeps returning server errors — running on "
+            f"{_fb_cand_safe} until {_fb_primary_safe} recovers.",
+            "msg msg-info",
+            meta=_fb_meta(gn.GATEWAY_NOTICE_MODEL_SERVER_ERROR_FALLBACK),
+        )
+    else:
+        slot.append(
+            "notice",
+            f"⚠️ {_fb_primary_safe} is throttled — running on {_fb_cand_safe} "
+            f"until {_fb_primary_safe} recovers.",
+            "msg msg-info",
+            meta=_fb_meta(gn.GATEWAY_NOTICE_MODEL_THROTTLED_FALLBACK),
+        )
+    logger.info(
+        "Re-queuing slot %s on fallback model %s (candidate %d of chain)",
+        slot.key,
+        _fb_candidate,
+        slot._fallback_candidate_idx,
+    )
+
+
+async def _on_acp_transient_exhausted(turn: _ChatTurn, exc, _fb_candidate) -> None:
+    """A transient error before the first token, with the retries spent."""
+    _is_synthetic = turn._is_synthetic
+    _message_without_merge_cards = turn._message_without_merge_cards
+    client = turn.client
+    slot = turn.slot
     # ── Throttle-exhaustion model fallback (agent.fallback_model) ──
     # The same-model budget of `_on_acp_transient_retry` is spent and the error is still
     # transient (throttle/capacity). _fallback_swap_for_turn already
@@ -938,26 +1100,7 @@ async def _on_acp_transient_exhausted(turn: _ChatTurn, exc, _fb_candidate) -> No
     # in v1 and Stop-suppressed cycles never swap (both guarded in
     # _run_chat's elif condition before the side-effecting swap runs).
     slot.purge_chunks()
-    _fb_primary_safe, _ = redact_exfiltration_urls(
-        slot._fallback_primary_model or "the selected model"
-    )
-    _fb_primary_safe, _ = redact_credentials(_fb_primary_safe)
-    _fb_cand_safe = redact(_fb_candidate)
-    # Persisted notice card (withheld-pin pattern): the explanation has
-    # to survive a reload because the state it explains does (the
-    # session stays on the fallback until the restore probe succeeds).
-    slot.append(
-        "notice",
-        f"⚠️ {_fb_primary_safe} is throttled — running on {_fb_cand_safe} "
-        f"until {_fb_primary_safe} recovers.",
-        "msg msg-info",
-    )
-    logger.info(
-        "Re-queuing slot %s on fallback model %s (candidate %d of chain)",
-        slot.key,
-        _fb_candidate,
-        slot._fallback_candidate_idx,
-    )
+    _announce_fallback_swap(turn, exc, _fb_candidate)
     slot._transient_5xx_retries = fallback_rewound_transient_budget()
     await asyncio.sleep(transient_retry_delay(1))
     # The rewind runs before the Stop guard below, as in _on_acp_transient_retry.
@@ -998,15 +1141,36 @@ async def _on_acp_transient_exhausted(turn: _ChatTurn, exc, _fb_candidate) -> No
         _queue_recovery(
             turn,
             0,
-            message,
+            _message_without_merge_cards,
             kind=SYNTHETIC_RECOVERY_KIND,
             # Verbatim replay, same rule as in _on_acp_transient_retry.
             payload=payload_for_replay(_is_synthetic),
         )
 
 
-async def _on_acp_posttoken_transient(turn: _ChatTurn, exc) -> None:
-    """A transient error after the turn streamed output."""
+async def _on_acp_posttoken_fallback(turn: _ChatTurn, exc) -> None:
+    """A capacity or throttle error after output, with this turn's one continue spent.
+
+    The partial is persisted while the live session is still on the model that wrote
+    it, so its usage row and footer name that model; then ``_fallback_swap_for_turn``
+    moves the session onto the next candidate, which gets its own continue. A spent or
+    unusable chain ends on the error card, whose own persist finds the partial saved.
+    """
+    await _persist_partial_reply(turn, "error: transient attempt")
+    _fb_candidate = await _fallback_swap_for_turn(turn.slot, turn.client)
+    if _fb_candidate is None:
+        await _on_acp_error_card(turn, exc)
+        return
+    await _on_acp_posttoken_transient(turn, exc, _fb_candidate)
+
+
+async def _on_acp_posttoken_transient(turn: _ChatTurn, exc, _fb_candidate: str = "") -> None:
+    """A transient error after the turn streamed output.
+
+    With *_fb_candidate*, ``_on_acp_posttoken_fallback`` already persisted the partial
+    and moved the live session onto that fallback: the swap is announced and the
+    candidate gets its own continue.
+    """
     _first_turn_history_assembled = turn._first_turn_history_assembled
     _msg = turn._msg
     _prompt_depth = turn._prompt_depth
@@ -1024,7 +1188,8 @@ async def _on_acp_posttoken_transient(turn: _ChatTurn, exc) -> None:
     # model NOT to re-run tools that already completed, so a post-tool
     # transient recovers safely (the model reads prior tool results and
     # continues) instead of double-running a side-effecting tool. We allow
-    # EXACTLY ONE such retry per turn (_posttoken_retry_used one-shot).
+    # EXACTLY ONE such retry per turn and model (_posttoken_retry_used one-shot; a
+    # fallback swap after a capacity or throttle error re-arms it for the candidate).
     #
     # PARITY NOTE: the subagent path carries a hand-maintained copy of
     # this ladder (subagent.py `_stream_with_transient_retry`) with
@@ -1048,10 +1213,11 @@ async def _on_acp_posttoken_transient(turn: _ChatTurn, exc) -> None:
     # gates — would wrongly burn the allowance on paths that never
     # recover, denying a LATER turn its one legitimate recovery. Loop
     # prevention still holds: a re-failure DURING the recovery turn takes
-    # the exception path (which never resets the flag) and the synthetic
-    # recovery turn is excluded from the per-turn reset, so the flag stays
-    # True across the recovery and a repeat post-token 5xx surfaces
-    # instead of re-queueing forever.
+    # the exception path, which resets the flag only when a capacity or
+    # throttle error moves the session to the next fallback candidate, and
+    # the synthetic recovery turn is excluded from the per-turn reset, so
+    # the flag stays True across the recovery and a repeat post-token 5xx
+    # surfaces instead of re-queueing forever.
     #
     # APPEND-ONLY design: never retract the streamed partial. We PRESERVE
     # it — finalize it as a normal assistant message exactly like
@@ -1083,6 +1249,12 @@ async def _on_acp_posttoken_transient(turn: _ChatTurn, exc) -> None:
     # and the drop-after-backoff arm inside the helper — neither can carry
     # this attempt's credits, so the seam is the only place that bills them.
     await _persist_partial_reply(turn, "error: transient attempt")
+    if _fb_candidate:
+        # The partial is already on screen, so the notice reads below the text it
+        # interrupts. The allowance re-arms for the candidate and is spent again only
+        # by the enqueue.
+        _announce_fallback_swap(turn, exc, _fb_candidate)
+        slot._posttoken_retry_used = False
     await _recover_posttoken_transient(
         slot,
         _msg,
@@ -1092,4 +1264,14 @@ async def _on_acp_posttoken_transient(turn: _ChatTurn, exc) -> None:
         _prompt_depth=_prompt_depth,
         _queue_recovery=functools.partial(_queue_recovery, turn),
         _stop_pressed=functools.partial(_stop_pressed, turn),
+        throttled=acp_error_is_throttle(exc),
     )
+    if _fb_candidate and not slot._posttoken_retry_used:
+        # The candidate's continue was dropped (Stop, a follow-up or a steer during the
+        # backoff), so this cycle ends here: refresh the walk state as the other
+        # no-requeue exits do. The sticky _active_fallback_model stays: the session
+        # really is on the fallback until the restore probe moves it back.
+        slot._fallback_candidate_idx = 0
+        slot._fallback_walked = []
+        slot._fallback_walk_refused = False
+        slot._fallback_walk_server_error = False

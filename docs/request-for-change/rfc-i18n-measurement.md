@@ -3,8 +3,8 @@ title: i18n — closing the measurement gap
 status: partial
 author: zezhexu
 created: 2026-08-01
-last-audited: 2026-10-06
-audited-at: 9348a25a34
+last-audited: 2026-11-19
+audited-at: fc89562d69
 doc-pr: 1075
 implementation-prs: [1009, 1047, 1107, 1123, 1321, 14228]
 tracking-issues: [1004]
@@ -13,7 +13,7 @@ superseded-by: []
 ---
 # RFC: i18n — closing the measurement gap
 
-- Status: partial — 2 of 6 proposals shipped, 1 partial, 3 unstarted. **Shipped:** #3, the pseudolocale overflow gate (`website/scripts/check-i18n-render.mjs` + `lib/render-scan.mjs`, real `scrollWidth − clientWidth` measurement against the IBM expansion curve, PR #1107), which CI runs as the `i18n` lane of `scripts/ci_e2e_parallel.py` (`npm run i18n:render`; see `docs/ci/i18n-gates.md`); #5, lazy-loading, shipped in PR #14228 as one dynamic `import()` per authored catalog in `website/src/i18n/lazy.ts`, without `i18next-http-backend`. **Partial:** #4, the `localeCompare` migration — `compareText` has real consumers and the live ceiling is the `BASELINE` constant in `website/src/i18n/localeFormatting.test.ts`; `SessionGridView.tsx` sorts through `byRecentActivity` and calls no `localeCompare`. **Unstarted:** #1 source-hash staleness, #2 GEMBA-MQM/MQM 2.0 scoring, #6 `saveMissing` + word-count coverage.
+- Status: partial — 2 of 6 proposals shipped, 1 partial, 3 unstarted. **Shipped:** #3, the pseudolocale overflow gate (`website/scripts/check-i18n-render.mjs` + `lib/render-scan.mjs`, real `scrollWidth − clientWidth` measurement against the IBM expansion curve, PR #1107), which CI runs as ci.yml's own `i18n-render` job (`npm run i18n:render`; moved out of the `scripts/ci_e2e_parallel.py` lane by #20638; see `docs/ci/i18n-gates.md`); #5, lazy-loading, shipped in PR #14228 as one dynamic `import()` per authored catalog in `website/src/i18n/lazy.ts`, without `i18next-http-backend`. **Partial:** #4, the `localeCompare` migration — `compareText` has real consumers and the live ceiling is the `BASELINE` constant in `website/src/i18n/localeFormatting.test.ts`; `SessionGridView.tsx` sorts through `byRecentActivity` and calls no `localeCompare`. **Unstarted:** #1 source-hash staleness, #2 GEMBA-MQM/MQM 2.0 scoring, #6 `saveMissing` + word-count coverage.
 - **Attribution caveat:** the two proposals that moved first (#3, #4) were already in flight under the pre-existing remediation program (issue #1004, which predates this RFC and already owned the pseudolocale assertions and locale-aware formatting). PR #1009 merged **18 hours before this document did**. The three genuinely novel *measurement* proposals — the ones the title is about — have zero code. Read "partial" accordingly.
 - Author: zezhexu
 - Created: 2026-08-01
@@ -88,7 +88,7 @@ the categories each locale requires, plus 5,014 non-plural keys:
 | `ru` | one, few, many, other | 5014 + 45×4 = 5194 | **5194** |
 
 `catalogParity.test.ts` checks each language against its *own* categories, and
-`scripts/i18n-translate.mjs` rejects an impossible plural form as well as adding
+`website/scripts/i18n-translate.mjs` rejects an impossible plural form as well as adding
 categories English lacks. The failure mode this avoids — shipping `_one`/`_other`
 everywhere and being silently wrong for Russian 2–4 — is what i18next's
 suffix-key dialect makes easy to reach.
@@ -97,7 +97,7 @@ suffix-key dialect makes easy to reach.
 Beta gate is "100% of the high-priority surface"; this is 100% everywhere.
 
 **Runtime-computed keys are effectively absent** — **exactly one dynamic site**
-(`website/src/surfaces/registry.ts:324`, `i18nT(s.labelKey)`) and zero
+(`website/src/surfaces/registry.ts::surfaceLabel`, `i18nT(s.labelKey)`) and zero
 template-literal keys, against roughly 5,700 `i18nT()` calls. Treat
 `node website/scripts/check-i18n-keys.mjs --report` as the authority on the total
 rather than any figure quoted here: independent AST scans of this tree disagree in
@@ -125,7 +125,7 @@ deliberately from the published table — see the appendix.)
 **Per-locale style guides exist for all nine non-English locales and are
 machine-enforced** (`website/src/i18n/style/*.md` + `*Style.test.ts`). I am aware
 of no comparable public example, though I have not surveyed systematically.
-`zhStyle.test.ts` is the strongest — 21 zero-tolerance
+`zhStyle.test.ts` is the strongest — 22 zero-tolerance
 assertions and a 12-pair terminology denylist gated on the *English* source
 rather than blind substring matching.
 
@@ -208,7 +208,7 @@ regression; it does not reach strings that were never catalog keys. Some of the
 40 construct LLM prompt text and fall outside the rule's scope, which governs
 user-facing strings (`formatArtifactCommentsMessage` in `website/src/components/CommentOverlay.tsx`),
 but user-visible ones are not — `website/src/App.tsx:499`, `website/src/App.tsx:619`,
-`website/src/components/InlineCommentOverlay.tsx:171`,
+`website/src/components/InlineCommentOverlay.tsx::InlineCommentOverlay`,
 `website/src/components/ArtifactFolderDeleteDialog.tsx:41`.
 
 **Message format is i18next's native dialect, not ICU.** Among the React i18n
@@ -252,7 +252,7 @@ in `website/electron/ipc-registrar.js`).
 ### Medium
 
 - A stored or server-provided tag that is not an exact `SUPPORTED_CODES` member is
-  **discarded** rather than negotiated (`website/src/i18n/detect.ts:133`), while the
+  **discarded** rather than negotiated (`website/src/i18n/detect.ts::resolveLanguage`), while the
   backend accepts any tag matching its own **conservative BCP-47 subset**
   (`src/kiro_crew/dashboard/handlers/core.py:299-307,377`). `dashboard.language='de-AT'`
   silently becomes browser-detected.
@@ -316,7 +316,7 @@ ever on the roadmap.
 **4. Migrate the 35 text-comparison `localeCompare` sites to `compareText`, and
 replace the other 4 with byte comparisons.** Those four compare ISO timestamps,
 where collation is the wrong tool entirely —
-`website/src/components/SessionGridView.tsx:214`,
+`website/src/components/SessionGridView.tsx::PlaceholderPane`,
 `website/src/pages/ArtifactDetailPage.tsx:49`, and both branches at
 `website/src/pages/ChatSidebar.tsx:560`. Pure adoption otherwise: the seam is
 built and tested with zero consumers. Note `localeFormatting.test.ts` is

@@ -1,24 +1,21 @@
 """The conductor work board's vocabularies, one spelling for every reader.
 
-Pure data, deliberately outside ``kiro_crew.crew_log``: the ``work/recorded`` entry
-type, the work-ledger store (``kiro_crew.work_ledger``) and the tool schemas
-(``kiro_crew.validation``) all import these tuples, and the last two sit on the
-gateway's boot path while the crew log's storage subsystem must stay unloaded
-until an entry point reaches storage. A leaf with no imports of its own is the
-only place all three can share without one of them dragging the others in.
+Pure data in a leaf with no imports of its own, outside ``kiro_crew.crew_log``: the
+``work/recorded`` entry type, the store (``kiro_crew.work_ledger``) and the tool
+schemas (``kiro_crew.validation``) all import it, and the last two sit on the
+gateway's boot path, where the crew log's storage subsystem must stay unloaded.
 """
 
 from __future__ import annotations
 
 import hashlib
+import re
+from collections.abc import Mapping, Sequence
 from typing import Any, NotRequired, TypedDict
 
 #: The projection that folds ``work/recorded`` into a board, as its readers name it.
-#: Here rather than in ``crew_log``: a reader outside that package needs the name to
-#: ask for the fold, and this module is the leaf it can reach without pulling the log's
-#: storage subsystem onto the gateway's boot path. Pinned against the kernel's own
-#: registry by ``test_pipeline_board_wiring``, because a rename there would otherwise
-#: make every such read answer "no board" instead of failing.
+#: Pinned against the kernel's registry by ``test_pipeline_board_wiring``: a rename
+#: there would otherwise make every read answer "no board" instead of failing.
 WORK_FOLD_NAME: str = "work"
 
 #: ``person`` is the dashboard owner steering a worker from a Crew Mode chat's side
@@ -32,8 +29,11 @@ WORK_ACTIONS: tuple[str, ...] = (
     "verdict",
     "close",
     "accept",
+    "ask",
     "report",
     "steer",
+    "retire",
+    "destroy",
 )
 WORK_ITEM_STATES: tuple[str, ...] = ("open", "accepted", "rejected", "abandoned")
 WORK_VERDICTS: tuple[str, ...] = ("pass", "fail", "pending", "refused", "error")
@@ -42,22 +42,16 @@ WORK_VERDICTS: tuple[str, ...] = ("pass", "fail", "pending", "refused", "error")
 #: Which of them a report may be WRITTEN with is :func:`worker_statuses`: ``reply``
 #: is admitted only while :data:`WORK_REMOTE_DISPATCH_SETTING` is on.
 WORK_WORKER_STATUSES: tuple[str, ...] = ("progress", "done", "blocked", "question", "reply")
-#: Worker statuses whose ARRIVAL needs the conductor, and the whole set that wakes
-#: it: ``done`` is a claim it must verify, ``blocked`` an external dependency it must
-#: clear, ``question`` a decision only it can make. ``progress`` is deliberately
-#: absent -- it advances the board and reaches the conductor on the next real wake,
-#: and charging a turn for it rebuilds the polling the watch exists to remove.
+#: Worker statuses whose arrival wakes the conductor: ``done`` is a claim to verify,
+#: ``blocked`` a dependency to clear, ``question`` a decision only it can make, and
+#: ``reply`` an answer to its follow-up that it must relay
+#: (rfc-conductor-remote-dispatch §3b). ``progress`` is absent: it reaches the
+#: conductor on the next real wake, and waking for it would rebuild polling.
 #:
-#: Here rather than in one of its two readers because BOTH need it and each sits
-#: where the other may not be imported: ``ledger_wake`` is the watch's pure gate and
-#: must not grow imports, and ``conductor_wake`` is reachable from the gateway's boot
-#: path. Two spellings of this set would let a trigger push for news the gate then
-#: refuses, which is precisely the wake nobody can see is wasted.
-#:
-#: ``reply`` is a worker's answer to a follow-up the conductor sent it
-#: (rfc-conductor-remote-dispatch §3b): it claims nothing finished and needs no
-#: evidence, but the conductor is waiting to relay it. Both readers decide through
-#: :func:`wake_statuses`, which drops it while the preview is off.
+#: Shared here by ``ledger_wake`` (the watch's pure gate) and ``conductor_wake``
+#: (on the boot path), which may not import each other; two spellings would let a
+#: trigger push news the gate refuses. Both read it through :func:`wake_statuses`,
+#: which drops ``reply`` while the preview is off.
 WORK_WAKE_STATUSES: tuple[str, ...] = ("done", "blocked", "question", "reply")
 #: The statuses only the remote-dispatch Feature Preview admits. With
 #: :data:`WORK_REMOTE_DISPATCH_SETTING` off, a report carrying one is refused as an
@@ -73,9 +67,46 @@ WORK_REMOTE_DISPATCH_SETTING: str = "work_ledger.remote_dispatch"
 WORK_BLOCKED_REASONS: tuple[str, ...] = ("approval", "needs_human")
 #: The statuses a ``reason`` may ride on.
 WORK_REASON_STATUSES: tuple[str, ...] = ("blocked", "question")
+
+
+def waits_on_person(
+    status: object, reason: object, *, answered: bool, running: bool = False
+) -> bool:
+    """Whether an OPEN item's last report waits on the PERSON: a ``blocked`` /
+    ``question`` naming one of :data:`WORK_BLOCKED_REASONS`, not answered since (a
+    conductor ``decide`` or a person's ``steer`` after the report), and its worker's
+    turn not *running*. The one rule behind every "needs you" count: the Board and
+    sidebar (``work_ledger_board.awaits_person``) and the crew-log workstreams fold."""
+    return (
+        not running
+        and not answered
+        and status in WORK_REASON_STATUSES
+        and reason in WORK_BLOCKED_REASONS
+    )
+
+
+def ask_is_current(events: Sequence[Mapping[str, Any]]) -> bool:
+    """Whether the item's ``ask`` record explains the question waiting now, by the
+    ledger's own event order (*events*, oldest first): no ``report`` was appended
+    after the newest ``ask`` event. Stamps have whole-second resolution and would
+    tie, so the order decides. A tail cut short of the ``ask`` event counts as
+    current only when it holds no report either."""
+    for event in reversed(events):
+        kind = event.get("kind")
+        if kind == "ask":
+            return True
+        if kind == "report":
+            return False
+    return True
+
+
 #: ``steer`` is a person's own text typed into a worker (actor ``person``). A person's
 #: steer outranks the conductor's decision: the conductor reads new steer events
-#: before it decides and never overrules them.
+#: before it decides and never overrules them. ``retire`` is the hub moving a remote
+#: binding into the item's history (rfc-conductor-remote-dispatch §5b); only the
+#: gateway writes it, and only with :data:`WORK_REMOTE_DISPATCH_SETTING` on.
+#: ``destroy`` marks a retired binding ``destroyed`` once its peer slot is closed,
+#: under the same switch.
 WORK_EVENT_KINDS: tuple[str, ...] = (
     "create",
     "bind",
@@ -84,47 +115,309 @@ WORK_EVENT_KINDS: tuple[str, ...] = (
     "verdict",
     "close",
     "steer",
+    "retire",
+    "destroy",
+    "ask",
 )
-#: Item records the crew log's ``work`` fold may HOLD for one board at once -- a
-#: memory bound on the fold, not a bound on the board's life. The fold forgets an
-#: item once it is closed and older than :data:`WORK_CLOSED_WINDOW` other closed
-#: items, so what it holds is the open items (at most 32, the store's open cap) plus
-#: that window; this ceiling is never reached by a board the store admits and only
-#: guards a log something else wrote. Also the highest goal ``item_cap`` the store
-#: accepts. It lives here because neither the fold nor the store may import the other.
+#: Item records the ``work`` fold may hold for one board at once: a memory bound on
+#: the fold, not on the board's life. The fold holds the open items (at most 32) plus
+#: :data:`WORK_CLOSED_WINDOW` closed ones, so a board the store admits never reaches
+#: this; it guards a log something else wrote. Here because the fold and the store
+#: may not import each other.
 WORK_STORED_ITEM_LIMIT: int = 256
 #: Closed items the ``work`` fold keeps whole, newest-closed last, for the surfaces
 #: that draw recent history. Older closed items leave the fold; their full history
 #: stays in the crew log.
 WORK_CLOSED_WINDOW: int = 32
-#: Ids of items the ``work`` fold has forgotten, oldest first, kept so an entry for one
-#: that is folded late (a worker report in a unit read after the close) is recognised
-#: and dropped instead of parked. Ids only; past the cap the oldest id of a CREATED item
-#: goes first, and a late entry for an id past it parks and counts in ``omitted`` like
-#: any unknown id. A baseline-born id goes only once the set holds nothing else, since a
-#: late baseline for one would materialise the item again.
+#: Ids of items the ``work`` fold has forgotten, oldest first, so a late entry for one
+#: is dropped instead of parked. Past the cap the oldest CREATED id goes first (a late
+#: entry for it then parks and counts in ``omitted``); a baseline-born id goes last,
+#: since a late baseline for it would materialise the item again.
 WORK_TOMBSTONE_LIMIT: int = 4096
 
-#: The conducting depth cap's default and bounds, and the config key it is set by. Here
-#: because the store (``work_ledger_records``) and the config section
-#: (``config.service_sections``, ``config.section_builders``) both need them, and the
-#: config package may not import the store. The meaning of the cap is documented on
-#: ``work_ledger_records.MAX_DEPTH``.
+#: The conducting depth cap's default, bounds and config key (meaning documented on
+#: ``work_ledger_records.MAX_DEPTH``). Here because the config package needs them
+#: and may not import the store.
 WORK_MAX_DEPTH_DEFAULT: int = 2
 WORK_MAX_DEPTH_MIN: int = 2
 WORK_MAX_DEPTH_MAX: int = 10
 WORK_MAX_DEPTH_SETTING: str = "work_ledger.max_depth"
+
+#: One crew tag (``work_ledger.remote_dispatch_tags``) or one remote-dispatch
+#: ``requires`` name: a short lower-case word with at least one letter and no
+#: dot, so a tag cannot carry a path, a URL, a dotted host name or a bare
+#: account number. Here because the config package needs it and may not import
+#: the remote-dispatch modules. Use ``fullmatch``: ``$`` would pass a newline.
+DISPATCH_TAG_RE = re.compile(r"(?=[a-z0-9_-]*[a-z])[a-z0-9][a-z0-9_-]{0,31}")
+
+#: Most tags a crew advertises, and most names one ``requires`` list holds.
+MAX_DISPATCH_TAGS: int = 16
+
+
+def coerce_dispatch_tags(raw: object) -> tuple[str, ...]:
+    """*raw* as a deduplicated tuple of valid tags, in order; anything else dropped."""
+    if not isinstance(raw, list):
+        return ()
+    out: list[str] = []
+    for tag in raw:
+        if isinstance(tag, str) and DISPATCH_TAG_RE.fullmatch(tag) and tag not in out:
+            out.append(tag)
+            # A peer's headroom feeds this list too: stop at the cap so a long
+            # one costs one pass, not a quadratic scan of the tail.
+            if len(out) == MAX_DISPATCH_TAGS:
+                break
+    return tuple(out)
+
+
 #: Fields a conductor action may set on an item. What the write route logs from
 #: the committed item is what the fold applies to the rebuilt one; the two read
 #: this one table so they cannot drift apart. A worker's fields are fixed.
 WORK_CONDUCTOR_FIELDS: dict[str, tuple[str, ...]] = {
     "create": ("title", "acceptance", "round"),
-    "bind": ("worker_session_key",),
+    "bind": ("worker_session_key", "worker_instance_id"),
     "decide": ("decision", "round"),
     "verdict": ("verdict", "fails"),
     "close": ("state", "decision"),
     "accept": ("acceptance",),
+    "ask": ("ask",),
+    "retire": ("worker_session_key", "worker_instance_id", "retired_bindings"),
+    "destroy": ("retired_bindings",),
 }
+
+#: The acceptance conditions the evaluator can judge, one example object per kind, as
+#: the text a tool description shows a conductor. ``work_ledger_record`` quotes it on
+#: its ``acceptance`` argument and ``work_dispatch`` points there, so the object can
+#: be written from the description alone; a kind's field names are otherwise only in
+#: the evaluator's source. ``cmd`` is absent because the evaluator refuses it.
+ACCEPTANCE_SHAPES: str = (
+    'One of: {"kind": "pr_checks", "pr": 123, "repo": "owner/name"}; {"kind": '
+    '"pr_merged", "pr": 123, "repo": "owner/name"}; {"kind": "file", "path": '
+    '"/absolute/path"} (add "exists": false for a path that must be gone); {"kind": '
+    '"human_approval"}; {"kind": "edition_check", "check": "<name>", "ref": "<id>"}.'
+)
+
+
+#: Most retired bindings an item keeps; past it the oldest destroyed one goes first.
+MAX_RETIRED_BINDINGS = 8
+
+#: The states a retired binding may hold.
+RETIRED_BINDING_STATES: frozenset[str] = frozenset({"retired", "destroyed"})
+
+#: The remote pair's caps, one definition for the bind that checks them and the
+#: retired history that keeps them (here, since both the store and the fold read
+#: them and neither may import the other): a peer slot key, the cap ``bind`` puts
+#: on a worker key, and a crew id, the cap the instance registry puts on an id.
+WORK_MAX_PEER_SLOT_CHARS: int = 512
+WORK_MAX_INSTANCE_ID_CHARS: int = 128
+#: An artifact value's cap, so a retired worker's pushed branch is kept whole.
+WORK_MAX_ARTIFACT_VALUE_CHARS: int = 512
+#: A retire reason and a stamp, as stored on a retired binding.
+WORK_MAX_RETIRE_REASON_CHARS: int = 64
+WORK_MAX_STAMP_CHARS: int = 64
+#: The retire reasons a conductor may give on ``work_ledger_record action=retire``
+#: (rfc-conductor-remote-dispatch §5b): the worker is stuck on a login, or the crew
+#: lacks what the item needs. ``crew_unreachable`` is the hub's own, never a caller's.
+WORK_CONDUCTOR_RETIRE_REASONS: tuple[str, ...] = ("login_blocked", "wrong_crew")
+
+#: Each retired binding's text fields and their caps.
+_RETIRED_BINDING_TEXT: dict[str, int] = {
+    "worker_session_key": WORK_MAX_PEER_SLOT_CHARS,
+    "worker_instance_id": WORK_MAX_INSTANCE_ID_CHARS,
+    "branch": WORK_MAX_ARTIFACT_VALUE_CHARS,
+    "reason": WORK_MAX_RETIRE_REASON_CHARS,
+    "retired_at": WORK_MAX_STAMP_CHARS,
+    "destroyed_at": WORK_MAX_STAMP_CHARS,
+}
+
+
+def coerce_retired_bindings(raw: Any) -> list[dict[str, Any]]:
+    """Stored or folded *raw* as a clean retired-binding list. NEVER raises.
+
+    An entry without both halves of the pair, or with an unknown state, is
+    dropped; a text field that is not a string reads as ``None``.
+    """
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for entry in raw[-MAX_RETIRED_BINDINGS:]:
+        state = entry.get("state") if isinstance(entry, dict) else None
+        if not isinstance(state, str) or state not in RETIRED_BINDING_STATES:
+            continue
+        clean: dict[str, Any] = {"state": entry["state"]}
+        for name, cap in _RETIRED_BINDING_TEXT.items():
+            value = entry.get(name)
+            clean[name] = value[:cap] if isinstance(value, str) and value else None
+        if clean["worker_session_key"] and clean["worker_instance_id"]:
+            out.append(clean)
+    return out
+
+
+#: The ``ask`` record's caps: what the item needs from the person, why, each option
+#: with what it leads to, and the pick with its reason. The conductor writes it once
+#: per item when it relays a question to the person; ``decide`` and ``close`` clear it.
+WORK_ASK_WHAT_CHARS: int = 200
+WORK_ASK_WHY_CHARS: int = 600
+WORK_ASK_LABEL_CHARS: int = 120
+WORK_ASK_OUTCOME_CHARS: int = 300
+WORK_ASK_MAX_OPTIONS: int = 6
+
+
+def coerce_ask(raw: Any) -> dict[str, Any] | None:
+    """Stored or folded *raw* as a clean ``ask`` record, or ``None``. NEVER raises.
+
+    A record needs ``what`` and the gateway's ``written_at``; an option needs a
+    label; a ``pick`` that is not one of the labels is dropped with its reason.
+    """
+    if not isinstance(raw, dict):
+        return None
+
+    def text(name: str, cap: int, value: Any = None) -> str:
+        value = raw.get(name) if value is None else value
+        return value[:cap] if isinstance(value, str) else ""
+
+    what = text("what", WORK_ASK_WHAT_CHARS)
+    written_at = text("written_at", WORK_MAX_STAMP_CHARS)
+    if not what or not written_at:
+        return None
+    options: list[dict[str, str]] = []
+    raw_options = raw.get("options")
+    for option in raw_options if isinstance(raw_options, list) else []:
+        if not isinstance(option, dict):
+            continue
+        label = option.get("label")
+        outcome = option.get("outcome")
+        if isinstance(label, str) and label:
+            options.append(
+                {
+                    "label": label[:WORK_ASK_LABEL_CHARS],
+                    "outcome": outcome[:WORK_ASK_OUTCOME_CHARS] if isinstance(outcome, str) else "",
+                }
+            )
+    options = options[:WORK_ASK_MAX_OPTIONS]
+    pick = text("pick", WORK_ASK_LABEL_CHARS)
+    if pick not in {option["label"] for option in options}:
+        pick = ""
+    return {
+        "what": what,
+        "why": text("why", WORK_ASK_WHY_CHARS),
+        "options": options,
+        "pick": pick,
+        "pick_why": text("pick_why", WORK_ASK_OUTCOME_CHARS) if pick else "",
+        "written_at": written_at,
+    }
+
+
+#: A ``work_report``'s optional ``discussion``: where a worker-hosted discussion
+#: stands, for the Board's "discussing" row. Every report carries the whole object
+#: and replaces the last one. Caps per text field, then per list
+#: (``(max items, {key: max chars})``); a value over a cap is refused, never cut.
+WORK_DISCUSSION_PHASES: tuple[str, ...] = ("talking", "checking", "asking", "done")
+WORK_DISCUSSION_TEXT_CHARS: dict[str, int] = {"direction": 200, "thread": 512}
+WORK_DISCUSSION_STRING_LISTS: dict[str, tuple[int, int]] = {
+    "agreed": (8, 120),
+    "checking": (3, 120),
+}
+WORK_DISCUSSION_OBJECT_LISTS: dict[str, tuple[int, dict[str, int]]] = {
+    "disputed": (5, {"point": 120, "sides": 160}),
+    "recent": (6, {"who": 20, "text": 200}),
+}
+WORK_DISCUSSION_COUNTS: dict[str, int] = {"round": 99, "minutes": 1440}
+#: What ``thread`` must look like: the Board's own LINKABLE rule, so the link it
+#: draws is one the host opens.
+WORK_DISCUSSION_THREAD_RE = re.compile(
+    r"^(?:https?://|/(?:artifacts|chat|schedule|capabilities|settings)\b)"
+)
+
+
+def discussion_problem(raw: Any) -> tuple[str, str, str] | None:
+    """Why *raw* is not a valid ``discussion``, as ``(kind, field, message)``, or ``None``.
+
+    ``kind`` is ``"too_long"`` for a value over a cap and ``"invalid"`` otherwise;
+    ``field`` names the exact part, e.g. ``discussion.agreed[3]``. Unknown keys are
+    refused, so a typo is not silently dropped.
+    """
+    if not isinstance(raw, dict):
+        return ("invalid", "discussion", "discussion must be an object")
+    known = {"phase", *WORK_DISCUSSION_TEXT_CHARS, *WORK_DISCUSSION_STRING_LISTS}
+    known |= {*WORK_DISCUSSION_OBJECT_LISTS, *WORK_DISCUSSION_COUNTS}
+    for key in raw:
+        if key not in known:
+            return ("invalid", f"discussion.{key}", f"discussion has no field {key!r}")
+    if raw.get("phase") not in WORK_DISCUSSION_PHASES:
+        return (
+            "invalid",
+            "discussion.phase",
+            f"discussion.phase must be one of {', '.join(WORK_DISCUSSION_PHASES)}",
+        )
+
+    def text(value: Any, cap: int, where: str) -> tuple[str, str, str] | None:
+        if not isinstance(value, str):
+            return ("invalid", where, f"{where} must be a string")
+        if len(value) > cap:
+            return ("too_long", where, f"{where} is {len(value)} chars; the cap is {cap}")
+        return None
+
+    for name, cap in WORK_DISCUSSION_TEXT_CHARS.items():
+        if name in raw and (bad := text(raw[name], cap, f"discussion.{name}")):
+            return bad
+    thread = raw.get("thread")
+    if thread and not WORK_DISCUSSION_THREAD_RE.match(thread):
+        return (
+            "invalid",
+            "discussion.thread",
+            "discussion.thread must be an http(s) URL or a /artifacts, /chat, /schedule, "
+            "/capabilities or /settings path",
+        )
+    for name, cap in WORK_DISCUSSION_COUNTS.items():
+        value = raw.get(name, 0)
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= cap:
+            return ("invalid", f"discussion.{name}", f"discussion.{name} must be 0..{cap}")
+    lists: dict[str, tuple[int, Any]] = {
+        **WORK_DISCUSSION_STRING_LISTS,
+        **WORK_DISCUSSION_OBJECT_LISTS,
+    }
+    for name, (most, shape) in lists.items():
+        value = raw.get(name, [])
+        where = f"discussion.{name}"
+        if not isinstance(value, list):
+            return ("invalid", where, f"{where} must be a list")
+        if len(value) > most:
+            return ("too_long", where, f"{where} has {len(value)} entries; the cap is {most}")
+        for i, entry in enumerate(value):
+            at = f"{where}[{i}]"
+            if isinstance(shape, int):
+                if bad := text(entry, shape, at):
+                    return bad
+                continue
+            if not isinstance(entry, dict):
+                return ("invalid", at, f"{at} must be an object")
+            for key in entry:
+                if key not in shape:
+                    return ("invalid", f"{at}.{key}", f"{at} has no field {key!r}")
+            for key, cap in shape.items():
+                if bad := text(entry.get(key), cap, f"{at}.{key}"):
+                    return bad
+    return None
+
+
+def coerce_discussion(raw: Any) -> dict[str, Any] | None:
+    """*raw* as a complete ``discussion`` (absent parts filled), or ``None``. NEVER raises.
+
+    The store refuses an invalid one on write, so ``None`` here means a value no
+    writer of this version produced; a reader then shows no discussion at all.
+    """
+    if discussion_problem(raw) is not None:
+        return None
+    out: dict[str, Any] = {"phase": raw["phase"]}
+    for name in WORK_DISCUSSION_COUNTS:
+        out[name] = raw.get(name, 0)
+    for name in WORK_DISCUSSION_TEXT_CHARS:
+        out[name] = raw.get(name, "")
+    for name in WORK_DISCUSSION_STRING_LISTS:
+        out[name] = list(raw.get(name, []))
+    for name in WORK_DISCUSSION_OBJECT_LISTS:
+        out[name] = [dict(entry) for entry in raw.get(name, [])]
+    return out
 
 
 def worker_statuses(remote_dispatch: bool) -> tuple[str, ...]:
@@ -141,16 +434,9 @@ def wake_statuses(remote_dispatch: bool) -> tuple[str, ...]:
     return tuple(s for s in WORK_WAKE_STATUSES if s not in WORK_REMOTE_DISPATCH_STATUSES)
 
 
-# --------------------------------------------------------------------------
-# the rendered board's SHAPE, for readers that want it checked
-# --------------------------------------------------------------------------
-#
-# Here for the same reason the tuples above are: every reader of a rendered work
-# board shares one spelling of it. ``_work_render`` narrows its return to
-# :class:`WorkBoardView`, so a reader that maps a board onto a dashboard's own
-# contract type has BOTH ends checked by mypy, and a field renamed here is an error
-# at every such reader rather than a key that silently reads as missing. A reader
-# that does not want the checking is unaffected -- these are annotations only.
+# The rendered board's shape. ``_work_render`` returns :class:`WorkBoardView`, so
+# mypy checks both ends of a reader that maps a board onto its own contract type,
+# and a renamed field is an error rather than a key that silently reads as missing.
 
 
 class WorkBoardEvent(TypedDict):
@@ -186,6 +472,8 @@ class WorkBoardItem(TypedDict):
     status: str | None
     #: One of :data:`WORK_BLOCKED_REASONS` on a blocked/question report, or unset.
     reason: str | None
+    #: When a ``progress`` report's worker will resume; present only while set.
+    wake_at: NotRequired[str]
     summary: str
     artifacts: dict[str, str]
     pr: int | None
@@ -196,6 +484,10 @@ class WorkBoardItem(TypedDict):
     decided_at: str | None
     #: When the item's current run of ``pending`` verdicts began, or unset.
     pending_since: str | None
+    #: The conductor's ``ask`` record (:func:`coerce_ask`); present only while set.
+    ask: NotRequired[dict[str, Any]]
+    #: The worker's last ``discussion`` (:func:`coerce_discussion`); present only while set.
+    discussion: NotRequired[dict[str, Any]]
     events: list[WorkBoardEvent]
 
 
@@ -220,11 +512,8 @@ class WorkBoardConductor(TypedDict):
 
 class WorkBoardView(TypedDict):
     """What the ``work`` fold renders: the header, every item in creation order, and
-    the count of entries it dropped.
-
-    ``omitted`` is part of the contract rather than an internal detail: an item missing
-    from a board is not recoverable by whoever reads the board, so the count has to be
-    able to travel to every surface that renders one.
+    ``omitted``, the count of dropped entries, which every surface must be able to
+    show because a reader cannot recover a missing item.
     """
 
     conductor: WorkBoardConductor
@@ -258,27 +547,20 @@ class WorkBoardForgotten(TypedDict):
 
 
 def work_event_id(ts: str, item_id: str, kind: str, text: str, *, status: str | None = None) -> str:
-    """Content-addressed id for one work event line. THE formula, with one home.
+    """Content-addressed id for one work event line. The one copy of the formula.
 
-    It lives in this leaf because BOTH sides need it and neither may import the other.
-    The store writes these ids; the crew-log fold reproduces them for an entry that
-    carries none, and the rebuild's completeness checks match events BY id -- so two
-    spellings of this formula would let a stored id and a folded id drift apart
-    silently, which is the one divergence those checks cannot detect. The fold is
-    forbidden from importing the store directly (the work-ledger store has a fixed
-    list of permitted importers, so that a board's identity stays server-resolved),
-    and a pure content hash is not an identity question, so widening that list for it
-    would trade a real boundary for a convenience. A shared leaf costs neither.
+    The store writes these ids and the crew-log fold reproduces them for entries
+    without one; the rebuild matches events by id, so two spellings could drift
+    undetected. The fold may not import the store (it has a fixed importer list),
+    hence this leaf.
 
-    Pipe-separated rather than concatenated, matching Issue Radar's ``_event_id``: bare
-    concatenation lets two different tuples produce one string, so two distinct events
-    could collapse into each other on read.
+    Pipe-separated, as in Issue Radar's ``_event_id``, so two different tuples
+    cannot concatenate to one string.
 
-    ``status`` IS part of the identity. Timestamps are seconds-precision, so a
-    ``progress`` report and a ``blocked`` report with the same summary in the same second
-    would otherwise share an id, and first-seen-wins dedupe would drop the transition --
-    the one line the conductor most needs to see. ``None`` renders as the empty string,
-    so every non-report kind keeps a stable formula.
+    ``status`` is part of the identity: timestamps are seconds-precision, so a
+    ``progress`` and a ``blocked`` report with the same summary in one second would
+    otherwise share an id and dedupe would drop the transition. ``None`` renders as
+    the empty string.
     """
     raw = f"{ts}|{item_id}|{kind}|{status or ''}|{text}".encode("utf-8")
     return hashlib.sha256(raw).hexdigest()[:16]

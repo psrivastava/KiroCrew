@@ -18,8 +18,13 @@ from typing import Any
 
 from aiohttp import web
 
+from kiro_crew import name_grant, redaction_seams
 from kiro_crew.acp.client import AcpAuthRequired
-from kiro_crew.acp_backends import ACP_BACKEND_GOOSE, ACP_BACKENDS_SIDE_READONLY
+from kiro_crew.acp_backends import (
+    ACP_BACKEND_GOOSE,
+    ACP_BACKEND_STRANDS,
+    ACP_BACKENDS_SIDE_READONLY,
+)
 from kiro_crew.agent_discovery import warm_project_agent_names
 from kiro_crew.agent_sdk.backend_identity import is_claude_backend_name
 from kiro_crew.agent_sdk.drivers.acp import (
@@ -53,6 +58,7 @@ from kiro_crew.dashboard.ws import (
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.hooks import HookManager
 from kiro_crew.llm_helpers import (
+    AcpError,
     PromptBusyExhaustedError,
     ToolApprovalPolicy,
     stream_and_collect,
@@ -370,6 +376,7 @@ async def _side_read_only_tools(side_backend: str | None) -> bool:
     return True
 
 
+@redaction_seams.in_seam(redaction_seams.CHAT)
 async def _run_side_turn(
     state: DashboardState,
     slot,
@@ -405,7 +412,8 @@ async def _run_side_turn(
     # already redacts each frame, but per-frame redaction alone misses a secret
     # split across streaming chunk boundaries; StreamRedactor withholds a
     # trailing credential-class run until it's confirmed safe. Mirrors
-    # chat_runner._wsred so /side has the same protection as the main chat.
+    # the chat turn's ``turn._wsred`` (chat_turn/turn_entry.py) so /side has the
+    # same protection as the main chat.
     _wsred = StreamRedactor()
 
     def _broadcast(**frame: Any) -> None:
@@ -578,20 +586,31 @@ async def _run_side_turn(
         # cannot reach a write: kiro-cli through the derived agent spec below,
         # claude-agent-acp through the session options its client sends for
         # ``side_read_only``, goose through the separate goose home its launch
-        # builds for ``side_read_only``. Off the set — or with the harness unknown because
+        # builds for ``side_read_only``, Strands through its gate module, which
+        # asks about every call, and a launch that mounts no MCP server for
+        # ``side_read_only``. Off the set — or with the harness unknown because
         # the config never loaded — the turn runs the pre-allowance posture: the
         # base agent under REJECT_ALL, and the prompt and fallback say tools are
         # unavailable here.
         tools_available = await _side_read_only_tools(side_backend)
         claude_side = tools_available and is_claude_backend_name(side_backend)
         goose_side = tools_available and side_backend == ACP_BACKEND_GOOSE
+        strands_side = tools_available and side_backend == ACP_BACKEND_STRANDS
         side_session_kwargs: dict[str, Any] = {}
-        if goose_side:
+        if strands_side:
+            # Strands reads no kiro agent spec. Every call asks through Crew's gate
+            # module; on a ``side_read_only`` session only the harness's own file
+            # read is proven, and every other call is refused before the gate.
+            side_agent: str | None = kiro_agent or slot_agent
+            approval_policy = ToolApprovalPolicy.READ_ONLY
+            binding: tuple[str, ...] = (side_agent or "", project or "", "strands_read_only")
+            side_session_kwargs["side_read_only"] = True
+        elif goose_side:
             # goose reads no kiro agent spec either. Its launch starts the side
             # session on a goose home of its own, where no permission.yaml can
             # pre-approve a tool and no MCP server is mounted, so every call
             # reaches the READ_ONLY gate below.
-            side_agent: str | None = kiro_agent or slot_agent
+            side_agent = kiro_agent or slot_agent
             approval_policy = ToolApprovalPolicy.READ_ONLY
             binding = (side_agent or "", project or "", "goose_read_only")
             side_session_kwargs["side_read_only"] = True
@@ -632,6 +651,11 @@ async def _run_side_turn(
             side_agent = kiro_agent or slot_agent
             approval_policy = ToolApprovalPolicy.REJECT_ALL
             binding = (side_agent or "", project or "", "reject_all")
+        if slot.is_restricted:
+            # Memory withheld as in the incognito or temporary parent (on claude,
+            # Claude Code's auto-memory off); in the binding so a tightening rebinds.
+            side_session_kwargs["include_memory"] = False
+            binding = (*binding, "memory_withheld")
 
         # The derivation suspended this task; a close (or close+reopen) may have
         # landed meanwhile. A stale task must not touch any session: its own
@@ -712,13 +736,24 @@ async def _run_side_turn(
         # actually did, not on the sidecar's transcript alone, so the model
         # behind a fresh process is never handed a bare question with nothing
         # telling it where it is or what it may do.
+        send_envelope = is_first_turn or (is_new and not resumed)
+        # A shell read runs only when its program name can be vouched for. While
+        # the environment refuses every name (a PowerShell profile, an inherited
+        # BASH_ENV, an ambiguous PATH) each one is declined and side chat has no
+        # card to fall back to, so the boundary names no shell. The check stats
+        # files, so it runs off the loop and only for a turn that sends the
+        # boundary.
+        shell_available = not (claude_side or goose_side or strands_side)
+        if send_envelope and shell_available:
+            shell_available = await asyncio.to_thread(name_grant.environment_refusal) is None
         message = build_side_message(
             slot,
             question,
-            is_first_turn=is_first_turn or (is_new and not resumed),
+            is_first_turn=send_envelope,
             tools_available=tools_available,
-            shell_available=not (claude_side or goose_side),
+            shell_available=shell_available,
             file_reads_available=not goose_side,
+            searches_available=not strands_side,
             cfg=cfg,
         )
         try:
@@ -891,15 +926,23 @@ async def _run_side_turn(
             is_error=True,
             final=True,
         )
-    except Exception:
+    except Exception as exc:
         logger.exception(
             "Side turn failed: slot=%s run_id=%s",
             slot.key,
             run_id,
         )
+        # Only text Kiro Crew wrote for a person (a throttle's "wait and retry")
+        # is shown; anything else is internal detail and stays in the log. Not
+        # `is_user_worded_failure`: it drops transient errors, and a throttle
+        # that outlasted its retries is one.
         _broadcast(
             role="assistant",
-            content="(side conversation failed — see server logs)",
+            content=(
+                redact(str(exc))
+                if isinstance(exc, AcpError) and exc.user_worded
+                else "(side conversation failed — see server logs)"
+            ),
             is_error=True,
             final=True,
         )
@@ -984,14 +1027,26 @@ async def api_side_open(request: web.Request) -> web.Response:
     )
 
 
-def _wire_side_row(entry: dict[str, Any]) -> dict[str, Any]:
-    """One stored side row as ``GET .../side`` returns it, redacted like its frame."""
+@redaction_seams.in_seam(redaction_seams.CHAT)
+def _wire_side_row(entry: dict[str, Any], workspace: str | None = None) -> dict[str, Any]:
+    """One stored side row as ``GET .../side`` returns it, redacted like its frame.
+
+    An answer carries the blocked-link records of its text under the hosts allowed
+    in *workspace*, as its final frame does.
+    """
     row: dict[str, Any] = {
         "id": entry.get("id", ""),
         "role": entry.get("role", ""),
         "content": redact(entry.get("content", "") or ""),
         "ts": entry.get("ts", ""),
     }
+    if row["role"] == "assistant":
+        # Body-scope import, for the cycle ``api_side_turn`` explains.
+        from kiro_crew.dashboard.chat_utils import blocked_links_for_workspace
+
+        records = blocked_links_for_workspace(row["content"], workspace)
+        if records:
+            row["link_blocks"] = records
     if entry.get("run_id"):
         row["run_id"] = entry["run_id"]
     if entry.get("steer"):
@@ -1042,7 +1097,7 @@ async def api_side_state(request: web.Request) -> web.Response:
             # The busy gate ``api_side_turn`` applies, so the panel offers steer and
             # queue exactly when a submit would get them.
             "running": side.turn_in_flight,
-            "messages": [_wire_side_row(entry) for entry in side.messages],
+            "messages": [_wire_side_row(entry, slot.workspace) for entry in side.messages],
             "queue": [
                 {
                     "id": entry["id"],
@@ -1137,14 +1192,14 @@ async def api_side_turn(request: web.Request) -> web.Response:
         return own
 
     if not request.body_exists:
-        return web.json_response({"error": "missing JSON body"}, status=400)
+        return web.json_response({"error": "missing JSON body", "code": "invalid_json"}, status=400)
     try:
         body = await request.json()
     except Exception:
-        return web.json_response({"error": "invalid JSON body"}, status=400)
+        return web.json_response({"error": "invalid JSON body", "code": "invalid_json"}, status=400)
     if not isinstance(body, dict):
         return web.json_response(
-            {"error": "body must be a JSON object"},
+            {"error": "body must be a JSON object", "code": "body_not_object"},
             status=400,
         )
 

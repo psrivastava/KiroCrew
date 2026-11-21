@@ -14,7 +14,7 @@ catch a regression rather than in the direction that restates the code.
   ...)``, ``mock.patch("kiro_crew.apps.backend....")`` and ``bmod._processes.clear()``
   sites rely on.
 * The owners form one acyclic stack under the facade and none imports it. The
-  constructs repository guards pin to ``backend.py`` stay there, and exactly four call
+  constructs repository guards pin to ``backend.py`` stay there, and exactly seven call
   sites reach them through ``backend_runtime._facade()`` at call time.
 * No test patches a forwarded name with ``create=True``, the one spelling the facade
   cannot undo.
@@ -41,6 +41,7 @@ from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest import mock
 
+import composition_contract_checks
 import pytest
 
 from kiro_crew.apps import backend
@@ -83,13 +84,12 @@ PARTS: tuple[ModuleType, ...] = (
 
 #: The backend's module-level surface: every name the one-module ``backend.py`` bound,
 #: dunders excluded. A name leaves this list only when the symbol it names is
-#: deliberately deleted.
+#: deliberately deleted; a name added since needs no line here.
 FROZEN_NAMES: tuple[str, ...] = (
     "ActivationVerdict",
     "Any",
     "AppProcess",
     "ContextVar",
-    "DEV_FLEET_APP_NAME",
     "GOVERNANCE_ERROR_REASON",
     "HealthProbeOutcome",
     "Iterator",
@@ -106,7 +106,6 @@ FROZEN_NAMES: tuple[str, ...] = (
     "REQUIREMENTS_TXT_MAX_BYTES",
     "UTF8_TEXT",
     "_BOOT_SPAWN_MAX_WORKERS",
-    "_BUILD_CAPABLE_APPS",
     "_BackendShutdownEvent",
     "_DEPS_ABI_NAME",
     "_DEPS_PIP_STDERR_TAIL",
@@ -117,7 +116,6 @@ FROZEN_NAMES: tuple[str, ...] = (
     "_DEPS_STAGING_SWEEP_RE",
     "_DEPS_STAMP_MAX_BYTES",
     "_DEPS_STAMP_NAME",
-    "_DEV_FLEET_DEFERRED",
     "_HEALTH_CHECK_INTERVAL",
     "_HEALTH_CHECK_RETRIES",
     "_HEALTH_CHECK_TIMEOUT",
@@ -151,6 +149,7 @@ FROZEN_NAMES: tuple[str, ...] = (
     "_app_enabled_state",
     "_audit_provision_failure",
     "_await_inflight_spawn",
+    "_bundled_pip_wheel",
     "_capped_spill",
     "_capture_adopted_owners",
     "_claim_port",
@@ -164,6 +163,7 @@ FROZEN_NAMES: tuple[str, ...] = (
     "_deps_tree_stamp_current",
     "_drain_exited_root_tree",
     "_drop_disabled_app_resources",
+    "_exec_backend_windows_refusal_text",
     "_find_free_port",
     "_find_node_binary",
     "_find_npm_binary",
@@ -179,6 +179,7 @@ FROZEN_NAMES: tuple[str, ...] = (
     "_health_warn_lock",
     "_is_asgi_entry",
     "_is_shell_entry",
+    "_keep_down",
     "_lifecycle_generation",
     "_listening_pids",
     "_lock",
@@ -199,6 +200,7 @@ FROZEN_NAMES: tuple[str, ...] = (
     "_provision_app_deps_locked",
     "_read_installed",
     "_read_pidfile",
+    "_read_pidfile_for_update",
     "_reap_orphaned_backend_group",
     "_reap_stale_app_backends",
     "_rebind_adopted_owners",
@@ -236,7 +238,10 @@ FROZEN_NAMES: tuple[str, ...] = (
     "annotations",
     "app_admission_denied",
     "app_backend_lifecycle_flock",
+    "app_backend_secret_mask_targets",
     "app_backend_visible_targets",
+    "app_declared_mask_targets",
+    "app_declared_readonly_targets",
     "app_deps_dir",
     "app_dir",
     "app_enabled_state",
@@ -248,6 +253,7 @@ FROZEN_NAMES: tuple[str, ...] = (
     "config_dir",
     "contextlib",
     "dataclass",
+    "exec_backend_platform_refusal",
     "field",
     "file_entry_point_refusal",
     "get_app_backend_port",
@@ -282,6 +288,7 @@ FROZEN_NAMES: tuple[str, ...] = (
     "resolve_app_python",
     "retire_windows_app_tracking",
     "run_limited",
+    "revive_lost_app_backends",
     "running_spawned_backend_pids",
     "sel",
     "shipped_builtin_app_root",
@@ -294,7 +301,6 @@ FROZEN_NAMES: tuple[str, ...] = (
     "spawned_backend_owner",
     "spawned_backend_owns_pid",
     "start_app_backend",
-    "start_deferred_app_backends",
     "start_enabled_app_backends",
     "stat",
     "stop_app_backend",
@@ -319,6 +325,8 @@ FACADE_CALL_SITES: frozenset[tuple[str, str, str]] = frozenset(
         ("stale_reap", "_reap_stale_app_backends", "_pid_alive"),
         ("restart", "_restart_exited_backend", "_start_app_backend"),
         ("restart", "_restart_exited_backend", "_starting_reservation"),
+        ("restart", "revive_lost_app_backends", "_start_app_backend"),
+        ("restart", "revive_lost_app_backends", "exec_backend_platform_refusal"),
         ("startup", "_start_backends_concurrently", "start_app_backend"),
     }
 )
@@ -344,6 +352,8 @@ FACADE_RESIDENTS: frozenset[str] = frozenset(
         "_find_npm_binary",
         "_is_asgi_entry",
         "_is_shell_entry",
+        "_exec_backend_windows_refusal_text",
+        "exec_backend_platform_refusal",
         "_shebang_argv",
         "_abi_shebang_of",
         "_deps_boot_path",
@@ -365,7 +375,7 @@ GUARDED_FACADE_TEXT: tuple[tuple[str, str], ...] = (
     ("test_dev_fleet_app.py", '"KIROCREW_PROJECT_DIR"'),
     ("test_sandbox_dev_fleet_live_target.py", "_shipped_md_notebook"),
     ("test_app_bridges.py", "resolve_app_python("),
-    ("test_app_backend_spawn_env.py", '_platform_extra["KIROCREW_DEVFLEET_REPO"]'),
+    ("test_app_backend_spawn_env.py", "_host_grants.backend_env_names()"),
 )
 
 #: Text the same guards require to be ABSENT from the facade's source. They read only
@@ -379,7 +389,6 @@ FORBIDDEN_BACKEND_TEXT: tuple[tuple[str, str], ...] = (
 #: Names the owners rebind with ``global``, and the one module that may hold each.
 GLOBAL_REBINDS: dict[str, ModuleType] = {
     "_warned_unconfined_cache": backend,
-    "_DEV_FLEET_DEFERRED": startup,
 }
 
 _ABSENT = object()
@@ -483,15 +492,10 @@ def clean_tables() -> Iterator[None]:
             table.update(before)
 
 
-# ---------------------------------------------------------------------------
 # The surface
-# ---------------------------------------------------------------------------
 
 
-class TestTheSurfaceSurvivesTheSplit:
-    def test_the_frozen_inventory_is_not_empty(self) -> None:
-        # An emptied list would make the case below pass while checking nothing.
-        assert len(FROZEN_NAMES) > 200
+class TestTheSurfaceSurvivesTheSplit(composition_contract_checks.TheFrozenInventoryIsNotEmpty):
 
     @pytest.mark.parametrize("name", FROZEN_NAMES)
     def test_every_name_the_module_bound_still_resolves_to_its_owners_object(
@@ -548,15 +552,23 @@ class TestTheSurfaceSurvivesTheSplit:
     def test_dir_lists_the_exported_names(self) -> None:
         assert set(FROZEN_NAMES) <= set(dir(backend))
 
-    def test_a_star_import_carries_exactly_the_public_names_of_the_inventory(
+    def test_a_star_import_carries_exactly_the_public_names_of_the_family(
         self, tmp_path: Path
     ) -> None:
         # ``__all__`` is derived, and a star import consults it and never the module
         # ``__getattr__``. The machinery binds only private names, so nothing it needs
         # leaks into a star importer's namespace and nothing public goes missing. The
-        # star import runs in a real module loaded from ``tmp_path``, the one place a
-        # star import is legal.
-        public = {name for name in FROZEN_NAMES if not name.startswith("_")}
+        # public names are read from the facade's and the owners' own namespaces, so a
+        # new public name needs no edit here, and every public name of the inventory is
+        # among them. The star import runs in a real module loaded from ``tmp_path``,
+        # the one place a star import is legal.
+        public = {
+            name
+            for module in (backend, *PARTS)
+            for name in vars(module)
+            if not name.startswith("_")
+        }
+        assert {name for name in FROZEN_NAMES if not name.startswith("_")} <= public
         assert set(backend.__all__) == public
         probe_path = tmp_path / "backend_star_probe.py"
         probe_path.write_text("from kiro_crew.apps.backend import *\n", encoding="utf-8")
@@ -620,9 +632,7 @@ class TestTheSurfaceSurvivesTheSplit:
         assert callers == {provisioning.__name__}
 
 
-# ---------------------------------------------------------------------------
 # One symbol per name, and writes that reach every binding of it
-# ---------------------------------------------------------------------------
 
 #: An exported name several owners import: defined in ``probe``.
 _MULTI_HOLDER = "_health_probe"
@@ -778,9 +788,7 @@ class TestOneNamespaceForWrites:
         assert backend.logger.name == backend.__name__ == "kiro_crew.apps.backend"
 
 
-# ---------------------------------------------------------------------------
 # A patch on the facade reaches the call site in whichever owner makes the call
-# ---------------------------------------------------------------------------
 
 
 class _Sel:
@@ -927,9 +935,7 @@ class TestAPatchOnTheFacadeReachesEveryCallSite:
         assert backend.start_app_backend("body-app") is record
 
 
-# ---------------------------------------------------------------------------
 # Every global a backend function reads is one a facade write reaches
-# ---------------------------------------------------------------------------
 
 
 def _function_global_reads(module: ModuleType) -> list[tuple[str, str]]:
@@ -982,9 +988,7 @@ class TestEverySeamReachesItsCallSite:
         assert ("_start_app_backend_body", "_warned_unconfined_cache") in facade_reads
 
 
-# ---------------------------------------------------------------------------
 # Layering and placement
-# ---------------------------------------------------------------------------
 
 
 def _engine_imports(source: str) -> set[str]:
@@ -1031,7 +1035,7 @@ def _facade_reads(source: str) -> set[tuple[str, str]]:
     return found
 
 
-class TestLayering:
+class TestLayering(composition_contract_checks.TheFacadeHelperIsOnlyEverCalledInPlace):
     def test_the_import_reader_sees_every_spelling_of_an_engine_import(self) -> None:
         # A reader that saw only absolute module strings would pass an owner importing
         # the facade lazily or relatively, which is the violation it exists to catch.
@@ -1075,24 +1079,6 @@ class TestLayering:
                 if isinstance(node, ast.Constant) and isinstance(node.value, str)
             }
             assert backend.__name__ not in constants, f"{part.__name__} spells the facade"
-
-    def test_the_facade_helper_is_only_ever_called_in_place(self) -> None:
-        # An alias (``f = _facade``) or a stored module would hide a sixth call site
-        # from the reader above, so every reference to ``_facade`` in an owner is its
-        # import or the callee of a call.
-        for part in PARTS:
-            tree = ast.parse(_source(part))
-            callees = {
-                id(node.func)
-                for node in ast.walk(tree)
-                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-            }
-            stray = [
-                node.lineno
-                for node in ast.walk(tree)
-                if isinstance(node, ast.Name) and node.id == "_facade" and id(node) not in callees
-            ]
-            assert stray == [], f"{part.__name__} refers to _facade at lines {stray}"
 
     def test_the_call_site_reader_can_fail(self) -> None:
         assert _facade_reads("def f():\n    return _facade()._pid_alive(1)\n") == {
@@ -1144,9 +1130,7 @@ class TestLayering:
         assert importlib.import_module(backend._PART_MODULES[0]) is tracking
 
 
-# ---------------------------------------------------------------------------
 # The facade's own code, as a type checker and a patched importlib see it
-# ---------------------------------------------------------------------------
 
 
 def _bare_loads(source: str) -> list[tuple[int, str]]:
@@ -1269,9 +1253,7 @@ class TestTheFacadesOwnCode:
         assert started == ["resolve-app"]
 
 
-# ---------------------------------------------------------------------------
 # A reload of the facade re-executes the whole backend
-# ---------------------------------------------------------------------------
 
 _RELOAD_PROBE = """
 import importlib, json, sys

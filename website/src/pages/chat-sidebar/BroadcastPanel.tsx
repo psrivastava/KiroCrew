@@ -16,7 +16,7 @@ import { Btn } from '../../components/ui'
 import SimpleSelect from '../../components/SimpleSelect'
 import { sendTurn } from '../../chat-core/transport/sendTurn'
 import { i18nT } from '../../i18n/t'
-import { fmtRelative } from '../../i18n/format'
+import { fmtRelative, joinSentences } from '../../i18n/format'
 import {
   BROADCAST_STATES, PRESET_STATES, broadcastTargets, deliveryFor, sendSteers,
   type BroadcastContext, type BroadcastCriteria, type BroadcastPreset, type BroadcastSlot, type BroadcastState, type CrewmateMode,
@@ -25,6 +25,7 @@ import type { ChatFolder, ChatTag } from '../../types'
 import { laneExtrasFor, type LaneSignals } from './board'
 import { DisclosureChevron } from './chrome'
 import type { AgentInfo, Slot } from './types'
+import { RadioChipGroup, radioChip } from '../../components/RadioChipGroup'
 
 const PRESETS: readonly Exclude<BroadcastPreset, 'custom'>[] = ['loop', 'running', 'waiting', 'all']
 const CREW_MODES: readonly CrewmateMode[] = ['only', 'include', 'exclude']
@@ -221,7 +222,7 @@ export default function BroadcastPanel({ slots: rowSlots, folders, tags, agents,
     const parts: string[] = []
     if (failed > 0) parts.push(i18nT('pages.chatSidebar.broadcast_failed_some', { n: failed }))
     if (unknown > 0) parts.push(i18nT('pages.chatSidebar.broadcast_unknown_some', { n: unknown }))
-    setError(parts.join(' '))
+    setError(joinSentences(parts))
   }
 
   return (
@@ -244,27 +245,28 @@ export default function BroadcastPanel({ slots: rowSlots, folders, tags, agents,
       />
 
       <div className="text-[11px] text-muted mb-1">{i18nT('pages.chatSidebar.broadcast_send_to')}</div>
-      <div className="flex flex-wrap gap-1 mb-2" role="group" aria-label={i18nT('pages.chatSidebar.broadcast_send_to')}>
+      <RadioChipGroup className="flex flex-wrap gap-1 mb-2" ariaLabel={i18nT('pages.chatSidebar.broadcast_send_to')}>
         {PRESETS.map(p => (
-          <Btn key={p} data-testid={`broadcast-preset-${p}`} aria-pressed={preset === p} className={chipCls(preset === p)} onClick={() => pickPreset(p)}>
+          <Btn key={p} type="button" data-testid={`broadcast-preset-${p}`} {...radioChip(preset === p)} className={chipCls(preset === p)} onClick={() => pickPreset(p)}>
             {i18nT(PRESET_KEYS[p])} · {presetCount(p)}
           </Btn>
         ))}
-        <Btn data-testid="broadcast-preset-custom" aria-pressed={preset === 'custom'} className={chipCls(preset === 'custom')} onClick={() => pickPreset('custom')}>
+        <Btn type="button" data-testid="broadcast-preset-custom" {...radioChip(preset === 'custom')} className={chipCls(preset === 'custom')} onClick={() => pickPreset('custom')}>
           {i18nT('pages.chatSidebar.broadcast_preset_custom')}
         </Btn>
-      </div>
+      </RadioChipGroup>
 
       <div className="text-[11px] text-muted mb-1">{i18nT('pages.chatSidebar.broadcast_crewmates')}</div>
       {/* One segmented control: three equal cells inside a shared border, so
           the row never grows past the panel and a long label truncates
           instead of wrapping onto a second line. */}
-      <div className="flex mb-2 rounded-md border border-border overflow-hidden" role="group" aria-label={i18nT('pages.chatSidebar.broadcast_crewmates')}>
+      <RadioChipGroup className="flex mb-2 rounded-md border border-border overflow-hidden" ariaLabel={i18nT('pages.chatSidebar.broadcast_crewmates')}>
         {CREW_MODES.map(m => (
           <Btn
             key={m}
+            type="button"
             data-testid={`broadcast-crew-${m}`}
-            aria-pressed={crewmates === m}
+            {...radioChip(crewmates === m)}
             title={i18nT(CREW_KEYS[m])}
             className={`flex-1 min-w-0 justify-center rounded-none border-0 border-e border-border last:border-e-0 px-1 py-1 text-[12px] ${crewmates === m ? 'bg-accent text-accent-fg hover:bg-accent-hover' : ''}`}
             onClick={() => setCrewmates(m)}
@@ -272,7 +274,7 @@ export default function BroadcastPanel({ slots: rowSlots, folders, tags, agents,
             <span className="truncate">{i18nT(CREW_KEYS[m])}</span>
           </Btn>
         ))}
-      </div>
+      </RadioChipGroup>
 
       <Btn
         data-testid="broadcast-custom-toggle"

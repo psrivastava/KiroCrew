@@ -27,14 +27,22 @@ from aiohttp import web
 import kiro_crew
 from kiro_crew import platform_compat
 from kiro_crew.config.loader import KiroCrewConfig
-from kiro_crew.config.paths import config_dir
+from kiro_crew.config.paths import config_dir, data_home
+from kiro_crew.dashboard import system_windows_probes
 from kiro_crew.dashboard.state import (
     DashboardState,
 )
-from kiro_crew.dashboard.status_counts import cached_status_snapshot
-from kiro_crew.embeddings import get_shared_embedder, model_file_present
+from kiro_crew.dashboard.status_counts import cached_status_snapshot, yolo_grant_fields
+from kiro_crew.embeddings import (
+    _load_llama_class,
+    _platform_libs_dirname,
+    get_shared_embedder,
+    model_file_present,
+    ollama_backend_selected,
+)
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.loop_lock import LoopBoundLock
+from kiro_crew.owner_only_files import restrict_file_to_owner_soft
 from kiro_crew.platform import current_context
 from kiro_crew.safety_override import (
     cached_disabled_approval_modes,
@@ -157,7 +165,7 @@ def _get_telemetry_salt() -> bytes:
             os.write(tmp_fd, salt)
             os.close(tmp_fd)
             tmp_fd = -1
-            platform_compat.chmod_safe(tmp_path, 0o600)
+            restrict_file_to_owner_soft(tmp_path)  # the hard link shares the DACL
             os.link(tmp_path, str(salt_file))
             return salt
         except FileExistsError:
@@ -243,7 +251,6 @@ async def api_status(request: web.Request) -> web.Response:
             owner_hash = await loop.run_in_executor(None, _get_owner_hash, state)
         except Exception:
             owner_hash = "unknown"
-    so_status = safety_override().status()
     # Off-loop: the duration values hit the filesystem (see _yolo_duration_fields).
     yolo_duration, until_shutdown_ok, disabled_approval_modes = await asyncio.to_thread(
         _yolo_duration_fields
@@ -251,6 +258,12 @@ async def api_status(request: web.Request) -> web.Response:
     # Off-loop for the same reason: the RSS read is procfs I/O on Linux and the
     # ceiling is a config read.
     gateway_rss_mb, watchdog_rss_max_mb = await asyncio.to_thread(_gateway_memory_fields)
+    # Off-loop: a few stat calls under the data home. The Settings page and the
+    # New Bot dialog read it to say when another account owns the files.
+    from kiro_crew.data_home_owner import check_data_home
+
+    data_home_access = (await asyncio.to_thread(check_data_home, data_home())).to_json()
+    map_writes_refused = bool(state.sessions._session_map.writes_refused())
     data.update(
         {
             "uptime_secs": int(uptime),
@@ -267,14 +280,17 @@ async def api_status(request: web.Request) -> web.Response:
             # operator opening the System page.
             "gateway_rss_mb": gateway_rss_mb,
             "watchdog_rss_max_mb": watchdog_rss_max_mb,
-            "yolo": so_status.active,
-            "yolo_active": so_status.active,
-            "yolo_expires_at": so_status.expires_at_iso or "",
-            "yolo_remaining_secs": so_status.remaining_secs,
-            # True when the live grant has no timed expiry at all (declared in
-            # config, or ad-hoc under yolo_duration: until_shutdown).
-            # ``yolo_remaining_secs`` is -1 and ``yolo_expires_at`` empty then.
-            "yolo_until_shutdown": so_status.permanent,
+            "data_home_access": data_home_access,
+            # Why session-map writes fail after an unreadable startup read, and the fix.
+            "session_map_writes_refused": map_writes_refused,
+            "session_map_remedy": (
+                "session_map.json could not be read at startup, so its chat and channel"
+                " bindings are not loaded and no change to the map is saved; restart the"
+                " gateway once the file is readable"
+                if map_writes_refused
+                else ""
+            ),
+            **yolo_grant_fields(),
             # The configured ad-hoc duration, and whether policy allows the
             # no-timed-expiry option — the Settings card lock-badges it when not.
             "yolo_duration": yolo_duration,
@@ -325,6 +341,7 @@ def _get_static_system_info() -> dict[str, object]:
             if real_arch == "1":
                 arch = "arm64 (Apple Silicon)"
         except Exception:
+            # Not Apple Silicon, or no answer: keep the arch as reported.
             pass
 
     info: dict[str, object] = {
@@ -355,8 +372,15 @@ def _get_static_system_info() -> dict[str, object]:
             with open("/proc/meminfo") as f:
                 for line in f:
                     if line.startswith("MemTotal:"):
-                        kb = int(line.split()[1])
-                        info["mem_total_gb"] = round(kb / (1024**2), 1)
+                        total_bytes = int(line.split()[1]) * 1024
+                        from kiro_crew.dashboard import session_transfer
+
+                        limit, _headroom = session_transfer._cgroup_memory_bounds(
+                            measured_only=True
+                        )
+                        if limit is not None:
+                            total_bytes = min(total_bytes, limit)
+                        info["mem_total_gb"] = round(total_bytes / (1024**3), 1)
                         break
                 else:
                     logger.warning("/proc/meminfo has no MemTotal line; mem_total_gb unavailable")
@@ -485,6 +509,9 @@ def _scan_mcp_processes() -> dict[str, object]:
               image. The final cmdline becomes "kiro-cli ..." and the
               "kirocrew_sandbox" string (only in the -f path arg) is lost.
               Sandbox count will be 0 even when sandboxes are running.
+      Windows: process command lines read in this process, a Toolhelp snapshot
+              plus NtQueryInformationProcess (``system_windows_probes``), since
+              there is no ``ps`` or ``/proc``.
     """
     try:
         _my = os.getpid()
@@ -507,6 +534,21 @@ def _scan_mcp_processes() -> dict[str, object]:
                         _seen.add(d)
                 except OSError:
                     pass
+        elif sys.platform == "win32":
+            _win_sigs = {"kirocrew_sandbox": "sandbox", "kiro-cli": "kiro_cli"}
+            rows = system_windows_probes.windows_process_command_lines(tuple(_win_sigs))
+            for pid, cmd in rows or ():
+                if pid == _my:
+                    continue
+                matched = False
+                # The reader matches case-insensitively, so this check does too.
+                folded = cmd.lower()
+                for sig, key in _win_sigs.items():
+                    if sig in folded:
+                        _counts[key] += 1
+                        matched = True
+                if matched:
+                    _seen.add(str(pid))
         else:
             _sigs = {
                 "kirocrew_sandbox": "sandbox",
@@ -517,6 +559,7 @@ def _scan_mcp_processes() -> dict[str, object]:
                     ["ps", "-eo", "pid,command"],
                     timeout=5,
                     text=True,
+                    encoding="utf-8",
                 )
                 for line in out.splitlines():
                     parts = line.split(None, 1)
@@ -533,6 +576,7 @@ def _scan_mcp_processes() -> dict[str, object]:
                     if matched:
                         _seen.add(pid_s.strip())
             except Exception:
+                # A host where ``ps`` fails reports zero processes rather than an error.
                 pass
         return {"mcp_processes": _counts, "mcp_total": len(_seen)}
     except Exception:
@@ -639,17 +683,13 @@ def _collect_system_metrics() -> dict[str, object]:
                 # with large dentry/inode caches). Fall back to the estimate
                 # (now including SReclaimable) on kernels without MemAvailable.
                 if "MemAvailable" in meminfo:
-                    mem_free = round(meminfo["MemAvailable"] / (1024**2), 1)
+                    free_kb = meminfo["MemAvailable"]
                 else:
-                    mem_free = round(
-                        (
-                            meminfo.get("MemFree", 0)
-                            + meminfo.get("Buffers", 0)
-                            + meminfo.get("Cached", 0)
-                            + meminfo.get("SReclaimable", 0)
-                        )
-                        / (1024**2),
-                        1,
+                    free_kb = (
+                        meminfo.get("MemFree", 0)
+                        + meminfo.get("Buffers", 0)
+                        + meminfo.get("Cached", 0)
+                        + meminfo.get("SReclaimable", 0)
                     )
                 # A /proc/meminfo with no MemTotal line is a probe that read
                 # nothing usable, not a 0 GB host, and a total defaulted to 0
@@ -658,7 +698,17 @@ def _collect_system_metrics() -> dict[str, object]:
                 # tolerates the absent shape) and say so.
                 total_kb = meminfo.get("MemTotal", 0)
                 if total_kb > 0:
-                    mem_total = round(total_kb / (1024**2), 1)
+                    total_bytes, free_bytes = total_kb * 1024, free_kb * 1024
+                    from kiro_crew.dashboard import session_transfer
+
+                    limit, headroom = session_transfer._cgroup_memory_bounds(measured_only=True)
+                    if limit is not None:
+                        total_bytes = min(total_bytes, limit)
+                        if headroom is not None:
+                            free_bytes = min(free_bytes, headroom)
+                        free_bytes = min(free_bytes, total_bytes)
+                    mem_total = round(total_bytes / (1024**3), 1)
+                    mem_free = round(free_bytes / (1024**3), 1)
                     data["mem_total_gb"] = mem_total
                     data["mem_free_gb"] = mem_free
                     data["mem_used_gb"] = round(mem_total - mem_free, 1)
@@ -675,6 +725,7 @@ def _collect_system_metrics() -> dict[str, object]:
         data["load_5m"] = round(load5, 2)
         data["load_15m"] = round(load15, 2)
     except Exception:
+        # No load average on this OS (Windows): the fields are left out.
         pass
     # Prefer the /proc/stat interval delta (no subprocess, counts iowait+steal);
     # fall back to the ps lifetime-average on non-Linux or the first sample.
@@ -714,6 +765,11 @@ def _collect_system_metrics() -> dict[str, object]:
                         tx_total += int(parts[9])
                     except (ValueError, IndexError):
                         pass
+        elif sys.platform == "win32":
+            octets = system_windows_probes.windows_network_octets()
+            if octets is None:
+                raise OSError("interface counters unavailable")
+            rx_total, tx_total = octets
         else:
             with open("/proc/net/dev") as f:
                 for line in f:
@@ -730,14 +786,17 @@ def _collect_system_metrics() -> dict[str, object]:
         if _prev_net["ts"] > 0:
             dt = now - _prev_net["ts"]
             if dt > 0.1:
-                _net_speed["rx_kbs"] = round(((rx_mb - _prev_net["rx"]) * 1024) / dt, 1)
-                _net_speed["tx_kbs"] = round(((tx_mb - _prev_net["tx"]) * 1024) / dt, 1)
-        _prev_net["rx"] = rx_mb
-        _prev_net["tx"] = tx_mb
+                # Raw byte counts, not the rounded MB totals: a 0.1 MB step
+                # would hide any rate below 0.1 MB per poll interval.
+                _net_speed["rx_kbs"] = round((rx_total - _prev_net["rx"]) / 1024 / dt, 1)
+                _net_speed["tx_kbs"] = round((tx_total - _prev_net["tx"]) / 1024 / dt, 1)
+        _prev_net["rx"] = rx_total
+        _prev_net["tx"] = tx_total
         _prev_net["ts"] = now
         data["net_rx_kbs"] = max(0, _net_speed["rx_kbs"])
         data["net_tx_kbs"] = max(0, _net_speed["tx_kbs"])
     except Exception:
+        # No readable interface counters: the network fields are left out.
         pass
 
     # Disk — cross-platform (shutil.disk_usage works on all platforms)
@@ -746,6 +805,7 @@ def _collect_system_metrics() -> dict[str, object]:
         data["disk_total_gb"] = round(disk_total_v / (1024**3), 1)
         data["disk_free_gb"] = round(disk_free_v / (1024**3), 1)
     except Exception:
+        # A failed disk read leaves its fields out; the other metrics still report.
         pass
 
     # Process monitoring
@@ -787,10 +847,20 @@ def _collect_system_metrics() -> dict[str, object]:
     # now (no external server), so report functional availability instead of a
     # separate PID. Field names ollama_running/ollama_remote are kept for
     # frontend compatibility. "Running" = embeddings are usable: the model file
-    # is present (it lazy-loads into memory on first embed) or already loaded.
+    # is present (it lazy-loads into memory on first embed) or already loaded,
+    # and the vendored llama.cpp import has not failed on a platform that ships
+    # it. That failure is cached for the life of the process, so the model never
+    # loads; the check is api_memory_embedding_status's, so both surfaces agree.
     try:
         embedder = get_shared_embedder()
-        data["ollama_running"] = model_file_present() or embedder.is_ready()
+        if ollama_backend_selected():
+            # An Ollama server makes the vectors; the vendored runtime and the
+            # GGUF file are not in use, so only the server probe counts.
+            runtime_failed, usable = False, embedder.is_ready()
+        else:
+            runtime_failed = _load_llama_class() is None and _platform_libs_dirname() is not None
+            usable = model_file_present() or embedder.is_ready()
+        data["ollama_running"] = usable and not runtime_failed
         data["ollama_remote"] = False
         data["embedding_model_loaded"] = embedder.is_ready()
     except Exception:

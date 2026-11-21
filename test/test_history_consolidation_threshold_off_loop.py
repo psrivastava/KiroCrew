@@ -1,13 +1,8 @@
 """The consolidation row counts never read the transcript on the loop.
 
-``HistoryConsolidator.maybe_consolidate`` runs on the gateway event loop after
-every completed turn, and ``check_idle_sessions`` on every sweep. The turn that
-just ended moved the transcript, so the message cache misses there, and counting
-rows on the loop meant a full read and JSON decode of the whole file. These
-tests pin that both counts go through one worker-thread counter (the streaming
-``_count_messages``, which never takes the writer lock and fills no cache), that
-every whole-transcript read is made in bounded chunks with the exact rows a
-whole-file read gives, and that one transcript has at most one count in flight.
+After a turn the message cache misses, so a count on the loop would decode the whole
+file. Both counts go through the streaming worker-thread ``_count_messages`` (no writer
+lock, no cache fill), reads are chunked yet exact, and one count runs per transcript.
 """
 
 from __future__ import annotations
@@ -67,6 +62,8 @@ def _consolidator(log: ConversationLog) -> HistoryConsolidator:
 async def _settle(c: HistoryConsolidator) -> None:
     while c._tasks:
         await asyncio.gather(*list(c._tasks))
+        # A gather of done tasks does not yield; let their _tasks.discard run.
+        await asyncio.sleep(0)
 
 
 async def _until(predicate, what: str) -> None:
@@ -96,7 +93,7 @@ class _Spy:
         monkeypatch.setattr(ConversationLog, name, _spy)
 
 
-# ---------------------------------------------------------------- the counter
+# the counter
 
 
 @pytest.mark.asyncio
@@ -139,7 +136,9 @@ async def test_the_threshold_fires_at_exactly_the_threshold(tmp_path):
         c.maybe_consolidate(KEY)
         await _settle(c)
 
-    run.assert_awaited_once_with(KEY, include_history=False)
+    run.assert_awaited_once()
+    assert run.await_args.args == (KEY,)
+    assert run.await_args.kwargs["include_history"] is False
     assert c._prefs_offset[KEY] == THRESHOLD
     assert not c._counting
 
@@ -428,8 +427,9 @@ async def test_a_turn_inside_the_retry_deadline_counts_nothing(tmp_path, monkeyp
     """After a restart ``_prefs_offset`` is 0, so only the deadline stops a count per turn."""
     log = _log(tmp_path)
     await _append(log, THRESHOLD + 5)
-    with history_mod.allow_on_loop_persist():
-        log.update_metadata(KEY, {"consolidation_attempts": 1, "consolidation_retry_at": 4e9})
+    await asyncio.to_thread(
+        log.update_metadata, KEY, {"consolidation_attempts": 1, "consolidation_retry_at": 4e9}
+    )
     c = _consolidator(log)
     counts = _Spy(monkeypatch, "_count_messages")
 
@@ -469,7 +469,7 @@ async def test_a_deadline_armed_after_the_turn_check_is_caught_in_the_thread(tmp
     assert not c._counting
 
 
-# ------------------------------------------------------------ the idle sweep
+# the idle sweep
 
 
 def _idle(c: HistoryConsolidator, key: str = KEY) -> None:
@@ -517,7 +517,9 @@ async def test_the_idle_sweep_counts_through_the_same_claim(tmp_path, monkeypatc
         await _settle(c)
 
     assert held.peak == 1
-    run.assert_awaited_once_with(KEY, include_history=False)
+    run.assert_awaited_once()
+    assert run.await_args.args == (KEY,)
+    assert run.await_args.kwargs["include_history"] is False
 
 
 @pytest.mark.asyncio
@@ -526,8 +528,7 @@ async def test_a_fully_consolidated_idle_key_runs_no_pass_and_is_stamped_clean(
 ):
     log = _log(tmp_path)
     await _append(log, 40)
-    with history_mod.allow_on_loop_persist():
-        log.mark_consolidated(KEY, 40)
+    await asyncio.to_thread(log.mark_consolidated, KEY, 40)
     c = _consolidator(log)
     counts = _Spy(monkeypatch, "_count_messages")
     _idle(c)
@@ -546,8 +547,9 @@ async def test_a_key_inside_its_retry_deadline_schedules_no_count(tmp_path):
     log = _log(tmp_path)
     await _append(log, 3)
     c = _consolidator(log)
-    with history_mod.allow_on_loop_persist():
-        log.update_metadata(KEY, {"consolidation_attempts": 1, "consolidation_retry_at": 4e9})
+    await asyncio.to_thread(
+        log.update_metadata, KEY, {"consolidation_attempts": 1, "consolidation_retry_at": 4e9}
+    )
     _idle(c)
 
     c.check_idle_sessions()
@@ -573,7 +575,7 @@ async def test_a_refused_idle_pass_sets_no_throttle(tmp_path):
     assert KEY not in c._history_consolidated
 
 
-# ------------------------------------------------------------- the chunks
+# the chunks
 
 
 def _reference_rows(raw: str) -> list[dict]:

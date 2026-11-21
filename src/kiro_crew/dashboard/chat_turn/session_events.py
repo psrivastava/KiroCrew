@@ -1,20 +1,24 @@
 """What a dashboard turn's session reports about itself mid-turn: a compaction's progress
 (``_on_compaction_status``), a native clear (``_on_clear_status``), an agent switch
-(``_on_agent_switched``) and its todo list (``_on_todo_update``)."""
+(``_on_agent_switched``), its todo list (``_on_todo_update``) and a notice its harness
+reported (``_on_harness_notice``, with the end-of-turn ``_finish_harness_notices``)."""
 
 from __future__ import annotations
 
 import asyncio
 from typing import TYPE_CHECKING, Literal
 
+from kiro_crew.agent_sdk.drivers.acp_vocab import NOTICE_KIND_ADAPTER
 from kiro_crew.crew_mode import slot_is_crew_mode_root as crew_mode_is_root
 from kiro_crew.dashboard.chat_utils import (
     _broadcast_compaction_result,
     drained_to_thread,
     has_leaked_tool_call,
 )
+from kiro_crew.dashboard.harness_notice_rows import notice_row
 from kiro_crew.dashboard.state import durable_row_count
 from kiro_crew.platform import redact_log_via_context
+from kiro_crew.runtime_ownership import is_shared_chat_runtime
 from kiro_crew.security import redact
 
 if TYPE_CHECKING:
@@ -28,7 +32,11 @@ if TYPE_CHECKING:
         restore_agent_selection,
         sel,
     )
-    from kiro_crew.dashboard.chat_turn.segment_flush import _cleared_segment_text, _flush_segment
+    from kiro_crew.dashboard.chat_turn.segment_flush import (
+        _TOOL_GROUP_ROLES,
+        _cleared_segment_text,
+        _flush_segment,
+    )
     from kiro_crew.dashboard.chat_turn.turn_admission import (
         _current_binding,
         _require_current_binding,
@@ -77,10 +85,14 @@ async def _on_compaction_status(turn: _ChatTurn, event) -> None:
     # notice row, and _flush_segment's cleanup walks back only to the
     # first non-chunk/non-tool row — so flushing after the notice
     # would stop at it and strand this segment's chunk rows as a
-    # duplicate in-memory bubble. Only a segment a cut was deferred
-    # over is finalized here, whether or not its construct has closed
-    # since: that is the text a deferred cut leaves unflushed, and any
-    # other pre-compaction text keeps the plain reset below. The
+    # duplicate in-memory bubble. Any text streamed before the terminal
+    # is finalized here: a harness that compacts on its own can do so
+    # AFTER the model answered (KAS streams the reply, then summarizes,
+    # then its own continuation says the request is done), so that text
+    # is the reply to the prompt, and resetting it would leave the prompt
+    # unanswered. A segment a cut was deferred over is finalized whether or
+    # not its construct has closed since; text that does not start with
+    # that deferred segment keeps the plain reset below. The
     # redactor's withheld tail is emitted first so the wire stream
     # carries the whole segment before the reset discards the
     # buffer. The leaked-call scan reads the accumulator here too,
@@ -88,7 +100,7 @@ async def _on_compaction_status(turn: _ChatTurn, event) -> None:
     if (
         not event.synthesized
         and event.text in ("completed", "failed")
-        and _deferred_cut_text
+        and turn.assistant_text.strip()
         and turn.assistant_text.startswith(_deferred_cut_text)
     ):
         _compaction_dropped_leak = _compaction_dropped_leak or has_leaked_tool_call(
@@ -143,8 +155,24 @@ async def _on_compaction_status(turn: _ChatTurn, event) -> None:
             turn.assistant_text = _cleared_segment_text(slot)
 
 
+def _foreign_shared_clear(turn: _ChatTurn, event) -> bool:
+    """A co-tenant's /clear fanned out by a shared chat runtime, so not ours.
+
+    ``chat_runtime_sharing`` preview: kiro-cli's clear frame names no session,
+    so a shared runtime fans it to every co-tenant marked ``runtime_global``.
+    Unless THIS turn typed /clear, the frame came from a peer.
+    """
+    return (
+        getattr(event, "runtime_global", False)
+        and not turn._this_turn_is_clear
+        and is_shared_chat_runtime(turn.client)
+    )
+
+
 async def _on_clear_status(turn: _ChatTurn, event) -> None:
     """A native clear the session confirms."""
+    if _foreign_shared_clear(turn, event):
+        return
     _replay_accepted_this_turn = turn._replay_accepted_this_turn
     _replay_pending = turn._replay_pending
     _this_turn_is_clear = turn._this_turn_is_clear
@@ -217,6 +245,8 @@ async def _on_clear_status(turn: _ChatTurn, event) -> None:
 
 async def _on_agent_switched(turn: _ChatTurn, event) -> Literal[_Flow.BREAK] | None:
     """An agent switch the session reports mid-turn."""
+    from kiro_crew.dashboard import gateway_notice as gn
+
     _spec_hooks: list
     _spec_hooks_cwd: str | None
     _turn_project = turn._turn_project
@@ -270,9 +300,20 @@ async def _on_agent_switched(turn: _ChatTurn, event) -> Literal[_Flow.BREAK] | N
             f"📌 Agent switch to {new_agent} was blocked — this thread is "
             f"pinned to {pinned_member}. The next turn restarts on the pinned crew.",
             "msg msg-info",
+            meta=gn.gateway_notice_meta(
+                gn.GATEWAY_NOTICE_AGENT_SWITCH_BLOCKED_PINNED,
+                agent=str(new_agent),
+                member=str(pinned_member),
+            ),
         )
         needs_session_reset = True
         turn.needs_session_reset = needs_session_reset
+        # The stream is broken off below with no terminal, so this
+        # turn lands, yet the reset kills a runtime that may still
+        # be mid-answer and the reloaded session may lack the
+        # prompt: a drained merge card goes back to the queue
+        # (``_merge_cards_reached_the_model`` lets a reset before a
+        # real ``end_turn`` win over landing).
         # The vetoed turn DID produce visible output (the notice
         # above) — and more importantly, tool calls completed
         # BEFORE the switch event may have had real side effects.
@@ -300,7 +341,7 @@ async def _on_agent_switched(turn: _ChatTurn, event) -> Literal[_Flow.BREAK] | N
         # loaded companion's patterns apply (test_security_posture).
         _crew_veto_agent = redact_log_via_context(event.text or "")
         logger.warning(
-            "agent switch to %r vetoed on Crew Mode chat %s",
+            "agent switch to %r vetoed on conductor mode chat %s",
             _crew_veto_agent,
             slot.key,
         )
@@ -310,20 +351,43 @@ async def _on_agent_switched(turn: _ChatTurn, event) -> Literal[_Flow.BREAK] | N
             outcome="denied",
             source="crew_mode_locked",
             resources=f"slot={slot.key} agent={_crew_veto_agent}",
-            error="a Crew Mode chat stays on its conductor",
+            error="a conductor mode chat stays on its own agent",
         )
         slot.append(
             "notice",
             f"📌 Agent switch to {new_agent} was blocked — this chat is in "
-            "Crew Mode, which stays on its conductor. The next turn restarts "
-            "on the conductor.",
+            "conductor mode, which stays on its own agent. The next turn restarts "
+            "on that agent.",
             "msg msg-info",
+            meta=gn.gateway_notice_meta(
+                gn.GATEWAY_NOTICE_AGENT_SWITCH_BLOCKED_CREW_MODE, agent=str(new_agent)
+            ),
         )
         needs_session_reset = True
         turn.needs_session_reset = needs_session_reset
         turn._produced_visible_output = True
         return _Flow.BREAK
-    elif new_agent:
+    elif (
+        new_agent
+        and (_pinned := _channel_pin_blocks(slot, new_agent, _turn_source_channels(turn)))
+        is not None
+    ):
+        # A session linked to a thread of a Slack channel that names its own
+        # agent is served only by that agent (the switch routes refuse the
+        # same move). kiro-cli has already switched, so veto like a member pin.
+        _announce_channel_pinned_veto(slot, new_agent, _pinned, gn)
+        needs_session_reset = True
+        turn.needs_session_reset = needs_session_reset
+        turn._produced_visible_output = True
+        return _Flow.BREAK
+    elif new_agent and (
+        not getattr(event, "runtime_global", False) or not is_shared_chat_runtime(client)
+    ):
+        # The vetoes above stay unconditional: a frame fanned out by a shared
+        # chat runtime (``chat_runtime_sharing`` preview) may still be this
+        # session's own switch, and a pinned thread must never run on as a
+        # foreign agent. Recording the switch is gated: a co-tenant's switch
+        # names no session and must not move this slot's agent.
         # A live provider event can change a template selection.
         # Restore cannot infer that authority from a different
         # transcript name, including a partially persisted switch.
@@ -370,6 +434,13 @@ async def _on_agent_switched(turn: _ChatTurn, event) -> Literal[_Flow.BREAK] | N
         except (Exception, asyncio.CancelledError):
             await drained_to_thread(restore_agent_selection, session_key, switch_change)
             raise
+        # The channel pin, read again with no await before the commit: the slot
+        # may have been linked to a pinned channel while the switch was written.
+        _late_pin = _channel_pin_blocks(slot, new_agent, _turn_source_channels(turn))
+        if _late_pin is not None:
+            await drained_to_thread(restore_agent_selection, session_key, switch_change)
+            _announce_channel_pinned_veto(slot, new_agent, _late_pin, gn)
+            return _Flow.BREAK
         slot.agent = new_agent
         # The rest of this turn runs as the new agent, so its tool
         # calls meet the new agent's spec hooks, never the old one's.
@@ -434,3 +505,144 @@ async def _on_todo_update(turn: _ChatTurn, event) -> None:
             _crew_log_turn_no,
             items=(event.todo or {}).get("tasks"),
         )
+
+
+#: Harness notice rows a turn holds while a reply segment is open. A notice past it
+#: is counted (``_held_harness_notices_dropped``) and said once, when the held rows land.
+MAX_HELD_HARNESS_NOTICES = 32
+
+
+def _segment_open(turn: _ChatTurn) -> bool:
+    """Whether the reply's current text segment is open: its text, or chunk rows of it."""
+    if turn.has_assistant_text:
+        return True
+    for row in reversed(turn.slot.messages):
+        role = row.get("role", "")
+        if role == "chunk":
+            return True
+        if role not in _TOOL_GROUP_ROLES:
+            return False
+    return False
+
+
+def _release_harness_notices(turn: _ChatTurn) -> None:
+    """Append the turn's held harness notice rows, oldest first, and forget them."""
+    held = list(turn._held_harness_notices)
+    turn._held_harness_notices.clear()
+    if turn._held_harness_notices_dropped:
+        logger.warning(
+            "%d harness notice(s) for %s past the %d held during a reply segment " "were dropped",
+            turn._held_harness_notices_dropped,
+            turn.slot.key,
+            MAX_HELD_HARNESS_NOTICES,
+        )
+        turn._held_harness_notices_dropped = 0
+    for content, meta in held:
+        append_and_surface(turn.state, turn.slot, "notice", content, "msg msg-info", meta=meta)
+
+
+def _on_harness_notice(turn: _ChatTurn, event) -> bool:
+    """A notice the session's harness reported mid-turn, as a notice row.
+
+    True when *event* carried one and this took it. An adapter's advisory reaches here
+    on the text chunk it rides, and is shown as a notice row instead of reply text. It
+    counts as the turn's visible output, as its text form does for every text reader
+    (``acp.harness_notices.text_chunk``): a turn a hook ended with only that advisory
+    answered the prompt, so it is not an empty response to replay. A mode change is
+    not the turn's output and counts as nothing.
+
+    A row lands between text segments only. One appended while a segment is open
+    would end up above the segment's reply and strand its chunk rows, because
+    ``_flush_segment`` walks back only to the first other row; so it is held, and
+    appended with the next notice that lands between segments, or after the reply's
+    last segment (``_finish_harness_notices``).
+    """
+    notice = getattr(event, "harness_notice", None)
+    row = notice_row(notice) if notice is not None else None
+    if notice is None or row is None:
+        return False
+    if notice.kind == NOTICE_KIND_ADAPTER:
+        turn._produced_visible_output = True
+    if len(turn._held_harness_notices) < MAX_HELD_HARNESS_NOTICES:
+        turn._held_harness_notices.append(row)
+    else:
+        turn._held_harness_notices_dropped += 1
+    if not _segment_open(turn):
+        _release_harness_notices(turn)
+    return True
+
+
+def _finish_harness_notices(turn: _ChatTurn) -> None:
+    """Append the harness notices still held once the reply's last segment is flushed.
+
+    Called after ``_turn_settle_answer``, so the rows are saved with the turn, and
+    again from the turn's teardown for an exit that skipped it; the second call finds
+    nothing held. Never raises: in the teardown an exception would mask the one that
+    ended the turn."""
+    try:
+        _release_harness_notices(turn)
+    except Exception:  # noqa: BLE001 - teardown must not raise
+        logger.warning("harness notice rows failed for %s", turn.slot.key, exc_info=True)
+
+
+def _announce_channel_pinned_veto(slot, new_agent: str, pinned: str, gn) -> None:
+    """Audit and show a provider switch vetoed on a session linked to a pinned
+    Slack channel; the caller keeps the slot's agent, resets and ends the turn."""
+    logger.warning("agent switch vetoed on Slack-pinned chat %s", slot.key)
+    sel().log_api_access(
+        caller=f"slot={slot.key}",
+        operation="chat_runner.agent_switch",
+        outcome="denied",
+        source="channel_agent_pinned",
+        resources=f"slot={slot.key}",
+        error="a session linked to a pinned Slack channel stays on its agent",
+    )
+    slot.append(
+        "notice",
+        f"📌 Agent switch to {new_agent} was blocked — this chat is linked to a"
+        f" Slack channel served by {pinned}. The next turn restarts on that agent.",
+        "msg msg-info",
+        meta=gn.gateway_notice_meta(
+            gn.GATEWAY_NOTICE_AGENT_SWITCH_BLOCKED_CHANNEL,
+            agent=str(new_agent),
+            channel_agent=str(pinned),
+        ),
+    )
+
+
+def _channel_pin_blocks(
+    slot: object, new_agent: str, source_channels: tuple[str, ...] = ()
+) -> str | None:
+    """The agent a Slack channel requires when a provider switch to *new_agent*
+    (a template) is not it.
+
+    The channels are the one *slot* is linked to, plus *source_channels*: the
+    channels the running turn's words came from, which hold whether or not the
+    slot is still linked. A source channel that could not be read blocks.
+    The provider names the kiro-cli agent it switched to, so it is a template.
+    ``"its own agent"`` stands in when the channel's agent cannot be named.
+    """
+    from kiro_crew.dashboard.slot_queue_repository import UNREADABLE_SOURCE_CHANNEL
+
+    channels = [ch for ch in source_channels if isinstance(ch, str) and ch]
+    if getattr(slot, "_slack_linked", False):
+        linked = getattr(slot, "_slack_channel", "") or ""
+        if linked:
+            channels.append(linked)
+    if not channels:
+        return None
+    from kiro_crew.slack.handler import channel_agent_mismatch
+
+    for channel in channels:
+        if channel == UNREADABLE_SOURCE_CHANNEL:
+            return "its own agent"
+        required = channel_agent_mismatch(channel, new_agent, "template")
+        if required is not None:
+            return required if required != "<unknown>" else "its own agent"
+    return None
+
+
+def _turn_source_channels(turn: object) -> tuple[str, ...]:
+    """The source channels stamped on *turn*; empty when none are."""
+    raw = getattr(turn, "_directive_source_channels", ()) or ()
+    return tuple(raw) if isinstance(raw, tuple) else ()

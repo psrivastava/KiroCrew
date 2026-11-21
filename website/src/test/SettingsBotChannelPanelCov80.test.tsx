@@ -196,6 +196,46 @@ describe('BotChannelPanel optional blocks', () => {
 })
 
 describe('BotChannelPanel save', () => {
+  it('keeps an allow-list entry added while the save was in flight', async () => {
+    let finish: (v: unknown) => void = () => {}
+    let loads = 0
+    const spec = makeSpec({
+      getConfig: () => { loads += 1; return Promise.resolve(config(loads > 1 ? { connected: true } : {})) },
+      saveConfig: vi.fn().mockReturnValue(new Promise(res => { finish = res })),
+    })
+    renderPanel(spec)
+    await screen.findByText('Allowed user IDs')
+    await act(async () => { fireEvent.click(await saveBtn()) })
+    const entry = screen.getByPlaceholderText('123')
+    fireEvent.change(entry, { target: { value: '777' } })
+    fireEvent.keyDown(entry, { key: 'Enter' })
+    await act(async () => { finish({ ok: true, restart_required: false, verify_warning: '' }) })
+    // The invalidation refetches a changed config (now connected) that only holds
+    // '42'; the entry added during the save must stay.
+    await waitFor(() => expect(loads).toBeGreaterThan(1))
+    expect(await screen.findByText('Connected')).toBeInTheDocument()
+    expect(screen.getByText('777')).toBeInTheDocument()
+  })
+
+  it('keeps a replacement token typed while the save was in flight on screen', async () => {
+    let finish: (v: unknown) => void = () => {}
+    let loads = 0
+    const saveConfig = vi.fn().mockReturnValueOnce(new Promise(res => { finish = res }))
+    const spec = makeSpec({
+      getConfig: () => { loads += 1; return Promise.resolve(config(loads > 1 ? { connected: true } : {})) },
+      saveConfig,
+    })
+    renderPanel(spec)
+    await screen.findByText('Allowed user IDs')
+    await act(async () => { fireEvent.click(await saveBtn()) })
+    fireEvent.click(screen.getByRole('button', { name: /^Replace/ }))
+    fireEvent.change(screen.getByPlaceholderText('zz-token-placeholder'), { target: { value: 'zz-new-token' } })
+    await act(async () => { finish({ ok: true, restart_required: false, verify_warning: '' }) })
+    expect(await screen.findByText('Connected')).toBeInTheDocument()
+    // The field stays open on the typed token rather than collapsing to the
+    // stored preview, so the next save sends something the user can see.
+    expect(screen.getByPlaceholderText('zz-token-placeholder')).toHaveValue('zz-new-token')
+  })
   it('refuses a threshold outside 1-100 without calling the API', async () => {
     const saveConfig = vi.fn()
     renderPanel(makeSpec({ saveConfig }))
@@ -203,8 +243,14 @@ describe('BotChannelPanel save', () => {
     fireEvent.change(screen.getByPlaceholderText('80'), { target: { value: '0' } })
     const btn = await saveBtn()
     await act(async () => { fireEvent.click(btn) })
-    expect(await screen.findByText(/must be a number between 1 and 100/)).toBeInTheDocument()
+    const error = await screen.findByText(/must be a number between 1 and 100/)
     expect(saveConfig).not.toHaveBeenCalled()
+    // Announced, and tied to the field it is about.
+    const alert = error.closest('[role="alert"]') as HTMLElement
+    expect(alert).not.toBeNull()
+    const field = screen.getByPlaceholderText('80')
+    expect(field).toHaveAttribute('aria-invalid', 'true')
+    expect(field).toHaveAttribute('aria-describedby', alert.id)
   })
 
   it('refuses a non-numeric threshold', async () => {
@@ -216,6 +262,30 @@ describe('BotChannelPanel save', () => {
     await act(async () => { fireEvent.click(btn) })
     expect(await screen.findByText(/must be a number between 1 and 100/)).toBeInTheDocument()
     expect(saveConfig).not.toHaveBeenCalled()
+  })
+
+  // `parseInt` reads only the leading digits, so it turns each of these into a
+  // number the reader never typed (50, 1). The panel reads the whole string.
+  it.each(['50.9', '1e3'])('refuses %s instead of saving its leading digits', async (typed) => {
+    const saveConfig = vi.fn()
+    renderPanel(makeSpec({ saveConfig }))
+    await screen.findByText('Allowed user IDs')
+    fireEvent.change(screen.getByPlaceholderText('80'), { target: { value: typed } })
+    const btn = await saveBtn()
+    await act(async () => { fireEvent.click(btn) })
+    expect(await screen.findByText(/must be a number between 1 and 100/)).toBeInTheDocument()
+    expect(saveConfig).not.toHaveBeenCalled()
+  })
+
+  it('saves a whole-number threshold as typed', async () => {
+    const saveConfig = vi.fn().mockResolvedValue({ ok: true, restart_required: false, verify_warning: '' })
+    renderPanel(makeSpec({ saveConfig }))
+    await screen.findByText('Allowed user IDs')
+    fireEvent.change(screen.getByPlaceholderText('80'), { target: { value: '65' } })
+    const btn = await saveBtn()
+    await act(async () => { fireEvent.click(btn) })
+    await waitFor(() => expect(saveConfig).toHaveBeenCalled())
+    expect(saveConfig.mock.calls[0][0]).toMatchObject({ soft_threshold_pct: 65 })
   })
 
   it('marks a stored token for removal instead of sending a blank one', async () => {

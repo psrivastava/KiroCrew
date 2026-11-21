@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { screen, fireEvent, waitFor, act } from '@testing-library/react'
 import { renderWithProviders } from './helpers'
 import OnboardingFlow from '../components/OnboardingFlow'
@@ -35,9 +35,15 @@ const patchConfig = vi.mocked(api.patchConfig)
 const kirocrewConfig = vi.mocked(api.kirocrewConfig)
 
 // The flow saves its first-run step in localStorage so a reload resumes it;
-// the store outlives a test, so start each one from step 1.
+// the store outlives a test, so start each one from step 1. Every first-run
+// mount seeds the Translucent panels default, which writes localStorage and
+// the <html> attribute, so clear those too: a test reads them whatever ran
+// before it.
 beforeEach(() => {
   localStorage.removeItem('mc-onboarding-step')
+  localStorage.removeItem(LIQUID_GLASS_STORAGE_KEY)
+  localStorage.removeItem(LIQUID_GLASS_SEEDED_KEY)
+  document.documentElement.removeAttribute('data-reduce-transparency')
 })
 
 const advanceToStep2 = () => {
@@ -62,16 +68,16 @@ describe('OnboardingFlow — About You step', () => {
     expect(screen.getByText('Pick your look')).toBeInTheDocument()
     advanceToStep2()
     expect(screen.getByText('Your role')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'UX Designer' })).toBeInTheDocument()
+    expect(screen.getByRole('radio', { name: 'UX Designer' })).toBeInTheDocument()
     expect(screen.getByText('How technical are you?')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'I write code' })).toBeInTheDocument()
+    expect(screen.getByRole('radio', { name: 'I write code' })).toBeInTheDocument()
   })
 
   it('persists selected role + technical level on Next and advances to the tour', async () => {
     renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
     advanceToStep2()
-    fireEvent.click(screen.getByRole('button', { name: 'UX Designer' }))
-    fireEvent.click(screen.getByRole('button', { name: 'Somewhat' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'UX Designer' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Somewhat' }))
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     await waitFor(() => {
       expect(patchConfig).toHaveBeenCalledWith('dashboard.user_role', 'designer')
@@ -95,10 +101,10 @@ describe('OnboardingFlow — About You step', () => {
   it('a second click on the selected answer keeps it selected', async () => {
     renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
     advanceToStep2()
-    const chip = screen.getByRole('button', { name: 'Developer' })
+    const chip = screen.getByRole('radio', { name: 'Developer' })
     fireEvent.click(chip)
     fireEvent.click(chip)
-    expect(chip).toHaveAttribute('aria-pressed', 'true')
+    expect(chip).toHaveAttribute('aria-checked', 'true')
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     expect(await screen.findByText('Work that runs on time')).toBeInTheDocument()
     expect(patchConfig).toHaveBeenCalledWith('dashboard.user_role', 'developer')
@@ -110,9 +116,9 @@ describe('OnboardingFlow — About You step', () => {
     })
     renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
     advanceToStep2()
-    const chip = await screen.findByRole('button', { name: 'Developer', pressed: true })
+    const chip = await screen.findByRole('radio', { name: 'Developer', checked: true })
     fireEvent.click(chip)
-    expect(chip).toHaveAttribute('aria-pressed', 'true')
+    expect(chip).toHaveAttribute('aria-checked', 'true')
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     expect(await screen.findByText('Work that runs on time')).toBeInTheDocument()
     expect(patchConfig).not.toHaveBeenCalled()
@@ -138,6 +144,17 @@ describe('OnboardingFlow — About You step', () => {
     expect(localStorage.getItem('mc-onboarding-step')).toBeNull()
   })
 
+  it('forgets a saved step once the user is onboarded without finishing the tour', async () => {
+    localStorage.setItem('mc-onboarding-step', '2')
+    localStorage.setItem('mc-onboarded', '1')
+    try {
+      renderWithProviders(<OnboardingFlow initialOpen={false} onComplete={vi.fn()} />)
+      await waitFor(() => expect(localStorage.getItem('mc-onboarding-step')).toBeNull())
+    } finally {
+      localStorage.removeItem('mc-onboarded')
+    }
+  })
+
   it('ignores a saved step once the user is onboarded (a /onboarding replay starts at step 1)', () => {
     localStorage.setItem('mc-onboarding-step', '4')
     localStorage.setItem('mc-onboarded', '1')
@@ -153,7 +170,7 @@ describe('OnboardingFlow — About You step', () => {
     const onComplete = vi.fn()
     renderWithProviders(<OnboardingFlow initialOpen onComplete={onComplete} />)
     advanceToStep2()
-    fireEvent.click(screen.getByRole('button', { name: 'Product Manager' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Product Manager' }))
     fireEvent.click(screen.getByRole('button', { name: /Skip/ }))
     await waitFor(() => {
       expect(patchConfig).toHaveBeenCalledWith('dashboard.user_role', 'product-manager')
@@ -166,7 +183,7 @@ describe('OnboardingFlow — About You step', () => {
     patchConfig.mockRejectedValue(new Error('gateway down'))
     renderWithProviders(<OnboardingFlow initialOpen onComplete={onComplete} />)
     advanceToStep2()
-    fireEvent.click(screen.getByRole('button', { name: 'UX Designer' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'UX Designer' }))
     // First Skip: save fails → informed, NOT dismissed
     fireEvent.click(screen.getByRole('button', { name: /Skip/ }))
     expect(await screen.findByRole('alert')).toHaveTextContent(/Skip again/)
@@ -192,12 +209,12 @@ describe('OnboardingFlow — About You step', () => {
     renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
     advanceToStep2()
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: 'Developer' })).toHaveAttribute(
-        'aria-pressed',
+      expect(screen.getByRole('radio', { name: 'Developer' })).toHaveAttribute(
+        'aria-checked',
         'true',
       )
-      expect(screen.getByRole('button', { name: 'I write code' })).toHaveAttribute(
-        'aria-pressed',
+      expect(screen.getByRole('radio', { name: 'I write code' })).toHaveAttribute(
+        'aria-checked',
         'true',
       )
     })
@@ -211,7 +228,7 @@ describe('OnboardingFlow — About You step', () => {
     patchConfig.mockRejectedValueOnce(new Error('gateway down'))
     renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
     advanceToStep2()
-    fireEvent.click(screen.getByRole('button', { name: 'UX Designer' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'UX Designer' }))
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     // Error surfaces, still on step 2, tour NOT shown
     expect(await screen.findByRole('alert')).toHaveTextContent(/Couldn't save/)
@@ -223,7 +240,7 @@ describe('OnboardingFlow — About You step', () => {
     patchConfig.mockRejectedValueOnce(new Error('gateway down'))
     renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
     advanceToStep2()
-    fireEvent.click(screen.getByRole('button', { name: 'UX Designer' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'UX Designer' }))
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     await screen.findByRole('alert')
     // Baseline must NOT have advanced on failure — retry re-sends the field.
@@ -242,15 +259,15 @@ describe('OnboardingFlow — About You step', () => {
     const onComplete = vi.fn()
     renderWithProviders(<OnboardingFlow initialOpen onComplete={onComplete} />)
     advanceToStep2()
-    fireEvent.click(screen.getByRole('button', { name: 'Developer' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Developer' }))
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     // In-flight: every input frozen — changing a chip now would advance the
     // flow with a stale value persisted.
     await screen.findByRole('button', { name: 'Saving…' })
-    const designerChip = screen.getByRole('button', { name: 'UX Designer' })
+    const designerChip = screen.getByRole('radio', { name: 'UX Designer' })
     expect(designerChip).toBeDisabled()
     fireEvent.click(designerChip) // no-op while frozen
-    expect(designerChip).toHaveAttribute('aria-pressed', 'false')
+    expect(designerChip).toHaveAttribute('aria-checked', 'false')
     expect(screen.getByRole('button', { name: /Skip/ })).toBeDisabled()
     fireEvent.keyDown(document, { key: 'Escape' }) // dismissal frozen too
     expect(onComplete).not.toHaveBeenCalled()
@@ -269,16 +286,16 @@ describe('OnboardingFlow — About You step', () => {
     const onComplete = vi.fn()
     renderWithProviders(<OnboardingFlow initialOpen onComplete={onComplete} />)
     advanceToStep2()
-    fireEvent.click(screen.getByRole('button', { name: 'Developer' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Developer' }))
     fireEvent.click(screen.getByRole('button', { name: /Skip/ }))
     // Skip's save is in flight: chips must be frozen so the completion that
     // follows can't silently drop an edit made mid-flight.
     await waitFor(() =>
-      expect(screen.getByRole('button', { name: 'UX Designer' })).toBeDisabled(),
+      expect(screen.getByRole('radio', { name: 'UX Designer' })).toBeDisabled(),
     )
-    fireEvent.click(screen.getByRole('button', { name: 'UX Designer' })) // no-op
-    expect(screen.getByRole('button', { name: 'UX Designer' })).toHaveAttribute(
-      'aria-pressed',
+    fireEvent.click(screen.getByRole('radio', { name: 'UX Designer' })) // no-op
+    expect(screen.getByRole('radio', { name: 'UX Designer' })).toHaveAttribute(
+      'aria-checked',
       'false',
     )
     release({})
@@ -293,7 +310,7 @@ describe('OnboardingFlow — About You step', () => {
     renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
     advanceToStep2()
     expect(screen.queryByLabelText('Describe your role')).not.toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: 'Other' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Other' }))
     const input = screen.getByLabelText('Describe your role')
     expect(input).toBeInTheDocument()
     expect(input).toHaveFocus()
@@ -306,7 +323,7 @@ describe('OnboardingFlow — About You step', () => {
   it('caps the typed role by code point, never splitting a surrogate pair', () => {
     renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
     advanceToStep2()
-    fireEvent.click(screen.getByRole('button', { name: 'Other' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Other' }))
     const input = screen.getByLabelText('Describe your role') as HTMLInputElement
     // 59 BMP chars + an astral char: a code-unit slice at 60 would keep only
     // the high surrogate and persist a broken character.
@@ -321,7 +338,7 @@ describe('OnboardingFlow — About You step', () => {
   it('persists the typed role alongside the other slug', async () => {
     renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
     advanceToStep2()
-    fireEvent.click(screen.getByRole('button', { name: 'Other' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Other' }))
     fireEvent.change(screen.getByLabelText('Describe your role'), {
       target: { value: '  solutions architect  ' },
     })
@@ -339,7 +356,7 @@ describe('OnboardingFlow — About You step', () => {
   it('Enter in the field advances instead of leaving the answer unsaved', async () => {
     renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
     advanceToStep2()
-    fireEvent.click(screen.getByRole('button', { name: 'Other' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Other' }))
     const input = screen.getByLabelText('Describe your role')
     fireEvent.change(input, { target: { value: 'SRE' } })
     fireEvent.keyDown(input, { key: 'Enter' })
@@ -363,7 +380,7 @@ describe('OnboardingFlow — About You step', () => {
     await waitFor(() =>
       expect(screen.getByLabelText('Describe your role')).toHaveValue('solutions architect'),
     )
-    fireEvent.click(screen.getByRole('button', { name: 'Developer' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Developer' }))
     expect(screen.queryByLabelText('Describe your role')).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     await waitFor(() =>
@@ -379,7 +396,7 @@ describe('OnboardingFlow — About You step', () => {
   it('Other with an empty field writes only the slug', async () => {
     renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
     advanceToStep2()
-    fireEvent.click(screen.getByRole('button', { name: 'Other' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Other' }))
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     await waitFor(() =>
       expect(patchConfig).toHaveBeenCalledWith('dashboard.user_role', 'other'),
@@ -395,7 +412,7 @@ describe('OnboardingFlow — About You step', () => {
     // going to "Skip all".
     renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
     advanceToStep2()
-    fireEvent.click(screen.getByRole('button', { name: 'Other' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Other' }))
     const input = screen.getByLabelText('Describe your role')
     fireEvent.change(input, { target: { value: 'S' } })
     expect(input).toHaveFocus()
@@ -434,15 +451,73 @@ describe('OnboardingFlow — About You step', () => {
     expect(document.activeElement).not.toBe(first)
   })
 
+  it('a Tab from the page behind the scrim re-enters the dialog, either direction', () => {
+    // The chat composer behind the scrim focuses itself when its session
+    // loads; neither first nor last, so without the re-entry Tab walks the page behind.
+    renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
+    const dialog = screen.getByRole('dialog')
+    const focusable = Array.from(
+      dialog.querySelectorAll<HTMLElement>(
+        'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+      ),
+    ).filter(el => !el.hasAttribute('disabled') && el.tabIndex >= 0)
+    const behind = document.createElement('textarea')
+    document.body.appendChild(behind)
+    try {
+      behind.focus()
+      fireEvent.keyDown(document, { key: 'Tab' })
+      expect(document.activeElement).toBe(focusable[0])
+      behind.focus()
+      fireEvent.keyDown(document, { key: 'Tab', shiftKey: true })
+      expect(document.activeElement).toBe(focusable[focusable.length - 1])
+    } finally {
+      behind.remove()
+    }
+  })
+
+  it('leaves a Tab from the click-focusable step heading to the browser, either direction', () => {
+    // The heading is inside the dialog but not a Tab stop, so it is neither
+    // first nor last: the browser moves focus on, the trap does not claim it.
+    renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
+    const heading = screen.getByRole('heading', { level: 1, name: 'Pick your look' })
+    expect(heading.tabIndex).toBe(-1)
+    heading.focus()
+    expect(fireEvent.keyDown(document, { key: 'Tab' })).toBe(true)
+    expect(document.activeElement).toBe(heading)
+    expect(fireEvent.keyDown(document, { key: 'Tab', shiftKey: true })).toBe(true)
+    expect(document.activeElement).toBe(heading)
+  })
+
+  it('leaves a Tab inside another modal over the step to that modal, either direction', () => {
+    // A theme pack's consent dialog opens over the Customize step with its
+    // own trap; pulling its focus back to "Skip all" would strand its buttons.
+    renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
+    const other = document.createElement('div')
+    other.setAttribute('role', 'dialog')
+    other.setAttribute('aria-modal', 'true')
+    const button = document.createElement('button')
+    other.appendChild(button)
+    document.body.appendChild(other)
+    try {
+      button.focus()
+      expect(fireEvent.keyDown(document, { key: 'Tab' })).toBe(true)
+      expect(document.activeElement).toBe(button)
+      expect(fireEvent.keyDown(document, { key: 'Tab', shiftKey: true })).toBe(true)
+      expect(document.activeElement).toBe(button)
+    } finally {
+      other.remove()
+    }
+  })
+
   it('re-seats focus inside the dialog when the save freeze lifts', async () => {
     // Every step-2 control is disabled during the save, so the browser drops
     // focus to <body>. On the failed-save path the modal stays open, and
-    // without re-seating focus the Tab trap's first/last comparisons stop
-    // matching and Tab escapes the aria-modal dialog.
+    // without re-seating focus it would sit on <body>, outside the aria-modal
+    // dialog with no visible ring, until the next Tab re-enters it.
     patchConfig.mockRejectedValueOnce(new Error('gateway down'))
     renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
     advanceToStep2()
-    fireEvent.click(screen.getByRole('button', { name: 'Other' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Other' }))
     fireEvent.change(screen.getByLabelText('Describe your role'), {
       target: { value: 'founder' },
     })
@@ -455,12 +530,12 @@ describe('OnboardingFlow — About You step', () => {
   it('keeps typed text when the user picks another role and comes back to Other', () => {
     renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
     advanceToStep2()
-    const other = screen.getByRole('button', { name: 'Other' })
+    const other = screen.getByRole('radio', { name: 'Other' })
     fireEvent.click(other)
     fireEvent.change(screen.getByLabelText('Describe your role'), {
       target: { value: 'founder' },
     })
-    fireEvent.click(screen.getByRole('button', { name: 'Developer' })) // field hides
+    fireEvent.click(screen.getByRole('radio', { name: 'Developer' })) // field hides
     expect(screen.queryByLabelText('Describe your role')).not.toBeInTheDocument()
     fireEvent.click(other) // back on — the answer is still there
     expect(screen.getByLabelText('Describe your role')).toHaveValue('founder')
@@ -468,17 +543,11 @@ describe('OnboardingFlow — About You step', () => {
 })
 
 describe('OnboardingFlow — Pick your look offers the Translucent panels switch', () => {
-  afterEach(() => {
-    localStorage.removeItem(LIQUID_GLASS_STORAGE_KEY)
-    localStorage.removeItem(LIQUID_GLASS_SEEDED_KEY)
-    document.documentElement.removeAttribute('data-reduce-transparency')
-  })
-
   it('shows the Settings switch between the mode row and the theme grid', () => {
     renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
     const sw = screen.getByRole('switch', { name: 'Translucent panels' })
     // Reads in order: mode row (Dark) -> the switch -> the COLOR THEME heading.
-    const dark = screen.getByRole('button', { name: 'Dark' })
+    const dark = screen.getByRole('radio', { name: 'Dark' })
     const heading = screen.getByText('Color theme')
     expect(dark.compareDocumentPosition(sw) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     expect(sw.compareDocumentPosition(heading) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
@@ -578,7 +647,7 @@ describe('OnboardingFlow — Pick your look previews the real dashboard', () => 
     expect(frame).toHaveAttribute('inert')
     expect(frame).toHaveAttribute('tabindex', '-1')
     // Above the mode row, so the picture sits over what changes it.
-    const system = screen.getByRole('button', { name: 'System' })
+    const system = screen.getByRole('radio', { name: 'System' })
     expect(box.compareDocumentPosition(system) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
   })
 })
@@ -594,8 +663,7 @@ describe('OnboardingFlow — end of the tour', () => {
   })
 
   // Walk 2 → 3 → 4 → 5. Popovers 3-4 advance with "Next"; popover 5 is the last
-  // step of first run and finishes with "Done". Privacy is NOT part of this flow
-  // — it is its own chapter before Customize (see PrivacyChapter.test.tsx).
+  // step of first run and finishes with "Done".
   const advanceToLastPopover = async () => {
     advanceToStep2()
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
@@ -634,13 +702,12 @@ describe('OnboardingFlow — end of the tour', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Done' }))
     await waitFor(() => expect(onComplete).toHaveBeenCalled())
-    // Finishing is NOT a skip — Privacy is already behind the user here.
+    // Finishing is NOT a skip.
     expect(onSkipAll).not.toHaveBeenCalled()
   })
 
-  // Privacy is mandatory, so every early exit has to be distinguishable from a
-  // completion: the host routes a skip back through the Privacy chapter when the
-  // user has not passed it yet (shell/boot/firstRun.tsx).
+  // Every early exit has to be distinguishable from a completion, so a host
+  // can route the two differently (shell/boot/firstRun.tsx).
   describe('abandoning the tour reports a SKIP, not a completion', () => {
     const cases: Array<[string, () => void]> = [
       ['"Skip all" on the Customize modal', () => {
@@ -710,7 +777,7 @@ describe('OnboardingFlow — end of the tour', () => {
     })
   })
 
-  it('does not render the privacy disclosure — it is its own chapter now', async () => {
+  it('does not render the privacy disclosure', async () => {
     renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
     await advanceToLastPopover()
 

@@ -138,7 +138,7 @@ describe('AboutPanel desktop auto-download toggle', () => {
     // Read side by side with the gateway switch, so the pair tells apart at a glance.
     mount({ ...BASE_INFO, autoDownload: true }, vi.fn().mockResolvedValue({ ok: true }))
     await waitForInfo()
-    const row = toggle().closest('[role="button"]') as HTMLElement
+    const row = toggle().closest('[data-setting-label]') as HTMLElement
     expect(row).toHaveTextContent(i18nT('pages.settings.aboutPanel.install_app_updates_automatically_hint'))
     expect(row.querySelector('[data-settings-hint]')).toBeNull()
   })
@@ -207,7 +207,7 @@ describe('AboutPanel desktop auto-download toggle', () => {
     const gatewayRow = () => document.querySelector('[data-setting-key="auto_update"]')
     const effect = (update_auto_effect: string) =>
       store.dispatch(sseStatus({ uptime: '1m', sessions: 0, messages: 0, update_auto_effect } as never))
-    afterEach(() => { store.dispatch(sseStatus({ uptime: '1m', sessions: 0, messages: 0 } as never)) })
+    afterEach(() => { act(() => { store.dispatch(sseStatus({ uptime: '1m', sessions: 0, messages: 0 } as never)) }) })
 
     // The rule's case table is `utils/updateSwitches.test.ts`; this proves About
     // feeds it the updater's answer and the effect.

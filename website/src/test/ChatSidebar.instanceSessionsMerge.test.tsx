@@ -7,7 +7,7 @@
  * ChatSidebar.offline.test.tsx, the owner of the mock setup).
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent, waitFor, within } from '@testing-library/react'
+import { act, render, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { MemoryRouter } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
@@ -296,6 +296,28 @@ describe('ChatSidebar – remote crew sessions in the live list', () => {
     })
     expect(screen.getByTestId('crew-group-inst-a')).toHaveTextContent('Peer crew member')
     expect(screen.getByText('LIVE newer slot')).toBeInTheDocument()
+  })
+
+  it("leaves out a peer's Slack conversation its own Slack list setting hides, unless it waits on you", async () => {
+    localStorage.setItem(PREVIEW_INSTANCE_SESSIONS, '1')
+    instanceChatSlotsMock.mockResolvedValue([
+      { ...DEFAULT_REMOTE_SLOT },
+      { ...DEFAULT_REMOTE_SLOT, key: 'slack_1.1', row_identity: 'inst-a:slack_1.1', title: 'Peer Slack thread', slack_list_hidden: true },
+      {
+        ...DEFAULT_REMOTE_SLOT,
+        key: 'slack_2.2',
+        row_identity: 'inst-a:slack_2.2',
+        title: 'Peer Slack approval',
+        slack_list_hidden: true,
+        pending_approval: true,
+      },
+    ])
+    renderSidebar()
+    await waitFor(() => {
+      expect(screen.getByTestId('crew-group-inst-a')).toHaveTextContent('REMOTE middle row')
+    })
+    expect(screen.getByTestId('crew-group-inst-a')).toHaveTextContent('Peer Slack approval')
+    expect(screen.getByTestId('crew-group-inst-a')).not.toHaveTextContent('Peer Slack thread')
   })
 
   it('prints each date-segment header once, even when a remote row was created in another bucket', async () => {
@@ -663,7 +685,7 @@ describe('ChatSidebar – remote crew sessions in the live list', () => {
     expect(vi.mocked(api.createChatSlot)).not.toHaveBeenCalled()
     expect(selectInstanceMock).not.toHaveBeenCalled()
     expect(JSON.parse(sessionStorage.getItem('kirocrew.crewWindow') || 'null')).toEqual({ instanceId: 'inst-a', key: 'chat-9' })
-    closeCrewWindow()
+    act(() => { closeCrewWindow() })
   })
 
   it('hands a crew row to a host with no chat pane of its own', async () => {
@@ -849,7 +871,7 @@ describe('ChatSidebar – remote crew sessions in the live list', () => {
       // raw-key lookup has two candidates. The remote one sits in its crew group.
       expect(screen.getByTestId('crew-group-inst-a')).toHaveTextContent('REMOTE same-key newer row')
 
-      store.dispatch(requestSlotReveal('s-new'))
+      act(() => { store.dispatch(requestSlotReveal('s-new')) })
 
       await waitFor(() => expect(scrolledInto).toHaveLength(1))
       expect(scrolledInto[0]).toContain('LIVE newer slot')

@@ -2,8 +2,8 @@
 
 Every file and directory name a member's space holds, the display-name and crew-id rules
 (validation, allocation, the label a crew may show), slugs and the containment-checked
-paths under ``members/``, and the first-welcome marker a just-created member's directory
-carries.
+paths under ``members/``, and the first-welcome marker and create-request record a
+just-created member's directory carries.
 
 :mod:`kiro_crew.members` stays the import path and the patch surface; see
 :mod:`kiro_crew.members_parts`.
@@ -13,14 +13,16 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import stat
 from collections.abc import Container, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
 from kiro_crew import platform_compat
 from kiro_crew.artifacts import slugify
-from kiro_crew.atomic_write import atomic_write, read_bytes_with_retry
+from kiro_crew.atomic_write import read_bytes_with_retry
 from kiro_crew.config.paths import data_home
 from kiro_crew.external_text import external_text_requires_redaction
 from kiro_crew.slugs import slug_hash_fallback
@@ -42,12 +44,11 @@ MEMBERS_DIR_NAME = "members"
 ACTIVITY_FILE_NAME = "activity.jsonl"
 
 # LEGACY ONLY. Nothing writes this file: participation events go to the
-# per-member append-only event log, and :func:`read_activity` reads that log
-# rather than this path. It survives as a migration SOURCE, folded in once per
-# member and then retired by rename (see the event-log service). Bounding it by
-# size therefore has nothing to bound, since the writer that grew it is gone;
-# the fold streams it under its own byte budget instead, because the file stays
-# agent-writable whatever its size.
+# per-member append-only event log, which :func:`read_activity` reads. It is
+# kept as a migration SOURCE, folded in once per member and then retired by
+# rename (see the event-log service). No size cap is needed since nothing
+# grows it; the fold streams it under its own byte budget because the file
+# stays agent-writable.
 
 #: Crew-slug -> DM-thread binding inside a member's directory.
 DM_FILE_NAME = "dm.json"
@@ -541,6 +542,47 @@ WELCOME_KIND_MATE = ""
 #: the user what it should work on.
 WELCOME_KIND_GOAL = "goal"
 
+#: Written into a member's directory once the ``POST /api/agents`` that created
+#: it has finished, when that request carried a ``request_id``: a repeat of the
+#: request is then answered with this member instead of ``409 agent_exists``.
+CREATE_REQUEST_FILENAME = "create_request.json"
+
+
+def _write_member_record(name: str, config, filename: str, record: dict[str, str]) -> None:
+    """Write *record* as *filename* in member *name*'s directory. Blocking IO."""
+    from kiro_crew.member_folder import open_member_folder
+
+    with open_member_folder(member_slug(name, config)) as folder:
+        # Mate's welcome is written at boot, before the gateway's own owner-only sweep
+        # runs, so the chain this creates is tightened here (members/ and members/<slug>/).
+        # Both levels are tightened through their descriptors. Without descriptors the
+        # walk has just refused a link by name, and they stay by name. When ``members``
+        # is a link, the folder it names is somewhere else and its mode is left as it is.
+        if folder.fd is None:
+            platform_compat.restrict_dir_to_owner(folder.path)
+        else:
+            os.fchmod(folder.fd, stat.S_IRWXU)
+        if not folder.members_is_link:
+            if folder.parent_fd is not None:
+                os.fchmod(folder.parent_fd, stat.S_IRWXU)
+            else:
+                platform_compat.restrict_dir_to_owner(folder.path.parent)
+        folder.write(filename, json.dumps(record) + "\n")
+
+
+def _read_member_record(slug: str, filename: str, member: str) -> dict | None:
+    """The record *filename* at *slug* when it names *member*, else ``None``.
+
+    A missing, unreadable or foreign record is ``None``, so a directory a
+    different member later reaches under the same slug is not read as this
+    one's. Blocking IO.
+    """
+    try:
+        record = json.loads(read_bytes_with_retry(member_dir(slug) / filename, max_bytes=4096))
+    except (OSError, ValueError, MemberSlugError):
+        return None
+    return record if isinstance(record, dict) and record.get("member") == member else None
+
 
 def mark_welcome_owed(name: str, *, config=None, kind: str = WELCOME_KIND_MATE) -> bool:
     """Record that the just-created member *name* owes a first welcome.
@@ -556,13 +598,7 @@ def mark_welcome_owed(name: str, *, config=None, kind: str = WELCOME_KIND_MATE) 
     if kind:
         record["kind"] = kind
     try:
-        path = member_dir(member_slug(name, config)) / WELCOME_OWED_FILENAME
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # Written at boot, before the gateway's own owner-only sweep runs, so the
-        # chain this creates is tightened here (members/ and members/<slug>/).
-        for _dir in (path.parent, path.parent.parent):
-            platform_compat.restrict_dir_to_owner(_dir)
-        atomic_write(path, json.dumps(record) + "\n")
+        _write_member_record(name, config, WELCOME_OWED_FILENAME, record)
     except Exception:
         logger.warning("Could not record the first welcome owed by %r", name, exc_info=True)
         return False
@@ -576,12 +612,8 @@ def owed_welcome_kind(slug: str, member: str) -> str | None:
     foreign record owes nothing. A record whose ``kind`` is not one this
     gateway knows owes nothing either. Blocking IO.
     """
-    try:
-        raw = read_bytes_with_retry(member_dir(slug) / WELCOME_OWED_FILENAME, max_bytes=4096)
-        record = json.loads(raw)
-    except (OSError, ValueError, MemberSlugError):
-        return None
-    if not isinstance(record, dict) or record.get("member") != member:
+    record = _read_member_record(slug, WELCOME_OWED_FILENAME, member)
+    if record is None:
         return None
     kind = record.get("kind", WELCOME_KIND_MATE)
     return kind if kind in (WELCOME_KIND_MATE, WELCOME_KIND_GOAL) else None
@@ -590,3 +622,29 @@ def owed_welcome_kind(slug: str, member: str) -> str | None:
 def welcome_owed(slug: str, member: str) -> bool:
     """Whether *member* (at *slug*) owes a first welcome of any kind. Blocking IO."""
     return owed_welcome_kind(slug, member) is not None
+
+
+def mark_create_request(name: str, request_id: str, *, config=None) -> None:
+    """Record that the ``POST /api/agents`` named *request_id* created member *name*.
+
+    Best effort: without the record a repeat of that request is refused as
+    ``agent_exists``, as every repeat was before. Blocking IO.
+    """
+    try:
+        record = {"member": name, "request_id": request_id}
+        _write_member_record(name, config, CREATE_REQUEST_FILENAME, record)
+    except Exception:
+        logger.warning("Could not record the create request of %r", name, exc_info=True)
+
+
+def created_by_request(name: str, request_id: str, *, config=None) -> bool:
+    """Whether member *name* was created by the ``POST /api/agents`` named *request_id*.
+
+    Blocking IO.
+    """
+    try:
+        slug = member_slug(name, config)
+    except MemberSlugError:
+        return False
+    record = _read_member_record(slug, CREATE_REQUEST_FILENAME, name)
+    return record is not None and record.get("request_id") == request_id

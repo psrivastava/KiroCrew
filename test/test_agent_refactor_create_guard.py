@@ -33,6 +33,7 @@ from pathlib import Path
 from unittest import mock
 
 import pytest
+import source_corpus
 from stale_package_attribute import package_attribute_replaced
 
 from kiro_crew import agent
@@ -169,12 +170,9 @@ def _rank(bound: str | None) -> int:
 class _Scope:
     """What each name in one file means, resolved to a fixed point.
 
-    A name maps to the dotted path of the module or object it is bound to,
-    ``"<local>"`` for a def, class or literal, ``"<unknown>"`` for a value only a
-    call or subscript produced, or is absent when the file never binds it (a
-    parameter, such as a fixture). String constants are kept apart, for resolving
-    patch targets spelled as text. When one name has several bindings, the one
-    closest to the facade wins.
+    A name maps to a dotted path, ``"<local>"`` (def, class, literal), ``"<unknown>"``
+    (call or subscript result), or is absent when unbound (a fixture parameter). String
+    constants are kept apart for text patch targets; the binding nearest the facade wins.
     """
 
     def __init__(self, tree: ast.AST) -> None:
@@ -670,16 +668,17 @@ def test_no_test_patches_a_forwarded_name_that_it_may_create() -> None:
     roots = [_REPO / "test", *sorted(_SRC.rglob("tests"))]
     scanned = parsed = 0
     hits: dict[tuple[str, str], list[str]] = {}
-    for root in roots:
-        for path in sorted(root.rglob("*.py")):
-            text = path.read_text(encoding="utf-8")
-            scanned += 1
-            if not _worth_parsing(text):
-                continue
-            parsed += 1
-            relative = path.relative_to(_REPO).as_posix()
-            for line, function, name in _create_patches(ast.parse(text)):
-                hits.setdefault((relative, function), []).append(f"line {line}: {name}")
+    with source_corpus.untraced():
+        for root in roots:
+            for path in sorted(root.rglob("*.py")):
+                text = path.read_text(encoding="utf-8")
+                scanned += 1
+                if not _worth_parsing(text):
+                    continue
+                parsed += 1
+                relative = path.relative_to(_REPO).as_posix()
+                for line, function, name in _create_patches(ast.parse(text)):
+                    hits.setdefault((relative, function), []).append(f"line {line}: {name}")
     assert scanned > 100, f"the scan read only {scanned} test files, so it measured nothing"
     assert parsed > 50, f"the scan parsed only {parsed} files, so its prefilter is too tight"
     assert set(hits) == _ALLOWED, hits

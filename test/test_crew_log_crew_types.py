@@ -76,7 +76,7 @@ CREW_TARGET = {"item": "WI-4", "target": {"kind": "crew", "name": "docs"}}
 DONE_REPORT = {"item": "WI-4", "status": "done"}
 
 
-# --- the table is the spec -------------------------------------------------
+# the table is the spec
 
 
 def test_the_crew_kind_declares_exactly_the_two_contract_types():
@@ -195,16 +195,26 @@ def test_both_target_forms_are_accepted(payload):
 def test_a_dispatch_may_carry_a_brief():
     payload = {**SESSION_TARGET, "brief": "drive it green"}
     validate_data(KIND_CREW, DISPATCH, payload)
+    _crew().append(DISPATCH, payload, src="crew:conductor")
+    assert [e.data for e in CrewLog.open(KIND_CREW, CREW).iter_from(1)] == [payload]
 
 
 @pytest.mark.parametrize("status", CREW_REPORT_STATUSES)
 def test_every_declared_status_is_accepted(status):
-    validate_data(KIND_CREW, REPORT, {"item": "WI-4", "status": status})
+    payload = {"item": "WI-4", "status": status}
+    validate_data(KIND_CREW, REPORT, payload)
+    # The status lands under its own name: a report is never re-filed as another.
+    _crew().append(REPORT, payload, src="crew:conductor")
+    assert [e.data["status"] for e in CrewLog.open(KIND_CREW, CREW).iter_from(1)] == [status]
 
 
 def test_a_report_may_carry_credits_as_an_int_or_a_float():
+    led = _crew()
     for credits in (0, 1, 0.21):
         validate_data(KIND_CREW, REPORT, {**DONE_REPORT, "credits": credits})
+        led.append(REPORT, {**DONE_REPORT, "credits": credits}, src="crew:conductor")
+    stored = [e.data["credits"] for e in CrewLog.open(KIND_CREW, CREW).iter_from(1)]
+    assert stored == [0, 1, 0.21]
 
 
 # --- the validator refuses what the spec calls invalid --------------------
@@ -309,8 +319,8 @@ def test_the_ownership_refusal_survives_a_registry_that_lost_its_crew_table(
     with pytest.raises(CrewLogError) as caught:
         check_ownership(KIND_SESSION, entry_type, "gateway")
     assert _code(caught) == lg.CODE_EVENT_TYPE_NOT_OWNED
-    # And the crew's own log still accepts it, now unvalidated -- which is the
-    # state this change replaced, so the two layers are demonstrably separate.
+    # And the crew's own log still accepts it, unvalidated, so the two layers
+    # are demonstrably separate.
     check_ownership(KIND_CREW, entry_type, "crew:conductor")
     validate_data(KIND_CREW, entry_type, {"anything": 1})
 

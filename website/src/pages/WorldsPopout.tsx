@@ -1,16 +1,23 @@
 import { safeSetItem } from '../utils/safeStorage'
 import { useState, useEffect } from 'react'
+import { ChevronDown, ChevronUp } from 'lucide-react'
 import { useAgentSync } from '../hooks/useAgentSync'
 import { usePopoutSync } from '../hooks/usePopoutSync'
 import { SCENES, SCENE_STORAGE_KEY, SCENE_LAYOUT_SCALE, type SceneKey } from './scenes/config'
 import { SCENE_COMPONENTS } from './scenes/components'
 import { useAppDispatch } from '../store'
 import { fetchSlots } from '../store/dashboardSlice'
+import { pollWhileVisible } from '../lib/pollWhileVisible'
 
 import { i18nT } from '../i18n/t'
+import { RadioChipGroup, radioChip } from '../components/RadioChipGroup'
 
 export default function WorldsPopout() {
-  const [scene, setScene] = useState<SceneKey>(() => (localStorage.getItem(SCENE_STORAGE_KEY) as SceneKey) || 'office')
+  const [scene, setScene] = useState<SceneKey>(() => {
+    const saved = localStorage.getItem(SCENE_STORAGE_KEY)
+    // A key another build saved names no scene here, and would hide them all.
+    return SCENES.find(s => s.key === saved)?.key ?? 'office'
+  })
   const [collapsed, setCollapsed] = useState(false)
   // The toggle renders only a ▼/▲ glyph, so it needs an explicit accessible
   // name: `title` alone is an unreliable accessible-name source across screen
@@ -24,8 +31,7 @@ export default function WorldsPopout() {
 
   useEffect(() => {
     dispatch(fetchSlots())
-    const iv = setInterval(() => dispatch(fetchSlots()), 5000)
-    return () => clearInterval(iv)
+    return pollWhileVisible(() => { dispatch(fetchSlots()) }, 5000)
   }, [dispatch])
 
   useEffect(() => { safeSetItem(SCENE_STORAGE_KEY, scene) }, [scene])
@@ -46,12 +52,13 @@ export default function WorldsPopout() {
         {...(collapsed ? { inert: '' } : {})}
       >
         <div style={{ overflow: 'hidden' }}>
-          <div style={{ display: 'flex', gap: 4, padding: '8px 12px', flexWrap: 'wrap', alignItems: 'center' }}>
+          <RadioChipGroup style={{ display: 'flex', gap: 4, padding: '8px 12px', flexWrap: 'wrap', alignItems: 'center' }} ariaLabel={i18nT('pages.worldsPopout.scene_label')}>
             {SCENES.map(s => (
               <button
                 key={s.key}
+                type="button"
                 onClick={() => changeScene(s.key)}
-                aria-pressed={scene === s.key}
+                {...radioChip(scene === s.key)}
                 style={{
                   padding: '4px 10px', borderRadius: 6, fontSize: 12,
                   border: scene === s.key ? '1.5px solid var(--accent, #f90)' : '1.5px solid var(--border, #333)',
@@ -64,7 +71,7 @@ export default function WorldsPopout() {
                 <span>{s.icon}</span><span>{s.label}</span>
               </button>
             ))}
-          </div>
+          </RadioChipGroup>
         </div>
       </div>
 
@@ -84,7 +91,7 @@ export default function WorldsPopout() {
               color: 'var(--text-muted, #999)', fontSize: 16, lineHeight: 1,
             }}
           >
-            {collapsed ? '▼' : '▲'}
+            {collapsed ? <ChevronDown size={16} /> : <ChevronUp size={16} />}
           </button>
 
           {SCENES.map(s => {

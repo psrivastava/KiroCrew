@@ -1,8 +1,8 @@
 /**
  * AgentBackendTab: what the open detail shows for a harness.
  *
- * The capability card and its MCP half, the standing caveats, the Kiro sign-in card
- * in the KAS detail, and a backend id the panel has never heard of. The list, the
+ * The capability card and its MCP half, the standing caveats, the Kiro account
+ * status line in the KAS detail, and a backend id the panel has never heard of. The list, the
  * switch, the status strip and Check again are pinned in AgentBackendTab.test.tsx.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
@@ -38,20 +38,24 @@ vi.mock('../components/settingRef/useConfigSchema', () => ({
   useConfigSchema: () => schemaMock(),
 }))
 
-// The card under the switch is a sentinel: its own behaviour (status query,
-// chooser, sign-out) is pinned in KiroSignInCard.test.tsx, and the real card
-// would need the kas-login API this file does not mock. Unlike the real card it
-// renders unconditionally, so its absence in a test can only be the tab's gate.
-vi.mock('../pages/developer/KiroSignInCard', () => ({
-  KiroSignInCard: ({ compact }: { compact?: boolean }) => (
-    <div data-testid="kiro-sign-in-card" data-compact={compact ? 'true' : 'false'} />
-  ),
+// The Kiro account line in the KAS detail is a sentinel: its own behaviour is
+// pinned in KiroAccountStatusLine.test.tsx, and the real line would need the
+// kas-login API this file does not mock. It renders unconditionally, so its
+// absence in a test can only be the tab's gate.
+vi.mock('../pages/developer/KiroAccountStatusLine', () => ({
+  KiroAccountStatusLine: () => <div data-testid="kiro-account-status-line" />,
 }))
 
 // Same sentinel treatment for the engine card under it: its behaviour is pinned in
 // KasBundleCard.test.tsx, and the real card would need the kas-bundle API.
 vi.mock('../pages/developer/KasBundleCard', () => ({
   KasBundleCard: () => <div data-testid="kas-bundle-card" />,
+}))
+
+// Same for the Strands provider card: its behaviour is pinned in
+// StrandsSetupCard.test.tsx, and the real card would need the secrets API.
+vi.mock('../pages/developer/StrandsSetupCard', () => ({
+  StrandsSetupCard: () => <div data-testid="strands-setup-card" />,
 }))
 
 import { AgentBackendTab } from '../pages/developer/AgentBackendTab'
@@ -176,16 +180,22 @@ describe('AgentBackendTab detail card', () => {
     expect(screen.getByText('Kiro Agent supports 2 of 2 features')).toBeInTheDocument()
   })
 
-  it('shows the capability list without needing a click', async () => {
-    // The disclosure existed because eight open cards buried the control. One card
-    // does not, and the capability set is what the reader came for.
+  it('folds the capability list into the closed About fold, with its count in the summary', async () => {
+    // Level two of the page (owner's layered-layout ruling): the card sits behind one
+    // closed fold under the Use button, and the summary carries the count so a reader
+    // comparing agents sees the number without a click.
     acpBackendsMock.mockResolvedValue({ backends: [probeRow('kiro', card())] })
     schemaMock.mockReturnValue(schemaWith(['kiro']))
     wrap()
     await waitFor(() =>
       expect(screen.getByText('Kiro Crew tools work in the chat')).toBeInTheDocument(),
     )
-    expect(screen.getByText('Kiro Crew tools work in the chat').closest('details')).toBeNull()
+    const fold = screen.getByTestId('agent-harness-about')
+    expect(screen.getByText('Kiro Crew tools work in the chat').closest('details')).toBe(fold)
+    expect((fold as HTMLDetailsElement).open).toBe(false)
+    expect(screen.getByTestId('agent-harness-about-summary').textContent).toBe(
+      'About Kiro CLI\u00a0· 1 of 2 features',
+    )
   })
 
   it('folds the detail lines behind a disclosure and keeps them out of the count', async () => {
@@ -210,7 +220,7 @@ describe('AgentBackendTab detail card', () => {
     await waitFor(() =>
       expect(screen.getByText('Kiro CLI supports 1 of 1 features')).toBeInTheDocument(),
     )
-    const saved = screen.getByText('Mates load their saved agent')
+    const saved = screen.getByText('Bots load their saved agent')
     const folded = saved.closest('details')
     expect(folded).not.toBeNull()
     expect(folded?.open).toBe(false)
@@ -220,7 +230,9 @@ describe('AgentBackendTab detail card', () => {
     expect(saved.parentElement?.textContent).toContain('Available.')
     const markdown = screen.getByText('Loads custom agents you define in a markdown file')
     expect(markdown.parentElement?.textContent).toContain('Not available.')
-    expect(screen.getByText('Kiro Crew tools work in the chat').closest('details')).toBeNull()
+    expect(screen.getByText('Kiro Crew tools work in the chat').closest('details')).toBe(
+      screen.getByTestId('agent-harness-about'),
+    )
   })
 
   it('renders no disclosure when the gateway sends no detail lines', async () => {
@@ -392,10 +404,10 @@ describe('AgentBackendTab detail card', () => {
     expect(row?.textContent).not.toContain('some_future_reason')
   })
 
-  it('states tool approval outside any disclosure, from the mechanism the server named', async () => {
-    // The one security-relevant line on the card and the reason a build-excluded
-    // agent cannot be picked, so it must not need a click. It is also the one
-    // GRADED line: the label comes from the mechanism, not from a boolean.
+  it('states tool approval first inside the About fold, from the mechanism the server named', async () => {
+    // The reason a build-excluded agent cannot be picked, and the one GRADED line:
+    // the label comes from the mechanism, not from a boolean. Folded by the owner's
+    // ruling; the summary's safety count is what keeps the folded lines findable.
     acpBackendsMock.mockResolvedValue({
       backends: [probeRow('kiro', card()), probeRow('kas', card({ tool_approval: 'seeded_settings' }))],
     })
@@ -406,7 +418,9 @@ describe('AgentBackendTab detail card', () => {
         screen.getByText('Asks before each tool, because Kiro Crew tells it to.'),
       ).toBeInTheDocument(),
     )
-    expect(screen.getByText(/because Kiro Crew tells it to/).closest('details')).toBeNull()
+    expect(screen.getByText(/because Kiro Crew tells it to/).closest('details')).toBe(
+      screen.getByTestId('agent-harness-about'),
+    )
     highlight('Kiro Agent')
     expect(screen.getByText(/cannot confirm it took effect/)).toBeInTheDocument()
   })
@@ -440,12 +454,10 @@ describe('AgentBackendTab detail card', () => {
     expect(screen.queryByText('Good to know')).toBeNull()
   })
 
-  it('opens nothing for a security note or a credential note', async () => {
-    // "Kiro Crew's sandbox is not confining this child" is as material as how the
-    // harness is made to ask, and both fail OPEN. A reader comparing agents must not
-    // have to open anything to find either -- and the same now holds for the one
-    // where-it-lives note the card keeps, since whose secret store an agent signs in
-    // against is a risk the reader takes on rather than a fact they look up once.
+  it('folds a security note and counts it in the summary, without the warning marker', async () => {
+    // "Kiro Crew's sandbox is not confining this child" fails OPEN. The owner folded
+    // it with the rest of the card, on one condition: the always-visible summary
+    // counts it.
     acpBackendsMock.mockResolvedValue({
       backends: [
         probeRow(
@@ -460,8 +472,74 @@ describe('AgentBackendTab detail card', () => {
     schemaMock.mockReturnValue(schemaWith(['kiro']))
     wrap()
     await waitFor(() => expect(screen.getByText(/Has its own sandbox/)).toBeInTheDocument())
-    expect(screen.getByText(/Has its own sandbox/).closest('details')).toBeNull()
-    expect(screen.getByText(/Signs in with its own file/).closest('details')).toBeNull()
+    const fold = screen.getByTestId('agent-harness-about')
+    expect(screen.getByText(/Has its own sandbox/).closest('details')).toBe(fold)
+    expect(screen.getByText(/Signs in with its own file/).closest('details')).toBe(fold)
+    const summary = screen.getByTestId('agent-harness-about-summary')
+    // Counted, not marked: the server sends no host condition, and the note holds
+    // only on Windows and macOS-with-sandbox, so a warning would fire where it is false.
+    expect(summary.textContent).toBe('About Kiro CLI\u00a0· 1 of 2 features\u00a0· 1 safety note')
+    expect(summary).toHaveAttribute('data-warning', 'false')
+    expect(summary.className).not.toContain('text-warn-text')
+  })
+
+  it('warns that tools may run without asking only for Claude or an unverified approval', async () => {
+    // A security note (Crew hands over its own credential) is counted but does not
+    // turn the summary into a warning; Claude's own pre-approved tools and an
+    // unverified approval mechanism do, in words as well as colour.
+    acpBackendsMock.mockResolvedValue({
+      backends: [
+        probeRow('kiro', card({ security_notes: ['host_credential_to_child'] })),
+        probeRow('claude', card()),
+        probeRow('kas', card({ tool_approval: 'unverified' })),
+      ],
+    })
+    schemaMock.mockReturnValue(schemaWith(['kiro', 'claude', 'kas']))
+    wrap()
+    const summary = () => screen.getByTestId('agent-harness-about-summary')
+    await waitFor(() => expect(summary().textContent).toContain('1 safety note'))
+    expect(summary()).toHaveAttribute('data-warning', 'false')
+    expect(summary().textContent).not.toContain('Some tools may run without asking')
+    // A real <summary>: the browser makes it focusable and Enter/Space toggle it.
+    expect(summary().tagName).toBe('SUMMARY')
+
+    highlight('Claude Code')
+    expect(summary().textContent).toContain('1 safety note\u00a0· Some tools may run without asking')
+    // Wraps at 320px rather than overflowing the row that clips it.
+    expect(screen.getByTestId('agent-harness-about-warning').className).not.toContain('nowrap')
+    expect(summary()).toHaveAttribute('data-warning', 'true')
+
+    highlight('Kiro Agent')
+    expect(summary().textContent).toContain('1 safety note\u00a0· Some tools may run without asking')
+  })
+
+  it('counts an agent-file limit that will not take effect, in the plural', async () => {
+    // A Pi-shaped card: no security note, no deny rule, but the hooks the person
+    // wrote to block tools do not run here. That is a safety line, so it is counted.
+    acpBackendsMock.mockResolvedValue({
+      backends: [
+        probeRow('kiro', {
+          ...card({ security_notes: ['host_credential_to_child'] }),
+          ...mcp({ ineffective: ['hooks', 'model'] }),
+        }),
+      ],
+    })
+    schemaMock.mockReturnValue(schemaWith(['kiro']))
+    wrap()
+    const summary = await screen.findByTestId('agent-harness-about-summary')
+    await waitFor(() => expect(summary.textContent).toContain('2 safety notes'))
+    expect(summary).toHaveAttribute('data-warning', 'false')
+  })
+
+  it('folds the which-agents-appear note under "Don\'t see an agent?"', async () => {
+    acpBackendsMock.mockResolvedValue({ backends: [probeRow('kiro', card())] })
+    schemaMock.mockReturnValue(schemaWith(['kiro']))
+    wrap()
+    const note = await screen.findByText(/decided when the gateway starts/)
+    const fold = screen.getByTestId('agent-harness-missing-agent') as HTMLDetailsElement
+    expect(note.closest('details')).toBe(fold)
+    expect(fold.open).toBe(false)
+    expect(fold.querySelector('summary')?.textContent).toBe("Don't see an agent?")
   })
 
   it('renders no card at all when the gateway sent none', async () => {
@@ -533,17 +611,20 @@ describe('AgentBackendTab MCP ability card', () => {
     schemaMock.mockReturnValue(schemaWith(['kiro']))
   })
 
-  it('states the deny rule outside any disclosure, on an agent that can lose a server', async () => {
-    // THE risk this card exists for: switching one tool off is an ordinary action that
-    // says nothing about servers, so a reader meets the difference by accident unless
-    // the card states it before they pick.
+  it('states the deny rule in the About fold and counts it, without the warning marker', async () => {
+    // Switching one tool off is an ordinary action that says nothing about servers,
+    // so a reader meets the difference by accident. Folded, so the summary counts it.
+    // Not a warning: the denied tool stays denied, the cost is function.
     acpBackendsMock.mockResolvedValue({
       backends: [probeRow('kiro', { ...card(), ...mcp({ per_tool_deny: 'whole-server' }) })],
     })
     wrap()
     const rule = await screen.findByText(/stops every tool on the same server/)
-    expect(rule.closest('details')).toBeNull()
+    expect(rule.closest('details')).toBe(screen.getByTestId('agent-harness-about'))
     expect(rule.textContent).toContain('Kiro CLI')
+    const summary = screen.getByTestId('agent-harness-about-summary')
+    expect(summary.textContent).toContain('1 safety note')
+    expect(summary).toHaveAttribute('data-warning', 'false')
   })
 
   it('links the deny rule to the MCP Servers list, where the reader acts on it', async () => {
@@ -559,8 +640,8 @@ describe('AgentBackendTab MCP ability card', () => {
       </QueryClientProvider>,
     )
     const rule = await screen.findByText(/stops every tool on the same server/)
-    const link = within(rule).getByRole('link', { name: 'Open the MCP Servers list in Connections' })
-    expect(link).toHaveAttribute('href', '/capabilities?tab=mcp&view=mcp-servers')
+    const link = within(rule).getByRole('link', { name: 'Open the MCP Servers list' })
+    expect(link).toHaveAttribute('href', '/capabilities?tab=mcp-servers')
   })
 
   it('marks the per-call exception as an exception, right under the rule', async () => {
@@ -573,7 +654,7 @@ describe('AgentBackendTab MCP ability card', () => {
     const rule = await screen.findByText(/stops every tool on the same server/)
     const exception = panel().getByText(/One exception/)
     expect(exception.textContent).toContain('kirocrew-core')
-    expect(exception.closest('details')).toBeNull()
+    expect(exception.closest('details')).toBe(rule.closest('details'))
     expect(rule.compareDocumentPosition(exception) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
   })
 
@@ -610,6 +691,20 @@ describe('AgentBackendTab MCP ability card', () => {
     expect(panel().getByText(/The auto-approve rules your agent config file sets/)).toBeInTheDocument()
     expect(panel().getByText(/The permission mode your agent config file asks for/)).toBeInTheDocument()
     expect(panel().getByText(/The hooks your agent config file defines/)).toBeInTheDocument()
+  })
+
+  it('names only the preToolUse hooks where the rest of the hooks still run', async () => {
+    // The server narrows the hooks line where Crew fires every other event itself, so
+    // the card must not tell that reader none of their hooks run.
+    acpBackendsMock.mockResolvedValue({
+      backends: [probeRow('kiro', { ...card(), ...mcp({ ineffective: ['hooks_pre_tool_use'] }) })],
+    })
+    wrap()
+    await waitFor(() =>
+      expect(panel().getByText(/The preToolUse hooks your agent config file defines/)).toBeInTheDocument(),
+    )
+    expect(panel().queryByText(/^The hooks your agent config file defines/)).toBeNull()
+    expect(panel().queryByText('hooks_pre_tool_use')).toBeNull()
   })
 
   it('renders no heading for an agent that honours the whole file', async () => {
@@ -798,7 +893,9 @@ describe('AgentBackendTab standing caveats', () => {
     wrap()
     await waitFor(() => expect(row('Kiro Agent')).toBeInTheDocument())
     highlight('Kiro Agent')
-    await waitFor(() => expect(detail().textContent).toContain('Default.'))
+    await waitFor(() =>
+      expect(detail().textContent).toContain('Kiro Agent is installed and ready to use.'),
+    )
     expect(screen.queryByText('Run: kiro login')).toBeNull()
   })
 
@@ -834,56 +931,53 @@ describe('AgentBackendTab standing caveats', () => {
 })
 
 describe('AgentBackendTab kiro sign-in', () => {
-  it('renders the Kiro sign-in inside the KAS detail, compact, while KAS is on offer', async () => {
-    // The identity it stores is used by the KAS relay alone, so it lives in the one
-    // row whose harness uses it -- and in the in-detail form, not a card inside the
-    // detail's own bordered panel.
+  it('shows the Kiro account line inside the KAS detail while KAS is on offer', async () => {
+    // The card itself is on Settings > Kiro account; the row that runs as the
+    // sign-in says whether it is stored and links there.
     wrap()
     await waitFor(() => expect(row('Kiro Agent')).toBeInTheDocument())
-    // Kiro CLI's detail is open: no sign-in there.
-    expect(screen.queryByTestId('kiro-sign-in-card')).toBeNull()
+    // Kiro CLI's detail is open: no line there.
+    expect(screen.queryByTestId('kiro-account-status-line')).toBeNull()
     highlight('Kiro Agent')
-    const signIn = screen.getByTestId('kiro-sign-in-card')
-    expect(detail().contains(signIn)).toBe(true)
-    expect(signIn).toHaveAttribute('data-compact', 'true')
+    expect(detail().contains(screen.getByTestId('kiro-account-status-line'))).toBe(true)
     // And not on the other harness that could be looked at next.
     highlight('Claude Code')
-    expect(screen.queryByTestId('kiro-sign-in-card')).toBeNull()
+    expect(screen.queryByTestId('kiro-account-status-line')).toBeNull()
   })
 
   it('keeps the KAS engine card off the harness row; it lives in Feature Previews', async () => {
     // The route is in shadow testing, so its switch is not in plain view of every
-    // KAS user: the KAS detail shows the sign-in and no engine card.
+    // KAS user: the KAS detail shows the account line and no engine card.
     wrap()
     await waitFor(() => expect(row('Kiro Agent')).toBeInTheDocument())
     highlight('Kiro Agent')
-    expect(screen.getByTestId('kiro-sign-in-card')).toBeInTheDocument()
+    expect(screen.getByTestId('kiro-account-status-line')).toBeInTheDocument()
     expect(screen.queryByTestId('kas-bundle-card')).toBeNull()
   })
 
-  it('renders no sign-in card when this deployment cannot select KAS', async () => {
+  it('renders no account line when this deployment cannot select KAS', async () => {
     // On a build or policy that hides that option there is nothing to sign in for.
     schemaMock.mockReturnValue(schemaWith(['kiro', 'claude']))
     wrap()
     await waitFor(() => expect(row('Kiro CLI')).toBeInTheDocument())
     expect(screen.queryByRole('radio', { name: 'Kiro Agent' })).toBeNull()
-    expect(screen.queryByTestId('kiro-sign-in-card')).toBeNull()
+    expect(screen.queryByTestId('kiro-account-status-line')).toBeNull()
     expect(screen.queryByTestId('kas-bundle-card')).toBeNull()
     highlight('Claude Code')
-    expect(screen.queryByTestId('kiro-sign-in-card')).toBeNull()
+    expect(screen.queryByTestId('kiro-account-status-line')).toBeNull()
   })
 
-  it('opens on KAS with the sign-in while KAS is the saved backend, even if it reads as unselectable', async () => {
+  it('opens on KAS with the account line while KAS is the saved backend, even if it reads as unselectable', async () => {
     kirocrewConfigMock.mockResolvedValue({ agent: { acp_backend: 'kas' } })
     schemaMock.mockReturnValue(schemaWith(['kiro']))
     wrap()
     await waitFor(() => expect(row('Kiro Agent')).toHaveAttribute('aria-current', 'true'))
     expect(row('Kiro Agent')).toBeChecked()
-    expect(screen.getByTestId('kiro-sign-in-card')).toBeInTheDocument()
+    expect(screen.getByTestId('kiro-account-status-line')).toBeInTheDocument()
   })
 
-  it('offers no sign-in card for an agent it only lists', async () => {
-    // The sign-in gate reads the OFFERED set, not the listed one. A KAS row that
+  it('offers no account line for an agent it only lists', async () => {
+    // The line's gate reads the OFFERED set, not the listed one. A KAS row that
     // exists only to explain itself must not draw a sign-in for an option nobody can
     // pick.
     acpBackendsMock.mockResolvedValue({
@@ -900,14 +994,11 @@ describe('AgentBackendTab kiro sign-in', () => {
     await waitFor(() => expect(row('Kiro Agent')).toBeInTheDocument())
     highlight('Kiro Agent')
     expect(panel().getByText('This build does not offer this agent.')).toBeInTheDocument()
-    expect(screen.queryByTestId('kiro-sign-in-card')).toBeNull()
+    expect(screen.queryByTestId('kiro-account-status-line')).toBeNull()
   })
 
-  it("opens the KAS detail when the URL carries the chat's sign-in highlight", async () => {
-    // The chat's "Sign in to Kiro" link is `/settings/agent?highlight=key:kiro-sign-in`.
-    // The Settings highlight hook waits for the anchor and rings it, but the anchor
-    // lives inside the KAS detail -- so the tab has to open that detail for the link
-    // to land on anything.
+  it('leaves the detail on the running backend for any highlight, the sign-in one included', async () => {
+    // The sign-in card has a tab of its own, so its highlight opens nothing here.
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
     render(
       <QueryClientProvider client={qc}>
@@ -916,31 +1007,9 @@ describe('AgentBackendTab kiro sign-in', () => {
         </MemoryRouter>
       </QueryClientProvider>,
     )
-    await waitFor(() => expect(row('Kiro Agent')).toBeChecked())
-    expect(row('Kiro CLI')).not.toBeChecked()
-    // Kiro CLI is still the one running: opening a detail switched nothing.
-    expect(row('Kiro CLI')).toHaveAttribute('aria-current', 'true')
-    expect(screen.getByTestId('kiro-sign-in-card')).toBeInTheDocument()
-    expect(patchConfigMock).not.toHaveBeenCalled()
-    // Once open, the reader is free to look elsewhere: the link does not drag them
-    // back while the parameter is still in the URL.
-    highlight('Claude Code')
-    expect(row('Claude Code')).toBeChecked()
-    expect(screen.queryByTestId('kiro-sign-in-card')).toBeNull()
-  })
-
-  it('leaves the detail on the running backend for any other highlight', async () => {
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-    render(
-      <QueryClientProvider client={qc}>
-        <MemoryRouter initialEntries={['/settings/agent?highlight=key%3Asomething-else']}>
-          <AgentBackendTab />
-        </MemoryRouter>
-      </QueryClientProvider>,
-    )
     await waitFor(() => expect(row('Kiro CLI')).toBeChecked())
     expect(row('Kiro Agent')).not.toBeChecked()
-    expect(screen.queryByTestId('kiro-sign-in-card')).toBeNull()
+    expect(screen.queryByTestId('kiro-account-status-line')).toBeNull()
   })
 })
 
@@ -997,13 +1066,20 @@ describe('AgentBackendTab new backend', () => {
     expect(screen.getByText(`${unheardOf} supports 2 of 3 features`)).toBeInTheDocument()
     // The graded line, from the routing enum.
     expect(screen.getByText(/through an add-on Kiro Crew loads and checks/)).toBeInTheDocument()
-    // The security note, never behind the disclosure.
-    expect(screen.getByText(/Signs in with its own file/).closest('details')).toBeNull()
+    // The security note, inside the About fold and counted in its summary.
+    expect(screen.getByText(/Signs in with its own file/).closest('details')).toBe(
+      screen.getByTestId('agent-harness-about'),
+    )
+    expect(screen.getByTestId('agent-harness-about-summary').textContent).toContain(
+      '1 safety note',
+    )
     // A where-it-lives note the server DID send renders, and as a plain line: which
     // notes reach the card is the server's classification (`OPERATOR_LINES`), and the
-    // panel renders what arrives rather than re-deciding it. Nothing is behind a
-    // toggle now that the group is one line for a stock harness.
-    expect(screen.getByText(/keeps its own copy of the chat/).closest('details')).toBeNull()
+    // panel renders what arrives rather than re-deciding it. No toggle of its own:
+    // it sits in the one About fold with the rest of the card.
+    expect(screen.getByText(/keeps its own copy of the chat/).closest('details')).toBe(
+      screen.getByTestId('agent-harness-about'),
+    )
     // The server's remedy, verbatim.
     expect(screen.getByText('Run: wireweave auth')).toBeInTheDocument()
 
@@ -1012,5 +1088,18 @@ describe('AgentBackendTab new backend', () => {
     await waitFor(() =>
       expect(patchConfigMock).toHaveBeenCalledWith('agent.acp_backend', unheardOf),
     )
+  })
+})
+
+describe('AgentBackendTab Strands setup', () => {
+  it('renders the provider card inside the Strands detail only', async () => {
+    schemaMock.mockReturnValue(schemaWith(['kiro', 'kas', 'strands', 'claude']))
+    wrap()
+    await waitFor(() => expect(row('Strands')).toBeInTheDocument())
+    expect(screen.queryByTestId('strands-setup-card')).toBeNull()
+    highlight('Strands')
+    expect(detail().contains(screen.getByTestId('strands-setup-card'))).toBe(true)
+    highlight('Claude Code')
+    expect(screen.queryByTestId('strands-setup-card')).toBeNull()
   })
 })

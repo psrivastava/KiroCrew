@@ -49,12 +49,15 @@ Instance fields read: ``_cfg``, ``_compaction``, ``_session_map``.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from kiro_crew.config.loader import AUTOCOMPACT_PCT_MAX, AUTOCOMPACT_PCT_MIN
 from kiro_crew.session_map import SUPPRESS_REPLAY_FLAG
 from kiro_crew.session_parts.policy import _resolve_compact_wait_secs
+
+logger = logging.getLogger("kiro_crew.session")
 
 if TYPE_CHECKING:
     from kiro_crew.session import LLMProvider, SessionManager
@@ -155,6 +158,24 @@ async def compact_if_needed(self: SessionManager, key: str) -> str:
     return await self._compaction.compact_if_needed(key)
 
 
+async def compact_if_idle(self: SessionManager, key: str, *, generation: int | None = None) -> str:
+    """Delegate the once-per-idle-stretch compaction ``session.idle_compaction`` fires."""
+    return await self._compaction.idle.compact_if_idle(key, generation=generation)
+
+
+def cancel_idle_compaction(self: SessionManager, key: str) -> bool:
+    """End *key*'s idle-compaction stretch; the session is in use again.
+
+    Called from the claim, registry-change and config paths, some of which run
+    on a manager a test built without its compaction boundary, so a manager
+    with none answers False.
+    """
+    compaction = self.__dict__.get("_compaction")
+    if compaction is None:
+        return False
+    return bool(compaction.idle.cancel(key))
+
+
 def set_compact_callback(self: SessionManager, cb: _CompactCallback | None) -> None:
     """Register the compaction completion callback."""
     self._compaction.set_compact_callback(cb)
@@ -185,6 +206,19 @@ def consume_needs_reinjection(self: SessionManager, key: str) -> bool:
     return self._compaction.consume_needs_reinjection(key)
 
 
+def remember_agent_spawn_context(self: SessionManager, key: str, texts: list[str]) -> None:
+    """Keep the ``agentSpawn`` hook output a live session's first turn sent."""
+    session = self._sessions.get(self._fold_key(key))
+    if session is not None:
+        session.agent_spawn_context = tuple(texts)
+
+
+def agent_spawn_context(self: SessionManager, key: str) -> tuple[str, ...]:
+    """The ``agentSpawn`` hook output kept for a live session; empty if none."""
+    session = self._sessions.get(self._fold_key(key))
+    return session.agent_spawn_context if session is not None else ()
+
+
 def provider_switch_replay_pending(self: SessionManager, key: str) -> bool:
     """Return whether a live session still owes conversation replay.
 
@@ -199,11 +233,42 @@ def provider_switch_replay_pending(self: SessionManager, key: str) -> bool:
 
 
 def mark_provider_switch_replay(self: SessionManager, key: str) -> bool:
-    """Re-arm replay after an accepted turn is discarded by cancellation."""
+    """Re-arm replay after an accepted turn is discarded by cancellation.
+
+    A re-arm keeps a delivery already noted; arming a settled lease starts it
+    undelivered.
+    """
     session = self._sessions.get(self._fold_key(key))
     if session is None:
         return False
+    if not session.provider_switch_replay:
+        session.provider_switch_replay_delivered_to = None
     session.provider_switch_replay = True
+    return True
+
+
+def provider_switch_replay_delivered(self: SessionManager, key: str, incarnation: object) -> bool:
+    """Return whether an armed lease's replay already reached *incarnation*.
+
+    *incarnation* is the provider's current ``context_incarnation``: a respawned
+    process reloading the same session id is a new one, so the replay is owed again.
+    """
+    session = self._sessions.get(self._fold_key(key))
+    return bool(
+        session is not None
+        and session.provider_switch_replay
+        and session.provider_switch_replay_delivered_to == incarnation
+    )
+
+
+def note_provider_switch_replay_delivered(
+    self: SessionManager, key: str, incarnation: object
+) -> bool:
+    """Record that a turn which did not land kept the armed lease's replay in *incarnation*."""
+    session = self._sessions.get(self._fold_key(key))
+    if session is None or not session.provider_switch_replay:
+        return False
+    session.provider_switch_replay_delivered_to = incarnation
     return True
 
 
@@ -234,6 +299,36 @@ def unlanded_marker_pending(self: SessionManager, key: str) -> bool:
     ever has one, so a turn on any other backend has nothing to await.
     """
     return self._session_map.sid_unlanded_pending(self._fold_key(key))
+
+
+def note_session_head(
+    self: SessionManager, key: str, provider: LLMProvider, *, is_new: bool, resumed: bool
+) -> None:
+    """Carry *key*'s session-head record between its fresh start and its resumes.
+
+    Run on every claim (:func:`~kiro_crew.session_parts.claims.get_or_create`), so
+    every surface that starts or resumes the session takes the same path. A fresh
+    session whose agent prompt carries a head (``kiro_crew.session_head``) records
+    its sid (``SessionMap.mark_sid_head``); a resumed one is told whether it started
+    with one (``provider.session_head_started``), which ``build_message`` reads to
+    re-send the agent prompt when the resumed session holds no head. Synchronous and
+    without file access: it runs after the claim holds its permit, where an await
+    could be cancelled before the caller receives the lease it must release. A
+    failure is logged and swallowed for the same reason: the record is
+    bookkeeping, and the claim it rides on has already succeeded.
+    """
+    try:
+        folded = self._fold_key(key)
+        if resumed:
+            provider.session_head_started = self._session_map.sid_head_pending(folded)
+            return
+        if not is_new or provider.session_head_held is not True:
+            return
+        sid = getattr(getattr(provider, "client", None), "_session_id", None)
+        if isinstance(sid, str) and sid:
+            self._session_map.mark_sid_head(folded, sid)
+    except Exception:
+        logger.warning("session head record not kept for %s", key, exc_info=True)
 
 
 def consume_first_turn_history_owed(self: SessionManager, key: str) -> bool:
@@ -278,7 +373,11 @@ def _trigger_compaction(
 
 
 async def _compact_session(self: SessionManager, key: str, pct: float) -> str:
-    """Delegate backend-specific compaction execution."""
+    """Delegate backend-specific compaction execution.
+
+    The trigger is not a parameter here: the coordinator records it when it
+    commits the compaction and reads it back, so this seam keeps its shape.
+    """
     return await self._compaction._compact_session(key, pct)
 
 

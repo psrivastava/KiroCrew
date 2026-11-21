@@ -1,16 +1,31 @@
-"""The session MCP report, the session-init OAuth drain, the MCP OAuth banner lifecycle, the
-scrub of the ACP strings it shows, and the stream's MCP arms (``_on_mcp_oauth_request``,
+"""The session MCP report, the session-start notice for Kiro Crew's own servers a session
+lacks, the session-init OAuth drain, the MCP OAuth banner lifecycle, the scrub of the ACP
+strings it shows, and the stream's MCP arms (``_on_mcp_oauth_request``,
 ``_on_mcp_server_initialized``, ``_on_mcp_server_init_failure``)."""
 
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 from typing import TYPE_CHECKING, Any
 
+from kiro_crew.agent_sdk.backends import ACP_BACKEND_OPENCODE, ACP_BACKENDS_OPEN_EXTERNAL_URL
 from kiro_crew.config.loader import oauth_endpoints_path
-from kiro_crew.dashboard.chat_utils import _redact_meta_for_role
+from kiro_crew.dashboard.chat_utils import (
+    _expire_dead_child_oauth_meta,
+    _live_child_instance,
+    _redact_meta_for_role,
+)
+from kiro_crew.dashboard.mcp_banner_dedupe import (
+    forget_mcp_banner,
+    rejected_banner_is_repeat,
+)
+from kiro_crew.dashboard.mcp_oauth_expiry_watch import watch_open_oauth_banners
+from kiro_crew.dashboard.mcp_oauth_provenance import record_emitted
+from kiro_crew.dashboard.session_notice_marks import _session_notice_is_new
 from kiro_crew.dashboard.urls import is_loopback
+from kiro_crew.mcp_cleanup import CONTROL_PLANE_SERVERS
 from kiro_crew.security import sanitized_oauth_endpoint, sanitized_oauth_endpoint_display
 
 if TYPE_CHECKING:
@@ -19,6 +34,9 @@ if TYPE_CHECKING:
         SessionMcpReport,
         _ChatSlot,
         _is_safe_oauth_url,
+        append_and_surface,
+        capabilities_of,
+        effective_session_key,
         get_visible_providers,
         kirocrew_managed_names,
         logger,
@@ -128,6 +146,7 @@ async def _drain_session_init_oauth_requests(
     # process instance is the identity every one of these banners is stamped
     # with — the flow's loopback listener and verifier live in it.
     minted_by = str(getattr(client, "process_instance", "") or "")
+    session_id = _provider_session_id(client)
     for req in pending:
         if not isinstance(req, dict):
             continue
@@ -144,6 +163,7 @@ async def _drain_session_init_oauth_requests(
             oauth_url,
             card_owned=bool(server_name) and server_name in managed,
             minted_by=minted_by,
+            session_id=session_id,
         )
 
 
@@ -162,17 +182,330 @@ def _publish_session_mcp_report(state: "DashboardState", slot: "_ChatSlot", prov
     report = _session_mcp_report(provider)
     if report is None:
         return
+    payload = report.payload()
+    # A server this session reports as connected has signed in, however that
+    # was learned: a mid-turn event, or a frame the init drain or a session
+    # load consumed without one. Its next rejection is news, so its
+    # rejected-banner record goes, before the unchanged-report early return.
+    for name in (payload or {}).get("ready") or ():
+        if isinstance(name, str) and name:
+            forget_mcp_banner(slot, name)
+            forget_mcp_banner(slot, _redact_acp_string(name))
+    _notice_mcp_sign_in_needed(state, slot, payload, provider)
+    _notice_mcp_may_need_sign_in(state, slot, payload, provider)
     # Stamp the payload with the session it describes. This copy outlives its
     # owner — the report itself lives on the transport and is inherently that
     # session's — so without the id a reader cannot tell a current answer from a
     # replaced session's, which is the leak every teardown patch chased.
     session_id = str(getattr(provider, "session_id", "") or "")
-    payload = report.payload()
     if slot.set_mcp_report(payload, session_id):
         state.broadcast_ws(
             "mcp_report_update",
             {"slot": slot.key, "mcp_report": payload},
         )
+
+
+def _unresolved_control_plane(provider: Any) -> list[str]:
+    """Kiro Crew's own servers this session's spec names and nothing sent it defines.
+
+    Read off the session's MCP report (``unresolved_refs``, which
+    :mod:`kiro_crew.acp.mcp_ref_guard` fills at session establishment), kept to
+    ``CONTROL_PLANE_SERVERS`` and returned as this module's own constants in their
+    order, never as spec text. Empty for a clean report, for a provider that keeps
+    none, and for one that cannot be read.
+    """
+    report = _session_mcp_report(provider)
+    if report is None:
+        return []
+    try:
+        payload = report.payload() or {}
+    except Exception:  # noqa: BLE001 - an informational row must never fail a turn
+        logger.debug("Failed to read the session MCP report", exc_info=True)
+        return []
+    refs = payload.get("unresolved_refs")
+    unresolved = {ref for ref in refs if isinstance(ref, str)} if isinstance(refs, list) else set()
+    return [name for name in CONTROL_PLANE_SERVERS if f"@{name}" in unresolved]
+
+
+def _unresolved_control_plane_notice(names: list[str]) -> str:
+    """The session-start notice naming the control-plane servers *names*."""
+    one = len(names) == 1
+    servers = ", ".join(names)
+    refs = ", ".join(f"@{name}" for name in names)
+    return (
+        "⚠ This session started without Kiro Crew's own MCP "
+        f"{'server' if one else 'servers'} {servers}. The agent's tools list names "
+        f"{refs}, but nothing Kiro Crew sent this session defines "
+        f"{'it' if one else 'them'}, so {'its' if one else 'their'} tools are missing "
+        "here. On Kiro CLI this usually means the agent ran without its skill view: "
+        "skill projection is off (agent.native_skill_projection), or too many skill "
+        "views are on disk, which the skill views row of kirocrew doctor reports with "
+        "the way to clear it. Fix that, then start a new chat."
+    )
+
+
+async def _notice_unresolved_control_plane(
+    state: "DashboardState", slot: "_ChatSlot", provider: Any
+) -> None:
+    """One notice row on a new session that lacks Kiro Crew's own servers its spec names.
+
+    The session's report records each ``@server`` ref nothing Kiro Crew sent the
+    session defines, and apart from this row only the gateway log and the slot
+    list's ``mcp_report`` carry it, which no chat surface renders. On kiro-cli a
+    custom agent gets ``kirocrew-core`` and ``kirocrew-cron`` through its skill view
+    only, so a spawn that falls back to the authored agent runs without them, and
+    this row is how the chat says so.
+
+    Only ``CONTROL_PLANE_SERVERS`` are named: every session is meant to hold them,
+    so their absence is never the healthy state, while any other unresolved ref is
+    left to the log line, the report and ``kirocrew doctor``. No row when
+    the session's settings file withholds Crew's servers: the seed-declined notice
+    already says so and names the remedy. Best-effort: a read that fails renders
+    no row rather than failing the turn.
+    """
+    missing = _unresolved_control_plane(provider)
+    if not missing:
+        return
+    read_cause = getattr(provider, "settings_withheld_cause", None)
+    if callable(read_cause):
+        try:
+            cause = await asyncio.to_thread(read_cause)
+        except Exception:  # noqa: BLE001 - an informational row must never fail a turn
+            logger.debug("settings-withheld cause could not be read", exc_info=True)
+            cause = ""
+        if isinstance(cause, str) and cause:
+            return
+    append_and_surface(
+        state, slot, "notice", _unresolved_control_plane_notice(missing), "msg msg-warn"
+    )
+
+
+#: ``meta.kind`` of the row that tells a chat its servers wait for a sign-in.
+MCP_SIGN_IN_NEEDED_KIND = "mcp_sign_in_needed"
+#: How many servers that row names; the rest are counted.
+_MCP_SIGN_IN_NOTICE_NAMES = 5
+
+
+def _mcp_sign_in_needed_notice(names: list[str], more: int) -> str:
+    """The row's own text, for a surface that draws no card for it.
+
+    The chat page draws the same sentence from ``meta`` in the reader's language
+    (``McpSignInNeededNotice.tsx``); keep the two in step.
+    """
+    if len(names) == 1 and not more:
+        name = names[0]
+        return (
+            f"⚠ {name} (an MCP server you added) needs you to sign in before its tools "
+            f'work in this chat. Send a message that names {name}, such as "Sign in to '
+            f'{name}".'
+        )
+    if more:
+        listed = ", ".join(names) + f" and {more} more"
+    else:
+        listed = ", ".join(names[:-1]) + f" and {names[-1]}"
+    return (
+        "⚠ These MCP servers you added need you to sign in before their tools work in "
+        f"this chat: {listed}. Each one needs its own sign-in. Send a message that "
+        f'names it, such as "Sign in to {names[0]}".'
+    )
+
+
+def _notice_mcp_sign_in_needed(
+    state: "DashboardState", slot: "_ChatSlot", payload: dict[str, Any] | None, provider: Any
+) -> None:
+    """One row per chat naming the servers this session reports as waiting for a sign-in.
+
+    A session that needs a sign-in draws a card only when its host sends a link by
+    itself. A host that waits to be asked (KAS: the user names the server) leaves
+    the chat with missing tools and nothing that says why, so this row names the
+    servers that have no sign-in card in the chat and how to sign in. It starts no
+    sign-in: the person does, by sending the message.
+
+    Shown only where naming a server starts its sign-in: a backend whose host
+    sends the consent link back (``ACP_BACKENDS_OPEN_EXTERNAL_URL``, the check
+    ``begin_mcp_sign_in`` makes first). Elsewhere the advice would start nothing.
+
+    Shown once per chat, so a server that stays unsigned does not repeat it on
+    every turn. Best-effort: a row that cannot be built is skipped.
+    """
+    if slot._mcp_sign_in_notice_shown:
+        return
+    if capabilities_of(provider).backend not in ACP_BACKENDS_OPEN_EXTERNAL_URL:
+        return
+    try:
+        waiting = [
+            _redact_acp_string(name)
+            for name in (payload or {}).get("awaiting_auth") or ()
+            if isinstance(name, str) and name
+        ]
+        # A card counts only while it still offers this server a way in: it has
+        # its link and is not finished, failed, withdrawn or expired. Marking a
+        # card finished keeps its oauth_url, and a restored transcript keeps it too.
+        # A card whose child is gone is judged expired only at read time, and that
+        # verdict is never saved, so the read gate judges each card here too.
+        # A rejected-link banner also counts: it already says why this server's
+        # sign-in did not start, and its advice differs from this row's.
+        live_child = _live_child_instance(state, slot)
+        carded = {
+            str(meta.get("server_name") or "")
+            for row in slot.messages
+            if isinstance(row, dict)
+            and row.get("role") == "mcp_oauth"
+            and isinstance(meta := row.get("meta"), dict)
+            and (
+                meta.get("rejected_url")
+                or (
+                    meta.get("oauth_url")
+                    and not any(
+                        meta.get(flag) for flag in ("completed", "failed", "superseded", "expired")
+                    )
+                    and _expire_dead_child_oauth_meta("mcp_oauth", meta, live_child) is meta
+                )
+            )
+        }
+        names = [name for name in waiting if name and name not in carded]
+        if not names:
+            return
+        shown = names[:_MCP_SIGN_IN_NOTICE_NAMES]
+        more = len(names) - len(shown)
+        slot._mcp_sign_in_notice_shown = True
+        append_and_surface(
+            state,
+            slot,
+            "notice",
+            _mcp_sign_in_needed_notice(shown, more),
+            "msg msg-warn",
+            meta={"kind": MCP_SIGN_IN_NEEDED_KIND, "servers": shown, "more": more},
+        )
+    except Exception:  # noqa: BLE001 - an informational row must never fail a turn
+        logger.debug("Failed to show the MCP sign-in notice", exc_info=True)
+
+
+#: ``meta.kind`` of the row that tells a chat a changed server waits for a new session.
+MCP_RESTART_TO_LOAD_KIND = "mcp_restart_to_load"
+
+#: The session notice mark of the row that tells an opencode chat a server may need a
+#: sign-in, so the chat shows it once however the list of servers grows.
+MCP_MAY_NEED_SIGN_IN_MARK = "mcp_may_need_sign_in"
+
+
+def _mcp_may_need_sign_in_notice(names: list[str], more: int) -> str:
+    """The row's text naming the remote servers *names* that asked Crew's probe to sign in."""
+    one = len(names) == 1 and not more
+    listed = ", ".join(names) + (f" and {more} more" if more else "")
+    return (
+        f"⚠ The MCP {'server' if one else 'servers'} {listed} may need a sign-in: "
+        f"{'it answers' if one else 'each answers'} a request without credentials by "
+        "asking for one. This harness cannot sign in to a remote MCP server through Kiro "
+        "Crew yet. If its tools already work in this chat, nothing is wrong. If they do "
+        "not, use a harness that can sign in, or give the server an Authorization header."
+    )
+
+
+def _notice_mcp_may_need_sign_in(
+    state: "DashboardState", slot: "_ChatSlot", payload: dict[str, Any] | None, provider: Any
+) -> None:
+    """One row per chat on opencode naming the servers its report lists in ``sign_in_suspected``.
+
+    opencode sends no sign-in frame, so that list is what Crew's credential-free
+    probe found (:mod:`kiro_crew.acp.mcp_sign_in_probe`).
+    The server may already be signed in through opencode itself, so the row says
+    "may", never that the server is broken. Best-effort: a row that cannot be
+    built is skipped.
+    """
+    try:
+        on_opencode = capabilities_of(provider).backend == ACP_BACKEND_OPENCODE
+        names = [
+            _redact_acp_string(name)
+            for name in ((payload or {}).get("sign_in_suspected") or () if on_opencode else ())
+            if isinstance(name, str) and name
+        ]
+        names = [name for name in names if name]
+        if not names or not _session_notice_is_new(slot, MCP_MAY_NEED_SIGN_IN_MARK):
+            return
+        shown = names[:_MCP_SIGN_IN_NOTICE_NAMES]
+        more = len(names) - len(shown)
+        append_and_surface(
+            state,
+            slot,
+            "notice",
+            _mcp_may_need_sign_in_notice(shown, more),
+            "msg msg-warn",
+        )
+    except Exception:  # noqa: BLE001 - an informational row must never fail a turn
+        logger.debug("Failed to show the MCP may-need-sign-in notice", exc_info=True)
+
+
+def _mcp_restart_to_load_notice(names: list[str]) -> str:
+    """The row's text naming the changed servers *names* this session will not load."""
+    if len(names) == 1:
+        return (
+            f"⚠ The MCP server {names[0]} was added or changed after this chat's session "
+            "started, and this session cannot load it. Start a new chat to use it."
+        )
+    return (
+        f"⚠ The MCP servers {', '.join(names)} were added or changed after this chat's "
+        "session started, and this session cannot load them. Start a new chat to use them."
+    )
+
+
+def notice_mcp_restart_to_load(state: "DashboardState", names: list[str]) -> int:
+    """Tell each running chat whose session cannot load an MCP config change about it.
+
+    A config write that rewrites the agent spec reaches a running session only on
+    a backend that applies it live: kiro-cli watches its agent file, KAS takes a
+    re-sent projection, Strands relaunches (``kiro_crew.mcp_hot_reload``). Any
+    other session keeps the server set it started with, so each such session's
+    report lists *names* in ``restart_to_load`` and its chat gets one notice row
+    naming them. Nothing is restarted. A server already listed is not told again.
+
+    Returns how many sessions were marked. Best-effort: a write already landed,
+    so a slot that cannot be read is skipped rather than failing the request.
+    """
+    from kiro_crew.mcp_hot_reload import (
+        provider_hot_reloads,
+        provider_reinjects_mcp,
+        provider_relaunches_for_mcp,
+    )
+
+    slots = getattr(state, "_slots", None)
+    if not names or not isinstance(slots, dict):
+        return 0
+    seen: set[int] = set()
+    marked = 0
+    for slot in list(slots.values()):
+        try:
+            provider = state.sessions.get_provider(effective_session_key(slot))
+            if provider is None or id(provider) in seen:
+                continue
+            seen.add(id(provider))
+            if (
+                provider_hot_reloads(provider)
+                or provider_reinjects_mcp(provider)
+                or provider_relaunches_for_mcp(provider)
+            ):
+                continue
+            report = _session_mcp_report(provider)
+            if report is None:
+                continue
+            fresh = list(report.mark_restart_to_load(names))
+            # Published even when nothing was admitted: a name past the bound
+            # still moves the report's omitted count.
+            _publish_session_mcp_report(state, slot, provider)
+            if not fresh:
+                continue
+            marked += 1
+            append_and_surface(
+                state,
+                slot,
+                "notice",
+                _mcp_restart_to_load_notice(fresh),
+                "msg msg-warn",
+                meta={"kind": MCP_RESTART_TO_LOAD_KIND, "servers": fresh},
+            )
+        except Exception:  # noqa: BLE001 - an informational row must never fail a write
+            logger.debug("Failed to mark a session restart_to_load", exc_info=True)
+    return marked
 
 
 def _record_session_mcp_event(
@@ -195,13 +528,37 @@ def _record_session_mcp_event(
     ``fanout_no_owner`` comes from ``AcpEvent.runtime_global``: the banner is
     still surfaced for an ownerless event, only the report mutation is gated —
     the same split the compaction path already makes.
+
+    A transport that folds each frame as it arrives (``folded_on_arrival``) has
+    already recorded the state this event names, and maybe a newer one, so the
+    event is not written to its report again: it only republishes. The slot
+    drops a payload equal to the one it holds, so a repeat pushes nothing.
     """
     report = _session_mcp_report(provider)
-    if report is None or not report.record_event(
-        kind, server_name, error, fanout_no_owner=fanout_no_owner
-    ):
+    if report is None:
         return
+    if not report.folded_on_arrival:
+        report.record_event(kind, server_name, error, fanout_no_owner=fanout_no_owner)
     _publish_session_mcp_report(state, slot, provider)
+
+
+def _watch_session_mcp_report(state: "DashboardState", slot: "_ChatSlot", provider: Any) -> None:
+    """Republish this slot's MCP report each time the session's servers move it.
+
+    The report follows its servers during a turn and between turns, and most of
+    those moves (a server that simply connects) yield no turn event. Called at
+    turn admission, after the report was published once: the hook belongs to the
+    session's current report, so each turn sets it on the report it will read.
+    """
+
+    def republish() -> None:
+        # Only while the slot still shows THIS session's report: a reset clears
+        # the stored copy, and a late frame must not bring it back.
+        session_id = str(getattr(provider, "session_id", "") or "")
+        if session_id and slot._mcp_report_session_id == session_id:
+            _publish_session_mcp_report(state, slot, provider)
+
+    provider.set_mcp_report_changed_hook(republish)
 
 
 def _redact_acp_string(s: str) -> str:
@@ -239,6 +596,36 @@ async def _approve_discovered_mcp_oauth_endpoint(server_name: str, oauth_url: st
     await approve_discovered_oauth_endpoint(server_name, oauth_url)
 
 
+def _provider_session_id(provider: Any) -> str:
+    """The ACP session id *provider* serves, or "" when it has none."""
+    session_id = getattr(provider, "session_id", "")
+    return session_id if isinstance(session_id, str) else ""
+
+
+def _append_rejected_mcp_oauth_banner(
+    slot: "_ChatSlot",
+    server_name: str,
+    safe_name: str,
+    ambiguous: bool,
+    session_id: str,
+    content: str,
+    meta: dict[str, Any],
+) -> None:
+    """Append a rejected-URL banner unless it repeats the last one shown.
+
+    kiro-cli retries a signed-out server's sign-in on every turn, so without
+    this check the same rejection is posted on every user turn and every
+    auto-nudge cycle. See :mod:`kiro_crew.dashboard.mcp_banner_dedupe`
+    for what counts as a change.
+    """
+    if rejected_banner_is_repeat(
+        slot, server_name, safe_name, ambiguous, session_id, content, str(meta.get("error", ""))
+    ):
+        logger.debug("ACP: not repeating an unchanged MCP OAuth rejection banner")
+        return
+    slot.append("mcp_oauth", content, "msg msg-warn", meta=meta)
+
+
 def _emit_mcp_oauth_request(
     state: "DashboardState",
     slot: "_ChatSlot",
@@ -246,6 +633,7 @@ def _emit_mcp_oauth_request(
     oauth_url: str,
     card_owned: bool = False,
     minted_by: str = "",
+    session_id: str = "",
 ) -> None:
     """Append an mcp_oauth banner so the user can authorize an MCP server.
 
@@ -274,6 +662,13 @@ def _emit_mcp_oauth_request(
     Deliberately annotates the authorize banner only. A rejected URL is a
     security notice rather than a consent prompt — no card can act on it — so it
     stays unconditionally visible wherever banners render.
+
+    ``session_id`` is the ACP session the request came from. With it, a
+    rejected banner that repeats the last one shown for the same server in the
+    same session is not posted again (see
+    :mod:`~kiro_crew.dashboard.mcp_banner_dedupe`). Without it every
+    rejection is posted. The authorize banner is always posted: it carries a
+    fresh link.
     """
     safe_name = _redact_acp_string(server_name)
     ambiguous = _mcp_server_name_is_ambiguous(server_name, safe_name)
@@ -281,11 +676,14 @@ def _emit_mcp_oauth_request(
 
     if not _is_safe_oauth_url(oauth_url):
         logger.warning("ACP: refusing unsafe MCP OAuth URL for %s", server_name or "(unknown)")
-        slot.append(
-            "mcp_oauth",
+        _append_rejected_mcp_oauth_banner(
+            slot,
+            server_name,
+            safe_name,
+            ambiguous,
+            session_id,
             f"🚫 {label} sent an unsafe authentication URL (scheme rejected).",
-            "msg msg-warn",
-            meta={
+            {
                 "server_name": safe_name,
                 "failed": True,
                 "rejected_url": True,
@@ -343,11 +741,14 @@ def _emit_mcp_oauth_request(
                 "chat to reconnect."
             )
             rejected_meta["error"] = loopback_advice[0].upper() + loopback_advice[1:]
-            slot.append(
-                "mcp_oauth",
+            _append_rejected_mcp_oauth_banner(
+                slot,
+                server_name,
+                safe_name,
+                ambiguous,
+                session_id,
                 f"🚫 {label}: {loopback_advice}",
-                "msg msg-warn",
-                meta=rejected_meta,
+                rejected_meta,
             )
             return
         endpoint_detail = ""
@@ -384,8 +785,12 @@ def _emit_mcp_oauth_request(
                 f" The rejected authorization endpoint was "
                 f"{rejected_host}{rejected_path} (query values withheld)."
             )
-        slot.append(
-            "mcp_oauth",
+        _append_rejected_mcp_oauth_banner(
+            slot,
+            server_name,
+            safe_name,
+            ambiguous,
+            session_id,
             f"🚫 {label} sent an authentication URL containing a credential "
             f"pattern (rejected).{endpoint_detail} If this is a self-hosted "
             "or otherwise unlisted identity provider, its authorization "
@@ -393,8 +798,7 @@ def _emit_mcp_oauth_request(
             'Crew data home, shaped {"additional_authorization_endpoints": '
             '[{"host": ..., "path": ...}]}; otherwise ask the server owner '
             "to fix the URL.",
-            "msg msg-warn",
-            meta=rejected_meta,
+            rejected_meta,
         )
         return
     # A new authorize request for this server means kiro-cli started a FRESH
@@ -408,6 +812,9 @@ def _emit_mcp_oauth_request(
     # a banner with no `oauth_url`, so superseding an older one there would take
     # away the only authorize affordance the user has and hand back nothing.
     _supersede_open_mcp_oauth_banners(state, slot, safe_name, ambiguous)
+    # A sign-in prompt is a new state for this server: a rejection after it is
+    # news again, so it must not be held back as a repeat of an older one.
+    forget_mcp_banner(slot, safe_name)
     content = f"🔐 {label} requires authentication."
     meta: dict[str, Any] = {
         "server_name": safe_name,
@@ -424,12 +831,21 @@ def _emit_mcp_oauth_request(
     }
     if card_owned:
         meta["card_owned"] = True
+    # Recorded before the append, so the first read of this row (a refetch the
+    # append's broadcast may trigger) already finds it. Every later read of the
+    # banner goes through `_redact_meta_for_role`, which shows the link only for
+    # a (child, URL) pair recorded here; see `mcp_oauth_provenance`.
+    record_emitted(minted_by, oauth_url)
     slot.append(
         "mcp_oauth",
         content,
         "msg msg-info",
         meta=meta,
     )
+    # The read gate withdraws this link on the next fetch once `minted_by` is no
+    # longer the live child, but an open tab does not refetch. This watch tells
+    # it as soon as that happens, however the child ended.
+    watch_open_oauth_banners(state, slot)
 
 
 def _supersede_open_mcp_oauth_banners(
@@ -467,6 +883,66 @@ def _supersede_open_mcp_oauth_banners(
     """
     if ambiguous:
         return
+    label = safe_name or "MCP server"
+    _retire_open_mcp_oauth_banners(
+        state,
+        slot,
+        safe_name,
+        {"superseded": True},
+        f"↻ {label} sign-in is no longer active — a newer request replaced it.",
+    )
+
+
+def _expire_ended_mcp_oauth_banners(
+    state: "DashboardState", slot: "_ChatSlot", server_name: str
+) -> None:
+    """Withdraw ``server_name``'s open Authorize links once its sign-in attempt ended.
+
+    The runtime calls this (see :func:`_watch_mcp_sign_in_ends`) when a sign-in
+    Crew started ends unconnected, whether or not a turn is running. The engine
+    kept that attempt's callback listener open only for its connect timeout (60 s
+    by default), so the link would walk the user through the provider's consent
+    page to a refused ``localhost`` port. The row takes
+    ``expired`` with ``expired_reason: "attempt_ended"``, which the banner draws
+    as a timed-out sign-in; a later success still turns it green (see
+    :func:`_mark_mcp_oauth_completed`). An ambiguous name retires nothing, for
+    the reason :func:`_supersede_open_mcp_oauth_banners` gives.
+    """
+    safe_name = _redact_acp_string(server_name)
+    if _mcp_server_name_is_ambiguous(server_name, safe_name):
+        return
+    label = safe_name or "MCP server"
+    _retire_open_mcp_oauth_banners(
+        state,
+        slot,
+        safe_name,
+        {"expired": True, "expired_reason": "attempt_ended"},
+        f"⌛ {label} sign-in timed out before it was completed.",
+    )
+
+
+def _watch_mcp_sign_in_ends(state: "DashboardState", slot: "_ChatSlot", client: Any) -> None:
+    """Have *client* retire this chat's Authorize links whose sign-in attempt ended.
+
+    Called by the mid-turn arm before it draws a link, the only path a sign-in
+    Crew starts reaches the chat by. An attempt that ends before that row exists
+    (its link queued behind a prompt, or the arm still awaiting discovery) finds
+    nothing to retire, so the arm asks ``client.mcp_sign_in_ended`` once the row
+    is appended.
+    """
+    client.set_mcp_sign_in_ended_hook(
+        functools.partial(_expire_ended_mcp_oauth_banners, state, slot)
+    )
+
+
+def _retire_open_mcp_oauth_banners(
+    state: "DashboardState",
+    slot: "_ChatSlot",
+    safe_name: str,
+    terminal: dict[str, Any],
+    new_content: str,
+) -> None:
+    """Withdraw the link from every open banner for ``safe_name``, marking it *terminal*."""
     for message in slot.messages:
         if message.get("role") != "mcp_oauth":
             continue
@@ -485,13 +961,11 @@ def _supersede_open_mcp_oauth_banners(
         # both slot.messages and a broadcast that bypasses _prepare_messages.
         # Safe here despite that gate being stricter than the emit-path one
         # (see the long note in _mark_mcp_oauth_completed) because `oauth_url`
-        # is dead data on this path — it is dropped outright below and the
-        # superseded branch renders no link.
+        # is dead data on this path — it is dropped outright below and a
+        # retired row renders no link.
         new_meta = _redact_meta_for_role("mcp_oauth", dict(meta))
         new_meta.pop("oauth_url", None)
-        new_meta["superseded"] = True
-        label = safe_name or "MCP server"
-        new_content = f"↻ {label} sign-in is no longer active — a newer request replaced it."
+        new_meta.update(terminal)
         row_mid = new_meta.get("mid")
         # Resolve by `mid`, this row's server-minted identity, NOT by `ts`. That
         # column is not an identity: `_ChatSlot.append` preserves an explicitly
@@ -519,7 +993,7 @@ def _supersede_open_mcp_oauth_banners(
         # the persisted meta, because the client MERGES an incoming meta over the
         # row's existing one rather than replacing it. Omitting the key would leave
         # the live URL in place on the client row -- harmless for a client that
-        # knows `superseded`, but a tab still running pre-upgrade JS would keep
+        # knows the terminal flag, but a tab still running pre-upgrade JS would keep
         # rendering the dead link. An empty string fails that client's own
         # isSafeOAuthUrl check, so the banner withdraws instead.
         state.broadcast_ws(
@@ -556,8 +1030,14 @@ def _session_mcp_report(provider: Any) -> "SessionMcpReport | None":
 def _mark_mcp_oauth_completed(
     state: "DashboardState", slot: "_ChatSlot", server_name: str, success: bool, error: str = ""
 ) -> None:
-    """Patch the most recent open mcp_oauth banner for ``server_name`` to a terminal state."""
+    """Patch the most recent open mcp_oauth banner for ``server_name`` to a terminal state.
+
+    A success also clears the server's rejected-banner record, so a later
+    sign-out is announced again even when its rejection reads the same.
+    """
     safe_name = _redact_acp_string(server_name)
+    if success:
+        forget_mcp_banner(slot, safe_name)
     target: dict | None = None
     for m in reversed(slot.messages):
         if m.get("role") != "mcp_oauth":
@@ -566,11 +1046,14 @@ def _mark_mcp_oauth_completed(
         # Compare against the redacted form already stored on the banner.
         if meta.get("server_name") != safe_name:
             continue
+        # A success still lands on a timed-out attempt's row: the server is
+        # signed in, however the sign-in finished.
+        attempt_ended = meta.get("expired_reason") == "attempt_ended"
         if (
             meta.get("completed")
             or meta.get("failed")
             or meta.get("superseded")
-            or meta.get("expired")
+            or (meta.get("expired") and not (success and attempt_ended))
         ):
             continue
         target = m
@@ -615,6 +1098,8 @@ def _mark_mcp_oauth_completed(
         new_meta["completed"] = True
         new_meta.pop("failed", None)
         new_meta.pop("error", None)
+        new_meta.pop("expired", None)
+        new_meta.pop("expired_reason", None)
     else:
         new_meta["failed"] = True
         safe_err = _redact_acp_string(error)
@@ -661,6 +1146,7 @@ async def _on_mcp_oauth_request(turn: _ChatTurn, event) -> None:
     # tagged exactly as the session-init drain tags it, or the render layer
     # cannot drop a prompt the Connections card already shows.
     server_name = event.server_name or ""
+    _watch_mcp_sign_in_ends(state, slot, client)
     managed = (
         await asyncio.to_thread(_connections_managed_mcp_names) if server_name else frozenset()
     )
@@ -672,7 +1158,10 @@ async def _on_mcp_oauth_request(turn: _ChatTurn, event) -> None:
         event.oauth_url,
         card_owned=bool(server_name) and server_name in managed,
         minted_by=str(getattr(client, "process_instance", "") or ""),
+        session_id=_provider_session_id(client),
     )
+    if client.mcp_sign_in_ended(server_name):
+        _expire_ended_mcp_oauth_banners(state, slot, server_name)
     _record_session_mcp_event(
         state,
         slot,

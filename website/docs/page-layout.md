@@ -23,7 +23,7 @@ controls. The layout rules that belong here:
 - In chat, the dock sits above the composer, in the composer's own column
   (`--mc-input-width`), and its tiles wrap in a narrow column. Long-run status reuses
   the side-panel dock, expansion and narrow-screen overlay, not another drawer.
-- Crew's permanent **Dashboard** tab renders the mate's dynamic dashboard
+- Crew's permanent **Dashboard** tab renders the Bot's dynamic dashboard
   (`CrewDashboardTab`) straight into the panel. There is no Command Center, no
   Published view selector and no in-chat dock opener. Once visited, its body stays mounted across
   tab-strip switches (Dashboard to Files), so it keeps its scroll and document.
@@ -55,6 +55,40 @@ refuses to shrink and the whole page scrolls instead.
 `PageHeader` also takes an `actions` node, rendered right-aligned on the title
 row. Put page-level buttons there rather than in the first `Card`.
 
+### Settings groups: a heading over one box
+
+Every Settings group is a heading, an optional one-line description, then ONE
+rounded box whose direct children are rows split by hairlines. The page itself is
+never wrapped in a card. All groups share one content width
+(`SETTINGS_CONTENT_MAX_W`, 720px) so the right edges line up from group to group.
+
+- **Row layout.** A small control or a setting that saves on its own sits on one
+  row: caption left, control right (`SettingsField` `layout="inline-fixed"` for
+  dropdowns, `"inline-auto"` for segmented controls and steppers). The control
+  sizes to its own content (dropdowns with a 12rem floor), so a long selected
+  label shows whole, and a trigger that is still cut carries the full text as its
+  `title`. The row wraps on the width the group box gives it, never on a viewport
+  breakpoint: when the caption (12rem basis) and the control do not fit side by
+  side, as in a narrow Settings pane, the control drops under the caption at full
+  width instead of being clipped. Inline rows are inline only inside a group box;
+  outside one they render stacked. Text a person types in order (a form) stays
+  `"stacked"`: caption above, full-width box below, so the box and its error
+  message are not squeezed into half a column.
+- **One indent.** A group heading, its description and any loose note between the
+  heading and the box start at the row text's inset (16px), never at the box
+  edge. Draw a heading with `SettingsSection` or `SettingsGroupHeader`, not a bare
+  `h4`: those two are the only owners of the indent. Loose text inside a
+  `SettingsSection` body gets the indent from the body itself.
+- **No box inside a box.** A `SettingsCard` or a grouped `Card` drawn inside
+  another box loses its own frame (`index.css`, `[data-settings-box]`). A row
+  that draws its own border is a bug: make it a plain row. A list of framed
+  choices (the harness picker) sits on the page directly, not inside a box.
+- **Inside a `Card`** in Settings (`CardFrameContext` `grouped`), the `CardTitle`
+  (or a flex header row holding it) and a following `<p>` move above the box as
+  the heading and description.
+- **Save** sits under the box, right-aligned to the box edge. A destructive
+  action sits apart from the constructive one, on its own row.
+
 ### A Settings tab's section list stays in view
 
 Tabs that host `SettingsSubNav` (Chat, Display, Notifications, Channels, Security)
@@ -68,10 +102,11 @@ the larger of 8px and the space between the list's row and the end of the conten
 the whole list inside the area at the end of the scroll as well. Both are measured off
 the nearest scrolling ancestor rather than computed from the viewport, so the cap also
 holds when Settings is embedded in a split pane. A capped list shows the same
-decorative "More below" cue as SidePanelLayout's tab column (`MoreBelowCue`) while
-rows remain below. The cue is a strip inside the cap, under the scrolling rows, so it
-stays on the list's visible bottom edge as the rows scroll; it hides at the end of the
-list and is absent when the list fits. The narrow single-column layout is unchanged.
+"More below" cue as SidePanelLayout's tab column (`MoreBelowCue`) while rows remain
+below. The cue is a strip inside the cap, under the scrolling rows, so it stays on the
+list's visible bottom edge as the rows scroll; it hides at the end of the list and is
+absent when the list fits. The cue is a button: a click scrolls the list down by most
+of its height. The narrow single-column layout is unchanged.
 
 ### Read every class here narrow-first
 
@@ -327,26 +362,35 @@ It is `isolate` so WelcomeView's own z-indexes order its cards against each othe
 and never against the composer's, and its column uses `safe center` and compact
 rows under 600px tall so a short window still fits both rows above the dock.
 
-`ChatPane.tsx` (split panes and a mate's chat) floats its composer the same
+`ChatPane.tsx` (split panes and a Bot's chat) floats its composer the same
 way: one dock root (`composer-dock-root`) over the scroller's bottom edge holding
 the jump pill, the bars, the queue, the question card, the notices and the
 composer, measured by the same `useComposerDockMetrics` and paid for by the same
-`DOCK_CLEARANCE_PX` (`pages/chat/composerDockMetrics.ts`, shared by both hosts).
+`DOCK_CLEARANCE_PX` (`pages/chat/composerDockMetrics.ts`, shared by every host).
 The pane has no welcome hero, so nothing in it ends above the dock.
+
+The crew window (`pages/chat/crew-window/CrewChatWindow.tsx`, a session on a
+connected crew) is the third host: its dock root (`crew-window-dock`) holds the
+window's notices column and the composer, takes the same measurement and
+clearance, and stops short of the scrollbar gutter like the other two. In that
+column a card notice (`ErrorNotice`'s framed default) stands on its own, and
+the frameless lines (an inline read failure, the offline readout, the rewind
+prompt) share one glass chip, so no text paints bare onto the rows passing
+under it.
 
 The same reading applies at the TOP of a chat that a host crowns with a glass
 chip: the Members page's DM header (the Glass identity pill, the switcher, the
 panel opener) floats over the pane's top edge and the conversation scrolls under
 it (#18325). `ChatPane` takes the band's measured height as `topInset` and pads
-its scroller's rows below it (a mate's chat draws no pinned-prompt band,
+its scroller's rows below it (a Bot's chat draws no pinned-prompt band,
 #18346, so the inset is the only thing it pays); the host measures the header
 with `useMeasuredHeight`, never a constant. Anything with controls that sits between such a header and the pane
 (a notice, a greeting card) stays in flow, padded below the header, and the pane
 then takes no inset: a control under the glass is an ambiguous tap. The row and
 its cells pass pointer events through; only the controls catch them. Details:
-[crew-mode](../../docs/system-specs/modules/crew-mode.md#mate-conversation-layout-switcher-profile-dashboard-files).
+[crew-mode](../../docs/system-specs/modules/crew-mode.md#bot-conversation-layout-switcher-profile-dashboard-files).
 
-### Mate conversation sends and runtime detail
+### Bot conversation sends and runtime detail
 
 A `ChatPane` with `crewmate` always uses the `responsive` composer mode:
 one normal Send arrow for idle, busy, delegated and stopping states. Enter,
@@ -373,7 +417,7 @@ when the frame arrived. A bounded-to-unbounded history upgrade keeps the current
 queue rather than replaying its fetched queue snapshot. Active-slot hydration
 remains owned by Sessions' existing switch/refresh path.
 
-The mate transcript filters runtime notices and stop events as well as
+The Bot transcript filters runtime notices and stop events as well as
 tools, reasoning and injected subagent rows, without changing stored history.
 Historical steer/requeue/decision metadata draws an ordinary user bubble.
 Errors, pending approvals, questions, files and OAuth actions remain accessible.

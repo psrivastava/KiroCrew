@@ -458,15 +458,10 @@ class TestUnlinkEndpoint:
 
     @pytest.mark.asyncio
     async def test_rebound_transcript_is_rejected_even_when_identity_and_stamp_match(self):
-        """A live slot can be REBOUND to a different transcript (a cron/workflow
-        injector assigning ``linked_session_key`` on an already-existing slot)
-        without changing ``row_identity`` or ``created_at``. The client staged
-        its confirm against the OLD binding, so the ``expect`` triple carries the
-        old (empty) ``linked_session_key``; the slot now carries a new one. The
-        gate must reject 409 rather than land the dismissal on the replacement
-        transcript the user never chose. Without the transcript binding in the
-        triple the row_identity+created_at would match and this would wrongly
-        pass — this is the GPT F1 rebind finding."""
+        """A slot rebound to another transcript rejects a stale confirm with 409.
+
+        An injector can set ``linked_session_key`` without changing ``row_identity`` or
+        ``created_at``, so the ``expect`` triple must include the transcript binding."""
         slot = _slot()
         state_slots = {"s1": slot}
         key = _identity_key(PR_A)
@@ -723,7 +718,7 @@ class TestUnlinkEndpoint:
 
     @pytest.mark.asyncio
     async def test_persist_writes_only_the_dismissed_field_never_a_full_save(self):
-        # GPT 5.6: a full-slot save rebuilds title/tags/folder from the requesting
+        # A full-slot save rebuilds title/tags/folder from the requesting
         # slot's live fields, so on a shared transcript it can revert a sibling
         # alias's committed rename. The unlink must persist ONLY the
         # dismissed_source_links field via update_metadata (a merge that leaves

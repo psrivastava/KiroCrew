@@ -1,6 +1,6 @@
 import { cn } from '../lib/utils'
 import { motion, useReducedMotion, type TargetAndTransition, type Transition } from 'framer-motion'
-import { ChevronRight, Hand, PanelRight, Target } from 'lucide-react'
+import { ChevronRight, Hand, Target, Zap } from 'lucide-react'
 import { useEffect, useState, type ReactNode } from 'react'
 import { KiroGhost } from './KiroGhost'
 import { KiroGhostMark } from './KiroGhostMark'
@@ -208,6 +208,33 @@ function Flow({ still }: { still: boolean }) {
   )
 }
 
+/** The slogan, as one sentence: a lead and its strong half. */
+function Tagline({ className }: { className?: string }) {
+  const lead = i18nT('components.crewMode.tagline_lead')
+  return (
+    <p className={cn('m-0', className)}>
+      {/* A sentence ending in a full-width stop (Chinese, Japanese) already
+          carries its own space; a second one reads as a gap. */}
+      {lead}{/[。！？]$/.test(lead) ? '' : ' '}
+      <strong className="font-semibold text-text-strong">{i18nT('components.crewMode.tagline_strong')}</strong>
+    </p>
+  )
+}
+
+/** What conductor mode is, in the welcome page's own words and pictures: the
+ *  slogan and the five-step flow, on their final frame. For a surface that must
+ *  explain the mode before the person turns it on (the mid-chat confirm). */
+export function CrewModeIntro() {
+  return (
+    <div data-testid="crew-mode-intro" className="@container/crewwelcome flex flex-col items-center gap-3 text-center">
+      <Tagline className="text-[15px] text-text" />
+      <div className="w-full rounded-3xl bg-aim-subtle/15 px-1 py-2">
+        <Flow still />
+      </div>
+    </div>
+  )
+}
+
 /** The welcome page an empty chat shows once Crew Mode is on.
  *
  *  Pictures, not prose: the mode's own hero (big solid type, the Kiro ghost on an
@@ -215,10 +242,10 @@ function Flow({ still }: { still: boolean }) {
  *  a flow that shows what the mode does in the order it does it, with one or two
  *  words per step: one goal, this chat splits it, a crew ghost flies into each
  *  task's own chat, the tasks land on the board, and the step that waits for you
- *  lights up. Then one "Task board" button (its icon alone where room is tight).
- *  Every word is generic, so nothing
- *  here reads as live work: the real board is the side panel's Overview, read from
- *  this chat's own work ledger.
+ *  lights up. Then one "Board" button, drawn like the side panel's Board tab (its
+ *  icon alone where room is tight). Every word is generic, so nothing
+ *  here reads as live work: the real board is the side panel's Board tab, read
+ *  from this chat's own work ledger.
  *
  *  Everything plays once and is done within CREW_WELCOME_PLAY_SECS; the moment the
  *  person starts on the composer the page jumps to its final frame, so nothing moves
@@ -228,7 +255,7 @@ function Flow({ still }: { still: boolean }) {
  *  art and the slogan and puts the button beside the title, and a page taller than
  *  the room scrolls, title in reach.
  *
- *  `onOpenTaskBoard` opens that Overview. Unset (a session with no Overview of its
+ *  `onOpenTaskBoard` opens that Board tab. Unset (a session with no board of its
  *  own), the button is left out. */
 export default function CrewModeWelcome({ onOpenTaskBoard, chatKey }: {
   onOpenTaskBoard?: () => void
@@ -236,11 +263,11 @@ export default function CrewModeWelcome({ onOpenTaskBoard, chatKey }: {
   chatKey?: string
 }) {
   const still = useSettled(useReducedMotion() ?? false, chatKey)
-  const lead = i18nT('components.crewMode.tagline_lead')
   const short = '[@media(max-height:480px)]:hidden'
   // Tight room: the same short-screen query, or a chat column narrower than 18rem.
   const tight = cn(short, '@max-[18rem]/crewwelcome:hidden')
-  const boardLabel = i18nT('components.crewMode.side_panel_open')
+  // The side panel's Board tab, as its strip draws it: the same glyph and name.
+  const boardLabel = i18nT('commandCenter.workers')
   return (
     <motion.div
       // Re-mounted when it settles: every part then mounts on its final frame, so an
@@ -285,20 +312,14 @@ export default function CrewModeWelcome({ onOpenTaskBoard, chatKey }: {
 
       <div className="flex flex-col items-center gap-1.5">
         <motion.h2
-          className="m-0 text-[36px] @[34rem]/crewwelcome:text-6xl [@media(max-height:480px)]:text-[28px] font-bold tracking-tight leading-none text-aim"
+          className="m-0 text-[36px] @[34rem]/crewwelcome:text-6xl [@media(max-height:480px)]:text-[28px] font-bold tracking-tight leading-none conductor-mode-title-text"
           {...enter(still, 0.15, { opacity: 0, y: 10 }, { opacity: 1, y: 0 })}
         >
           {i18nT('components.crewMode.title')}
         </motion.h2>
-        <motion.p
-          className={`m-0 text-[15px] @[34rem]/crewwelcome:text-lg text-text ${short}`}
-          {...enter(still, 0.25, { opacity: 0, y: 8 }, { opacity: 1, y: 0 })}
-        >
-          {/* A sentence ending in a full-width stop (Chinese, Japanese) already
-              carries its own space; a second one reads as a gap. */}
-          {lead}{/[。！？]$/.test(lead) ? '' : ' '}
-          <strong className="font-semibold text-text-strong">{i18nT('components.crewMode.tagline_strong')}</strong>
-        </motion.p>
+        <motion.div {...enter(still, 0.25, { opacity: 0, y: 8 }, { opacity: 1, y: 0 })} className={short}>
+          <Tagline className="text-[15px] @[34rem]/crewwelcome:text-lg text-text" />
+        </motion.div>
       </div>
 
       {/* No frame: a soft wash under the flow, so it reads as part of the hero. */}
@@ -322,7 +343,8 @@ export default function CrewModeWelcome({ onOpenTaskBoard, chatKey }: {
             title={boardLabel}
             className="justify-center min-h-[44px] sm:min-h-0 [@media(pointer:coarse)]:min-h-11 [@media(pointer:coarse)]:min-w-11"
           >
-            <PanelRight size={14} aria-hidden="true" />
+            {/* The Board tab's glyph (`SidePanelTabIcons`, kind `workers`). */}
+            <Zap size={16} aria-hidden="true" className="shrink-0" />
             <span data-testid="crew-mode-open-board-label" aria-hidden="true" className={tight}>{boardLabel}</span>
           </Btn>
         </motion.div>

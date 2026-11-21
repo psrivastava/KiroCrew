@@ -13,7 +13,8 @@ The generated default configuration is `~/.kiro/agents/kirocrew.json`. Its shipp
 - A `postToolUse` audit hook for shell calls. It appends each command to
   `audit.log` under the data home (`~/.kiro/crew` or `KIROCREW_HOME`); the gateway
   (and a standalone `kirocrew chat`, at its start) rotates that file at 8 MiB,
-  keeping one previous generation as `audit.log.1`.
+  keeping one previous generation as `audit.log.1`. On Windows the hook runs the
+  gateway's Python directly instead of a POSIX shell command.
 
 ## Switching Agents
 
@@ -62,11 +63,40 @@ Cron jobs can specify an agent at creation time.
 
 Kiro Crew owns and rewrites a fixed set of specs; [agent-spec-fields.md](agent-spec-fields.md) lists every one of them with what refreshes it. The primary and lite specs are required; the others support goal conducting, pipeline fleet supervision, security conducting, knowledge extraction, research, and heartbeat features.
 
-`kirocrew-conductor` tracks its goal in the work ledger: it mounts `kirocrew-work`, binds each item to a session before seeding it, and settles every completion claim with the acceptance evaluator instead of by reading a transcript. **Crew Mode** is a chat that runs on a conductor: pick `kirocrew-conductor` in the agent picker and the chat keeps its memory and history and runs on it. From the first message on it is locked, so the chat stays on the conductor; start a new chat to work with another agent. Making the conductor the default agent starts every new chat on it the same way. `agent.crew_mode_agent` names the conductor Crew Mode runs; changing it, or an update that ships a new default, moves every Crew Mode chat, new and old, onto the new conductor (a busy chat at its next idle point), and the chat keeps its work ledger. Every conductor is Crew Mode: a chat you started on the team lead, the pipeline, security or ledger conductor, scheduled ones included, is a Crew Mode chat when the dashboard loads it, locked the same way. A chat that turned Crew Mode on (switched onto the conductor, or a new chat born on it) keeps the sessions it dispatches out of your folders; History still lists them. A conductor chat from before the switch existed keeps filing them as it always did. Nothing is deleted and no folder moves. The server enforces the lock: once the chat has a user message, switching a Crew Mode chat to another agent, from the picker, `/agent` or a session-control send, is refused with `409 crew_mode_locked`, and an agent switch the backend makes mid-turn is blocked the same way. Before the first message only a switch back to a template that is not a conductor passes. The pipeline and security conductors mount `kirocrew-work` too and record each item they dispatch as a work-ledger row, which is what their Dashboard tab reads; their own queue or findings ledger stays the detail behind that row. `kirocrew-ledger-conductor` is a deprecated alias of it — the same spec under the flow's old name, kept for one release so a session or cron that names the old string keeps resolving, and removed next release. `kirocrew-worker` is the agent a conductor names for a leaf item — the default agent's own resolved toolset plus the two reporting tools. In short, `kirocrew-worker` is `kirocrew` + `@kirocrew-work` − cron scheduling − the opt-in sets nobody assigned to it: a worker gets your default agent's own toolset so it can do any item's work, but it does not auto-approve scheduling a recurring job that would outlive the item. Which fields are mirrored, when the mirror is re-checked, and what happens when it cannot be re-derived are in [agent-spec-fields.md](agent-spec-fields.md).
+`kirocrew-conductor` tracks its goal in the work ledger: it mounts `kirocrew-work`, binds each item to a session before seeding it, and settles every completion claim with the acceptance evaluator instead of by reading a transcript. **Conductor mode** is a chat that runs on a conductor: pick `kirocrew-conductor` in the agent picker and the chat keeps its memory and history and runs on it. From the first message on it is locked, so the chat stays on the conductor; start a new chat to work with another agent. Turning it on in a chat that already has messages asks you to confirm first, since it cannot be undone there. Making the conductor the default agent starts every new chat on it the same way. `agent.crew_mode_agent` names the conductor conductor mode runs (default `kirocrew-conductor`); changing it, or an update that ships a new default, moves every conductor mode chat, new and old, onto the new conductor (a busy chat at its next idle point), and the chat keeps its work ledger. Every conductor is conductor mode: a chat you started on the team lead, the pipeline, security or ledger conductor, scheduled ones included, is a conductor mode chat when the dashboard loads it, locked the same way. A chat that turned conductor mode on (switched onto the conductor, or a new chat born on it) keeps the sessions it dispatches out of your folders; History still lists them. A conductor chat from before the switch existed keeps filing them as it always did. Nothing is deleted and no folder moves. The server enforces the lock: once the chat has a user message, switching a conductor mode chat to another agent, from the picker, `/agent` or a session-control send, is refused with `409 crew_mode_locked`, and an agent switch the backend makes mid-turn is blocked the same way. Before the first message only a switch back to a template that is not a conductor passes. The pipeline and security conductors mount `kirocrew-work` too and record each item they dispatch as a work-ledger row, which is what their Dashboard tab reads; their own queue or findings ledger stays the detail behind that row. `kirocrew-ledger-conductor` is a deprecated alias of it — the same spec under the flow's old name, kept for one release so a session or cron that names the old string keeps resolving, and removed next release. `kirocrew-worker` is the agent a conductor names for a leaf item — the default agent's own resolved toolset plus the two reporting tools. In short, `kirocrew-worker` is `kirocrew` + `@kirocrew-work` − cron scheduling − the opt-in sets nobody assigned to it: a worker gets your default agent's own toolset so it can do any item's work, but it does not auto-approve scheduling a recurring job that would outlive the item. Which fields are mirrored, when the mirror is re-checked, and what happens when it cannot be re-derived are in [agent-spec-fields.md](agent-spec-fields.md).
+
+### Conductor mode in the dashboard
+
+Conductor mode is on in the dashboard, with nothing to turn on. A new chat's
+composer offers the conductor mode switch, and an ongoing plain chat offers it
+right of the permission button (that chat then stays in conductor mode). A
+conductor mode chat shows its welcome, its side panel's **Board** tab lists its
+crew members, and the Sessions list draws it as a crew card with a **Conductor
+mode** filter. Its crew members are listed there, not as rows of your list. To
+start every new chat in conductor mode, turn on **Settings → Chat → Sessions →
+Start New Chats in conductor mode** (off by default). The first time you open a
+conductor mode chat, its side panel opens on the **Board**. To keep the panel
+closed instead, turn off **Settings → Chat → Side panel → Auto-Open Board in Side
+Panel** (on by default). Conductor mode used to be a Feature Preview; a switch for
+it saved from then is ignored.
+
+The LTS edition does not offer conductor mode:
+
+- no conductor mode switch, welcome, filter, Board tab or crew member breadcrumb;
+- the conductor mode agent templates are in the agent picker like any agent;
+- a chat already in conductor mode is an ordinary chat on its agent, and each of its
+  crew members is an ordinary row of your list, whose approvals and finished
+  turns alert you like any chat's;
+- a conductor mode chat you started yourself that has a message offers no agent
+  switch, since the gateway keeps it on its agent.
+
+The gateway is the same in every build: only what the dashboard shows changes. A
+conductor mode chat stays locked to its agent (`409 crew_mode_locked`) and its crew
+members stay out of your folders.
 
 ## Custom Agents
 
-Custom agents are JSON or markdown files in `~/.kiro/agents/` (or a project's `.kiro/agents/`). They define their own system prompt, tools, MCP servers, and permissions. To create, edit or delete your own custom agents in the app, open **Customize → Custom agents**: it lists every installed custom agent by origin, edits the ones you own (description, model, prompt, tools, skills), duplicates a package or built-in one into one you own, and refuses to delete a custom agent while a mate, the default agent, a schedule, a chat folder's default agent, a webhook token or a private copy still uses it — the refusal lists them. Deleting on disk also works: remove the file from `~/.kiro/agents/`. A crew still bound to a deleted name does not break: kiro-cli cannot resolve the missing spec and falls back to the default agent spec for that session, so the crew keeps running — with the default prompt and tools instead of the deleted template's. Check a template's bindings and repoint them before removing the file so no crew silently changes behavior.
+Custom agents are JSON or markdown files in `~/.kiro/agents/` (or a project's `.kiro/agents/`). They define their own system prompt, tools, MCP servers, and permissions. To create, edit or delete your own custom agents in the app, open **Customize → Custom agents**: it lists every installed custom agent by origin, edits the ones you own (description, model, prompt, tools, skills), duplicates a package or built-in one into one you own, and refuses to delete a custom agent while a Bot, the default agent, a schedule, a chat folder's default agent, a webhook token or a private copy still uses it — the refusal lists them. Deleting on disk also works: remove the file from `~/.kiro/agents/`. A crew still bound to a deleted name does not break: kiro-cli cannot resolve the missing spec and falls back to the default agent spec for that session, so the crew keeps running — with the default prompt and tools instead of the deleted template's. Check a template's bindings and repoint them before removing the file so no crew silently changes behavior.
 
 ```json
 {
@@ -115,7 +145,7 @@ What differs from a JSON agent:
 
 ## Managing Agents
 
-**Customize → Custom agents** lists every agent definition and is where one is edited — model, system prompt, skills and tools. A mate's editor (**Customize → Mates**, or the Mates page) shows the agent it is built from in its **Built from** section, read-only: a mate does not own that definition, so editing it there would change every mate built from the same agent. Drop a new JSON or markdown file into `~/.kiro/agents/` and it appears automatically. `/agents` redirects to Customize.
+**Customize → Custom agents** lists every agent definition and is where one is edited — model, system prompt, skills and tools. A Bot's editor (**Customize → Bots**, or the Bots page) shows the agent it is built from in its **Built from** section, read-only: a Bot does not own that definition, so editing it there would change every Bot built from the same agent. Drop a new JSON or markdown file into `~/.kiro/agents/` and it appears automatically. `/agents` redirects to Customize.
 
 ## Mapping Skills to an Agent
 
@@ -158,7 +188,30 @@ What the Skills section shows:
 | `src/kiro_crew/config/prompt.md` | Shipped system prompt. A development project can override it with `agents/prompt.md`. |
 | `~/.kiro/crew/agent.json` | Optional user overrides merged on top of defaults. |
 | `~/.kiro/crew/prompt.md` | Optional user prompt override, which takes priority over the shipped prompt. It must be UTF-8: a file that is unreadable, misencoded (for example UTF-16 from PowerShell redirection) or refused falls back to the shipped prompt with a gateway WARNING. |
-| `~/.kiro/agents/kirocrew.json` | Installed generated agent configuration. |
+| `~/.kiro/agents/kirocrew.json` | Installed generated agent configuration. Rebuilt on every gateway start; not the place to add an MCP server. |
+
+## MCP Servers on the Default Agent
+
+Kiro Crew rebuilds `kirocrew.json` on every gateway start from the shipped
+defaults, `~/.kiro/crew/agent.json`, and every MCP source it reads: the Kiro
+global `~/.kiro/settings/mcp.json`, the dashboard's own server list
+(`~/.kiro/crew/mcp.json`), installed apps, and edition-provided servers. It
+copies those servers into the spec itself, so the spec pins `includeMcpJson`
+off.
+
+To add, turn on or turn off an MCP server, use **MCP Servers**
+(`/mcp`). An agent asked to do it
+opens that page with `find_ui` or a guide, or offers an MCP card through
+`propose_change`. It does not tell you to hand-edit `kirocrew.json` or run
+`jq`/`sed` on it.
+
+If a server's tools are missing from sessions, check that tab first. A server
+whose program is not found on this computer is dropped from the spec at the
+rebuild, and the gateway log names it (`Dropping MCP server ...: command not
+found`). Once the program is installed where the gateway already searches, the
+next default-agent session start rebuilds the spec and the server is back. A
+program found only through the server's own `env.PATH`, or under a Node version
+installed after the gateway started, still needs a gateway restart.
 
 ## Reinstalling Agent Config
 

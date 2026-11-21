@@ -163,15 +163,9 @@ class TestTheReaderOnlyAnswersForItsOwnSubject:
 class TestTheReaderAnswersForTheShapeAMonitorActuallyStores:
     """The watched side is read from a real ``MonitorState``, not a hand-written string.
 
-    ``infer_monitor`` stores the CANONICAL subject (``owner/name#123``) and the
-    inferred kind, not the URL the owner armed with. A check that puts that stored
-    subject back through inference gets nothing -- the shorthand carries no host by
-    design -- so every judged pull-request watch had its target dropped and answered
-    FALLBACK on every tick, which fires and spends the turn the judge exists to save.
-
-    Hand-written monitor fields hid that: they spelled the watched side as the URL
-    and the kind as the wire name, so the comparison ran on two values neither
-    producer emits.
+    ``infer_monitor`` stores the CANONICAL subject (``owner/name#123``), which carries no
+    host, so re-inferring it gets nothing and the target answers FALLBACK every tick.
+    Hand-written fields would compare two values neither producer emits.
     """
 
     MESSAGE = "Watch https://github.com/kirodotdev/KiroCrew/pull/12787 until CI is green."
@@ -242,15 +236,33 @@ class TestTheReaderAnswersForTheShapeAMonitorActuallyStores:
             for target in targets
         )
 
+    def test_a_brief_spelling_the_slug_in_another_case_is_accepted(self) -> None:
+        """GitHub slugs are case-insensitive, so the lowercased URL is the watched PR.
+
+        Both shapes a monitor stores: the canonical shorthand, and the URL a
+        structured monitor keeps. A different number is still another pull request.
+        """
+        kind, watched = self._stored()
+        lowered = "https://github.com/kirodotdev/kirocrew/pull/12787"
+        observation = {"target": watched.lower(), "kind": kind}
+        assert judge.pr_observation_is_about(
+            lowered, monitor_kind=kind, monitor_target=watched, observation=observation
+        )
+        assert judge.pr_observation_is_about(
+            lowered,
+            monitor_kind="github_pull_request",
+            monitor_target="https://github.com/kirodotdev/KiroCrew/pull/12787",
+        )
+        assert not judge.pr_observation_is_about(
+            lowered.replace("12787", "12788"), monitor_kind=kind, monitor_target=watched
+        )
+
 
 class TestAgeParsing:
     """Ages decide what gets DROPPED at the cap, so the real row shape must parse.
 
-    Transcript rows carry an ISO 8601 string (verified against a live history file),
-    while a probe observation carries an epoch float. Reading only the float made
-    every session row age 0.0 -- and with all ages equal, which item lost its place at
-    the cap was arbitrary, so a newer actionable row could be discarded before an
-    older one.
+    Transcript rows carry an ISO 8601 string, probe observations an epoch float. Read
+    as 0.0, every row ties and the cap could drop a newer actionable row first.
     """
 
     def test_an_iso_string_is_a_real_age(self) -> None:

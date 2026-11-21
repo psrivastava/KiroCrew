@@ -37,6 +37,7 @@ import pytest
 from test_sandbox_launcher_program import program_on_disk, rendered_payload
 
 from kiro_crew import sandbox, sandbox_launcher, sandbox_plan
+from kiro_crew.apps import credential_masks
 
 pytestmark = pytest.mark.skipif(
     sys.platform == "win32",
@@ -126,12 +127,30 @@ def _pinned_host(root: Path, monkeypatch: pytest.MonkeyPatch) -> _Host:
     monkeypatch.setattr(sandbox, "config_dir", lambda: pinned.crew)
     monkeypatch.setattr(sandbox, "kiro_agents_dir", lambda: pinned.home / ".kiro" / "agents")
     monkeypatch.setattr(sandbox, "carveout_chain_has_planted_link", lambda _path: False)
+    # The seal-parent walk stops inside the pinned root, so no golden names this machine.
+    walk = sandbox._literal_ancestor_guards
+    monkeypatch.setattr(
+        sandbox,
+        "_literal_ancestor_guards",
+        lambda paths: tuple(p for p in walk(paths) if p.startswith(str(pinned.root) + os.sep)),
+    )
     monkeypatch.setattr(sandbox, "_voice_runtime_paths_cache", pinned.voice_cache(pinned.crew))
     monkeypatch.setattr(os, "getuid", lambda: _UID, raising=False)
     monkeypatch.setattr(os, "getgid", lambda: _GID, raising=False)
     monkeypatch.setattr(sandbox, "_ssh_supports_accept_new", lambda: True)
+    # The shipped built-ins declare agent-read-only directories in their manifests; like
+    # the tables below, the declarations are pinned so a manifest edit leaves the goldens.
+    monkeypatch.setattr(sandbox, "_app_declared_readonly_leaves", lambda: ())
+    # Pin a present per-user systemd manager so the golden's stand-in-root order is the
+    # machine-independent one (the volatile /run/user/$UID leads where it is coherent);
+    # test_sandbox_plan covers the no-manager order.
+    monkeypatch.setattr(sandbox, "_runtime_dir_is_durable", lambda _root: True)
     for name, table in _PINNED_TABLES.items():
         monkeypatch.setattr(sandbox, name, table)
+    # The shipped built-ins' ``credentialMasks`` are a table too: a declaration added to
+    # one leaves these goldens alone, as a leaf added to a core table does.
+    monkeypatch.setattr(credential_masks, "_builtin_manifests", lambda: [])
+    credential_masks.clear_cache()
     assert type(sandbox._sandbox_policy()).__name__ == "DefaultSandboxPolicy"
     return pinned
 
@@ -311,6 +330,23 @@ _LAUNCHER_PLAN_GOLDEN: dict[str, Any] = {
     "sensitive_dir_ids": {"<ROOT>/crew/apps": [13, 14]},
     "private_dirs": ["<ROOT>/crew/apps/alpha/data"],
     "private_dir_ids": {"<ROOT>/crew/apps/alpha/data": [11, 12]},
+    "parent_pins": [
+        "<ROOT>/crew",
+        "<ROOT>/op/.kiro",
+        "<ROOT>/op",
+        "<ROOT>/op/.kiro/crew",
+        "<ROOT>/op/.kiro/crew/apps",
+        "<ROOT>/op/.kiro/crew/mcp",
+        "<ROOT>/op/.kirocrew",
+        "<ROOT>/op/.kirocrew/apps",
+        "<ROOT>/op/.kirocrew/mcp",
+        "<ROOT>/crew/apps",
+        "<ROOT>/crew/mcp",
+        "<ROOT>/op/.kiro/crew/apps/aws-control",
+        "<ROOT>/op/.kirocrew/apps/aws-control",
+        "<ROOT>/crew/apps/aws-control",
+    ],
+    "mask_parent_pins": [],
     "readonly_dirs": [
         "<ROOT>/crew/policy_cache",
         "<ROOT>/crew/run",
@@ -392,6 +428,7 @@ _LAUNCHER_PLAN_GOLDEN: dict[str, Any] = {
     "required_mask_targets": ["<ROOT>/outside"],
     "mask_occupants": {"<ROOT>/crew/apps": [21, 22, 0], "<ROOT>/op/.aws": [23, 24, 1, 1, 25, 26]},
     "crew_home_aliases": [["<ROOT>/op/.kiro/crew", "<ROOT>/crew", 31, 32]],
+    "published_file_record": {},
     "expose_files": [["<ROOT>/op/.aws/sso/cache/token.json", "token.json"]],
     "env_prefixes": [
         "AWS_SECRET",
@@ -523,6 +560,7 @@ _PROFILE_GOLDEN = """\
 (deny file-link (literal "<ROOT>/op/.kirocrew/crew-panels"))
 (deny file-read* (require-all (subpath "<ROOT>/op/.aws") (require-not (literal "<ROOT>/op/.aws/config"))))
 (deny file-link (subpath "<ROOT>/op/.aws"))
+(allow file-read-metadata (literal "<ROOT>/op/.aws"))
 (deny file-read* (subpath "<ROOT>/op/.kube"))
 (deny file-link (subpath "<ROOT>/op/.kube"))
 (deny file-read* (subpath "<ROOT>/crew/policy_cache"))
@@ -584,6 +622,19 @@ _PROFILE_GOLDEN = """\
 (deny file-link (subpath "<ROOT>/crew/run"))
 (deny file-write* (literal "<ROOT>/crew/run"))
 (deny file-write* (literal "<ROOT>/crew"))
+(deny file-write* (literal "<ROOT>/op/.kiro"))
+(deny file-write* (literal "<ROOT>/op"))
+(deny file-write* (literal "<ROOT>/op/.kiro/crew"))
+(deny file-write* (literal "<ROOT>/op/.kiro/crew/apps"))
+(deny file-write* (literal "<ROOT>/op/.kiro/crew/mcp"))
+(deny file-write* (literal "<ROOT>/op/.kirocrew"))
+(deny file-write* (literal "<ROOT>/op/.kirocrew/apps"))
+(deny file-write* (literal "<ROOT>/op/.kirocrew/mcp"))
+(deny file-write* (literal "<ROOT>/crew/apps"))
+(deny file-write* (literal "<ROOT>/crew/mcp"))
+(deny file-write* (literal "<ROOT>/op/.kiro/crew/apps/aws-control"))
+(deny file-write* (literal "<ROOT>/op/.kirocrew/apps/aws-control"))
+(deny file-write* (literal "<ROOT>/crew/apps/aws-control"))
 (deny file-write* (literal "<ROOT>/op/.kiro/crew/subagents"))
 (deny file-write* (subpath "<ROOT>/op/.kiro/crew/subagents"))
 (deny file-link (subpath "<ROOT>/op/.kiro/crew/subagents"))
@@ -654,6 +705,10 @@ _PROFILE_GOLDEN = """\
 (deny file-link (require-all (subpath "<ROOT>/crew/apps") (require-not (subpath "<ROOT>/crew/apps/alpha/data"))))
 (allow file-read-metadata (literal "<ROOT>/crew/apps/alpha"))
 (allow file-read-metadata (literal "<ROOT>/crew/apps"))
+(deny network-outbound (remote unix-socket (path-regex #"^/(private/)?tmp/mcs-[^/]*\\.sock$")))
+(deny network-outbound (remote unix-socket (path-regex #"^<ROOT>/crew/run/tunnel-sidecar-[^/]*\\.sock$")))
+(deny file-write* (regex #"^/(private/)?tmp/mcs-[^/]*\\.sock$"))
+(deny file-link (regex #"^/(private/)?tmp/mcs-[^/]*\\.sock$"))
 """
 
 

@@ -9,18 +9,21 @@ import FolderMoveSubmenu from '../FolderMoveSubmenu'
 import OfflineMenuReason, { OfflineReasonRow } from '../OfflineMenuReason'
 import { offlineMenuRow, offlineProps } from '../../utils/offline'
 import { useConnected } from '../../hooks/useConnected'
+import { useMenuOpensDialog } from '../../hooks/useMenuOpensDialog'
 import { DndDraggable, DndDroppable } from '../dnd'
 import { childFolders, isDescendantFolder, folderSubtreeStats } from '../../utils/artifactFolderTree'
 import { useImeGuard } from '../../hooks/useImeGuard'
 import { useScrollEdges } from '../../hooks/useScrollEdges'
 import { FOLDER_COLOR_PALETTE } from '../folderColorCatalog'
 import { i18nT } from '../../i18n/t'
-import { publishNoticeKey } from '../PublishHub'
+import { publicationBadgeLabel, usePublicationProviderName } from '../../lib/publicationBadge'
+import { LiveSiteLink } from './LiveSiteLink'
 import ErrorNotice from '../ErrorNotice'
 import { useOpenInEditor } from '../FilePathMenu'
 import { canOpenFileInEditor, editorAcceptsPath } from '../../lib/electron'
 import { usePathKind } from '../../hooks/usePathKind'
 import { useBranding } from '../../hooks/useBranding'
+import { guidePick } from '../../uiLocations/targetRegistry'
 import type { Artifact, ArtifactFolder, SessionDoc } from '../../types'
 
 export type SortKey = 'name' | 'slug' | 'kind' | 'source' | 'version' | 'tags' | 'updated'
@@ -33,6 +36,7 @@ export const KIND_BADGE: Record<Artifact['kind'], 'ok' | 'err' | 'warn' | 'aim'>
   svg: 'warn',
   json: 'ok',
   text: 'ok',
+  canvas: 'aim',
   webapp: 'aim',
   image: 'warn',
   // A crewmate's dashboard package. `aim` with `widget` and `webapp`, the other
@@ -43,6 +47,17 @@ export const KIND_BADGE: Record<Artifact['kind'], 'ok' | 'err' | 'warn' | 'aim'>
   // falls back to its default tone, so a package reads as an ordinary document in
   // the one place its versions and its revert live.
   dashboard: 'aim',
+}
+
+/** An artifact's kind as a small pill, sized to sit beside 11-13px row text
+ *  rather than above it. The library table, the masonry and the card grid all
+ *  draw the kind through this. */
+export function KindPill({ kind }: { kind: Artifact['kind'] }) {
+  return (
+    <Badge variant={KIND_BADGE[kind]} className="text-[10.5px] leading-4 px-1.5 py-0 font-sans">
+      {kind}
+    </Badge>
+  )
 }
 
 export function isoToTs(iso: string): number {
@@ -213,10 +228,8 @@ export function FolderNameInput({ initial = '', placeholder = 'Folder name', onC
 
           The copy promises only what the draft actually has. It survives for as
           long as this input stays mounted and no longer — unmounting the host
-          discards it, and from the folder menu that happens as soon as the menu
-          closes (characterized in ArtifactsPageCoverage's rename case). So the
-          note names that cost outright instead of asking for the field to be
-          kept open and leaving the consequence unsaid. */}
+          discards it. So the note names that cost outright instead of asking
+          for the field to be kept open and leaving the consequence unsaid. */}
       {!connected && (
         <OfflineReasonRow id={noteId} testId="folder-name-offline-held" className="mt-1" message={i18nT('utils.offline.name_not_saved_keep_field_open')} />
       )}
@@ -229,6 +242,12 @@ export function FolderNameInput({ initial = '', placeholder = 'Folder name', onC
 export function FolderMenu({ folder, folders, actions }: { folder: ArtifactFolder; folders: ArtifactFolder[]; actions: FolderActions }) {
   const moveTargets = folders.filter(f => !isDescendantFolder(folders, folder.id, f.id))
   const connected = useConnected()
+  // Rename mounts an autofocused inline field. Opened straight from `onSelect`,
+  // the menu's focus trap pulls focus back out of it and the close then
+  // restores the trigger; the field's blur commits the unchanged name and
+  // rename mode ends before a key is typed. `openLayer` opens it after the
+  // menu's close commit and keeps that close from restoring the trigger.
+  const menuLayer = useMenuOpensDialog()
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -242,9 +261,9 @@ export function FolderMenu({ folder, folders, actions }: { folder: ArtifactFolde
           <MoreVertical size={13} />
         </button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" onClick={(e) => e.stopPropagation()}>
+      <DropdownMenuContent align="end" onClick={(e) => e.stopPropagation()} onCloseAutoFocus={menuLayer.onCloseAutoFocus}>
         <DropdownMenuItem
-          {...offlineMenuRow(connected, i18nT('utils.offline.rename_folders'), i18nT('pages.artifactsPage.rename'), () => actions.onRename(folder))}
+          {...offlineMenuRow(connected, i18nT('utils.offline.rename_folders'), i18nT('pages.artifactsPage.rename'), () => menuLayer.openLayer(() => actions.onRename(folder)))}
         >
           <Pencil size={13} className="text-muted shrink-0" /> {i18nT('pages.artifactsPage.rename')}
         </DropdownMenuItem>
@@ -253,8 +272,6 @@ export function FolderMenu({ folder, folders, actions }: { folder: ArtifactFolde
           folders={moveTargets}
           currentFolderId={folder.parent_id || null}
           // Dimmed with its siblings; the pick is refused here, at the sink.
-          offline={!connected}
-          offlineTitle={i18nT('utils.offline.gateway_offline_reconnect', { action: i18nT('utils.offline.move_folders') })}
           onPick={(pid) => { if (!connected) return; actions.onMove(folder, pid || '') }}
         />
         <DropdownMenuSeparator />
@@ -430,11 +447,14 @@ export function ArtifactRow({ a, onOpen, onDelete, deletingSlug, onTogglePin, pi
 }) {
   // The row's own writes go to the gateway, so they gate like every other sink.
   const rowConnected = useConnected()
+  const providerName = usePublicationProviderName(a.publication)
   const inner = (setDropRef?: (el: HTMLElement | null) => void) => (
     <DndDraggable id={`artifact-row:${a.slug}`} data={{ type: 'artifact', slug: a.slug, name: a.name, folderId: a.folder_id || '' } satisfies LibraryDrag}>
       {({ setNodeRef, listeners, isDragging }) => (
         <tr
-          ref={(el) => { setNodeRef(el); setDropRef?.(el) }}
+          // The artifact's name as the row shows it: a guide's pick outlines
+          // the one row named exactly like this (artifacts.list).
+          {...guidePick(a.name, (el: Element | null) => { setNodeRef(el as HTMLElement | null); setDropRef?.(el as HTMLElement | null) })}
           {...listeners}
           style={{ opacity: isDragging ? 0.4 : 1 }}
           className={`group/artrow transition-colors cursor-pointer ${dropHighlight ? 'bg-accent/10' : 'hover:bg-bg-hover'}`}
@@ -467,17 +487,33 @@ export function ArtifactRow({ a, onOpen, onDelete, deletingSlug, onTogglePin, pi
                 <Share2
                   size={12}
                   className={a.publication.last_error ? 'text-danger' : a.publication.notice ? 'text-warn' : 'text-ok'}
-                  aria-label={a.publication.last_error ? i18nT('pages.artifactsPage.published_sync_issue') : a.publication.notice ? i18nT(publishNoticeKey({ rolling_out: 'pages.artifactsPage.published_rolling_out', distribution_disabled: 'pages.artifactsPage.published_distribution_disabled', notice_generic: 'pages.artifactsPage.published_notice_generic' }, a.publication.notice_code)) : i18nT('pages.artifactsPage.published', { visibility: a.publication.visibility.toLowerCase() })}
-                />
+                  aria-label={publicationBadgeLabel(a.publication, providerName)}
+                >
+                  <title>{publicationBadgeLabel(a.publication, providerName)}</title>
+                </Share2>
               )}
             </div>
             {a.description && <div className="text-[12px] text-muted truncate max-w-[400px]">{a.description}</div>}
+            <LiveSiteLink slug={a.slug} />
+            {a.publication?.last_error && (
+              <span role="presentation" className="block mt-1" onClick={(e) => e.stopPropagation()}>
+                {/* The hand-off is on: this list holds no unsaved input. */}
+                <ErrorNotice
+                  variant="inline"
+                  className="whitespace-normal"
+                  title={i18nT('pages.artifactsPage.published_sync_issue')}
+                  message={a.publication.last_error}
+                  askAgent
+                  testId="publication-sync-error"
+                />
+              </span>
+            )}
           </td>
           <td className="px-2.5 py-2 border-b border-border">
             <code className="text-[12px] text-muted">{a.slug}</code>
           </td>
           <td className="px-2.5 py-2 border-b border-border">
-            <Badge variant={KIND_BADGE[a.kind]}>{a.kind}</Badge>
+            <KindPill kind={a.kind} />
           </td>
           <td className="px-2.5 py-2 border-b border-border text-[12px] text-muted truncate max-w-[180px]" title={a.session_title || a.source}>{a.session_title || a.source}</td>
           <td className="px-2.5 py-2 border-b border-border text-sm text-muted">{i18nT('pages.artifactsPage.v')}{a.version}</td>
@@ -777,24 +813,39 @@ export function FolderRow({ folder, folders, depth, expanded, onToggle, actions,
               onClick={() => { if (!renaming) onToggle(folder.id) }}
               style={{ opacity: isDragging ? 0.4 : 1 }}
               className={`group cursor-pointer transition-colors focus-ring-accent-inset ${isOver || dropHighlight ? 'bg-accent/15' : 'hover:bg-bg-hover'}`}
-              aria-expanded={expanded}
             >
               <td colSpan={9} className="px-2.5 py-1.5 border-b border-border" style={depth > 0 ? { paddingLeft: `${10 + depth * 20}px` } : undefined}>
                 <div className={`flex items-center gap-1.5 rounded transition-shadow ${isOver || dropHighlight ? 'ring-2 ring-inset ring-accent/50 px-1 -mx-1' : ''}`}>
-                  <Chevron size={13} className="text-muted shrink-0" />
-                  <FolderGlyph folder={folder} size={14} open={expanded} />
                   {renaming ? (
-                    <span className="min-w-0 flex-1 max-w-[280px]">
-                      <FolderNameInput
-                        initial={folder.name}
-                        placeholder={i18nT('pages.artifactsPage.rename_folder')}
-                        onCommit={(name) => actions.onRenameSubmit(folder, name)}
-                        onCancel={actions.onRenameCancel}
-                        onClose={restoreRowFocus}
-                      />
-                    </span>
+                    <>
+                      <Chevron size={13} className="text-muted shrink-0" />
+                      <FolderGlyph folder={folder} size={14} open={expanded} />
+                      <span className="min-w-0 flex-1 max-w-[280px]">
+                        <FolderNameInput
+                          initial={folder.name}
+                          placeholder={i18nT('pages.artifactsPage.rename_folder')}
+                          onCommit={(name) => actions.onRenameSubmit(folder, name)}
+                          onCancel={actions.onRenameCancel}
+                          onClose={restoreRowFocus}
+                        />
+                      </span>
+                    </>
                   ) : (
-                    <span className="text-sm text-text-strong font-medium truncate">{folder.name}</span>
+                    // The row is not a tab stop (tabIndex -1 is only the rename
+                    // editor's focus return) and the ⋯ menu has no expand item,
+                    // so this button is the keyboard's only way into a folder.
+                    // A sibling of the menu button, never its parent. It stops
+                    // the click so the row's own handler does not toggle twice.
+                    <button
+                      type="button"
+                      aria-expanded={expanded}
+                      onClick={(e) => { e.stopPropagation(); onToggle(folder.id) }}
+                      className="flex items-center gap-1.5 min-w-0 p-0 bg-transparent border-none rounded cursor-pointer text-left focus-ring-accent"
+                    >
+                      <Chevron size={13} aria-hidden className="text-muted shrink-0" />
+                      <FolderGlyph folder={folder} size={14} open={expanded} />
+                      <span className="text-sm text-text-strong font-medium truncate">{folder.name}</span>
+                    </button>
                   )}
                   <span className="text-[11px] text-muted">
                     {stats.artifactCount}{stats.subfolderCount > 0 ? ` · ${i18nT('pages.artifactsPage.folder', { count: stats.subfolderCount })}` : ''}
@@ -802,7 +853,7 @@ export function FolderRow({ folder, folders, depth, expanded, onToggle, actions,
                   {/* The cell spans the whole table, which scrolls sideways on a
                       phone, so `ml-auto` would park the always-visible touch menu
                       past the viewport edge. Touch keeps it inline after the count. */}
-                  <span className="ml-auto [@media(hover:none)]:ml-0 opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100 transition-opacity">
+                  <span className="ml-auto [@media(hover:none)]:ml-0 opacity-0 group-hover:opacity-100 has-[:focus-visible]:opacity-100 [@media(hover:none)]:opacity-100 transition-opacity">
                     <FolderMenu folder={folder} folders={folders} actions={actions} />
                   </span>
                 </div>

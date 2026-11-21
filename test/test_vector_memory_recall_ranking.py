@@ -1,15 +1,13 @@
 """Tests for how vector memory recall selects and ranks the memories it returns.
 
-They pin Snowball stemming in keyword scoring, the keyword fallback that keeps two-character
-CJK words, per-tag recency decay and its rate sanitizer, MMR reranking over the full
-candidate pool (cached Jaccard, negative scores, the FAISS tier's pool parity with the
-sqlite tiers), the bounded FAISS search window, and the startup cap on ``pref.*`` rows that
-keeps the rows matching the request. The store core lives in ``test_vector_memory.py``, and
-stored vectors and FAISS index upkeep in ``test_vector_memory_embedding_lifecycle.py``.
+Stemming, the CJK keyword fallback, recency decay, MMR over the full pool, the FAISS window
+and the ``pref.*`` startup cap. The store core is in ``test_vector_memory.py``; vectors and
+FAISS upkeep are in ``test_vector_memory_embedding_lifecycle.py``.
 """
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 from datetime import datetime, timedelta, timezone
@@ -107,13 +105,9 @@ class TestStemWords:
 
 
 class TestMmrJaccardCacheAndRecall:
-    """_mmr_rerank keeps the FULL candidate pool and memoizes the query-independent
-    pairwise Jaccard, rather than truncating the pool toward `limit`.
+    """_mmr_rerank keeps the FULL pool and memoizes the query-independent pairwise Jaccard.
 
-    Truncating by relevance would silently drop a relevant-but-diverse tail item that
-    MMR is specifically meant to surface. Recall is
-    preserved by keeping the pool; cost is reduced by computing each candidate↔candidate
-    similarity at most once (it depends only on the two token sets, not the query).
+    Truncating toward `limit` would drop the relevant-but-diverse tail item MMR exists for.
     """
 
     @staticmethod
@@ -179,23 +173,10 @@ class TestMmrJaccardCacheAndRecall:
 
 
 class TestMmrRerankNegativeScores:
-    """Regression: MMR relevance normalization inverted ranking for negative scores.
+    """MMR relevance normalization must not invert ranking for negative scores.
 
-    ``score = cosine_sim * (0.7 + 0.3*importance) * exp(-0.03*days)``. The index is
-    ``faiss.IndexFlatIP`` (inner product on normalized vectors = cosine in [-1, 1]),
-    so ``cosine_sim`` — and therefore ``score`` — can be NEGATIVE for a query that is
-    dissimilar to the stored memories. The normalizer was::
-
-        max_score = max(c[score_key] for c in candidates) or 1.0
-        ...
-        relevance = candidates[idx][score_key] / max_score
-
-    The ``or 1.0`` only guards ``max_score == 0``. When every score is negative,
-    ``max_score`` is negative and ``score / max_score`` GROWS as the true score gets
-    worse (e.g. -1.0 / -0.1 = +10.0 vs -0.1 / -0.1 = +1.0), so MMR selects the LEAST
-    relevant candidate first — an inverted ranking in the core recall path. The fix
-    (``if max_score <= 0: max_score = 1.0``) is folded into this CR alongside the
-    full-pool + cached-Jaccard rework, since both touch ``_mmr_rerank``.
+    ``faiss.IndexFlatIP`` cosines can be NEGATIVE. Dividing by a negative ``max_score``
+    makes worse scores larger (-1.0 / -0.1 = +10), so ``max_score <= 0`` must use 1.0.
     """
 
     def test_all_negative_scores_keep_best_first(self):
@@ -396,6 +377,120 @@ def test_eligible_rows_scopes_ineligibility_to_candidate_ids_no_full_scan(
     assert scoped == {rid for rid in unfiltered if rid in set(passed_ids)}
 
 
+def _recorded_ids(call) -> object:
+    """The ``record_ids`` an ``_ineligible_ids`` call passed, positional or keyword."""
+    return call.args[0] if call.args else call.kwargs.get("record_ids")
+
+
+def _seed_recall_with_dead_meta(store: VectorMemoryStore) -> tuple[list[float], str]:
+    """Live facts and episodes matching one query, one of each made ineligible,
+    and many dead ``memory_record_meta`` rows a full scan would read.
+
+    Returns the query vector and the id of the ineligible episode.
+    """
+    base = [1.0, 0.0, 0.0, 0.0]
+    for i in range(4):
+        assert (
+            store.set_semantic(f"project.build{i}", f"build session note {i}", 0.9, "user_explicit")
+            is None
+        )
+    # Pairwise cosines of at most 0.5 stay under the write-time dedup threshold,
+    # which refuses a near-copy when faiss is installed; each scores 0.71 against
+    # the query.
+    embeddings = (
+        [1.0, 1.0, 0.0, 0.0],
+        [1.0, 0.0, 1.0, 0.0],
+        [1.0, 0.0, 0.0, 1.0],
+        [1.0, -1.0, 0.0, 0.0],
+    )
+    for i, embedding in enumerate(embeddings):
+        assert store.write_episodic(
+            f"episode {i} about the build session", embedding=embedding, source="user_explicit"
+        )
+    episode_ids = [
+        row[0]
+        for row in store.db.execute("SELECT id FROM episodic_memories ORDER BY id").fetchall()
+    ]
+    blocked_episode = episode_ids[0]
+    with store._db_lock:
+        store.db.execute(
+            "UPDATE memory_record_meta SET status = 'superseded' "
+            "WHERE record_id = 'key:project.build0'"
+        )
+        store.db.execute(
+            "UPDATE memory_record_meta SET status = 'forgotten' WHERE record_id = ?",
+            (blocked_episode,),
+        )
+        for i in range(2000):
+            store.db.execute(
+                "INSERT INTO memory_record_meta (record_id, kind, revision, status, "
+                "content_hash, updated_at) VALUES (?,?,?,?,?,?)",
+                (f"key:dead-{i}", "fact", 1, "superseded", "h", "2026-01-01"),
+            )
+        store.db.commit()
+    return base, blocked_episode
+
+
+@pytest.mark.parametrize("rung", ["resident", "per_call"])
+def test_semantic_v1_scopes_ineligibility_to_scored_rows(tmp_path: Path, opened, rung) -> None:
+    """The V1 fact scan looks eligibility up for the rows it scored, never by an
+    unscoped ``_ineligible_ids()`` that scans all of ``memory_record_meta``."""
+    store = opened(VectorMemoryStore(db_path=tmp_path / "mem.db", embedding_dim=4))
+    store.init()
+    _seed_recall_with_dead_meta(store)
+    if rung == "per_call":
+        rung_patch = mock.patch.object(store, "_semantic_scoring_set", return_value=None)
+    else:
+        assert store._semantic_scoring_set() is not None
+        rung_patch = contextlib.nullcontext()
+
+    with (
+        rung_patch,
+        mock.patch.object(store, "_ineligible_ids", wraps=store._ineligible_ids) as eligibility,
+    ):
+        rows = store._semantic_candidates_v1("build session")
+
+    assert eligibility.call_count >= 1
+    assert all(_recorded_ids(call) is not None for call in eligibility.call_args_list)
+    assert sorted(row["key"] for row in rows) == [f"project.build{i}" for i in (1, 2, 3)]
+
+
+@pytest.mark.skipif(not _HAS_NUMPY, reason="the resident rung needs numpy")
+@pytest.mark.parametrize("rung", ["resident", "per_call"])
+def test_sqlite_vector_search_scopes_ineligibility_to_candidates(
+    tmp_path: Path, opened, rung
+) -> None:
+    """The stored-vector episodic search looks eligibility up for its candidates
+    only, never by an unscoped ``_ineligible_ids()``."""
+    store = opened(VectorMemoryStore(db_path=tmp_path / "mem.db", embedding_dim=4))
+    store.init()
+    query, blocked_episode = _seed_recall_with_dead_meta(store)
+    if rung == "per_call":
+        rung_patch = mock.patch.object(store, "_episodic_scoring_set", return_value=None)
+    else:
+        assert store._episodic_scoring_set(len(query)) is not None
+        rung_patch = contextlib.nullcontext()
+
+    with (
+        rung_patch,
+        mock.patch.object(store, "_ineligible_ids", wraps=store._ineligible_ids) as eligibility,
+    ):
+        rows = store._sqlite_vector_search(query, "build session", limit=10, mmr=False)
+
+    assert eligibility.call_count >= 1
+    assert all(_recorded_ids(call) is not None for call in eligibility.call_args_list)
+    ids = {row["id"] for row in rows}
+    assert blocked_episode not in ids
+    live = {
+        row[0]
+        for row in store.db.execute(
+            "SELECT id FROM episodic_memories WHERE id != ?", (blocked_episode,)
+        )
+    }
+    assert len(live) == 3
+    assert ids == live
+
+
 class TestSanitizeDecayRates:
     """_sanitize_decay_rates: user-edited JSON is screened, not trusted."""
 
@@ -557,14 +652,8 @@ class TestEpisodicDecayRates:
 class TestEpisodicKeywordFallbackCjk:
     """The no-embeddings episodic fallback must not discard whole-word CJK queries.
 
-    ``search_episodic`` drops to ``_fts5_episodic_search`` whenever no query
-    embedding is available -- the normal state for a deployment with no embedding
-    model configured. That fallback matches with ``LIKE '%token%'``, which is a
-    plain substring test and needs no tokenizer, so a spaceless CJK term is a
-    perfectly good needle. The only thing standing between the query and the row
-    is the minimum-token-length filter, which counts CHARACTERS: two characters
-    is a stopword in English but an ordinary whole word in Chinese, Japanese and
-    Korean, so the filter emptied the term list and the search returned nothing.
+    ``_fts5_episodic_search`` matches with ``LIKE '%token%'``, so a CJK term works. The
+    minimum-length filter counts CHARACTERS, and two characters is a whole CJK word.
     """
 
     @staticmethod
@@ -703,12 +792,8 @@ class TestFaissMmrPoolRecallContract:
     """FAISS episodic tier must hand MMR the same recall-contract pool as the
     sqlite tiers.
 
-    The sqlite tiers (per-call and resident) hand ``_mmr_rerank`` their entire
-    embedded population, bounded only by ``_MMR_MAX_POOL`` — the pool comment in
-    ``_mmr_rerank`` declares truncating toward ``limit`` a recall change. The
-    FAISS tier must feed MMR the same full pool rather than a ``limit * 2`` slice
-    (16 at the default ``limit=8``), so it does not drop the relevant-but-diverse
-    tail pick that is the whole point of MMR.
+    That is the full population bounded by ``_MMR_MAX_POOL``, not a ``limit * 2`` slice,
+    which would drop the relevant-but-diverse tail pick.
     """
 
     dim = 16
@@ -773,11 +858,8 @@ class TestFaissMmrPoolRecallContract:
     def _population(self):
         """20 near-duplicate rows outranking one diverse row on pure relevance.
 
-        Duplicates share one token set (pairwise Jaccard 1.0) with cosines
-        descending from ~0.995; the diverse row sits at rank 21 with cosine 0.6
-        and zero token overlap. With the old ``limit * 2`` pool (16) the diverse
-        row never reaches MMR; from the full pool MMR must select it (its MMR
-        value 0.6·rel ≈ 0.36 beats a second duplicate's 0.6·rel − 0.4·1.0 ≈ 0.19).
+        The diverse row is rank 21 (cosine 0.6), past a ``limit * 2`` pool of 16. Its MMR
+        value 0.6·rel ≈ 0.36 beats a second duplicate's 0.6·rel − 0.4·1.0 ≈ 0.19.
         """
         import numpy as np
 
@@ -834,12 +916,8 @@ class TestFaissMmrPoolRecallContract:
     def test_tag_filtered_mmr_keeps_narrow_window(self, tmp_path: Path, monkeypatch) -> None:
         """ATTACK: a tag_filter with mmr=True must keep the narrow limit*2 window.
 
-        ``_matches_tags`` screens candidates AFTER the FAISS window, and only
-        ``_sqlite_vector_search`` masks tags over the complete active population.
-        A wide MMR pool would satisfy the ``expected = min(limit, k)`` starvation
-        probe with tagged hits inside the top ``_MMR_MAX_POOL`` and never fall
-        through, dropping a tagged row ranked past the window. The narrow window
-        keeps the probe routing tag-filtered queries to the full-population tier.
+        ``_matches_tags`` screens AFTER the FAISS window. A wide pool would satisfy the
+        starvation probe and never fall through to ``_sqlite_vector_search``.
         """
         store, index = self._build_store(tmp_path, monkeypatch, self._population())
         store.search_episodic(

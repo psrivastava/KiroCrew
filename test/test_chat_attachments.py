@@ -104,6 +104,28 @@ def test_same_image_twice_is_stored_once_and_both_refs_rewritten(sessions, tmp_p
     assert out == f"![x]({_dest(copied)}) and ![y]({_dest(copied)})"
 
 
+def test_a_long_basename_is_cut_in_its_stem_and_keeps_its_extension(sessions, tmp_path):
+    """A name over the length cap loses stem characters, never its image suffix.
+
+    The shape is a dashboard upload: a 32-hex uuid, ``_``, then a default macOS
+    screenshot name. The copy must still read as a PNG, and the original must
+    still pair with it for the write boundaries' corroboration.
+    """
+    name = "0" * 32 + "_Screenshot_2026-11-06_at_09.18.00.png"
+    source = _write_png(tmp_path / "uploads" / name)
+    text = f"look ![shot]({source})"
+
+    out = persist_inline_images(text, sessions_dir=sessions, stem=STEM)
+
+    stored = _stored_files(sessions)
+    assert len(stored) == 1, stored
+    assert stored[0].endswith(".png"), stored[0]
+    copied = attachments_dir(sessions, STEM) / stored[0]
+    assert out == f"look ![shot]({_dest(copied)})"
+    assert persist_inline_images(out, sessions_dir=sessions, stem=STEM) == out
+    assert same_text_modulo_images(text, out, sessions_dir=sessions, stem=STEM)
+
+
 def test_remote_and_data_destinations_are_untouched(sessions):
     """(3) Nothing remote is ours to copy."""
     text = (
@@ -633,17 +655,9 @@ def test_same_text_modulo_images_pairs_a_preserved_copy_with_its_original(sessio
 def test_same_text_modulo_images_pairs_a_copy_stored_on_a_unc_data_home(monkeypatch, tmp_path):
     r"""The roaming-profile case: the stored copy's own destination is ``//...``.
 
-    A markdown destination cannot carry ``\\fileserver\...`` -- the CommonMark
-    parser reading it drops the backslashes -- so ``_posix_separators`` spells a
-    stored Windows path with forward slashes, and on a roaming profile the data
-    home is itself a share, which makes that spelling ``//fileserver/...``. Read
-    as a protocol-relative URL, the stored side contributes no reference at all:
-    ``stored_seen`` stays false, the two id-matched rows fail to corroborate, and
-    the pair the two write boundaries exist to collapse becomes two history rows.
-
-    Purely lexical throughout (no path here is written), and every spelling is
-    forward-slash with ``peek_data_home`` patched, so the gate answers the same on
-    the Linux CI box as on Windows -- the reason the UNC-gate tests give.
+    ``_posix_separators`` spells a share home as ``//fileserver/...``; read as a
+    protocol-relative URL it gives no reference, and the pair becomes two history rows.
+    Purely lexical with ``peek_data_home`` patched, so it answers the same on Linux.
     """
     from kiro_crew.messaging import outbound_files as module
 
@@ -700,26 +714,32 @@ def test_an_escaped_bracket_in_the_alt_text_does_not_end_it(sessions, tmp_path):
     assert _stored_files(sessions)
 
 
-def test_a_long_run_of_image_openers_is_left_alone_quickly(sessions, tmp_path):
+def test_a_long_run_of_image_openers_is_left_alone_unscanned(sessions, tmp_path, monkeypatch):
     """Bounded on hostile markup: the scanner is quadratic in the number of ``![``
     openers, and this runs under the session lock, so a row past the opener bound
-    is left as written -- in milliseconds, not the tens of seconds the scan costs.
+    is left as written without the reference scan ever running.
     """
-    import time
+    import kiro_crew.chat_attachments as chat_attachments
 
+    scanned: list[int] = []
+    real_scan = chat_attachments.iter_local_refs
+
+    def recording_scan(text):
+        scanned.append(len(text))
+        return real_scan(text)
+
+    monkeypatch.setattr(chat_attachments, "iter_local_refs", recording_scan)
     png = _write_png(tmp_path / "scratch" / "shot.png")
     text = "![" * 20000 + f"![shot]({png})"
-    started = time.monotonic()
     assert persist_inline_images(text, sessions_dir=sessions, stem=STEM) == text
-    assert time.monotonic() - started < 2.0
+    assert scanned == []
     assert not _stored_files(sessions)
     # And the corroboration helper takes the same exit.
     assert not same_text_modulo_images(text, text + " ", sessions_dir=sessions, stem=STEM)
+    assert scanned == []
 
 
-# ---------------------------------------------------------------------------
 # A destination has to survive the parser that reads it back.
-# ---------------------------------------------------------------------------
 
 #: CommonMark's backslash rule, mirrored here so the cases below can state the
 #: property directly: inside a link destination a backslash before ASCII
@@ -819,14 +839,8 @@ def test_persisting_an_already_rewritten_row_changes_nothing(sessions, tmp_path)
 def test_a_row_holding_the_pre_repair_spelling_is_repaired_in_place(tmp_path):
     """Rows already on disk are reached, because this is where they are rewritten.
 
-    A build that wrote the destination natively left a row whose reader resolves
-    a DIFFERENT path. Such a row names a file that is already stored, so nothing
-    is copied -- but the destination is re-encoded, and the row heals the next
-    time it is persisted.
-
-    The home is shaped as shipped (``~/.kiro/crew``): it is the dot-led segment
-    that makes the native spelling unreadable, so a sessions directory without
-    one could not express the defect at all.
+    A natively spelled destination is re-encoded without copying. The home is shaped as
+    shipped (``~/.kiro/crew``): the dot-led segment is what breaks the native spelling.
     """
     sessions = tmp_path / ".kiro" / "crew" / "sessions"
     sessions.mkdir(parents=True)

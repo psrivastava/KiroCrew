@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -68,11 +69,11 @@ class TestSlotProbeWrapsSharedRestoreBody:
         from kiro_crew.dashboard import chat_runner
 
         slot = self._slot(_model_pick_gen=4)  # picked after the swap
-        with patch(
-            "kiro_crew.dashboard.chat_runner.probe_fallback_restore", new_callable=AsyncMock
-        ) as probe:
-            await chat_runner._probe_fallback_restore_for_slot(slot, MagicMock())
-        assert probe.await_args.kwargs["stale"] is True
+        # A restore attempt fails, which would keep the fallback record; only the
+        # stale path drops it without trying the primary.
+        client = SimpleNamespace(set_model=AsyncMock(side_effect=RuntimeError("primary down")))
+        await chat_runner._probe_fallback_restore_for_slot(slot, client)
+        assert (slot._active_fallback_model, slot._fallback_primary_model) == ("", "")
 
     @pytest.mark.asyncio
     async def test_heal_hook_restores_the_activation_snapshot(self):
@@ -452,3 +453,62 @@ class TestSlotModelGuard:
         assert resp.status == 200
         assert state._slots["a"].model == "claude-opus-4.8"
         state.sessions.reset.assert_awaited_once()
+
+
+class TestModelFieldType:
+    """``model`` must be text: anything else saved to ``slot.model`` breaks the slot."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad", [5, True, ["x"], {"a": 1}], ids=repr)
+    @pytest.mark.parametrize("bulk", [False, True], ids=["slot", "bulk"])
+    async def test_a_non_string_model_is_refused_and_nothing_changes(self, tmp_path, bad, bulk):
+        state = _make_state(tmp_path)
+        state.sessions.reset = AsyncMock()
+        state.get_or_create_slot("a", model="auto")
+        state.push_slots_update = MagicMock()
+        app = TestBulkModelSwitch._app(state) if bulk else TestSlotModelGuard._app(state)
+        path = "/api/chat/slots/model" if bulk else "/api/chat/slots/a/model"
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(path, json={"model": bad})
+            data = await resp.json()
+
+        assert resp.status == 400
+        assert data["code"] == "invalid_model"
+        assert state._slots["a"].model == "auto"
+        state.sessions.reset.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bulk", [False, True], ids=["slot", "bulk"])
+    async def test_a_null_model_is_the_default_with_a_warning(self, tmp_path, bulk):
+        state = _make_state(tmp_path)
+        state.sessions.reset = AsyncMock()
+        state.get_or_create_slot("a", model="auto")
+        state.push_slots_update = MagicMock()
+        app = TestBulkModelSwitch._app(state) if bulk else TestSlotModelGuard._app(state)
+        path = "/api/chat/slots/model" if bulk else "/api/chat/slots/a/model"
+
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(path, json={"model": None})
+            data = await resp.json()
+
+        assert resp.status == 200
+        assert data["model"] == ""
+        assert "null" in data["warning"]
+        assert state._slots["a"].model == ""
+
+    @pytest.mark.asyncio
+    async def test_a_new_chat_takes_the_same_reading(self, tmp_path):
+        from chat_test_helpers import _make_app_with_agent_routes
+        from dashboard_owner_helpers import as_owner
+
+        state = _make_state(tmp_path)
+        async with TestClient(TestServer(as_owner(_make_app_with_agent_routes(state)))) as client:
+            refused = await client.post("/api/chat/slots", json={"name": "m-bad", "model": 5})
+            assert refused.status == 400
+            assert (await refused.json())["code"] == "invalid_model"
+            assert "m-bad" not in state._slots
+            made = await client.post("/api/chat/slots", json={"name": "m-null", "model": None})
+            assert made.status == 200, await made.text()
+            assert "null" in (await made.json())["warning"]
+        assert state._slots["m-null"].model == ""

@@ -15,6 +15,7 @@ from acp_client_helpers import _pin_the_installed_kiro_cli_version  # noqa: F401
 
 from kiro_crew.acp.client import AcpClient, AcpError, AcpProcessDied
 from kiro_crew.acp.types import ACP_BACKEND_OPENCODE, AcpPromptStats
+from kiro_crew.testing.synthetic_credentials import SAMPLE_AWS_SECRET
 
 # ── Phase 1: stop_reason and turn_done tests ──
 
@@ -751,12 +752,8 @@ class TestDispatchSubagentEvents:
     async def test_dispatch_ignores_activity_naming_this_session(self):
         """A frame naming THIS session is the parent's own stream, not a child's.
 
-        kiro-cli carries the parent turn's own ``tool_call_chunk`` on
-        ``_kiro.dev/session/update`` with ``params.sessionId`` set to the
-        parent's session, the same method a child's update arrives on, so the
-        sessionId is the only separator. Recorded live in
-        ``test/fixtures/acp_frames/kiro/session.jsonl``. Both carriers are
-        checked so one guard cannot cover half the shape.
+        Parent and child updates share ``_kiro.dev/session/update``, so ``sessionId`` is
+        the only separator (``test/fixtures/acp_frames/kiro/session.jsonl``).
         """
         from kiro_crew.acp.types import EVENT_SUBAGENT_ACTIVITY, JsonRpcMessage
 
@@ -824,14 +821,8 @@ class TestDispatchSubagentEvents:
         """``AcpClient`` is a PASSTHROUGH for kiro-cli's native-child roster: it
         yields the full list and retains nothing.
 
-        The roster cap (``NATIVE_CHILD_ROSTER_CAP``) binds every store that
-        REMEMBERS child ids -- the parent handle's counted set, its KAS display
-        roster, ``AcpRuntime``'s routing recognition set, and this client's
-        Claude child set, which takes the same cap, the same overflow count and
-        the same answer for a child past it
-        (``test_children_past_the_cap_are_counted_and_get_no_row``). This asserts
-        a kiro-cli roster fills none of them here: a store that arrives without
-        the cap is the one-of-N shape that makes a cap decision partial.
+        ``NATIVE_CHILD_ROSTER_CAP`` binds every store that remembers child ids; a store
+        here without the cap would make the cap decision partial.
         """
         from kiro_crew.acp.types import EVENT_SUBAGENT_LIST, JsonRpcMessage
 
@@ -883,7 +874,7 @@ class TestDispatchSubagentEvents:
                         "update": {
                             "sessionUpdate": "tool_call_chunk",
                             "toolCallId": "tc-1",
-                            "title": "leak AKIAIOSFODNN7EXAMPLE now",
+                            "title": f"leak aws_secret_access_key={SAMPLE_AWS_SECRET} now",
                         },
                     }
                 ),
@@ -896,7 +887,9 @@ class TestDispatchSubagentEvents:
                         "sessionId": "s1",
                         "update": {
                             "sessionUpdate": "agent_message_chunk",
-                            "content": {"text": "secret AKIAIOSFODNN7EXAMPLE here"},
+                            "content": {
+                                "text": f"secret aws_secret_access_key={SAMPLE_AWS_SECRET} here"
+                            },
                         },
                     }
                 ),
@@ -917,13 +910,13 @@ class TestDispatchSubagentEvents:
         acts = [e for e in events if e.kind == EVENT_SUBAGENT_ACTIVITY]
         tc = [a for a in acts if a.tool_call_id == "tc-1"]
         txt = [a for a in acts if a.text]
-        # Title redacted (credential scrubbed, no raw AKIA leaks through).
+        # Title redacted (credential scrubbed, no raw secret leaks through).
         assert len(tc) == 1
-        assert "AKIAIOSFODNN7EXAMPLE" not in tc[0].title
+        assert SAMPLE_AWS_SECRET not in tc[0].title
         assert "[REDACTED" in tc[0].title
         # Nested content.text was extracted (robustness) AND redacted (security).
         assert len(txt) == 1 and txt[0].sub_session_id == "s1"
-        assert "AKIAIOSFODNN7EXAMPLE" not in txt[0].text
+        assert SAMPLE_AWS_SECRET not in txt[0].text
         assert "[REDACTED" in txt[0].text
 
     @pytest.mark.asyncio

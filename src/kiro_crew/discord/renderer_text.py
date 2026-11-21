@@ -3,9 +3,10 @@
 The trailing ``[OPTIONS:]`` and steering-marker strips (an unclosed marker still
 streaming in included), the delivered form a candidate cut is graded through, the check
 that a table card buries no local image reference, Discord subtext, the steer-chip
-neutralizer and the platform-cap slicer every seal bounds its payloads with. None of
-them redacts: the display-form redaction pass stays with the sends in
-:mod:`kiro_crew.discord.renderer`. New text transforms of this kind go here;
+neutralizer and the platform-cap slicer every seal bounds its payloads with. Only the
+steer-chip neutralizer redacts, because its escapes would otherwise split a credential
+before the send-time pass sees it; that display-form redaction pass otherwise stays
+with the sends in :mod:`kiro_crew.discord.renderer`. New text transforms of this kind go here;
 :mod:`kiro_crew.discord.renderer` imports these and stays their import path and patch
 surface.
 """
@@ -15,8 +16,21 @@ from __future__ import annotations
 import re
 
 from kiro_crew.discord.client import DISCORD_MAX_TEXT
+from kiro_crew.messaging.display_safety import outside_redaction_tags, redact_for_display
 from kiro_crew.messaging.outbound_files import protected_ref_spans
 from kiro_crew.messaging.renderer import chunk_text, split_options_trailer
+from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+
+
+def _redact_steer(text: str) -> str:
+    """The redactors ``renderer._redact_all`` applies, in the same order.
+
+    Spelled here because an owner never imports its facade; the facade's own copy
+    stays pinned there by the composition contract.
+    """
+    text, _ = redact_exfiltration_urls(text)
+    return redact_credentials(text)[0]
+
 
 # kiro-cli's inline "[STEERING steer-<id>: …]" steer-ack marker (see the
 # Telegram renderer for the full rationale — Discord likewise has no parser).
@@ -30,12 +44,11 @@ from kiro_crew.messaging.renderer import chunk_text, split_options_trailer
 # the first line end left a real marker unrecognised. ``]`` is the terminator
 # this grammar actually has.
 #
-# Requiring ``steer-<id>`` rather than a bare ``[STEERING`` is the ruling
-# ``messaging.driver`` already applies: opening with the sentinel is not being a
-# marker, so prose that merely mentions it stays visible now that the class no
-# longer stops at a line end. The id class matches driver's, and is the SAME in
-# both patterns, because the summary is matched at the offset the marker pattern
-# chose -- a narrower id class there would silently drop the summary.
+# ``steer-<id>`` is required, not a bare ``[STEERING`` (the same rule as
+# ``messaging.driver``), so prose that only mentions the word stays visible even
+# though the class crosses line ends. The id class matches driver's and is the
+# SAME in both patterns: the summary is matched at the marker's offset, so a
+# narrower id class there would silently drop the summary.
 _STEER_MARKER_RE = re.compile(r"\[STEERING\s+steer-[0-9a-f-]+(?:\s*:[^\]]*)?\]", re.IGNORECASE)
 _STEER_SUMMARY_RE = re.compile(r"\[STEERING\s+steer-[0-9a-f-]+\s*:\s*([^\]]*)\]", re.IGNORECASE)
 
@@ -101,11 +114,31 @@ def _as_subtext(text: str) -> str:
 
 
 def _neutralize_md(raw: str) -> str:
-    """Collapse whitespace, cap length, and strip Markdown control chars from a
+    r"""Collapse whitespace, cap length, and strip Markdown control chars from a
     steer's text so the chip renders literally (inside a blockquote) and can't
-    perturb surrounding formatting."""
+    perturb surrounding formatting.
+
+    Discord parses markup Telegram does not: spoilers ``||x||``, strikethrough
+    ``~~x~~`` and, at a line start, headings ``# x`` and subtext ``-# x``. Those
+    are backslash-escaped rather than stripped, so the reader sees the words as
+    typed; a leading ``-`` is escaped whole, which covers ``-#`` and a ``- x``
+    list bullet alike. A typed backslash is escaped first so it cannot cancel
+    one of ours.
+
+    The text is redacted before the strip and again BEFORE the escapes go in: an inserted ``\`` splits a
+    token such as ``abc~SECRET`` so the send-time redaction pass misses it,
+    while Discord renders the ``\`` away and shows the reader the
+    whole credential.
+    NOT idempotent: apply it once, to the raw text.
+    """
     t = " ".join((raw or "").split())[:120]
-    return re.sub(r"[*_`\[\]()]", "", t)
+    # Redacted before the strip too: dropping ``_`` takes a token's own separator
+    # (``ghp_``) with it, and the stripped text does not read as that token.
+    t, _ = redact_for_display(t, _redact_steer)
+    t = outside_redaction_tags(t, lambda text: re.sub(r"[*_`\[\]()]", "", text))
+    t, _ = redact_for_display(t, _redact_steer)
+    t = re.sub(r"([\\|~])", r"\\\1", t)
+    return re.sub(r"^([-#])", r"\\\1", t)
 
 
 def _fit_platform_cap(text: str, limit: int = DISCORD_MAX_TEXT) -> list[str]:

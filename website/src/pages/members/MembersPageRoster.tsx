@@ -29,7 +29,7 @@ import { api, type MemberRosterRow } from '../../api/client'
 import { crewDisplayName } from '../../components/AgentSelector'
 import { MEMBERS_ROSTER_QUERY_KEY } from '../../api/membersQuery'
 import { useMutation, type QueryClient } from '@tanstack/react-query'
-import { fmtList } from '../../i18n/format'
+import { fmtList, fmtNumber } from '../../i18n/format'
 import { usePersistedBool } from '../../hooks/usePersistedBool'
 import { usePersistedString } from '../../hooks/usePersistedString'
 import { findReport, type ErrorReport } from '../../utils/errorReport'
@@ -40,7 +40,7 @@ import { hasNoCrewmates, listedByDefault, parseSort, parseSourceFilter, parseSta
 import ResizeHandle from '../../components/ResizeHandle'
 import { LIST_SHELL_CLS, LIST_HEADER_CLS, LIST_TITLE_CLS, LIST_BODY_CLS, ROW_STATUS_CLS } from '../../components/listShell'
 import { ListDock } from '../../components/ListDock'
-import { tabStatus } from '../../lib/sessionTabs'
+import { busySlotKeys, liveMateThreads, mateNeedsYouByKey } from '../../lib/crewMode'
 import TeamGroupHeader from './TeamGroupHeader'
 import CrewmateImportDialog from './CrewmateImportDialog'
 import { useMemberProjection } from '../../state/useMemberProjection'
@@ -135,33 +135,24 @@ export function useMembersPageRosterView({
   const { teamsQ } = teamsRead
   // A child queued behind the spawn caps has not started, so `subagents_running`
   // misses it, yet the gateway still refuses a new turn on that session: the
-  // queued depth counts as busy here as it does in the Command Bar.
+  // queued depth counts as busy here as it does in the Command Bar. A session the
+  // mate dispatched counts too, keyed by its `mate_root` whether or not the mate
+  // thread's tab is live.
   const subagentQueued = useAppSelector((s) => s.chat.subagentQueued)
-  const liveRunning = useMemo(() => {
-    const byKey: Record<string, boolean> = {}
-    for (const s of liveSlots) {
-      if (s.mode === 'member') byKey[s.key] = !!(s.running || s.subagents_running || (subagentQueued?.[s.key] ?? 0) > 0)
-    }
-    return byKey
-  }, [liveSlots, subagentQueued])
+  const busyKeys = useMemo(() => busySlotKeys(liveSlots, subagentQueued), [liveSlots, subagentQueued])
+  const liveThreads = useMemo(() => liveMateThreads(liveSlots), [liveSlots])
   const isRunning = useCallback(
     (m: MemberRosterRow) => {
       const key = slotKeyOf(m)
-      return key && key in liveRunning ? liveRunning[key] : m.running
+      if (!key) return m.running
+      if (busyKeys.has(key)) return true
+      return liveThreads.has(key) ? false : m.running
     },
-    [slotKeyOf, liveRunning],
+    [slotKeyOf, busyKeys, liveThreads],
   )
   // A member turn parked on the user — an approval or a question — read off
-  // the same slot frames; `tabStatus` is the shared ranking of those two.
-  const liveNeedsYou = useMemo(() => {
-    const byKey: Record<string, boolean> = {}
-    for (const sl of liveSlots) {
-      if (sl.mode !== 'member') continue
-      const st = tabStatus(sl, [], sl.key)
-      byKey[sl.key] = st === 'permission' || st === 'question'
-    }
-    return byKey
-  }, [liveSlots])
+  // the same slot frames, through the map the dock's mate rows read too.
+  const liveNeedsYou = useMemo(() => mateNeedsYouByKey(liveSlots), [liveSlots])
   // The active member's projected roster view over its server row: the drawer
   // Configuration and header read config fields (kiro_agent/model/workspace/
   // memory_store) and last_active_ts from the projection when present, the row
@@ -262,10 +253,21 @@ export function useMembersPageRosterView({
   // The optimistic flip and its revert are per-ROW functional patches on the
   // roster cache, not a whole-roster snapshot restore: two members starred in
   // quick succession must not have the second's failure undo the first.
+  // An unstar also zeroes `star_order`, as the server does, so the dock order
+  // and its drag writes never read a slot the server has already cleared.
+  // `starOrder` restores the row's slot when a failed unstar is reverted.
   const patchStar = useCallback(
-    (name: string, starred: boolean) =>
+    (name: string, starred: boolean, starOrder?: number) =>
       queryClient.setQueryData<MemberRosterRow[]>(MEMBERS_ROSTER_QUERY_KEY, (rows) =>
-        rows?.map((r) => (r.name === name ? { ...r, starred } : r)),
+        rows?.map((r) =>
+          r.name !== name
+            ? r
+            : !starred
+              ? { ...r, starred, star_order: 0 }
+              : starOrder === undefined
+                ? { ...r, starred }
+                : { ...r, starred, star_order: starOrder },
+        ),
       ),
     [queryClient],
   )
@@ -295,7 +297,7 @@ export function useMembersPageRosterView({
       // Same reason as onSuccess: a refetch that started after onMutate's
       // cancel must not land its snapshot on top of the final row.
       await queryClient.cancelQueries({ queryKey: MEMBERS_ROSTER_QUERY_KEY })
-      patchStar(m.name, !next)
+      patchStar(m.name, !next, m.star_order)
       // Localized copy, never the raw server text: the client throws the
       // response body (or `HTTP 500`), which is neither translated nor
       // meant for a user. The journaled report is recovered from that
@@ -447,6 +449,10 @@ interface MembersPageRosterColumnProps {
   openQuick: () => void
   postCreateError: PostCreateFailure | null
   createHeld: string | null
+  /** Import from file is the owner's (a relay teammate's view): its doors are hidden. */
+  importHeld: boolean
+  /** The owner check behind `importHeld` failed: said on the roster. */
+  ownerCheckFailed: boolean
   slotKeyOf: (m: MemberRosterRow) => string
   /** The crewmate whose face is centre stage in the first Mate's entrance
    *  (#23207), so its row holds the face unpainted until it lands; `''` for none. */
@@ -457,7 +463,7 @@ interface MembersPageRosterColumnProps {
 export function MembersPageRosterColumn({
   rosterRead, teamsRead, layout, drawers, rosterView, rosterSignals, profileFlight, navigation, teamView,
   activeName, scrollActiveRowIntoView, gone, createOpen, openAdvanced, openQuick, postCreateError, createHeld,
-  slotKeyOf, faceOnStageFor,
+  importHeld, ownerCheckFailed, slotKeyOf, faceOnStageFor,
 }: MembersPageRosterColumnProps) {
   const { t } = useTranslation()
   const [importing, setImporting] = useState(false)
@@ -604,7 +610,7 @@ export function MembersPageRosterColumn({
                   </DropdownMenuItem>
                   {/* Import from file, the same dialog the switcher opens, so the
                       phone roster (where the switcher is hidden) reaches it too. */}
-                  {createHeld === null && (
+                  {createHeld === null && !importHeld && (
                     <DropdownMenuItem onSelect={() => setImporting(true)} data-testid="member-add-import">
                       <FileUp size={13} className="lucide-inline text-muted shrink-0" aria-hidden="true" />
                       <span {...uiLocation('members.add-menu.import')}>{t('pages.membersPage.import_from_file')}</span>
@@ -650,8 +656,9 @@ export function MembersPageRosterColumn({
                 ? '\u2014'
                 : narrowed
                   ? t('pages.membersPage.member_count_filtered', {
-                      shown: sortedMembers.length,
+                      shown: fmtNumber(sortedMembers.length),
                       count: shownMembers.length,
+                      n: fmtNumber(shownMembers.length),
                     })
                   : t('pages.membersPage.member_count', { count: shownMembers.length })}
             </div>
@@ -674,6 +681,19 @@ export function MembersPageRosterColumn({
             {/* A failed team read renders the roster FLAT, which is not "no teams"
                 -- it is unknown, and said here on the roster the grouping lives
                 on. No draft on this page, so the hand-off is safe. */}
+            {/* The owner check behind Import from file failed, so the door is held:
+                said here, where it would have been, not dropped. No draft on this
+                page, so the hand-off is safe. */}
+            {ownerCheckFailed && (
+              <div className="px-4 pb-2">
+                <ErrorNotice
+                  message={t('pages.membersPage.owner_check_failed')}
+                  variant="inline"
+                  askAgent
+                  testId="member-roster-owner-check-error"
+                />
+              </div>
+            )}
             {teamsNoticeShown && (
               <div className="px-4 pb-2">
                 <ErrorNotice
@@ -695,7 +715,6 @@ export function MembersPageRosterColumn({
               // Menu rows keep the menu open (preventDefault) so several can be
               // toggled in one visit, as the sidebar's do.
             <SearchFilterBar
-              className="px-2"
               placeholder={t('pages.membersPage.search_members')}
               clearLabel={t('pages.chatSidebar.clear_search')}
               value={filter}
@@ -856,7 +875,7 @@ export function MembersPageRosterColumn({
                 // instead (see the DM thread section), so the two panes never
                 // show the same hero twice on a wide viewport.
                 <li className="md:hidden">
-                  <CrewmateEmptyHero onCreate={openQuick} onAdvanced={openAdvanced} held={createHeld} onImport={() => setImporting(true)} />
+                  <CrewmateEmptyHero onCreate={openQuick} onAdvanced={openAdvanced} held={createHeld} onImport={importHeld ? undefined : () => setImporting(true)} />
                 </li>
               )}
               {loadError && (
@@ -880,7 +899,12 @@ export function MembersPageRosterColumn({
                   />
                   {/* The plain retry first: a failed read is usually transient,
                       and "ask about it" alone reads as the only way out. */}
-                  <Btn onClick={() => void rosterQuery.refetch()} data-testid="member-roster-retry">
+                  <Btn
+                    onClick={() => { if (!rosterQuery.isFetching) void rosterQuery.refetch() }}
+                    aria-disabled={rosterQuery.isFetching || undefined}
+                    className="aria-disabled:opacity-30 aria-disabled:cursor-not-allowed"
+                    data-testid="member-roster-retry"
+                  >
                     {t('pages.membersPage.roster_load_retry')}
                   </Btn>
                 </li>
@@ -931,7 +955,6 @@ export function MembersPageRosterColumn({
                         <MemberRow
                           key={m.name}
                           m={m}
-                          t={t}
                           activeName={activeName}
                           // In the drawer a pick closes it first, so the switch
                           // lands on the entry below the drawer's duplicate.
@@ -964,8 +987,12 @@ export function MembersPageRosterColumn({
                         names: fmtList(hiddenNames),
                       })
                     : t('pages.membersPage.hidden_more_hint', {
-                        count: hiddenCount - hiddenNames.length,
-                        names: fmtList(hiddenNames, { type: 'unit', style: 'short' }),
+                        // "N more bots" is the list's last item, so each language
+                        // places its one conjunction and its own separator.
+                        names: fmtList([
+                          ...hiddenNames,
+                          t('pages.membersPage.hidden_more_count', { count: hiddenCount - hiddenNames.length }),
+                        ]),
                       })}
                 </li>
               )}

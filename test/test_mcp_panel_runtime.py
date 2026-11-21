@@ -1,19 +1,9 @@
 """Runtime behaviour of the ``kirocrew-panel`` MCP server.
 
-``test_mcp_panel_registration.py`` covers the REGISTRY wiring -- that the server
-appears in every declaration surface, that the conductor grants are exact, that no
-tool takes a session argument. None of that executes the module, so the half this
-file covers is the half the security argument actually rests on:
-
-* the strict identity gate, whose entire purpose is refusing a subagent rather
-  than resolving it to its parent's crew;
-* the redaction of gateway refusal prose, which is the justification recorded for
-  this module's ``NON_EGRESS`` output-boundary classification in
-  ``security_posture``;
-* the refusal paths, which are what a caller sees when it gets something wrong.
-
-A security claim with no executing test is a comment, so each test here names the
-claim it is holding up.
+``test_mcp_panel_registration.py`` covers the registry wiring without running the
+module. This file runs it: the identity gate that refuses a subagent instead of
+resolving it to its parent's crew, the redaction behind the ``NON_EGRESS``
+classification in ``security_posture``, and the refusal paths.
 """
 
 from __future__ import annotations
@@ -33,6 +23,7 @@ from kiro_crew.mcp_panel import (
     _validate_args,
     run_mcp_server,
 )
+from kiro_crew.testing.synthetic_credentials import github_classic
 
 #: A verified caller. Every test that is not ABOUT the identity gate needs one,
 #: or it exercises the refusal instead of the behaviour under test.
@@ -65,7 +56,7 @@ def _verified_caller() -> Any:
         yield
 
 
-# --------------------------------------------------------------- identity gate
+# identity gate
 
 
 class TestTheStrictIdentityGate:
@@ -134,35 +125,23 @@ class TestTheStrictIdentityGate:
         assert "crew" not in sent and "slug" not in sent, f"caller-controlled identity in {sent}"
 
 
-# ------------------------------------------------------------------- redaction
+# redaction
 
 
 class TestRefusalProseIsRedacted:
     """The module's ``NON_EGRESS`` output-boundary classification, under test.
 
-    The two ``redact`` calls exist because gateway refusal prose is returned to the
-    agent verbatim so it can correct itself -- and that prose is built from an
-    upstream error string this module does not author. If a refusal ever quotes
-    something credential-shaped, returning it raw would hand it to the model. That
-    reasoning is the recorded justification for the classification, so it gets a
-    test rather than a comment.
+    Refusal prose goes back to the agent verbatim and is built from an upstream
+    error string, so anything credential-shaped in it must be redacted first.
     """
 
-    # ASSEMBLED AT RUNTIME, never written as literals.
-    #
-    # These have to be credential-SHAPED to reach the detectors under test, which
-    # makes them indistinguishable from real leaked keys to a scanner reading this
-    # file -- GitHub push protection rejected the Slack-shaped one outright. Joining
-    # the parts keeps the shape at runtime while the source contains no matchable
-    # string, so the test stays honest without an allowlist entry that would teach
-    # the scanner to ignore this path. Do not "simplify" these back into literals.
-    #
-    # One per detector in the shared redactor, so a single pattern regressing does
-    # not leave this test green on the strength of the others.
+    # Assembled at runtime so the source holds no string a secret scanner matches
+    # (GitHub push protection rejects the Slack-shaped one). Do not turn these into
+    # literals. One per detector, so one pattern regressing still fails the test.
     CREDENTIALS = [
         "-".join(["xoxb", "123456789012", "1234567890123", "abcdefghijklmnopqrstuvwx"]),
-        "_".join(["ghp", "1234567890abcdefghijklmnopqrstuvwxyz"]),
-        "".join(["AKIA", "IOSFODNN7", "EXAMPLE"]),
+        github_classic(seed=89),
+        "aws_secret_access_key=" + "".join(["Qh4Tm2Vx9KpRc/Z8Nw3Hd", "/Jf1Lb5Gs0Ye9Ua2WkE"]),
     ]
 
     @pytest.mark.parametrize("secret", CREDENTIALS)
@@ -204,7 +183,7 @@ class TestRefusalProseIsRedacted:
         assert "REDACTED" not in out
 
 
-# ---------------------------------------------------------------- publish tool
+# publish tool
 
 
 class TestPanelPublish:
@@ -262,7 +241,7 @@ class TestPanelPublish:
         assert out.startswith("Published using the `default` template (1 top-level field).")
 
 
-# -------------------------------------------------------------- templates tool
+# templates tool
 
 
 class TestPanelTemplates:
@@ -281,7 +260,7 @@ class TestPanelTemplates:
         assert "No panel templates" in out
 
 
-# --------------------------------------------------------- dashboard read tool
+# dashboard read tool
 
 
 class TestDashboardFields:
@@ -339,7 +318,7 @@ class TestDashboardFields:
     def test_a_field_list_carrying_a_credential_comes_back_scrubbed(self) -> None:
         """The prose is built from gateway state this module does not author, so
         the whole rendered answer goes through the redactor, not just a refusal."""
-        secret = "_".join(["ghp", "1234567890abcdefghijklmnopqrstuvwxyz"])
+        secret = github_classic(seed=89)
         with patch(
             "kiro_crew.mcp_panel._get",
             return_value={
@@ -354,7 +333,7 @@ class TestDashboardFields:
         assert "REDACTED" in out
 
 
-# -------------------------------------------------------- dashboard write tool
+# dashboard write tool
 
 
 class TestDashboardWrite:
@@ -452,10 +431,12 @@ class TestDashboardWrite:
         assert "REDACTED" not in out
 
     def test_a_refusal_carrying_a_credential_is_scrubbed(self) -> None:
-        secret = "".join(["AKIA", "IOSFODNN7", "EXAMPLE"])
+        secret = "".join(["Qh4Tm2Vx9KpRc/Z8Nw3Hd", "/Jf1Lb5Gs0Ye9Ua2WkE"])
         with patch(
             "kiro_crew.mcp_panel._post",
-            return_value={"error": f"wrong_type: 'risk_note' wants string, got {secret}"},
+            return_value={
+                "error": f"wrong_type: 'risk_note' wants string, got aws_secret_access_key={secret}"
+            },
         ):
             out = _call_tool_inner("dashboard_write", {"field": "risk_note", "value": 1})
 
@@ -513,13 +494,9 @@ class TestDashboardWrite:
 class TestDashboardWriteClear:
     """``clear: true`` empties an array or object field, through the server's whole entry.
 
-    An MCP client can drop an empty list, an empty object or a top-level null from a
-    call's arguments, so ``value: []`` or ``value: {}`` reaches this server as no
-    value at all. A boolean arrives intact, which is why emptying a field is spelled
-    as one. Which empty value to write (``[]`` or ``{}``) is read from the field list
-    the ``dashboard_fields`` tool uses, so the gateway's own type-check still applies.
-    Every case goes through ``_call_tool``, the schema included, because the schema is
-    where a call with nothing to write is answered.
+    An MCP client can drop ``value: []`` or ``value: {}`` from the arguments, but a
+    boolean arrives intact. The empty value to write comes from the ``dashboard_fields``
+    field list. Cases go through ``_call_tool`` because the schema answers an empty call.
     """
 
     WRITTEN_ARRAY = {"ok": True, "written": {"field": "for_you", "type": "array"}}
@@ -703,7 +680,7 @@ class TestDashboardWriteClear:
         assert "clear" in tool["description"]
 
 
-# ------------------------------------------------------------ field rendering
+# field rendering
 
 
 class TestTheFieldRendering:
@@ -887,7 +864,7 @@ class TestTheFieldRendering:
         assert "tries" not in out
 
 
-# ------------------------------------------------------------- module plumbing
+# module plumbing
 
 
 class TestTheDispatchSurface:

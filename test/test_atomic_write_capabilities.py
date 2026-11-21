@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import os
 import stat
+import threading
 
 import pytest
 
@@ -56,7 +57,7 @@ def test_atomic_write_at_replaces_inside_pinned_directory(tmp_path):
         aw.atomic_write_at(dir_fd, "value.txt", "two", fsync=True, mode=0o600)
     finally:
         os.close(dir_fd)
-    assert (root / "value.txt").read_text() == "two"
+    assert (root / "value.txt").read_text(encoding="utf-8") == "two"
 
 
 @pytest.mark.skipif(not platform_compat.IS_POSIX, reason="descriptor-relative writes are POSIX")
@@ -64,16 +65,16 @@ def test_atomic_write_at_replaces_symlink_without_touching_target(tmp_path):
     root = tmp_path / "root"
     root.mkdir()
     victim = tmp_path / "victim.txt"
-    victim.write_text("keep")
+    victim.write_text("keep", encoding="utf-8")
     (root / "value.txt").symlink_to(victim)
     dir_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
     try:
         aw.atomic_write_at(dir_fd, "value.txt", "managed", mode=0o600)
     finally:
         os.close(dir_fd)
-    assert victim.read_text() == "keep"
+    assert victim.read_text(encoding="utf-8") == "keep"
     assert not (root / "value.txt").is_symlink()
-    assert (root / "value.txt").read_text() == "managed"
+    assert (root / "value.txt").read_text(encoding="utf-8") == "managed"
 
 
 def test_atomic_write_at_rejects_non_leaf_name(tmp_path):
@@ -113,10 +114,13 @@ def test_restrict_to_owner_runs_before_any_content_is_written(tmp_path, monkeypa
     write reporting 0 bytes forever instead of failing.
     """
     events: list[str] = []
+    test_thread = threading.get_ident()
     real_restrict = platform_compat.restrict_to_owner
 
     def _spy(path, **_kw):
-        events.append("restrict")
+        # This thread only: the SEL writer thread re-locks its non-empty log per append.
+        if threading.get_ident() == test_thread:
+            events.append("restrict")
         return real_restrict(path)
 
     monkeypatch.setattr(platform_compat, "restrict_to_owner", _spy)

@@ -10,11 +10,44 @@ import tempfile
 import unittest
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
+import pytest
 import yaml
 
-from scripts.ci_file_shards import file_shard
+from scripts import ci_file_shard_pins
+from scripts.ci_file_shards import file_shard, hash_shard, read_pins
 
 ROOT = Path(__file__).resolve().parents[1]
+_DEFAULT_SUBPROCESS_TIMEOUT_SECONDS = 45
+# Lost-run ceiling for the Windows `--surface backend` scan (testing-conventions
+# class 6). The slowest passing call in a windows-pytest-progress-7 artifact took
+# 42.251775s (run 39911553168); 10x is 422.5s, rounded up to 425s. Fifteen
+# consecutive green main runs (41234261776..41278128347) measured 18.2s-25.2s.
+_WINDOWS_BACKEND_SCOPE_TIMEOUT_SECONDS = 425
+# The same ceiling off Windows. The slowest of 117 passing calls in
+# linux-pytest-progress-8 artifacts (runs 42132423515..42955291680) took
+# 45.704918s (run 42938841346); 10x is 457.0s, rounded up to 460s.
+_LINUX_BACKEND_SCOPE_TIMEOUT_SECONDS = 460
+# At most half the module timeout, so an expired scan fails by name instead of
+# pytest-timeout killing the xdist worker (Windows has no SIGALRM).
+pytestmark = pytest.mark.timeout(
+    2 * max(_WINDOWS_BACKEND_SCOPE_TIMEOUT_SECONDS, _LINUX_BACKEND_SCOPE_TIMEOUT_SECONDS)
+)
+
+
+def _backend_scope_timeout_seconds(*, windows: bool) -> int:
+    """Bound the scan from the shard time measured on Windows or Linux runners."""
+    return (
+        _WINDOWS_BACKEND_SCOPE_TIMEOUT_SECONDS if windows else _LINUX_BACKEND_SCOPE_TIMEOUT_SECONDS
+    )
+
+
+def _tail(output: str | bytes | None, limit: int = 2000) -> str:
+    """Last ``limit`` characters a timed-out child wrote, for the failure message."""
+    if output is None:
+        return ""
+    if isinstance(output, bytes):
+        output = output.decode("utf-8", "replace")
+    return output[-limit:]
 
 
 class TestFileShards(unittest.TestCase):
@@ -40,7 +73,7 @@ class TestFileShards(unittest.TestCase):
         path.write_text(content, encoding="utf-8")
         return path
 
-    def run_python(self, *extra):
+    def run_python(self, *extra, timeout=_DEFAULT_SUBPROCESS_TIMEOUT_SECONDS):
         env = dict(os.environ)
         env.pop("PYTEST_ADDOPTS", None)
         env.pop("PYTEST_PLUGINS", None)
@@ -53,15 +86,21 @@ class TestFileShards(unittest.TestCase):
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         env["PYTHONPATH"] = str(ROOT)
         env["TMPDIR"] = env["TMP"] = env["TEMP"] = str(self.root)
-        return subprocess.run(
-            [sys.executable, "-B", *extra],
-            cwd=self.root,
-            env=env,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            timeout=45,
-        )
+        try:
+            return subprocess.run(
+                [sys.executable, "-B", *extra],
+                cwd=self.root,
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            self.fail(
+                f"{extra} still running when its {exc.timeout}s ceiling expired; "
+                f"stdout tail: {_tail(exc.stdout)!r}; stderr tail: {_tail(exc.stderr)!r}"
+            )
 
     def run_pytest(self, *extra):
         return self.run_python("-m", "pytest", "-p", "scripts.ci_file_shards", "-q", *extra)
@@ -137,8 +176,220 @@ class TestFileShards(unittest.TestCase):
         self.assertCountEqual(all_files, {item.split("::")[0] for item in baseline})
         self.assertEqual(len(all_files), 26)
 
+    def write_pins(self, name, count, pins):
+        lines = [f"# shards: {count}"] + [f"{owner} {path}" for path, owner in pins.items()]
+        return self.write(name, "\n".join(lines) + "\n")
+
+    def test_pinned_union_matches_unsharded_items_and_moves_only_pinned_files(self):
+        self.seed_suite()
+        self.write("test/a space/test_spaced.py", "def test_one(): pass\n")
+        self.assert_ok(self.run_pytest("--collect-only"))
+        baseline = self.items()
+        self.assertEqual(len(baseline), 55)
+        files = sorted({item.split("::")[0] for item in baseline})
+        hashed = {name: file_shard(self.root / name, self.root, 3) for name in files}
+        # Move every other file off its hash shard, the spaced path included. A
+        # stale pin (a deleted file) and the unpinned files must not matter.
+        pins = {name: hashed[name] % 3 + 1 for name in files[::2]}
+        pins["test/a space/test_spaced.py"] = hashed["test/a space/test_spaced.py"] % 3 + 1
+        pins["test/test_deleted.py"] = 1
+        pin_file = self.write_pins("pins.txt", 3, pins)
+        all_items = []
+        for index in range(1, 4):
+            self.assert_ok(
+                self.run_pytest(
+                    "--file-shards=3", f"--file-shard={index}", f"--file-shard-pins={pin_file}"
+                )
+            )
+            shard_items = self.items()
+            for item in shard_items:
+                name = item.split("::")[0]
+                self.assertEqual(pins.get(name, hashed[name]), index, item)
+            all_items.extend(shard_items)
+        self.assertCountEqual(all_items, baseline)
+        self.assertEqual(len(all_items), len(set(all_items)))
+
+    def test_pinned_xdist_workers_collect_identical_shards(self):
+        for index in range(6):
+            self.write(f"test/test_x_{index}.py", "def test_a(): pass\ndef test_b(): pass\n")
+        pins = {}
+        for index in range(0, 6, 2):
+            name = f"test/test_x_{index}.py"
+            pins[name] = file_shard(self.root / name, self.root, 2) % 2 + 1
+        pin_file = self.write_pins("pins.txt", 2, pins)
+        collected = []
+        for index in (1, 2):
+            self.assert_ok(
+                self.run_pytest(
+                    "-p",
+                    "xdist.plugin",
+                    "-n2",
+                    "--file-shards=2",
+                    f"--file-shard={index}",
+                    f"--file-shard-pins={pin_file}",
+                )
+            )
+            self.assertEqual(self.items("gw0"), self.items("gw1"))
+            collected.extend(self.items("gw0"))
+        self.assertEqual(len(collected), 12)
+        self.assertEqual(len(set(collected)), 12)
+
+    def test_malformed_pin_files_fail_instead_of_guessing_an_owner(self):
+        self.write("test/test_ok.py", "def test_ok(): pass\n")
+        cases = {
+            "count mismatch": self.write_pins("count.txt", 3, {"test/test_ok.py": 1}),
+            "no header": self.write("no-header.txt", "1 test/test_ok.py\n"),
+            "bad header": self.write("bad-header.txt", "# shards: eight\n"),
+            "owner out of range": self.write("range.txt", "# shards: 2\n3 test/test_ok.py\n"),
+            "owner zero": self.write("zero.txt", "# shards: 2\n0 test/test_ok.py\n"),
+            "no path": self.write("nopath.txt", "# shards: 2\n1\n"),
+            "pinned twice": self.write(
+                "twice.txt", "# shards: 2\n1 test/test_ok.py\n2 test/test_ok.py\n"
+            ),
+            "missing file": self.root / "absent.txt",
+        }
+        for label, path in cases.items():
+            with self.subTest(label):
+                result = self.run_pytest(
+                    "--file-shards=2", "--file-shard=1", f"--file-shard-pins={path}"
+                )
+                self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+        good = self.write_pins("good.txt", 2, {"test/test_ok.py": 1})
+        result = self.run_pytest(f"--file-shard-pins={good}")
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+
+    def test_committed_pin_file_matches_the_workflow_shard_count(self):
+        workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
+        for job, name in (
+            ("backend-test", "ci_file_shard_pins.txt"),
+            ("backend-test-windows", "ci_file_shard_pins_windows.txt"),
+        ):
+            count = workflow["jobs"][job]["env"]["SHARD_COUNT"]
+            pins = read_pins(ROOT / "scripts" / name, count)
+            # The pins balance the shards only if every shard holds some of them.
+            self.assertEqual(set(pins.values()), set(range(1, count + 1)), name)
+
+    def test_pin_generator_reads_only_the_named_platforms_artifacts(self):
+        run = self.root / "runs" / "a"
+        for platform, module in (("linux", "test/test_lin.py"), ("windows", "test/test_win.py")):
+            shard_dir = run / f"{platform}-pytest-progress-1"
+            shard_dir.mkdir(parents=True)
+            record = {"event": "phase_end", "module": module, "phase": "call", "elapsed": 5.0}
+            (shard_dir / "gw0.jsonl").write_text(json.dumps(record) + "\n", encoding="utf-8")
+            self.write(module, "def test_ok(): pass\n")
+        out = self.root / "pins.txt"
+        argv = [str(run), "--platform=windows", "--shards=2", "--pins=5"]
+        self.assertEqual(ci_file_shard_pins.main(argv + [f"--out={out}", f"--root={self.root}"]), 0)
+        self.assertEqual(set(read_pins(out, 2)), {"test/test_win.py"})
+
+    def test_pin_generator_balances_measured_seconds_and_is_deterministic(self):
+        runs = self.root / "runs"
+        heavy = {f"test/test_heavy_{i}.py": 100.0 - i for i in range(10)}
+        light = {f"test/test_light_{i}.py": 1.0 for i in range(40)}
+        weights = {**heavy, **light}
+        for run, factor in (("a", 1.0), ("b", 2.0), ("c", 1.0)):
+            shard_dir = runs / run / "linux-pytest-progress-1"
+            shard_dir.mkdir(parents=True)
+            records = [{"event": "collection_end", "elapsed": 9.0}]
+            for name, seconds in weights.items():
+                for phase in ("setup", "call", "teardown"):
+                    records.append(
+                        {
+                            "event": "phase_end",
+                            "module": name,
+                            "phase": phase,
+                            "elapsed": seconds * factor / 3,
+                        }
+                    )
+            # A record with no module (an unattributable test) is not a file.
+            records.append({"event": "phase_end", "test": "dynamic", "elapsed": 99.0})
+            (shard_dir / "gw0.jsonl").write_text(
+                "".join(json.dumps(r) + "\n" for r in records), encoding="utf-8"
+            )
+        for name in weights:
+            self.write(name, "def test_ok(): pass\n")
+        # Measured but since deleted: never pinned, however heavy it was.
+        records = [
+            {"event": "phase_end", "module": "test/test_gone.py", "phase": "call", "elapsed": 500.0}
+        ]
+        for run in "abc":
+            with (runs / run / "linux-pytest-progress-1" / "gw0.jsonl").open("a") as stream:
+                stream.write("".join(json.dumps(r) + "\n" for r in records))
+        out = self.root / "pins.txt"
+        argv = [str(runs / run) for run in "abc"]
+        argv += ["--shards=4", "--pins=10", f"--out={out}", f"--root={self.root}"]
+        self.assertEqual(ci_file_shard_pins.main(argv), 0)
+        first = out.read_text(encoding="utf-8")
+        self.assertEqual(ci_file_shard_pins.main(argv), 0)
+        self.assertEqual(out.read_text(encoding="utf-8"), first)
+        pins = read_pins(out, 4)
+        self.assertEqual(set(pins), set(heavy))
+        self.assertNotIn("test/test_gone.py", pins)
+        pinned = [0.0] * 4
+        hashed = [0.0] * 4
+        for name, seconds in weights.items():
+            pinned[pins.get(name, hash_shard(name, 4)) - 1] += seconds
+            hashed[hash_shard(name, 4) - 1] += seconds
+        self.assertLess(max(pinned) - min(pinned), max(hashed) - min(hashed))
+        self.assertLessEqual(max(pinned) - min(pinned), 100.0)
+
+    def test_pin_generator_every_file_plans_each_measured_file_and_evens_the_rest(self):
+        runs = self.root / "runs"
+        # The names are chosen by hash: every light file's hash owner is shard 1,
+        # so a plan that stops at the two heavy files cannot even the shards.
+        light = [
+            n for n in (f"test/test_light_{i}.py" for i in range(200)) if hash_shard(n, 2) == 1
+        ]
+        light = light[:30]
+        weights = {"test/test_heavy_0.py": 100.0, "test/test_heavy_1.py": 100.0}
+        weights.update(dict.fromkeys(light, 10.0))
+        # Measured in one run of three: its median share is zero, so it has no weight.
+        unweighted = "test/test_new.py"
+        for run in "abc":
+            shard_dir = runs / run / "linux-pytest-progress-1"
+            shard_dir.mkdir(parents=True)
+            seconds = {**weights, unweighted: 50.0} if run == "c" else weights
+            records = [
+                {"event": "phase_end", "module": name, "phase": "call", "elapsed": value}
+                for name, value in seconds.items()
+            ]
+            (shard_dir / "gw0.jsonl").write_text(
+                "".join(json.dumps(r) + "\n" for r in records), encoding="utf-8"
+            )
+        for name in (*weights, unweighted):
+            self.write(name, "def test_ok(): pass\n")
+        out = self.root / "pins.txt"
+        argv = [str(runs / run) for run in "abc"]
+        argv += ["--shards=2", "--pins=2", f"--out={out}", f"--root={self.root}"]
+
+        def spread() -> float:
+            pins = read_pins(out, 2)
+            load = [0.0, 0.0]
+            for name, seconds in weights.items():
+                load[pins.get(name, hash_shard(name, 2)) - 1] += seconds
+            return abs(load[0] - load[1])
+
+        self.assertEqual(ci_file_shard_pins.main(argv), 0)
+        self.assertEqual(set(read_pins(out, 2)), {"test/test_heavy_0.py", "test/test_heavy_1.py"})
+        self.assertEqual(spread(), 100.0)
+        self.assertEqual(ci_file_shard_pins.main(argv + ["--every-file"]), 0)
+        # Every weighted file is planned; the unweighted one keeps its hash shard.
+        self.assertEqual(set(read_pins(out, 2)), set(weights))
+        self.assertEqual(spread(), 0.0)
+
+    def test_reduced_backend_scope_timeout_accounts_for_windows(self):
+        self.assertEqual(
+            _backend_scope_timeout_seconds(windows=False), _LINUX_BACKEND_SCOPE_TIMEOUT_SECONDS
+        )
+        self.assertEqual(
+            _backend_scope_timeout_seconds(windows=True), _WINDOWS_BACKEND_SCOPE_TIMEOUT_SECONDS
+        )
+
     def test_reduced_backend_scope_populates_every_ci_shard(self):
-        result = self.run_python(str(ROOT / "scripts/ci-surface-tests.py"), "--surface", "backend")
+        timeout = _backend_scope_timeout_seconds(windows=os.name == "nt")
+        result = self.run_python(
+            str(ROOT / "scripts/ci-surface-tests.py"), "--surface", "backend", timeout=timeout
+        )
         self.assert_ok(result)
         files = result.stdout.splitlines()
         self.assertTrue(files)
@@ -268,6 +519,27 @@ class TestFileShards(unittest.TestCase):
             )
             actual.extend(self.items())
         self.assertCountEqual(actual, baseline)
+
+    def test_targets_file_collects_only_listed_files_without_putting_them_on_argv(self):
+        self.write("test/conftest.py", "import pytest\n@pytest.fixture\ndef seeded(): return 1\n")
+        self.write("test/test_listed.py", "def test_ok(seeded): assert seeded == 1\n")
+        self.write("test/nested/test_deep.py", "def test_ok(): pass\n")
+        # Neither the sibling nor a directory holding no target may be imported.
+        self.write("test/test_sibling.py", "raise RuntimeError('sibling imported')\n")
+        self.write("apps/demo/conftest.py", "raise RuntimeError('untargeted directory walked')\n")
+        targets = self.write("targets.txt", "\ntest/test_listed.py\ntest/nested/test_deep.py\n")
+        args = ("--file-shards=1", "--file-shard=1", f"--file-shard-targets={targets}")
+        self.assert_ok(self.run_pytest(*args))
+        self.assertCountEqual(
+            self.items(), ["test/test_listed.py::test_ok", "test/nested/test_deep.py::test_ok"]
+        )
+        # A listed path that is not a file fails, as it did as an argument.
+        missing = self.write("missing.txt", "test/test_listed.py\ntest/test_gone.py\n")
+        result = self.run_pytest(*args[:2], f"--file-shard-targets={missing}")
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+        # Without sharding the targets would silently widen to the whole suite.
+        result = self.run_pytest(f"--file-shard-targets={targets}")
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
 
     def test_custom_filename_pattern_norecursedirs_and_cli_ignore_survive(self):
         self.write(
@@ -537,10 +809,38 @@ class TestFileShards(unittest.TestCase):
             self.assertIn("-p scripts.ci_file_shards", command)
             self.assertIn('--file-shards "$SHARD_COUNT" --file-shard ${{ matrix.group }}', command)
             self.assertNotIn("--splits", command)
+            pins = (
+                "ci_file_shard_pins.txt"
+                if name == "backend-test"
+                else "ci_file_shard_pins_windows.txt"
+            )
+            leaf = command.split('if [ "$LEAF" = "true" ]; then', 1)[1].split("exit 0", 1)[0]
+            # Corpus gates are sharded; changed files are not (they repeat on every job).
+            self.assertIn("ci_file_shards", leaf)
+            self.assertIn("leaf changed files, pass", leaf)
+            changed_loop = leaf.split("leaf changed files, pass", 1)[1]
+            self.assertNotIn("ci_file_shards", changed_loop)
+            self.assertIn('"${CHANGED[@]}"', leaf)
+            # Subset lists reach pytest as a targets file, never as argv. The
+            # `=` keeps the out-of-checkout path out of rootdir discovery.
+            gates_run = leaf.split("leaf changed files, pass", 1)[0]
+            self.assertIn('--file-shard-targets="$RUNNER_TEMP/leaf-gates.txt"', gates_run)
+            reduced = command.rsplit('if [ "$REDUCED" = "true" ]; then', 1)[1]
+            reduced = reduced.split("exit 0", 1)[0]
+            self.assertIn('--file-shard-targets="$TARGETS_FILE"', reduced)
+            self.assertNotIn("TARGETS[@]", reduced)
+            # Pins are measured on the full suite and apply to it alone; the
+            # leaf and reduced invocations keep pure hash ownership.
+            self.assertEqual(command.count("--file-shard-pins"), 1)
+            full = command.rsplit("exit 0", 1)[1]
+            self.assertIn(f"--file-shard-pins scripts/{pins}", full)
+            run_env = next(s for s in job["steps"] if s.get("name", "").startswith("Run tests"))[
+                "env"
+            ]
+            self.assertEqual(run_env["REDUCED"], "${{ steps.scope.outputs.reduced }}")
+            self.assertEqual(run_env["LEAF"], "${{ steps.scope.outputs.leaf }}")
             if name == "backend-test":
-                leaf = command.split('if [ "$LEAF" = "true" ]; then', 1)[1].split("exit 0", 1)[0]
-                self.assertNotIn("ci_file_shards", leaf)
-                self.assertIn('"${CHANGED[@]}"', leaf)
+                self.assertEqual(run_env["LEAF_REPEAT"], "3")
                 self.assertCountEqual(
                     [word for word in command.split() if word.startswith("--cov=")],
                     [
@@ -550,9 +850,155 @@ class TestFileShards(unittest.TestCase):
                         "--cov=src/kiro_crew/apps/builtins/code_review_sage/tests",
                     ],
                 )
+            else:
+                # Changed files run unsharded on all eight Windows shards; one
+                # pass each keeps a heavy leaf diff inside the 60-minute job.
+                self.assertEqual(run_env["LEAF_REPEAT"], "1")
+                # The ~45 KB gate list would pass Windows' 32,767-character env
+                # var limit and break every test that spawns a child.
+                self.assertNotIn("LEAF_GATES", run_env)
+                self.assertIn('done < "$GATES_FILE"', leaf)
+                self.assertNotIn("--cov=", command)
+                self.assertIn("--no-cov", command)
         for name, job in workflow["jobs"].items():
             if name not in ("backend-test", "backend-test-windows"):
                 self.assertNotIn("ci_file_shards", json.dumps(job))
+
+    def run_windows_scope(
+        self,
+        selector="printf 'test/test_a.py\\n'",
+        timeout=_DEFAULT_SUBPROCESS_TIMEOUT_SECONDS,
+        **env,
+    ):
+        """Execute backend-test-windows' "Select test scope" step; return (reduced, leaf)."""
+        workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
+        step = next(
+            s for s in workflow["jobs"]["backend-test-windows"]["steps"] if s.get("id") == "scope"
+        )
+        call = "python scripts/ci-surface-tests.py --surface backend --summary"
+        self.assertEqual(step["run"].count(call), 1)
+        out = self.root / "github-output"
+        out.write_text("", encoding="utf-8")
+        caps = {k: v for k, v in step["env"].items() if not v.startswith("${{")}
+        inputs = {
+            "EVENT": "pull_request",
+            "WINDOWS_PATHS": "false",
+            "ONLY_FRONTEND": "false",
+            "LEAF_TESTS": "false",
+            "LEAF_TARGETS": "",
+            "LEAF_GATES": "",
+            **env,
+        }
+        result = subprocess.run(
+            # The shell flags Actions uses for `shell: bash`.
+            [
+                "bash",
+                "--noprofile",
+                "--norc",
+                "-eo",
+                "pipefail",
+                "-c",
+                step["run"].replace(call, selector),
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=timeout,
+            env={
+                "PATH": os.environ.get("PATH", ""),
+                "GITHUB_OUTPUT": str(out),
+                "TARGETS_FILE": str(self.root / "targets.txt"),
+                "GATES_FILE": str(self.root / "gates.txt"),
+                **caps,
+                **inputs,
+            },
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        outputs = dict(
+            line.split("=", 1)
+            for line in out.read_text(encoding="utf-8").splitlines()
+            if "=" in line
+        )
+        return outputs.get("reduced"), outputs.get("leaf")
+
+    # The step is OS-independent bash; on a Windows host `bash` on PATH can be the
+    # WSL launcher (test/ai_review_workflows_helpers.py), so the Linux shards run it.
+    @unittest.skipIf(os.name == "nt", "runs the workflow's bash; PATH bash may be WSL on Windows")
+    def test_windows_scope_reduces_only_where_linux_does_and_no_windows_path_hit(self):
+        leaf = {
+            "LEAF_TESTS": "true",
+            "LEAF_TARGETS": "test/test_a.py\ntest/test_gate.py\n",
+            "LEAF_GATES": "test/test_gate.py\n",
+        }
+        frontend = {"ONLY_FRONTEND": "true"}
+        # Frontend-only and leaf-only diffs take the reduced and leaf scopes.
+        self.assertEqual(self.run_windows_scope(**frontend), ("true", None))
+        self.assertEqual(self.run_windows_scope(**leaf), ("true", "true"))
+        # A hit (or an absent) `windows` bucket keeps the full suite on both.
+        for paths in ("true", ""):
+            self.assertEqual(
+                self.run_windows_scope(WINDOWS_PATHS=paths, **frontend), ("false", None)
+            )
+            self.assertEqual(self.run_windows_scope(WINDOWS_PATHS=paths, **leaf), ("false", None))
+        # A push (main, release/**) always runs the full Windows suite.
+        self.assertEqual(self.run_windows_scope(EVENT="push", **frontend), ("false", None))
+        self.assertEqual(self.run_windows_scope(EVENT="push", **leaf), ("false", None))
+        # A backend change, and `ci-full-run` (which forces only_frontend and
+        # leaf_tests false in the `changes` job), run the full suite.
+        self.assertEqual(self.run_windows_scope(), ("false", None))
+        # Selector failure or empty output falls back to the full suite.
+        self.assertEqual(self.run_windows_scope("false", **frontend), ("false", None))
+        self.assertEqual(self.run_windows_scope("true", **frontend), ("false", None))
+        # Empty leaf targets fall through to the frontend/backend decision.
+        self.assertEqual(
+            self.run_windows_scope(LEAF_TESTS="true", LEAF_TARGETS=" \n"), ("false", None)
+        )
+        # Leaf weight budget: past either cap the full suite runs instead.
+        many = "".join(f"test/test_leaf_{i}.py\n" for i in range(41))
+        self.assertEqual(
+            self.run_windows_scope(LEAF_TESTS="true", LEAF_TARGETS=many), ("false", None)
+        )
+        heavy = sorted(read_pins(ROOT / "scripts/ci_file_shard_pins_windows.txt", 8))
+        five = "".join(f"{name}\n" for name in heavy[:5])
+        self.assertEqual(
+            self.run_windows_scope(LEAF_TESTS="true", LEAF_TARGETS=five), ("false", None)
+        )
+        four = "".join(f"{name}\n" for name in heavy[:4])
+        self.assertEqual(
+            self.run_windows_scope(LEAF_TESTS="true", LEAF_TARGETS=four), ("true", "true")
+        )
+        # A file Windows never collects is dropped from the explicit changed list
+        # (explicit paths bypass pytest_ignore_collect); none left runs full.
+        listed = (ROOT / "test/windows-collect-ignore.txt").read_text(encoding="utf-8")
+        ignored = next(n for n in (ln.split("#", 1)[0].strip() for ln in listed.splitlines()) if n)
+        both = f"test/{ignored}\ntest/test_a.py\n"
+        self.assertEqual(
+            self.run_windows_scope(LEAF_TESTS="true", LEAF_TARGETS=both), ("true", "true")
+        )
+        kept = (self.root / "targets.txt").read_text(encoding="utf-8").split()
+        self.assertEqual(kept, ["test/test_a.py"])
+        self.assertEqual(
+            self.run_windows_scope(LEAF_TESTS="true", LEAF_TARGETS=f"test/{ignored}\n"),
+            ("false", None),
+        )
+
+    def test_full_run_and_push_leave_the_windows_scope_inputs_false(self):
+        workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"))
+        changes = workflow["jobs"]["changes"]
+        self.assertEqual(changes["outputs"]["windows_paths"], "${{ steps.filter.outputs.windows }}")
+        steps = {s.get("id"): s for s in changes["steps"]}
+        full_run = "${{ contains(github.event.pull_request.labels.*.name, 'ci-full-run') }}"
+        for step_id in ("decide", "leaf"):
+            self.assertEqual(steps[step_id]["env"]["FULL_RUN"], full_run)
+        self.assertIn('[ "$FULL_RUN" != "true" ]', steps["decide"]["run"])
+        self.assertIn('[ "$FULL_RUN" = "true" ] || [ -z "${BASE_SHA:-}" ]', steps["leaf"]["run"])
+        windows = workflow["jobs"]["backend-test-windows"]
+        scope = next(s for s in windows["steps"] if s.get("id") == "scope")
+        self.assertEqual(
+            scope["env"]["WINDOWS_PATHS"], "${{ needs.changes.outputs.windows_paths }}"
+        )
+        self.assertEqual(scope["env"]["EVENT"], "${{ github.event_name }}")
 
 
 if __name__ == "__main__":

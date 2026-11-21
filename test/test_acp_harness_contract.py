@@ -1,18 +1,11 @@
 """The harness layer's own contract.
 
-Every seam a host can differ on is asserted here per host, so a backend added
-later cannot half-implement the layer and still start. These are the assertions
-that make the layer worth having: without them a new harness could inherit
-kiro-cli's answer on a seam it actually differs on, and the first sign of it
-would be a live session behaving wrongly.
+Every seam a host can differ on is asserted per host, so a new backend cannot
+half-implement the layer and silently inherit kiro-cli's answer. The wire bytes are
+pinned in ``test_acp_harness_wire_parity.py``.
 
-The wire consequences of these answers -- the actual bytes -- are pinned
-separately in ``test_acp_harness_wire_parity.py``.
-
-Every stub below patches the module that DEFINES the helper, never a local
-binding inside a harness: the harnesses call through their defining modules
-precisely so a stub aimed at the definition reaches them, and a test that
-patched a local name would leave the real filesystem work running.
+Stubs patch the module that defines a helper, never a local binding in a harness,
+or the real filesystem work would keep running.
 """
 
 from __future__ import annotations
@@ -42,7 +35,10 @@ from kiro_crew.acp.harness import kas as kas_mod
 from kiro_crew.acp.harness._common import KIRO_FAMILY_ALIASES
 from kiro_crew.acp.kas_transport import METHOD_KAS_AUTH_GET_ACCESS_TOKEN
 from kiro_crew.acp.types import (
+    ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_DEEPSEEK,
+    ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_CLIENT_CAPABILITIES,
@@ -55,7 +51,18 @@ from kiro_crew.agent_sdk.backends import ACP_BACKEND_LAUNCH
 from kiro_crew.config import paths as paths_mod
 from kiro_crew.mcp_gateway import session_servers as session_servers_mod
 
-ALL_BACKENDS = [ACP_BACKEND_KIRO, ACP_BACKEND_KAS, ACP_BACKEND_CODEX]
+ALL_BACKENDS = [
+    ACP_BACKEND_KIRO,
+    ACP_BACKEND_KAS,
+    ACP_BACKEND_CODEX,
+    ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_GOOSE,
+    ACP_BACKEND_DEEPSEEK,
+]
+
+#: Hosts with a shared-runtime harness that no session is routed to yet: they keep
+#: their per-process adapter until the routing change names them.
+REGISTERED_AHEAD_OF_ROUTING = {ACP_BACKEND_CLAUDE, ACP_BACKEND_GOOSE, ACP_BACKEND_DEEPSEEK}
 
 #: The hosts reached through kiro-cli's own binary and ACP relay. They share a
 #: notification vocabulary, an agent-spec permission routing and a spawn-time effort
@@ -143,14 +150,8 @@ def test_the_registry_serves_every_backend_it_claims_to():
 def test_harness_for_refuses_an_unserved_backend():
     """Refusing beats defaulting.
 
-    A backend with no harness that silently got kiro-cli's would start fine and
-    then send the wrong protocol version, the wrong teardown verb and an argv for
-    a different binary.
-
-    Spelled with an id no harness serves rather than a real one. It named ``codex``
-    while codex had no harness; a registered host is the wrong probe for this,
-    because the day it registers the test would pass only by refusing something it
-    should serve.
+    A defaulted backend would send kiro-cli's protocol version, teardown verb and
+    argv. The id is one no harness serves, so registering a host cannot break this.
     """
     with pytest.raises(ValueError, match="no ACP harness"):
         harness_for("byo-harness")
@@ -244,23 +245,21 @@ async def test_kiro_spawn_refuses_when_fork_governance_is_unresolved(
 
 
 @pytest.mark.asyncio
-async def test_kiro_spawn_refuses_a_bound_unowned_spec_over_the_ceiling(
+async def test_kiro_spawn_plan_leaves_the_over_ceiling_check_to_the_launch(
     found_binary, kiro_gates_pass, monkeypatch, tmp_path
 ):
-    """kiro-cli honours the spec file's grants and Crew never rewrites a spec it does
-    not own, so the spawn asks, under kiro-cli's own backend id, and is refused."""
-    from kiro_crew.acp.session_handle import AcpRuntimeError
+    """The over-ceiling check judges the name kiro-cli is finally handed, a skill view
+    or the authored name, which the runtime decides after the plan
+    (``runtime_spawn_launch._refuse_over_ceiling_launch``), so the plan never asks."""
+    calls: list[str | None] = []
 
-    calls: list[tuple[str | None, str]] = []
-
-    def _over(agent, backend):
-        calls.append((agent, backend))
+    def _over(agent, backend, **_kw):
+        calls.append(agent)
         raise agent_mod.SharedTemplateOverCeiling("over the ceiling")
 
     monkeypatch.setattr(agent_mod, "require_shared_template_within_ceiling", _over)
-    with pytest.raises(AcpRuntimeError, match="over the ceiling"):
-        await harness_for(ACP_BACKEND_KIRO).resolve_spawn(_ctx(tmp_path))
-    assert calls == [("a", ACP_BACKEND_KIRO)]
+    await harness_for(ACP_BACKEND_KIRO).resolve_spawn(_ctx(tmp_path))
+    assert calls == []
 
 
 @pytest.mark.asyncio
@@ -341,12 +340,24 @@ async def test_a_missing_binary_aborts_the_spawn(monkeypatch, tmp_path, backend)
     # no harness may return an argv for a binary that is not there -- and narrowing
     # it to one family would leave the next host's spawn unasserted.
     monkeypatch.setattr(client_mod, "_resolve_codex_acp_bin", lambda: (None, "/nowhere"))
+    from kiro_crew.acp import launch as launch_mod
+    from kiro_crew.acp.harness import claude as claude_harness
+
+    monkeypatch.setattr(claude_harness, "_resolve_claude_acp_bin", lambda: (None, "/nowhere"))
+    monkeypatch.setattr(claude_harness, "_claude_acp_argv_cache", launch_mod._UNRESOLVED)
+    # goose resolves through the shared self-served ladder and its per-backend
+    # cache; emptied too, so a developer machine with goose installed still sees
+    # the refusal instead of a plan.
+    monkeypatch.setattr(launch_mod, "_resolve_self_served_bin", lambda b: (None, "/nowhere"))
+    monkeypatch.setattr(launch_mod, "_self_served_bin_caches", {})
     with pytest.raises(AcpRuntimeError, match="not found") as raised:
         await harness_for(backend).resolve_spawn(_ctx(tmp_path))
     # The two kiro-cli hosts tag the refusal so the chat row can offer the
-    # feature-request form; codex-acp is a different binary whose install the
-    # operator chose, and its refusal stays an untagged error row.
-    assert getattr(raised.value, "kiro_cli_missing", False) is (backend != ACP_BACKEND_CODEX)
+    # feature-request form; codex-acp and claude-agent-acp are different binaries
+    # whose install the operator chose, and their refusals stay untagged error rows.
+    assert getattr(raised.value, "kiro_cli_missing", False) is (
+        backend in (ACP_BACKEND_KIRO, ACP_BACKEND_KAS)
+    )
 
 
 def test_kiro_injects_the_api_key_and_kas_strips_it(monkeypatch):
@@ -425,19 +436,23 @@ def test_client_capabilities_are_the_shared_constants():
     assert harness_for(ACP_BACKEND_KAS).client_capabilities == KAS_CLIENT_CAPABILITIES
 
 
-def test_kas_capabilities_open_only_settings_and_external_urls():
-    """KAS's extra capabilities are the settings channel and ``openExternalUrl``.
+def test_kas_capabilities_open_only_settings_external_urls_and_user_input():
+    """KAS's extra capabilities are the settings channel, ``openExternalUrl`` and
+    ``userInput``.
 
-    ``openExternalUrl`` is answered by the runtime for an MCP sign-in it started.
-    Every other ``_meta.kiro`` capability is a callback Crew does not implement,
-    so declaring one would invite a request with no handler; ``secretStorage`` in
-    particular would make Crew the store of MCP tokens. The settings channel is
-    declared EMPTY here: the runtime fills it at spawn from the operator's
-    settings (``client_meta_settings``), so the constant stays the pristine shape
-    every host's handshake is compared against.
+    Any other ``_meta.kiro`` capability would invite a request with no handler
+    (``secretStorage`` would make Crew the MCP token store). ``userInput`` is served
+    by ``acp/elicitation.py``. The settings channel carries only ``codeIntelligence``
+    here; the runtime adds the rest at spawn.
     """
     kas = harness_for(ACP_BACKEND_KAS).client_capabilities
-    assert kas["_meta"] == {"kiro": {"settings": {}, "openExternalUrl": True}}
+    assert kas["_meta"] == {
+        "kiro": {
+            "settings": {"codeIntelligence": {"enabled": True}},
+            "openExternalUrl": True,
+            "userInput": True,
+        }
+    }
     assert harness_for(ACP_BACKEND_KAS).opens_external_urls is True
     assert harness_for(ACP_BACKEND_KIRO).opens_external_urls is False
     assert {k: v for k, v in kas.items() if k != "_meta"} == ACP_CLIENT_CAPABILITIES
@@ -446,12 +461,8 @@ def test_kas_capabilities_open_only_settings_and_external_urls():
 def test_only_the_host_with_a_settings_channel_has_it_filled():
     """H6: whether ``initialize`` carries settings is a membership answer.
 
-    KAS opened ``_meta.kiro.settings`` and reads Tool Search from it; kiro-cli has
-    no such channel and takes the same setting from the cli.json overlay. A host
-    answering yes here without the channel would have its handshake rejected;
-    one answering no while it HAS the channel runs with every setting at the
-    engine's default -- which for Tool Search on KAS is the silent "loader never
-    mounted" the runtime's gate exists to prevent.
+    KAS reads Tool Search from ``_meta.kiro.settings``; kiro-cli reads cli.json. A
+    wrong yes rejects the handshake; a wrong no silently runs on engine defaults.
     """
     assert harness_for(ACP_BACKEND_KAS).client_meta_settings is True
     assert harness_for(ACP_BACKEND_KIRO).client_meta_settings is False
@@ -476,6 +487,188 @@ async def test_kas_projects_the_agent_spec(kas_projection_stubbed, monkeypatch, 
     )
     extras = await harness_for(ACP_BACKEND_KAS).session_extras("a", work_dir=str(tmp_path))
     assert extras.custom_agents == projected
+
+
+@pytest.mark.asyncio
+async def test_kas_reads_workspace_mcp_settings_beside_the_session(
+    kas_projection_stubbed, monkeypatch, tmp_path
+):
+    """A session opened in another checkout is finished from THAT checkout's files."""
+    from kiro_crew.acp.kas_permissions import CREW_SETTINGS_MCP_KEY
+
+    monkeypatch.setattr(agent_mod, "_KIRO_MCP_JSON", tmp_path / "absent-global.json")
+    monkeypatch.setattr(kas_agents_mod, "build_kas_custom_agents", lambda *_a, **_kw: [{"id": "a"}])
+    for name in ("runtime", "session"):
+        settings = tmp_path / name / ".kiro" / "settings"
+        settings.mkdir(parents=True)
+        (settings / "mcp.json").write_text(json.dumps({"mcpServers": {name: {}}}))
+    extras = await harness_for(ACP_BACKEND_KAS).session_extras(
+        "a", work_dir=str(tmp_path / "runtime"), session_cwd=str(tmp_path / "session")
+    )
+    (entry,) = extras.custom_agents
+    assert list(entry[CREW_SETTINGS_MCP_KEY]["fileServers"]) == ["session"]
+
+
+@pytest.mark.asyncio
+async def test_kas_stamps_the_servers_the_spec_declares(
+    kas_projection_stubbed, monkeypatch, tmp_path
+):
+    """A declared server hoisted to the session-level array is still the agent's."""
+    from kiro_crew.acp.kas_permissions import CREW_SETTINGS_MCP_KEY
+
+    monkeypatch.setattr(agent_mod, "_KIRO_MCP_JSON", tmp_path / "absent-global.json")
+    monkeypatch.setattr(kas_agents_mod, "build_kas_custom_agents", lambda *_a, **_kw: [{"id": "a"}])
+    spec = {"name": "a", "prompt": "p", "tools": [], "mcpServers": {"mine": {"command": "m"}}}
+    (tmp_path / "a.json").write_text(json.dumps(spec), encoding="utf-8")
+    extras = await harness_for(ACP_BACKEND_KAS).session_extras("a", work_dir=str(tmp_path))
+    (entry,) = extras.custom_agents
+    assert entry[CREW_SETTINGS_MCP_KEY]["declared"] == ["mine"]
+    assert entry[CREW_SETTINGS_MCP_KEY]["legacy"] is True
+
+
+@pytest.mark.asyncio
+async def test_kas_does_not_keep_legacy_mcp_json_for_a_spec_that_states_the_key(
+    kas_projection_stubbed, monkeypatch, tmp_path
+):
+    """The fixture's spec has no opt-in key; one that states it is not kept."""
+    from kiro_crew.acp.kas_permissions import CREW_SETTINGS_MCP_KEY
+
+    monkeypatch.setattr(agent_mod, "_KIRO_MCP_JSON", tmp_path / "absent-global.json")
+    monkeypatch.setattr(kas_agents_mod, "build_kas_custom_agents", lambda *_a, **_kw: [{"id": "a"}])
+    spec = {"name": "a", "prompt": "p", "tools": [], "includeMcpJson": False}
+    (tmp_path / "a.json").write_text(json.dumps(spec), encoding="utf-8")
+    extras = await harness_for(ACP_BACKEND_KAS).session_extras("a", work_dir=str(tmp_path))
+    (entry,) = extras.custom_agents
+    assert entry[CREW_SETTINGS_MCP_KEY]["legacy"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("key", "opted_in"),
+    [
+        ({"includeMcpJson": True}, True),
+        ({"useLegacyMcpJson": True}, True),
+        ({"includeMcpJson": False}, False),
+    ],
+)
+async def test_kas_stamps_the_specs_own_mcp_json_opt_in(
+    kas_projection_stubbed, monkeypatch, tmp_path, key, opted_in
+):
+    """The wire entry never carries ``true``, so the exclusion reads it from the stamp."""
+    from kiro_crew.acp.kas_permissions import CREW_SETTINGS_MCP_KEY
+
+    monkeypatch.setattr(agent_mod, "_KIRO_MCP_JSON", tmp_path / "absent-global.json")
+    monkeypatch.setattr(kas_agents_mod, "build_kas_custom_agents", lambda *_a, **_kw: [{"id": "a"}])
+    spec = {"name": "a", "prompt": "p", "tools": [], **key}
+    (tmp_path / "a.json").write_text(json.dumps(spec), encoding="utf-8")
+    extras = await harness_for(ACP_BACKEND_KAS).session_extras("a", work_dir=str(tmp_path))
+    (entry,) = extras.custom_agents
+    assert entry[CREW_SETTINGS_MCP_KEY]["optedIn"] is opted_in
+
+
+@pytest.mark.asyncio
+async def test_kas_does_not_keep_legacy_mcp_json_for_a_checkout_spec(
+    kas_projection_stubbed, monkeypatch, tmp_path
+):
+    """The list names user-level files; a checkout's spec of a listed name is not one."""
+    from kiro_crew.acp import kas_mcp_json_legacy
+    from kiro_crew.acp.kas_permissions import CREW_SETTINGS_MCP_KEY
+
+    monkeypatch.setattr(agent_mod, "_KIRO_MCP_JSON", tmp_path / "absent-global.json")
+    monkeypatch.setattr(kas_agents_mod, "build_kas_custom_agents", lambda *_a, **_kw: [{"id": "b"}])
+    listed = kas_mcp_json_legacy.list_path()
+    listed.parent.mkdir(parents=True, exist_ok=True)
+    listed.write_text(json.dumps({"agents": ["b"]}), encoding="utf-8")
+    checkout = tmp_path / "checkout"
+    (checkout / ".kiro" / "agents").mkdir(parents=True)
+    spec = {"name": "b", "prompt": "p", "tools": []}
+    (checkout / ".kiro" / "agents" / "b.json").write_text(json.dumps(spec), encoding="utf-8")
+    extras = await harness_for(ACP_BACKEND_KAS).session_extras("b", work_dir=str(checkout))
+    (entry,) = extras.custom_agents
+    assert entry[CREW_SETTINGS_MCP_KEY]["legacy"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_checkout_spec_session_still_records_the_list(
+    kas_projection_stubbed, monkeypatch, tmp_path
+):
+    """The first KAS session records the list whatever spec it runs."""
+    from kiro_crew.acp import kas_mcp_json_legacy
+
+    monkeypatch.setattr(agent_mod, "_KIRO_MCP_JSON", tmp_path / "absent-global.json")
+    monkeypatch.setattr(kas_agents_mod, "build_kas_custom_agents", lambda *_a, **_kw: [{"id": "b"}])
+    checkout = tmp_path / "checkout"
+    (checkout / ".kiro" / "agents").mkdir(parents=True)
+    spec = {"name": "b", "prompt": "p", "tools": []}
+    (checkout / ".kiro" / "agents" / "b.json").write_text(json.dumps(spec), encoding="utf-8")
+    assert not kas_mcp_json_legacy.list_path().exists()
+    await harness_for(ACP_BACKEND_KAS).session_extras("b", work_dir=str(checkout))
+    assert json.loads(kas_mcp_json_legacy.list_path().read_text(encoding="utf-8")) == {
+        "agents": ["a"]
+    }
+
+
+@pytest.mark.asyncio
+async def test_kas_names_an_unreadable_global_mcp_json_in_the_session_notice(
+    kas_projection_stubbed, monkeypatch, tmp_path
+):
+    """A UTF-16 global mcp.json gets the same reason kiro-cli's refusal gives."""
+    from kiro_crew.acp.session_mcp import _named_path
+
+    settings = tmp_path / "mcp.json"
+    settings.write_bytes(b"\xff\xfe" + json.dumps({"mcpServers": {"x": {}}}).encode("utf-16-le"))
+    monkeypatch.setattr(agent_mod, "_KIRO_MCP_JSON", settings)
+    monkeypatch.setattr(kas_agents_mod, "build_kas_custom_agents", lambda *_a, **_kw: [{"id": "a"}])
+    extras = await harness_for(ACP_BACKEND_KAS).session_extras("a", work_dir=str(tmp_path))
+    assert extras.withheld_credentials_notice == (
+        f"⚠ Kiro Crew could not read the global MCP settings ({_named_path(settings)})"
+        " because it is saved as UTF-16; re-save it as UTF-8. Its MCP server settings"
+        " may not apply to this session."
+    )
+
+
+@pytest.mark.asyncio
+async def test_kas_names_a_glob_it_cannot_match_and_keeps_the_server(
+    kas_projection_stubbed, monkeypatch, tmp_path
+):
+    """A declared server's global ``[...]`` glob: the server runs, the notice says so."""
+    settings = tmp_path / "mcp.json"
+    settings.write_text(
+        json.dumps({"mcpServers": {"own": {"disabledTools": ["fs_[rw]*"]}}}), encoding="utf-8"
+    )
+    monkeypatch.setattr(agent_mod, "_KIRO_MCP_JSON", settings)
+    (tmp_path / "a.json").write_text(
+        json.dumps({"name": "a", "prompt": "p", "mcpServers": {"own": {"command": "x"}}}),
+        encoding="utf-8",
+    )
+    built = [{"id": "a", "mcpServers": {"own": {"command": "x"}}}]
+    monkeypatch.setattr(kas_agents_mod, "build_kas_custom_agents", lambda *_a, **_kw: built)
+    extras = await harness_for(ACP_BACKEND_KAS).session_extras("a", work_dir=str(tmp_path))
+    assert extras.withheld_credentials_notice == (
+        "⚠ disabledTools pattern `fs_[rw]*` for `own` can't be applied on KAS,"
+        " so that tool stays on."
+    )
+    from kiro_crew.acp.kas_settings_mcp import finish_settings_mcp
+
+    (agent,) = extras.custom_agents
+    sent = finish_settings_mcp(agent)
+    assert "own" in sent["mcpServers"]
+    assert sent["excludedTools"] == ["@own/fs_[rw]*"]
+
+
+@pytest.mark.asyncio
+async def test_kas_says_nothing_of_a_muted_servers_glob(
+    kas_projection_stubbed, monkeypatch, tmp_path
+):
+    """A muted server never starts, so its unmatched glob gets no notice."""
+    monkeypatch.setattr(agent_mod, "_KIRO_MCP_JSON", tmp_path / "absent.json")
+    own = {"command": "x", "disabled": True, "disabledTools": ["fs_[rw]*"]}
+    (tmp_path / "a.json").write_text(
+        json.dumps({"name": "a", "prompt": "p", "mcpServers": {"own": own}}), encoding="utf-8"
+    )
+    monkeypatch.setattr(kas_agents_mod, "build_kas_custom_agents", lambda *_a, **_kw: [{"id": "a"}])
+    extras = await harness_for(ACP_BACKEND_KAS).session_extras("a", work_dir=str(tmp_path))
+    assert not extras.withheld_credentials_notice
 
 
 @pytest.mark.asyncio
@@ -638,11 +831,8 @@ async def test_kas_answers_the_token_callback_from_the_vault(monkeypatch):
 def test_the_reader_loop_answers_through_the_harness_that_claimed_the_method():
     """The answer comes from the host that named the method, not a fixed answerer.
 
-    The guard upstream accepts ANY method a host claims in
-    ``host_answered_methods``. With a hardcoded answerer, a host that claimed a
-    different method would pass that guard and be handed the credential another
-    host's harness built -- the mistaken-identity failure this layer exists to
-    prevent, and one no test of either host alone would catch.
+    With a fixed answerer, a host claiming another method in ``host_answered_methods``
+    would get a credential another host's harness built.
     """
     import inspect as _inspect
 
@@ -677,7 +867,11 @@ def test_kiro_keeps_its_legacy_notification_drain():
 
 
 def test_kas_stages_status_and_catalog_and_requires_readiness():
-    from kiro_crew.acp.types import METHOD_KAS_MCP_STATUS, METHOD_KAS_TOOLS_CHANGED
+    from kiro_crew.acp.types import (
+        METHOD_KAS_MCP_GOVERNANCE_DISABLED,
+        METHOD_KAS_MCP_STATUS,
+        METHOD_KAS_TOOLS_CHANGED,
+    )
 
     aliases = harness_for(ACP_BACKEND_KAS).notification_aliases
     assert aliases.session_update == KIRO_FAMILY_ALIASES.session_update
@@ -685,6 +879,10 @@ def test_kas_stages_status_and_catalog_and_requires_readiness():
     assert aliases.mcp_init == KIRO_FAMILY_ALIASES.mcp_init + (
         METHOD_KAS_MCP_STATUS,
         METHOD_KAS_TOOLS_CHANGED,
+        # Staged like the status frames: the host emits it under the session id
+        # during session/new, and the readiness wait reads it to end a
+        # fail-closed start early instead of timing out.
+        METHOD_KAS_MCP_GOVERNANCE_DISABLED,
     )
     assert aliases.mcp_readiness
 
@@ -764,14 +962,8 @@ def test_teardown_verbs_are_per_host():
 def test_the_contract_mirrors_no_membership_table():
     """No harness member restates a table both drivers already read.
 
-    How a live session's model changes, and how privileged tools are made to ask,
-    are answered by ``ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION`` and
-    ``ACP_BACKEND_ROUTING``, and both drivers read those directly. A harness member
-    mirroring one would be a second declaration free to disagree with the one that
-    decides -- the exact drift this layer promises to remove, arriving as a feature.
-
-    A member belongs here when a CALLER asks the harness for it. Both of these are
-    looked up, so the honest surface is smaller.
+    Drivers read ``ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION`` and ``ACP_BACKEND_ROUTING``
+    directly; a harness mirror would be a second declaration free to disagree.
     """
     assert not hasattr(HarnessAdapter, "model_switch")
     assert not hasattr(HarnessAdapter, "effort_switch")
@@ -827,19 +1019,9 @@ _RECLAIM_PROBES = (
 def test_reclaim_thresholds_pass_the_operator_configuration_through(backend):
     """Every harness passes the operator's thresholds through, in their own unit.
 
-    Universal, and asserted for every harness alike. Age passes through unchanged:
-    nothing about age depends on what a harness measures. RSS passes through
-    unchanged too -- UNLESS the harness measures a different SET of processes, in
-    which case the incoming number is in a unit it does not measure and the harness
-    states its own. The two shapes are told apart by what the harness declares on
-    itself, never by its identity: a bounded scope (``CORE_RSS_DEPTH``) and the
-    ceiling for that scope (``CORE_RSS_CEILING_MB``) travel together, and a harness
-    declaring neither is held to pass-through. The second probe is what makes a
-    stated ceiling distinguishable from a reinterpreted one: the answer must be the
-    SAME for two different inputs, and must be the declared constant, so a harness
-    scaling or clamping the operator's number fails on one probe or the other.
-    Quietly reinterpreting an operator's configured ceiling for one host is the
-    failure this ratchet catches, whichever host it is.
+    Age always passes through. RSS passes through unless the harness declares both
+    ``CORE_RSS_DEPTH`` and ``CORE_RSS_CEILING_MB``; then it must return that constant.
+    Two probes with different inputs catch a harness that scales or clamps the number.
     """
     harness = harness_for(backend)
     depth = getattr(type(harness), "CORE_RSS_DEPTH", None)
@@ -857,7 +1039,9 @@ def test_reclaim_thresholds_pass_the_operator_configuration_through(backend):
                 f"ceiling through; got {policy.max_rss_mb!r} for {rss!r}"
             )
         else:
-            assert isinstance(depth, int) and depth >= 1
+            # 0 is the launched process alone (claude-agent-acp: the adapter, not the
+            # per-session children below it).
+            assert isinstance(depth, int) and depth >= 0
             assert policy.max_rss_mb == ceiling, (
                 f"{backend!r} measures a bounded scope (depth {depth}) and must state its "
                 f"declared ceiling {ceiling!r} in that unit; got {policy.max_rss_mb!r} for "
@@ -871,15 +1055,8 @@ def test_reclaim_thresholds_pass_the_operator_configuration_through(backend):
 def test_the_kiro_lookup_is_total():
     """Kiro's harness lookup CANNOT fail, so the default path gains no failure mode.
 
-    The shared-process spawn asks a table which host it is starting. If that
-    lookup could raise for Kiro, every ordinary session would have gained a way
-    to fail before its process exists -- a new failure mode on the default path
-    in service of adapter support, which is precisely what H13 forbids.
-
-    Total by construction on three counts, each asserted rather than assumed: the
-    id is a key of the table, the table is a literal in the same module as the
-    class it names, and the class takes no constructor argument that could be
-    missing or malformed.
+    Asserted on three counts: the id is a key of the table, the table is a literal in
+    the class's module, and the class takes no constructor argument.
     """
     import inspect
 
@@ -960,12 +1137,8 @@ def _harness_modules() -> list[str]:
 def test_no_harness_module_imports_the_runtime(module):
     """The harness layer never reaches back into ``AcpRuntime``.
 
-    A harness that held a runtime could grow a hidden coupling, and the next
-    backend's author would have to reproduce it without being told. The one
-    exception is the error TYPE, which lives in ``session_handle`` and is imported
-    inside function bodies rather than at module scope. The per-process host
-    adapters are held to the same rule: the client launches them, and the runtime
-    is not theirs to reach.
+    The one exception is the error type from ``session_handle``, imported inside
+    function bodies. Per-process host adapters follow the same rule.
     """
     from kiro_crew.acp import harness as pkg
 
@@ -1040,12 +1213,8 @@ def test_the_kiro_family_ignores_the_advertised_capabilities(backend):
 def test_codex_narrows_the_array_against_what_the_handshake_advertised():
     """The counterexample the two family assertions above must not swallow.
 
-    codex reads no agent spec, so this array IS the session's tool surface -- and an
-    element whose transport the adapter never advertised is ACCEPTED rather than
-    refused: ``session/new`` answers with a ``sessionId`` and that server is never
-    wired. The narrowing here is the only guard that the array Crew sends is the
-    array the adapter honours, because a session carrying an unwired server reports
-    nothing.
+    codex accepts a server whose transport it never advertised and silently never
+    wires it, so this narrowing is the only guard.
     """
     harness = harness_for(ACP_BACKEND_CODEX)
     requested = [{"name": "keep", "url": "http://keep"}, {"name": "drop", "type": "sse"}]
@@ -1208,15 +1377,9 @@ def test_the_spawn_mask_reaches_the_sandbox(tmp_path):
 def test_an_enforced_host_may_not_spawn_without_a_mask():
     """A host this core's tool gate ENFORCES must carry a credential mask.
 
-    Vacuous while every host the shared-process runtime serves asks by
-    construction, and that is the point: it arms itself the moment an enforced
-    host joins. For such a host the mask is the ONLY thing between a third-party
-    binary and the operator's credential homes, because ACP cannot make it ask
-    about a passive read -- so an empty mask there is a missing control, not a
-    simplification.
-
-    Read off the class rather than by spawning: resolving a real mask touches the
-    filesystem, and this asks a question about the harness's contract.
+    Vacuous until an enforced host joins. ACP cannot make it ask about a passive
+    read, so the mask is the only guard on credential homes. Read off the class
+    because resolving a real mask touches the filesystem.
     """
     import inspect as _inspect
 
@@ -1224,16 +1387,32 @@ def test_an_enforced_host_may_not_spawn_without_a_mask():
     from kiro_crew.acp.harness import _HARNESSES
 
     for backend, harness_cls in _HARNESSES.items():
-        routing = acp_tool_gate.routing_for(backend)
         source = _inspect.getsource(harness_cls.resolve_spawn)
-        if routing is acp_tool_gate.Routing.AGENT_SPEC:
-            # Asks by construction: no mask needed, and none claimed.
+        if not acp_tool_gate.is_enforced(backend):
+            # The gate does not enforce this host, so there is no gate a mask
+            # compensates for: an AGENT_SPEC host asks by construction, and claude
+            # (SEEDED_SETTINGS) is made to ask by the seed Crew writes, with no mask
+            # on its per-process launch either. None claimed.
             assert "extra_hidden_dirs" not in source, backend
             continue
         assert "extra_hidden_dirs=" in source, (
-            f"{backend} is not AGENT_SPEC-routed, so its harness must resolve an "
+            f"{backend} is enforced by the tool gate, so its harness must resolve an "
             f"OS credential mask and put it on the plan"
         )
+
+
+def test_every_enforced_host_module_calls_the_re_exposure_seam():
+    """An enforced host that never calls ``adapter_expose_files`` leaves ``known_hosts`` hidden."""
+    from kiro_crew import acp_tool_gate
+    from kiro_crew.acp.harness import _HARNESSES, _PROCESS_ADAPTERS
+    from kiro_crew.acp_backends import ACP_BACKEND_ROUTING
+
+    hosts = {**_HARNESSES, **_PROCESS_ADAPTERS}
+    enforced = {b for b in ACP_BACKEND_ROUTING if acp_tool_gate.is_enforced(b)}
+    assert enforced <= set(hosts), "every enforced backend has a launch class to read"
+    for backend in sorted(enforced):
+        source = inspect.getsource(inspect.getmodule(hosts[backend]))
+        assert "adapter_expose_files(" in source, backend
 
 
 # ── Seam 1c: the spawn sees the sandbox tier ──
@@ -1269,8 +1448,7 @@ async def test_the_kiro_family_ignores_the_sandbox_tier(
     """Neither shipped host reads the tier, so its argv cannot move with it.
 
     Both ask by construction and carry no mask, so there is nothing for a tier to
-    invalidate -- and a spawn that changed shape with the tier would be a wire
-    difference this PR does not have.
+    invalidate.
     """
     from kiro_crew.acp.harness import kas as kas_module
 
@@ -1312,20 +1490,14 @@ async def test_codex_refuses_a_tier_that_would_drop_its_mask(monkeypatch, tmp_pa
 def test_an_enforced_host_must_consult_the_sandbox_tier():
     """A host carrying a mask must also refuse where the mask would be dropped.
 
-    Resolving a mask is not enough on its own: ``wrap_argv`` discards it on the
-    ``off`` tier and on a backend-less host with unsandboxed exec opted in, so a
-    harness that only resolved one would spawn a third-party binary with the
-    operator's credential homes readable and nothing compensating.
-
-    Vacuous while every host here asks by construction, and armed the moment one
-    does not. Read off the class because the property is that the source consults
-    the tier, which a passing spawn on this machine cannot show.
+    ``wrap_argv`` drops the mask on the ``off`` tier and on a backend-less host with
+    unsandboxed exec. Vacuous until an enforced host joins; read off the class.
     """
     from kiro_crew import acp_tool_gate
     from kiro_crew.acp.harness import _HARNESSES
 
     for backend, harness_cls in _HARNESSES.items():
-        if acp_tool_gate.routing_for(backend) is acp_tool_gate.Routing.AGENT_SPEC:
+        if not acp_tool_gate.is_enforced(backend):
             continue
         source = inspect.getsource(harness_cls.resolve_spawn)
         assert "sandbox_mode" in source, (
@@ -1372,6 +1544,10 @@ def test_every_per_process_host_has_an_adapter_and_no_runtime_harness():
         adapter = process_adapter_for(backend)
         assert isinstance(adapter, ProcessAdapter)
         assert adapter.backend == backend
+        if backend in REGISTERED_AHEAD_OF_ROUTING:
+            # Its runtime harness exists for its own tests; no session reaches it.
+            assert backend not in ACP_BACKENDS_ACP_RUNTIME
+            continue
         with pytest.raises(ValueError, match="no ACP harness for backend"):
             harness_for(backend)
 
@@ -1381,6 +1557,10 @@ def test_the_client_keeps_its_own_arm_for_every_runtime_served_host():
     from kiro_crew.acp.harness import process_adapter_for
 
     for backend in ALL_BACKENDS:
+        if backend in REGISTERED_AHEAD_OF_ROUTING:
+            # Still launched per process, by its own adapter, until it is routed.
+            assert process_adapter_for(backend) is not None
+            continue
         assert process_adapter_for(backend) is None
 
 
@@ -1501,6 +1681,9 @@ def test_a_missing_self_served_binary_names_its_install_command(
     monkeypatch.delenv(launch.bin_env_var, raising=False)
     monkeypatch.setattr(acp_client, "_mise_which", lambda _name: None)
     monkeypatch.setattr(acp_client, "augmented_path", lambda _path: str(empty))
+    # ``tmp_path`` is its own repo, so the Copilot config walk stops there, not in the
+    # host's home, where a real ``.mcp.json`` would refuse the spawn.
+    (tmp_path / ".git").mkdir()
     client = acp_client.AcpClient(work_dir=tmp_path, acp_backend=backend)
 
     with pytest.raises(AcpError) as excinfo:

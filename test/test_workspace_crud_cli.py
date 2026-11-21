@@ -15,6 +15,11 @@ from pathlib import Path
 import pytest
 
 from conftest import requires_symlinks
+
+# ``main`` imports the mirrored facade lazily. Imported here, before any test
+# patches ``config_dir`` or ``sel``, so its owners bind the real objects: a
+# first import under those patches composes a family that disagrees with itself.
+from kiro_crew import cli_commands  # noqa: F401
 from kiro_crew import platform_compat
 from kiro_crew.cli import main
 
@@ -64,12 +69,17 @@ class TestWorkspaceArgparse:
     ) -> None:
         """Req 6.1: workspace subparser with list/create/update/delete."""
         cfg_path = _write_config(tmp_path, _base_config())
-        # Verify each subcommand is accepted by argparse (no SystemExit(2)).
-        for subcmd, argv in [
-            ("list", ["kirocrew", "workspace", "list"]),
-            ("create", ["kirocrew", "workspace", "create", "--name", "newtest"]),
-            ("update", ["kirocrew", "workspace", "update", "staging"]),
-            ("delete", ["kirocrew", "workspace", "delete", "staging"]),
+        # Verify each subcommand is accepted by argparse (no SystemExit(2)) and
+        # leaves the workspace set it promises in the config file.
+        for subcmd, argv, expected in [
+            ("list", ["kirocrew", "workspace", "list"], ["default", "staging"]),
+            (
+                "create",
+                ["kirocrew", "workspace", "create", "--name", "newtest"],
+                ["default", "newtest", "staging"],
+            ),
+            ("update", ["kirocrew", "workspace", "update", "staging"], ["default", "staging"]),
+            ("delete", ["kirocrew", "workspace", "delete", "staging"], ["default"]),
         ]:
             with (
                 unittest.mock.patch("kiro_crew.config.loader.config_path", return_value=cfg_path),
@@ -78,6 +88,8 @@ class TestWorkspaceArgparse:
             ):
                 # Should not raise SystemExit(2) (argparse error)
                 main()
+            stored = json.loads(cfg_path.read_text(encoding="utf-8"))
+            assert sorted(stored["workspaces"]) == expected, subcmd
             # Re-write config since delete/create mutate it
             _write_config(tmp_path, _base_config())
 
@@ -254,24 +266,6 @@ class TestWorkspaceArgparse:
         assert "Deleted workspace: staging" in out
 
 
-# ── Dispatch routing (Req 6.5) ──
-
-
-class TestWorkspaceDispatch:
-    """Verify args.command == 'workspace' routes to _handle_workspace."""
-
-    def test_dispatch_routes_to_handle_workspace(self, tmp_path: Path) -> None:
-        """Req 6.5: workspace command dispatches to _handle_workspace."""
-        cfg_path = _write_config(tmp_path, _base_config())
-        with (
-            unittest.mock.patch("kiro_crew.config.loader.config_path", return_value=cfg_path),
-            unittest.mock.patch("sys.argv", ["kirocrew", "workspace", "list"]),
-            unittest.mock.patch("kiro_crew.cli_commands._handle_workspace") as mock_handler,
-        ):
-            main()
-        mock_handler.assert_called_once()
-
-
 # ── List output (Req 5.1) ──
 
 
@@ -298,6 +292,26 @@ class TestWorkspaceList:
         # Non-default workspace present without marker
         assert "staging" in out
         assert "workspace-staging" in out
+
+    def test_list_prints_each_row_on_one_line(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A newline or control character in a stored field stays inside its row."""
+        data = _base_config()
+        data["workspaces"]["staging"] = {"dir": "work\nspace\x07-staging"}
+        cfg_path = _write_config(tmp_path, data)
+        with (
+            unittest.mock.patch("kiro_crew.config.loader.config_path", return_value=cfg_path),
+            unittest.mock.patch("sys.argv", ["kirocrew", "workspace", "list"]),
+        ):
+            main()
+
+        lines = capsys.readouterr().out.splitlines()
+        # Header plus one line per workspace: the newline did not split a row.
+        assert len(lines) == 3
+        row = next(line for line in lines if line.startswith("staging "))
+        assert "work\\x0aspace-staging" in row
+        assert "\x07" not in row
 
 
 # ── Create errors (Req 5.4, 5.5) ──
@@ -1026,6 +1040,144 @@ class TestCliRound8Hardening:
         ], "the losing create's copied files leaked into the winner's workspace"
         leftovers = [p.name for p in tmp_path.iterdir() if ".staging-" in p.name]
         assert leftovers == [], f"staging residue: {leftovers}"
+
+    @pytest.mark.parametrize(
+        ("error", "shown", "not_shown"),
+        [
+            (PermissionError(13, "Access is denied"), "Access is denied", "already exists"),
+            (FileExistsError(17, "File exists"), "already exists", "could not move"),
+        ],
+        ids=["sharing-violation", "occupied"],
+    )
+    def test_a_failed_publish_reports_its_own_cause(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        error: OSError,
+        shown: str,
+        not_shown: str,
+    ) -> None:
+        """A rename refused for another reason (a Windows sharing violation)
+        names that reason; only an occupied destination reads as one."""
+        (tmp_path / "workspace").mkdir()
+        (tmp_path / "workspace" / "notes.md").write_text("x", encoding="utf-8")
+        cfg_path = _write_config(tmp_path, _base_config())
+        with (
+            unittest.mock.patch("kiro_crew.config.loader.config_path", return_value=cfg_path),
+            unittest.mock.patch("kiro_crew.config.loader.config_dir", return_value=tmp_path),
+            unittest.mock.patch("kiro_crew.cli_commands.config_dir", return_value=tmp_path),
+            unittest.mock.patch.object(
+                platform_compat,
+                "publish_dir_noreplace",
+                side_effect=error,
+            ),
+            unittest.mock.patch(
+                "sys.argv",
+                ["kirocrew", "workspace", "create", "--name", "copied", "--copy-from", "default"],
+            ),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+        assert exc_info.value.code == 1
+        err = capsys.readouterr().err
+        assert shown in err and not_shown not in err
+        assert "copied" not in json.loads(cfg_path.read_text(encoding="utf-8"))["workspaces"]
+
+    @pytest.mark.parametrize("held", [False, True], ids=["read-only-git", "held-open"])
+    @pytest.mark.parametrize("stage", ["copy", "publish", "write"])
+    def test_a_refused_create_removes_a_staged_git_tree_or_names_it(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], stage: str, held: bool
+    ) -> None:
+        """The staged copy keeps the source's ``.git``, whose files git writes read-only.
+        A copy that fails, a refused publish and a config write that fails before the
+        install each remove it the way Windows allows; a file another program still
+        holds open keeps the folder, and stderr names it."""
+        import contextlib
+        import os
+        import shutil
+
+        from windows_sim import readonly_unlink_refused
+
+        loose = tmp_path / "workspace" / ".git" / "objects" / "ab" / ("c" * 38)
+        loose.parent.mkdir(parents=True)
+        loose.write_bytes(b"blob")
+        os.chmod(loose, 0o444)
+        cfg_path = _write_config(tmp_path, _base_config())
+        real_rmtree_force = platform_compat.rmtree_force
+        real_copytree = shutil.copytree
+        sim: dict = {}
+
+        depth = [0]
+
+        def _copy_then_fail(src: object, dst: object, *args: object, **kwargs: object) -> None:
+            # copytree recurses through the patched name; only the outer copy fails.
+            depth[0] += 1
+            try:
+                real_copytree(src, dst, *args, **kwargs)  # type: ignore[call-overload]
+            finally:
+                depth[0] -= 1
+            if depth[0] == 0:
+                raise PermissionError(13, "The process cannot access the file")
+
+        def _refuse(*_args: object, **_kwargs: object) -> None:
+            raise PermissionError(13, "Access is denied")
+
+        def _rmtree_force(path: object) -> bool:
+            if held:
+                return False
+            # Windows unlink rules for the cleanup alone: that is what is judged.
+            with readonly_unlink_refused() as refused:
+                sim.update(refused)
+                return real_rmtree_force(path)  # type: ignore[arg-type]
+
+        failing = {
+            "copy": unittest.mock.patch.object(shutil, "copytree", side_effect=_copy_then_fail),
+            "publish": unittest.mock.patch.object(
+                platform_compat, "publish_dir_noreplace", side_effect=_refuse
+            ),
+            "write": unittest.mock.patch(
+                "kiro_crew.config.loader.update_config_locked", side_effect=_refuse
+            ),
+        }[stage]
+        outcome = {
+            "copy": contextlib.nullcontext(),
+            "publish": pytest.raises(SystemExit),
+            "write": pytest.raises(PermissionError),
+        }[stage]
+        with (
+            unittest.mock.patch("kiro_crew.config.loader.config_path", return_value=cfg_path),
+            unittest.mock.patch("kiro_crew.config.loader.config_dir", return_value=tmp_path),
+            unittest.mock.patch("kiro_crew.cli_commands.config_dir", return_value=tmp_path),
+            failing,
+            unittest.mock.patch.object(platform_compat, "rmtree_force", side_effect=_rmtree_force),
+            unittest.mock.patch(
+                "sys.argv",
+                [
+                    "kirocrew",
+                    "workspace",
+                    "create",
+                    "--name",
+                    "copied",
+                    "--copy-from",
+                    "default",
+                ],
+            ),
+            outcome as exc_info,
+        ):
+            main()
+        if stage == "publish":
+            assert exc_info.value.code == 1
+        leftovers = [p.name for p in tmp_path.iterdir() if ".staging-" in p.name]
+        err = capsys.readouterr().err
+        if stage == "copy":
+            assert "nothing was copied" in err
+        if held:
+            assert len(leftovers) == 1
+            assert "could not remove the partial copy at" in err and leftovers[0] in err
+        else:
+            assert sim["refused"], "the read-only object was never refused; nothing was judged"
+            assert leftovers == [], f"staging residue: {leftovers}"
+            assert "could not remove the partial copy" not in err
 
 
 class TestWorkspaceNameRefusalNamesTheShape:

@@ -1,9 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { screen, fireEvent, waitFor, within } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { renderWithProviders } from '../../test/helpers'
 import { NavigationLeaveGuardProvider, useMayLeaveForNavigation } from '../../components/NavigationLeaveGuard'
 import { api } from '../../api/client'
+import { ApiError } from '../../api/apiError'
 import NewCrewmateDialog from './NewCrewmateDialog'
+import { i18nT } from '../../i18n/t'
 import { POSE_IDS, seedIconPose } from '../../lib/avatarPoses'
 
 vi.mock('../../api/client', async importOriginal => {
@@ -17,6 +20,7 @@ vi.mock('../../api/client', async importOriginal => {
       availableModels: vi.fn(() => Promise.resolve({ models: [] })),
       members: vi.fn(() => Promise.resolve({ members: [] })),
       createKirocrewAgent: vi.fn(() => Promise.resolve({ ok: true, name: 'Scout' })),
+      memoryOwnerlessStores: vi.fn(() => Promise.resolve({ stores: [] })),
     },
   }
 })
@@ -73,6 +77,24 @@ describe('NewCrewmateDialog', () => {
     expect(body).toMatchObject({ name: 'Scout', kiro_agent: 'kirocrew' })
     expect(body).not.toHaveProperty('first_greeting')
     await waitFor(() => expect(props.onCreated).toHaveBeenCalledWith({ name: 'Scout', job: '' }), { timeout: 4000 })
+  })
+
+  it('holds Create while the name is empty, and pressing it says why instead of closing', async () => {
+    renderWithProviders(<NewCrewmateDialog open {...props} />)
+    await screen.findByTestId('crewmate-create-form')
+    const create = screen.getByTestId('crewmate-create-submit')
+    expect(create.getAttribute('aria-disabled')).toBe('true')
+    // Held, not native-disabled: it stays focusable and still answers a press.
+    expect(create).not.toBeDisabled()
+    fireEvent.click(create)
+    expect(await screen.findByText(i18nT('pages.membersPage.create_name_required'))).toBeInTheDocument()
+    expect(api.createKirocrewAgent).not.toHaveBeenCalled()
+    expect(props.onClose).not.toHaveBeenCalled()
+    expect(screen.getByRole('dialog')).toBeInTheDocument()
+    typeName('   ')
+    expect(create.getAttribute('aria-disabled')).toBe('true')
+    typeName('Scout')
+    expect(create.getAttribute('aria-disabled')).not.toBe('true')
   })
 
   it('Advanced settings offers no template to build from: every mate starts as the built-in worker', async () => {
@@ -326,7 +348,7 @@ describe('NewCrewmateDialog', () => {
       expect(await screen.findByRole('textbox', { name: 'Goal' })).toBeInTheDocument()
     })
 
-    it('reads top to bottom: look, Name label, name, hint, Create, then the Advanced settings toggle last', async () => {
+    it('reads top to bottom: look, Name label, name, the Advanced settings toggle, then the one Create in the footer', async () => {
       card()
       const region = await screen.findByRole('dialog')
       // Document order, read off one walk of the card.
@@ -336,17 +358,32 @@ describe('NewCrewmateDialog', () => {
         screen.getByTestId('crewmate-create-look'),
         screen.getByTestId('crewmate-create-name-label'),
         screen.getByRole('textbox', { name: 'Name' }),
-        screen.getByTestId('crewmate-create-submit'),
         screen.getByTestId('crewmate-create-secondary'),
+        screen.getByTestId('crewmate-create-submit'),
       ]
       for (const el of order) expect(at(el)).toBeGreaterThan(-1)
       for (let i = 1; i < order.length; i++) expect(at(order[i])).toBeGreaterThan(at(order[i - 1]))
-      // No hint line between the name and Create, and the folded card ends
-      // with the secondary line: its toggle is the last control, and no second Create.
       expect(screen.queryByTestId('crewmate-create-quick-hint')).toBeNull()
-      expect(within(region).getAllByRole('button').at(-1)).toBe(toggle())
-      expect(screen.queryByTestId('crewmate-create-submit-end')).toBeNull()
+      expect(within(region).getAllByRole('button').at(-1)).toBe(screen.getByTestId('crewmate-create-submit'))
       expect(screen.getByTestId('crewmate-create-submit')).toHaveClass('w-full')
+    })
+
+    it.each([false, true])('renders exactly one Create, in the sticky footer (advanced unfolded: %s)', async (unfold) => {
+      card()
+      const region = await screen.findByRole('dialog')
+      if (unfold) {
+        fireEvent.click(toggle())
+        await screen.findByTestId('crewmate-create-advanced')
+      }
+      const creates = within(region).getAllByRole('button', { name: 'Create bot' })
+      expect(creates).toHaveLength(1)
+      const footer = screen.getByTestId('crewmate-create-footer')
+      expect(footer).toContainElement(creates[0])
+      expect(footer).toHaveClass('sticky', 'bg-card')
+      // The footer is the form's last child, outside the folding region, so
+      // it is the same button whether Advanced settings is open or not.
+      expect(screen.queryByTestId('crewmate-create-advanced')?.contains(footer) ?? false).toBe(false)
+      expect(footer.closest('form')?.getAttribute('data-testid')).toBe('crewmate-create-form')
     })
 
     it('the secondary line under Create holds only the centred Advanced settings toggle, chevron before its label', async () => {
@@ -375,49 +412,60 @@ describe('NewCrewmateDialog', () => {
       }
     })
 
-    it('Advanced settings unfolds directly under its toggle and ends with a second Create', async () => {
+    it.each([false, true])('Enter in the Name field submits through the footer Create (advanced unfolded: %s)', async (unfold) => {
+      vi.mocked(api.createKirocrewAgent).mockImplementationOnce(() => new Promise(() => {}))
+      const user = userEvent.setup()
+      card()
+      await screen.findByTestId('crewmate-create-form')
+      if (unfold) fireEvent.click(toggle())
+      await user.type(screen.getByRole('textbox', { name: 'Name' }), 'Scout{Enter}')
+      await waitFor(() => expect(api.createKirocrewAgent).toHaveBeenCalledTimes(1))
+      expect(vi.mocked(api.createKirocrewAgent).mock.calls[0][0]).toMatchObject({ name: 'Scout' })
+    })
+
+    it('Advanced settings unfolds directly under its toggle, above the footer Create', async () => {
       card()
       const region = await screen.findByRole('dialog')
       fireEvent.click(toggle())
       const advanced = screen.getByTestId('crewmate-create-advanced')
       const all = Array.from(region.querySelectorAll('*'))
       const at = (el: Element) => all.indexOf(el)
-      expect(at(advanced)).toBeGreaterThan(at(screen.getByTestId('crewmate-create-secondary')))
-      expect(at(screen.getByTestId('crewmate-create-submit'))).toBeLessThan(at(screen.getByTestId('crewmate-create-secondary')))
       expect(advanced.previousElementSibling).toBe(screen.getByTestId('crewmate-create-secondary'))
-      const end = screen.getByTestId('crewmate-create-submit-end')
-      expect(advanced).toContainElement(end)
-      expect(within(region).getAllByRole('button').at(-1)).toBe(end)
-      expect(end).toHaveClass('w-full', 'min-h-11')
-      expect(end).toHaveTextContent('Create mate')
+      expect(at(screen.getByTestId('crewmate-create-submit'))).toBeGreaterThan(at(advanced))
+      expect(advanced).not.toContainElement(screen.getByTestId('crewmate-create-submit'))
     })
 
-    it('the closing Create submits the same create, once per press', async () => {
+    it('the footer Create submits once per press, and is locked while the create is in flight', async () => {
       vi.mocked(api.createKirocrewAgent).mockImplementationOnce(() => new Promise(() => {}))
       card()
       await screen.findByTestId('crewmate-create-form')
       typeName('Scout')
       fireEvent.click(toggle())
-      fireEvent.click(screen.getByTestId('crewmate-create-submit-end'))
+      fireEvent.click(screen.getByTestId('crewmate-create-submit'))
       await waitFor(() => expect(api.createKirocrewAgent).toHaveBeenCalledTimes(1))
       expect(vi.mocked(api.createKirocrewAgent).mock.calls[0][0]).toMatchObject({ name: 'Scout', kiro_agent: 'kirocrew' })
-      // In flight: both Create buttons are locked, so no second POST leaves.
-      await waitFor(() => expect(screen.getByTestId('crewmate-create-submit-end')).toBeDisabled())
-      expect(screen.getByTestId('crewmate-create-submit')).toBeDisabled()
-      fireEvent.click(screen.getByTestId('crewmate-create-submit-end'))
+      // Held, not `disabled`: the button a reader pressed keeps focus while the
+      // POST is out (a native disable would blur it to <body>), and a second
+      // press is refused by the form's busy guard, not by the browser.
+      await waitFor(() => expect(screen.getByTestId('crewmate-create-submit')).toHaveAttribute('aria-disabled', 'true'))
+      expect(screen.getByTestId('crewmate-create-submit')).not.toBeDisabled()
       fireEvent.click(screen.getByTestId('crewmate-create-submit'))
       expect(api.createKirocrewAgent).toHaveBeenCalledTimes(1)
     })
 
-    it('the toggle, the look and both Creates are locked with the form while a create is in flight', async () => {
+    it('the toggle, the look and Create are locked with the form while a create is in flight', async () => {
       vi.mocked(api.createKirocrewAgent).mockImplementationOnce(() => new Promise(() => {}))
       card()
       const dialog = await screen.findByRole('dialog')
       typeName('Scout')
       fireEvent.click(screen.getByTestId('crewmate-create-submit'))
+      // The toggle and the look cannot be the control a create started from, so
+      // they keep the native lock. Create is HELD with aria-disabled instead:
+      // the pressed control stays focusable rather than blurring to <body>.
       await waitFor(() => expect(toggle()).toBeDisabled())
       expect(screen.getByTestId('crewmate-create-look')).toBeDisabled()
-      expect(screen.getByTestId('crewmate-create-submit')).toBeDisabled()
+      expect(screen.getByTestId('crewmate-create-submit')).toHaveAttribute('aria-disabled', 'true')
+      expect(screen.getByTestId('crewmate-create-submit')).not.toBeDisabled()
       // The one way out — the modal's own X — is locked too, so an in-flight
       // create cannot be abandoned mid-POST.
       expect(within(dialog).getByRole('button', { name: 'Close' })).toBeDisabled()
@@ -439,6 +487,102 @@ describe('NewCrewmateDialog', () => {
     expect(unloadPrevented()).toBe(true)
     expect(mayLeave()).toBe(false)
     expect(confirm).toHaveBeenCalledTimes(1)
+  })
+
+  describe('starting from kept memory', () => {
+    const kept = { stores: [{ name: 'member-reviewer-abc', former_owner: 'Reviewer' }] }
+    beforeEach(() => { vi.mocked(api.memoryOwnerlessStores).mockResolvedValue(kept) })
+    const pick = async (label: string) => {
+      const select = await screen.findByRole('combobox', { name: 'Memory' })
+      fireEvent.click(select)
+      fireEvent.click(await screen.findByRole('option', { name: label }))
+    }
+
+    it('offers nothing extra when no memory was kept', async () => {
+      vi.mocked(api.memoryOwnerlessStores).mockResolvedValue({ stores: [] })
+      renderWithProviders(<NewCrewmateDialog open startExpanded {...props} />)
+      await screen.findByTestId('crewmate-create-form')
+      await waitFor(() => expect(api.memoryOwnerlessStores).toHaveBeenCalled())
+      expect(screen.queryByRole('combobox', { name: 'Memory' })).toBeNull()
+    })
+
+    it('says the kept-memory list failed to load instead of offering nothing', async () => {
+      vi.mocked(api.memoryOwnerlessStores).mockRejectedValue(new Error('boom'))
+      renderWithProviders(<NewCrewmateDialog open startExpanded {...props} />)
+      expect(await screen.findByTestId('crewmate-create-options-error')).toHaveTextContent(
+        "Couldn't load the Memory choices",
+      )
+      expect(screen.queryByRole('combobox', { name: 'Memory' })).toBeNull()
+    })
+
+    it('a non-owner refused the owner-only list gets no notice, as when nothing is kept', async () => {
+      vi.mocked(api.memoryOwnerlessStores).mockRejectedValue(
+        new ApiError(403, 'only the Crew owner can do that', JSON.stringify({ code: 'owner_only' })),
+      )
+      const { queryClient, rerender } = renderWithProviders(<NewCrewmateDialog open startExpanded {...props} />)
+      await waitFor(() => expect(queryClient.getQueryState(['memory-ownerless-stores'])?.status).toBe('error'))
+      rerender(<NewCrewmateDialog open startExpanded {...props} />)
+      expect(screen.queryByTestId('crewmate-create-options-error')).toBeNull()
+      expect(screen.queryByRole('combobox', { name: 'Memory' })).toBeNull()
+    })
+
+    it('defaults to an empty memory and sends no adopt', async () => {
+      renderWithProviders(<NewCrewmateDialog open startExpanded {...props} />)
+      const select = await screen.findByRole('combobox', { name: 'Memory' })
+      expect(select.textContent?.trim()).toBe('Start with an empty memory')
+      expect(fieldHint(select)).toHaveTextContent('Only one bot can take over each kept memory.')
+      typeName('Scout')
+      fireEvent.click(screen.getByTestId('crewmate-create-submit'))
+      await waitFor(() => expect(api.createKirocrewAgent).toHaveBeenCalledTimes(1))
+      expect(vi.mocked(api.createKirocrewAgent).mock.calls[0][0]).not.toHaveProperty('adopt_memory_store')
+    })
+
+    it('sends the picked kept store as adopt_memory_store', async () => {
+      renderWithProviders(<NewCrewmateDialog open startExpanded {...props} />)
+      await pick('Memory of Reviewer (deleted bot)')
+      typeName('Scout')
+      fireEvent.click(screen.getByTestId('crewmate-create-submit'))
+      await waitFor(() => expect(api.createKirocrewAgent).toHaveBeenCalledTimes(1))
+      expect(vi.mocked(api.createKirocrewAgent).mock.calls[0][0]).toMatchObject({
+        name: 'Scout', adopt_memory_store: 'member-reviewer-abc',
+      })
+    })
+
+    it('says so when the kept memory was taken meanwhile, and re-reads the list', async () => {
+      vi.mocked(api.createKirocrewAgent).mockRejectedValueOnce(
+        new ApiError(409, 'conflict', JSON.stringify({ code: 'adopt_memory_unavailable' })),
+      )
+      renderWithProviders(<NewCrewmateDialog open startExpanded {...props} />)
+      await pick('Memory of Reviewer (deleted bot)')
+      typeName('Scout')
+      const reads = vi.mocked(api.memoryOwnerlessStores).mock.calls.length
+      fireEvent.click(screen.getByTestId('crewmate-create-submit'))
+      expect(await screen.findByTestId('crewmate-create-error')).toHaveTextContent(
+        'That memory can no longer be used, so nothing was created',
+      )
+      await waitFor(() => expect(vi.mocked(api.memoryOwnerlessStores).mock.calls.length).toBeGreaterThan(reads))
+      // The pick is put back where the user can see it, not kept as a stale value
+      // a retry would quietly drop.
+      expect(screen.getByRole('combobox', { name: 'Memory' }).textContent?.trim()).toBe('Start with an empty memory')
+    })
+
+    it.each(['member_memory_unavailable', 'member_thread_busy'])(
+      'keeps the pick when the create fails for a reason other than the store (%s)',
+      async (code) => {
+        vi.mocked(api.createKirocrewAgent).mockRejectedValueOnce(
+          new ApiError(409, 'conflict', JSON.stringify({ code })),
+        )
+        renderWithProviders(<NewCrewmateDialog open startExpanded {...props} />)
+        await pick('Memory of Reviewer (deleted bot)')
+        typeName('Scout')
+        fireEvent.click(screen.getByTestId('crewmate-create-submit'))
+        const error = await screen.findByTestId('crewmate-create-error')
+        expect(error).not.toHaveTextContent('That memory can no longer be used')
+        expect(screen.getByRole('combobox', { name: 'Memory' }).textContent?.trim()).toBe(
+          'Memory of Reviewer (deleted bot)',
+        )
+      },
+    )
   })
 })
 

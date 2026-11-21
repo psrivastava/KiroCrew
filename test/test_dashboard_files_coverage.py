@@ -1,8 +1,6 @@
 """Coverage tests for ``kiro_crew.dashboard.handlers.files``.
 
-The handlers in that module were largely exercised only through their happy
-paths (or not at all). This file targets the endpoints and error arms the
-existing suite leaves untouched:
+Targets the endpoints and error arms beyond the happy paths:
 
 * ``/api/file-read`` — the ``resolve=1`` project-relative branch, the
   directory-vs-missing 404 discrimination, the HEAD probe, per-extension
@@ -45,6 +43,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from dashboard_owner_helpers import as_owner
+from redaction_structured_cases import github_classic
 from tmpdir_helpers import SHORT_TMP_PREFIX, short_tmp_base
 
 from kiro_crew import atomic_write as atomic_write_mod
@@ -111,6 +110,17 @@ def _get_app(route: str, handler) -> web.Application:
 # ahead of every branch under test, so these three classes were skipped on
 # win32 and the endpoints had no Windows coverage at all.
 class TestFileRead:
+    @pytest.fixture(autouse=True)
+    def _redaction_on(self, tmp_path, _floor_monkeypatch):
+        """The owner's switch ships OFF, and OFF stands the credential pass down on
+        the owner's own file view. These cases are about the pass, so it is ON here."""
+        from kiro_crew.security import redaction_switch
+
+        _floor_monkeypatch.setattr(
+            redaction_switch, "_path", lambda: tmp_path / "redaction.json"
+        )
+        _floor_monkeypatch.setattr(redaction_switch, "DEFAULT_REDACTION_ENABLED", True)
+
     @staticmethod
     def _client_app() -> web.Application:
         return _get_app("/api/file-read", files_mod.api_file_read)
@@ -160,9 +170,12 @@ class TestFileRead:
         A cut first severs a credential at the cap and serves its prefix as real
         bytes; whoever writes the file chooses the offset.
         """
-        secret = "AKIAIOSFODNN7EXAMPLE"
+        # A GitHub token with a valid checksum is redacted; an AWS key ID stays visible.
+        secret = github_classic(seed=21)
         f = tmp_path / "padded.txt"
-        f.write_bytes(("a" * (files_mod._FILE_READ_CAP - 10) + secret + "\nkeep\n").encode("utf-8"))
+        # A blank before it: a token glued to a letter is no token by its format.
+        padding = "a" * (files_mod._FILE_READ_CAP - 11) + " "
+        f.write_bytes((padding + secret + "\nkeep\n").encode("utf-8"))
         async with TestClient(TestServer(self._client_app())) as client:
             resp = await client.get(f"/api/file-read?path={f}")
             body = await resp.text()
@@ -186,10 +199,13 @@ class TestFileRead:
         def b64(raw: str) -> str:
             return base64.urlsafe_b64encode(raw.encode()).rstrip(b"=").decode()
 
-        jwt = b64('{"alg":"HS256","typ":"JWT"}') + "." + b64("x" * 3000) + "." + "s" * 43
+        # A signed JWT: a JSON payload object, each segment within the 2000-character
+        # bound the rule table reads a JWT segment to.
+        payload = b64('{"sub":"' + "x" * 1400 + '"}')
+        jwt = b64('{"alg":"HS256","typ":"JWT"}') + "." + payload + "." + "s" * 43
         head = (jwt + "\n") * 4
         cap, margin = files_mod._FILE_READ_CAP, files_mod._STREAM_HOLDBACK_JWT_MAX
-        secret = "AKIAIOSFODNN7EXAMPLE"
+        secret = github_classic(seed=22)
         filler = "a" * (cap + margin - 6 - len(head))
         f = tmp_path / "shrink.txt"
         f.write_bytes((head + filler + secret + "\nkeep\n").encode("utf-8"))
@@ -218,7 +234,9 @@ class TestFileRead:
         def b64(raw: str) -> str:
             return base64.urlsafe_b64encode(raw.encode()).rstrip(b"=").decode()
 
-        jwt = b64('{"alg":"HS256","typ":"JWT"}') + "." + b64("x" * 4500) + "." + "s" * 43
+        # A signed JWT's payload is a JSON object.
+        payload = b64('{"sub":"' + "x" * 4500 + '"}')
+        jwt = b64('{"alg":"HS256","typ":"JWT"}') + "." + payload + "." + "s" * 43
         assert len(jwt) > files_mod._STREAM_HOLDBACK_JWT_MAX
         cap = files_mod._FILE_READ_CAP
         f = tmp_path / "long_jwt.txt"
@@ -246,7 +264,9 @@ class TestFileRead:
         def b64(raw: str) -> str:
             return base64.urlsafe_b64encode(raw.encode()).rstrip(b"=").decode()
 
-        jwt = b64('{"alg":"HS256","typ":"JWT"}') + "." + b64("x" * 8500) + "." + "s" * 43
+        # A signed JWT's payload is a JSON object.
+        payload = b64('{"sub":"' + "x" * 8500 + '"}')
+        jwt = b64('{"alg":"HS256","typ":"JWT"}') + "." + payload + "." + "s" * 43
         cap, margin = files_mod._FILE_READ_CAP, files_mod._STREAM_HOLDBACK_JWT_MAX
         start = cap - before_cap
         assert len(jwt) > 2 * margin
@@ -420,8 +440,8 @@ class TestFileRead:
     @pytest.mark.asyncio
     async def test_credentials_in_content_are_redacted(self, tmp_path, mock_sel):
         f = tmp_path / "creds.txt"
-        secret = "AKIAIOSFODNN7EXAMPLE"
-        f.write_text(f"aws_access_key_id={secret}\n", encoding="utf-8", newline="\n")
+        secret = github_classic(seed=23)
+        f.write_text(f"GITHUB_TOKEN={secret}\n", encoding="utf-8", newline="\n")
         async with TestClient(TestServer(self._client_app())) as client:
             resp = await client.get(f"/api/file-read?path={f}")
             assert resp.status == 200
@@ -530,39 +550,23 @@ class TestFileWrite:
     async def test_replace_failure_is_500_and_cleans_up_temp(self, tmp_path, mock_sel, pinned):
         """A failed publish is a 500 that leaves the original intact and no temp.
 
-        Run over BOTH publish branches, because they are different syscalls with
-        different cleanup: with a pinned parent descriptor ``atomic_write``
-        publishes with ``renameat`` (``os.rename`` plus ``src_dir_fd``/
-        ``dst_dir_fd``) and reclaims the temp with ``os.unlink(name, dir_fd=)``,
-        while the by-name floor publishes with ``os.replace`` and unlinks by path.
-
-        The capability probe is FORCED rather than left to the host, and that is
-        load-bearing in both directions. ``pinned_parent_replace_supported()``
-        answers ``os.rename in os.supports_dir_fd``, and a patched ``os.rename``
-        is a mock that is not in that frozenset — so patching the syscall alone
-        would flip the probe to False and quietly exercise the by-name floor
-        twice. It is forced in BOTH modules that ask it, because they ask about
-        different things: the handler's binding decides whether a descriptor is
-        produced at all, and ``atomic_write``'s own decides whether it accepts the
-        one it is handed (it refuses rather than falling back to a by-name write).
-        The ``_mkstemp_at`` spy asserts which stager really ran, so neither case
-        can drift onto the other's branch unnoticed.
-
-        The pinned case SKIPS where the platform has no descriptor-relative walk:
-        forcing a probe cannot conjure ``os.O_DIRECTORY``, so on Windows the
-        handler has no descriptor to pass and the by-name floor is all there is.
+        Runs over the pinned (``renameat``) and by-name (``os.replace``) branches. The
+        probe is FORCED in both modules, since a patched ``os.rename`` is not in
+        ``os.supports_dir_fd``; the ``_mkstemp_at`` spy proves which stager ran. The
+        pinned case skips without ``os.O_DIRECTORY`` (Windows).
         """
         f = tmp_path / "doomed.md"
         f.write_text("original", encoding="utf-8")
         doomed = "rename" if pinned else "replace"
-        with patch.object(
-            files_mod, "pinned_parent_replace_supported", lambda: pinned
-        ), patch.object(
-            atomic_write_mod, "pinned_parent_replace_supported", lambda: pinned
-        ), patch.object(
-            atomic_write_mod, "_mkstemp_at", wraps=atomic_write_mod._mkstemp_at
-        ) as staged_at, patch.object(
-            os, doomed, side_effect=OSError(f"{doomed} failed")
+        with (
+            patch.object(files_mod, "pinned_parent_replace_supported", lambda: pinned),
+            patch.object(
+                atomic_write_mod, "pinned_parent_replace_supported", lambda: pinned
+            ),
+            patch.object(
+                atomic_write_mod, "_mkstemp_at", wraps=atomic_write_mod._mkstemp_at
+            ) as staged_at,
+            patch.object(os, doomed, side_effect=OSError(f"{doomed} failed")),
         ):
             async with TestClient(TestServer(self._client_app())) as client:
                 resp = await client.post(
@@ -577,27 +581,23 @@ class TestFileWrite:
     @pytest.mark.asyncio
     @_PUBLISH_BRANCHES
     async def test_temp_unlink_failure_still_reports_500(self, tmp_path, mock_sel, pinned):
-        """The cleanup ``os.unlink`` is itself wrapped: its OSError is swallowed
-        so the caller still gets the real 500 rather than an unhandled error.
+        """A failing cleanup ``os.unlink`` is swallowed, so the caller still gets the 500.
 
-        Both branches again: the pinned cleanup passes ``dir_fd=`` and the
-        by-name one does not, so a swallowed failure has to be proven on each.
-        See the sibling above for why the probe is forced in both modules and why
-        the pinned case skips without a descriptor-relative walk.
+        Proven on both branches (pinned passes ``dir_fd=``); see the sibling above.
         """
         f = tmp_path / "twice.md"
         f.write_text("original", encoding="utf-8")
         doomed = "rename" if pinned else "replace"
-        with patch.object(
-            files_mod, "pinned_parent_replace_supported", lambda: pinned
-        ), patch.object(
-            atomic_write_mod, "pinned_parent_replace_supported", lambda: pinned
-        ), patch.object(
-            atomic_write_mod, "_mkstemp_at", wraps=atomic_write_mod._mkstemp_at
-        ) as staged_at, patch.object(
-            os, doomed, side_effect=OSError(f"{doomed} failed")
-        ), patch.object(
-            os, "unlink", side_effect=OSError("unlink failed")
+        with (
+            patch.object(files_mod, "pinned_parent_replace_supported", lambda: pinned),
+            patch.object(
+                atomic_write_mod, "pinned_parent_replace_supported", lambda: pinned
+            ),
+            patch.object(
+                atomic_write_mod, "_mkstemp_at", wraps=atomic_write_mod._mkstemp_at
+            ) as staged_at,
+            patch.object(os, doomed, side_effect=OSError(f"{doomed} failed")),
+            patch.object(os, "unlink", side_effect=OSError("unlink failed")),
         ):
             async with TestClient(TestServer(self._client_app())) as client:
                 resp = await client.post(
@@ -811,8 +811,10 @@ class TestFileWatch:
                 return target if len(seen) == 1 else target + ".elsewhere"
             return real_realpath(p, *a, **kw)
 
-        with patch.object(files_mod, "_validate_dashboard_path", return_value=target), \
-             patch.object(os.path, "realpath", fake_realpath):
+        with (
+            patch.object(files_mod, "_validate_dashboard_path", return_value=target),
+            patch.object(os.path, "realpath", fake_realpath),
+        ):
             async with TestClient(TestServer(self._client_app())) as client:
                 resp = await client.get(f"/api/file-watch?path={f}")
                 assert resp.status == 200
@@ -879,7 +881,7 @@ class TestOutboxList:
     async def test_filename_that_looks_like_a_credential_is_hidden(self, outbox, mock_sel):
         # A GitHub PAT-shaped name is rewritten by redact(), so the entry is
         # dropped rather than advertised over the API.
-        secretish = "ghp_" + "a" * 36
+        secretish = github_classic(seed=31)
         (outbox / secretish).write_text("x", encoding="utf-8")
         (outbox / "ordinary.txt").write_text("x", encoding="utf-8")
         async with TestClient(TestServer(self._client_app())) as client:
@@ -911,7 +913,7 @@ class TestOutboxList:
         # on the loop that stalls every session, so the scan must not run there.
         (outbox / "kept.txt").write_text("kept", encoding="utf-8")
         (outbox / "a_subdir").mkdir()
-        (outbox / ("ghp_" + "b" * 36)).write_text("x", encoding="utf-8")
+        (outbox / github_classic(seed=32)).write_text("x", encoding="utf-8")
         loop_thread = threading.get_ident()
         scan_threads: set[int] = set()
         real_iterdir = Path.iterdir
@@ -945,12 +947,59 @@ class TestOutboxDownload:
     normalized away by the URL layer before the handler ever sees it."""
 
     @staticmethod
-    def _request(filename: str):
+    def _request(filename: str, query: dict[str, str] | None = None):
         req = MagicMock()
         req.match_info = {"filename": filename}
         # A bare MagicMock answers headers.get("Range") with a truthy mock.
         req.headers = {}
+        req.query = query or {}
         return req
+
+    @staticmethod
+    def _write_pdf(outbox) -> bytes:
+        # Not valid UTF-8, so the route takes the binary branch a real PDF takes.
+        body = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n1 0 obj<<>>endobj\n%%EOF\n"
+        (outbox / "report.pdf").write_bytes(body)
+        return body
+
+    @pytest.mark.asyncio
+    async def test_pdf_is_served_inline_by_default(self, outbox, mock_sel):
+        body = self._write_pdf(outbox)
+        resp = await files_mod.api_outbox_download(self._request("report.pdf"))
+        assert resp.status == 200
+        assert resp.headers["Content-Type"] == "application/pdf"
+        assert resp.headers["Content-Disposition"] == "inline; filename*=UTF-8''report.pdf"
+        assert resp.body == body
+
+    @pytest.mark.asyncio
+    async def test_download_flag_serves_an_inline_type_as_attachment(self, outbox, mock_sel):
+        body = self._write_pdf(outbox)
+        resp = await files_mod.api_outbox_download(
+            self._request("report.pdf", {"download": "1"})
+        )
+        assert resp.status == 200
+        assert resp.headers["Content-Type"] == "application/pdf"
+        assert resp.headers["Content-Disposition"] == "attachment; filename*=UTF-8''report.pdf"
+        assert resp.body == body
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", ["0", "true", "", "yes"])
+    async def test_only_download_1_changes_the_disposition(self, outbox, mock_sel, value):
+        self._write_pdf(outbox)
+        resp = await files_mod.api_outbox_download(
+            self._request("report.pdf", {"download": value})
+        )
+        assert resp.headers["Content-Disposition"].startswith("inline;")
+
+    @pytest.mark.asyncio
+    async def test_download_flag_keeps_every_refusal(self, outbox, mock_sel):
+        (outbox.parent / "escape.txt").write_text("secret", encoding="utf-8")
+        (outbox / "leak.txt").write_text(github_classic(seed=33), encoding="utf-8")
+        flag = {"download": "1"}
+        escaped = await files_mod.api_outbox_download(self._request("../escape.txt", flag))
+        assert escaped.status == 403
+        leaked = await files_mod.api_outbox_download(self._request("leak.txt", flag))
+        assert leaked.status == 400
 
     @pytest.mark.asyncio
     async def test_traversal_out_of_outbox_is_403(self, outbox, mock_sel):
@@ -981,7 +1030,7 @@ class TestOutboxDownload:
 
     @pytest.mark.asyncio
     async def test_credential_bearing_text_aborts_download(self, outbox, mock_sel):
-        (outbox / "leak.txt").write_text("ghp_" + "b" * 36, encoding="utf-8")
+        (outbox / "leak.txt").write_text(github_classic(seed=34), encoding="utf-8")
         resp = await files_mod.api_outbox_download(self._request("leak.txt"))
         assert resp.status == 400
         assert "redacted" in json.loads(resp.body)["error"]
@@ -1043,8 +1092,13 @@ class TestRevealPath:
     ):
         f = tmp_path / "doc.pdf"
         f.write_text("x", encoding="utf-8")
-        with patch("sys.platform", "linux"), \
-             patch("kiro_crew.dashboard.handlers.files.platform_compat.open_with_default_app", return_value=True) as launch:
+        with (
+            patch("sys.platform", "linux"),
+            patch(
+                "kiro_crew.dashboard.handlers.files.platform_compat.open_with_default_app",
+                return_value=True,
+            ) as launch,
+        ):
             async with TestClient(TestServer(self._client_app())) as client:
                 resp = await client.post(
                     "/api/reveal", json={"path": str(f), "action": "open"}
@@ -1079,8 +1133,13 @@ class TestRevealPath:
     ):
         f = tmp_path / "doc.pdf"
         f.write_text("x", encoding="utf-8")
-        with patch("sys.platform", "darwin"), \
-             patch("kiro_crew.dashboard.handlers.files.platform_compat.reveal_in_file_manager", return_value=True) as reveal:
+        with (
+            patch("sys.platform", "darwin"),
+            patch(
+                "kiro_crew.dashboard.handlers.files.platform_compat.reveal_in_file_manager",
+                return_value=True,
+            ) as reveal,
+        ):
             async with TestClient(TestServer(self._client_app())) as client:
                 resp = await client.post("/api/reveal", json={"path": str(f)})
                 assert resp.status == 200
@@ -1094,11 +1153,23 @@ class TestRevealPath:
         # run" — a click in the file viewer must not become a 500 either way.
         f = tmp_path / "doc.pdf"
         f.write_text("x", encoding="utf-8")
-        for platform, action in (("darwin", "reveal"), ("linux", "reveal"),
-                                 ("win32", "reveal"), ("linux", "open")):
-            with patch("sys.platform", platform), \
-                 patch("kiro_crew.dashboard.handlers.files.platform_compat.reveal_in_file_manager", return_value=False), \
-                 patch("kiro_crew.dashboard.handlers.files.platform_compat.open_with_default_app", return_value=False):
+        for platform, action in (
+            ("darwin", "reveal"),
+            ("linux", "reveal"),
+            ("win32", "reveal"),
+            ("linux", "open"),
+        ):
+            with (
+                patch("sys.platform", platform),
+                patch(
+                    "kiro_crew.dashboard.handlers.files.platform_compat.reveal_in_file_manager",
+                    return_value=False,
+                ),
+                patch(
+                    "kiro_crew.dashboard.handlers.files.platform_compat.open_with_default_app",
+                    return_value=False,
+                ),
+            ):
                 async with TestClient(TestServer(self._client_app())) as client:
                     resp = await client.post(
                         "/api/reveal", json={"path": str(f), "action": action}
@@ -1117,9 +1188,17 @@ class TestRevealPath:
         f.write_text("x", encoding="utf-8")
         for action in ("reveal", "open"):
             mock_sel.log_tool_invocation.reset_mock()
-            with patch("sys.platform", "linux"), \
-                 patch("kiro_crew.dashboard.handlers.files.platform_compat.reveal_in_file_manager", return_value=False), \
-                 patch("kiro_crew.dashboard.handlers.files.platform_compat.open_with_default_app", return_value=False):
+            with (
+                patch("sys.platform", "linux"),
+                patch(
+                    "kiro_crew.dashboard.handlers.files.platform_compat.reveal_in_file_manager",
+                    return_value=False,
+                ),
+                patch(
+                    "kiro_crew.dashboard.handlers.files.platform_compat.open_with_default_app",
+                    return_value=False,
+                ),
+            ):
                 async with TestClient(TestServer(self._client_app())) as client:
                     resp = await client.post(
                         "/api/reveal", json={"path": str(f), "action": action}
@@ -1198,7 +1277,10 @@ class TestNativePickers:
         directory, so the bare name is exactly what must never run."""
         monkeypatch.setattr(platform_compat, "trusted_system_bin", lambda name: None)
         spawn = AsyncMock()
-        with patch("sys.platform", "darwin"), patch("asyncio.create_subprocess_exec", spawn):
+        with (
+            patch("sys.platform", "darwin"),
+            patch("asyncio.create_subprocess_exec", spawn),
+        ):
             async with TestClient(
                 TestServer(_app("POST", "/api/upload", files_mod.api_upload))
             ) as client:
@@ -1216,7 +1298,10 @@ class TestNativePickers:
         monkeypatch.setattr(files_mod, "_SCREENSHOT_DIR", tmp_path / "shots")
         monkeypatch.setattr(platform_compat, "trusted_system_bin", lambda name: None)
         spawn = AsyncMock()
-        with patch("sys.platform", "darwin"), patch("asyncio.create_subprocess_exec", spawn):
+        with (
+            patch("sys.platform", "darwin"),
+            patch("asyncio.create_subprocess_exec", spawn),
+        ):
             async with TestClient(
                 TestServer(_app("POST", "/api/screenshot", files_mod.api_screenshot))
             ) as client:
@@ -1230,8 +1315,12 @@ class TestNativePickers:
     @pytest.mark.asyncio
     async def test_upload_returns_selected_paths(self, mock_sel, trusted_dialog_bin):
         proc = _FakeProc(stdout=b"/Users/x/a.png\n\n/Users/x/b.txt\n")
-        with patch("sys.platform", "darwin"), \
-             patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as spawn:
+        with (
+            patch("sys.platform", "darwin"),
+            patch(
+                "asyncio.create_subprocess_exec", AsyncMock(return_value=proc)
+            ) as spawn,
+        ):
             async with TestClient(
                 TestServer(_app("POST", "/api/upload", files_mod.api_upload))
             ) as client:
@@ -1243,8 +1332,10 @@ class TestNativePickers:
     @pytest.mark.asyncio
     async def test_upload_cancelled_dialog_returns_no_paths(self, mock_sel, trusted_dialog_bin):
         proc = _FakeProc(stdout=b"\n  \n")
-        with patch("sys.platform", "darwin"), \
-             patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+        with (
+            patch("sys.platform", "darwin"),
+            patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
+        ):
             async with TestClient(
                 TestServer(_app("POST", "/api/upload", files_mod.api_upload))
             ) as client:
@@ -1254,8 +1345,10 @@ class TestNativePickers:
     @pytest.mark.asyncio
     async def test_upload_timeout_kills_dialog_and_returns_504(self, mock_sel, trusted_dialog_bin):
         proc = _FakeProc(fail_first=True, kill_raises=True)
-        with patch("sys.platform", "darwin"), \
-             patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+        with (
+            patch("sys.platform", "darwin"),
+            patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
+        ):
             async with TestClient(
                 TestServer(_app("POST", "/api/upload", files_mod.api_upload))
             ) as client:
@@ -1287,8 +1380,10 @@ class TestNativePickers:
             Path(argv[2]).write_bytes(b"\x89PNG\r\n\x1a\n")
             return _FakeProc()
 
-        with patch("sys.platform", "darwin"), \
-             patch("asyncio.create_subprocess_exec", fake_exec):
+        with (
+            patch("sys.platform", "darwin"),
+            patch("asyncio.create_subprocess_exec", fake_exec),
+        ):
             async with TestClient(
                 TestServer(_app("POST", "/api/screenshot", files_mod.api_screenshot))
             ) as client:
@@ -1303,8 +1398,12 @@ class TestNativePickers:
     async def test_screenshot_user_cancel_returns_empty_path(self, tmp_path, mock_sel,
                                                              monkeypatch, trusted_dialog_bin):
         monkeypatch.setattr(files_mod, "_SCREENSHOT_DIR", tmp_path / "shots")
-        with patch("sys.platform", "darwin"), \
-             patch("asyncio.create_subprocess_exec", AsyncMock(return_value=_FakeProc())):
+        with (
+            patch("sys.platform", "darwin"),
+            patch(
+                "asyncio.create_subprocess_exec", AsyncMock(return_value=_FakeProc())
+            ),
+        ):
             async with TestClient(
                 TestServer(_app("POST", "/api/screenshot", files_mod.api_screenshot))
             ) as client:
@@ -1367,8 +1466,10 @@ class TestNativePickers:
                                                   trusted_dialog_bin):
         monkeypatch.setattr(files_mod, "_SCREENSHOT_DIR", tmp_path / "shots")
         proc = _FakeProc(fail_first=True)
-        with patch("sys.platform", "darwin"), \
-             patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+        with (
+            patch("sys.platform", "darwin"),
+            patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
+        ):
             async with TestClient(
                 TestServer(_app("POST", "/api/screenshot", files_mod.api_screenshot))
             ) as client:
@@ -1393,13 +1494,9 @@ def cfg_file(tmp_path):
 def config_client_app(cfg_file, mock_sel) -> web.Application:
     """The endpoint under an OWNER caller, so the body-validation paths are reachable.
 
-    ``PUT`` is owner-gated, and the gate reads ``request.app["state"]`` plus the
-    authenticated claims the token middleware normally populates. Without both,
-    every PUT below would answer 403 (or 500 on the missing state) and stop
-    testing what it names. ``owner_id = ""`` with the caller defaulting to the
-    signed local bootstrap subject is the standalone-local shape, matching
-    ``test_agent_config_owner_gate_invariant``; a test that wants a non-owner
-    sends ``X-Test-User``.
+    The owner gate reads ``request.app["state"]`` and the token claims; without both
+    every PUT answers 403. ``owner_id = ""`` is the standalone-local shape; a test that
+    wants a non-owner sends ``X-Test-User``.
     """
 
     class _State:
@@ -1599,6 +1696,8 @@ class TestDashboardConfigPut:
             "merge_queued_messages",
             "tail_fork_enabled",
             "folder_suggestions_enabled",
+            "folder_suggestions_auto_apply",
+            "project_tags_enabled",
             "topic_tags_enabled",
             "link_previews",
             "quick_send",
@@ -1606,6 +1705,8 @@ class TestDashboardConfigPut:
             "mcp_app_panel",
             "side_panel_always_open",
             "side_panel_pin_summary",
+            "new_chat_crew_mode",
+            "auto_open_conductor_board",
         ]
         async with TestClient(TestServer(config_client_app)) as client:
             for field in bool_fields:
@@ -1617,11 +1718,15 @@ class TestDashboardConfigPut:
     async def test_coded_boolean_errors_carry_a_machine_code(self, config_client_app):
         coded = {
             "folder_suggestions_enabled": "invalid_folder_suggestions_enabled",
+            "folder_suggestions_auto_apply": "invalid_folder_suggestions_auto_apply",
+            "project_tags_enabled": "invalid_project_tags_enabled",
             "topic_tags_enabled": "invalid_topic_tags_enabled",
             "link_previews": "invalid_link_previews",
             "mcp_app_panel": "invalid_mcp_app_panel",
             "side_panel_always_open": "invalid_side_panel_always_open",
             "side_panel_pin_summary": "invalid_side_panel_pin_summary",
+            "new_chat_crew_mode": "invalid_new_chat_crew_mode",
+            "auto_open_conductor_board": "invalid_auto_open_conductor_board",
         }
         async with TestClient(TestServer(config_client_app)) as client:
             for field, code in coded.items():
@@ -1703,9 +1808,13 @@ class TestDashboardConfigPut:
             "tail_fork_enabled": True,
             "link_previews": True,
             "folder_suggestions_enabled": True,
+            "folder_suggestions_auto_apply": True,
+            "project_tags_enabled": False,
             "topic_tags_enabled": True,
             "side_panel_always_open": True,
             "side_panel_pin_summary": True,
+            "new_chat_crew_mode": True,
+            "auto_open_conductor_board": False,
         }
         async with TestClient(TestServer(config_client_app)) as client:
             resp = await client.put("/api/dashboard/config", json=payload)

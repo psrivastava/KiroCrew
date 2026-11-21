@@ -36,8 +36,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, urlencode
 
-from kiro_crew import __version__, agent_scratch, platform_compat, release_channel
+from kiro_crew import (
+    __version__,
+    agent_scratch,
+    diagnostics_host_name,
+    platform_compat,
+    release_channel,
+)
+from kiro_crew.cli_log_files import boot_log_paths
 from kiro_crew.config.loader import config_dir
+from kiro_crew.dashboard import crash_dump_store
 from kiro_crew.kiro_cli import PATH_ONLY_INSTALL_NOTE, pin_kiro_cli
 from kiro_crew.platform import PlatformCompositionError, current_context, safe_context_call
 from kiro_crew.security import (
@@ -124,10 +132,11 @@ class BundleResult:
     skipped: list[str] = field(default_factory=list)
     #: member name -> number of secret redactions applied (0 = clean)
     redaction_summary: dict[str, int] = field(default_factory=dict)
-    #: Count of home/data-home path prefixes collapsed to ``~`` across all text
-    #: members. Tracked apart from :attr:`redaction_summary` because a path
-    #: collapse hides an OS login, not a secret -- folding it into the secret
-    #: tally would overstate "N secret(s) auto-redacted" in the issue body.
+    #: Count of home/data-home path prefixes collapsed to ``~``, plus host-name
+    #: replacements, across all text members. Tracked apart from
+    #: :attr:`redaction_summary` because each hides a login or a machine name,
+    #: not a secret -- folding it into the secret tally would overstate
+    #: "N secret(s) auto-redacted" in the issue body.
     path_collapses: int = 0
     github_issue_url: str = ""
     #: The ONE release-provenance resolution this bundle was written from.
@@ -225,7 +234,9 @@ def _home_prefixes() -> list[str]:
     Only the paths that embed the OS login: the user's home directory and the
     data-home directory. Each is emitted in every spelling it can appear in (see
     :func:`_prefix_spellings`): the native form, the forward-slash form, and the
-    JSON-escaped backslash form on Windows.
+    JSON-escaped backslash form on Windows. A symlinked home is also collapsed
+    in its resolved spelling, which ``os.getcwd()`` and ``Path.resolve()``
+    write into logs.
 
     The data-home prefix is emitted on its own ONLY when it is not nested under
     home. When it IS under home (the usual case -- ``<home>/.kiro/crew``),
@@ -241,6 +252,9 @@ def _home_prefixes() -> list[str]:
     bases: list[str] = []
     if home and not _is_root_or_single_segment(home):
         bases.append(home)
+        resolved = os.path.realpath(home)
+        if not _is_root_or_single_segment(resolved):
+            bases.append(resolved)
     if data_home and not _is_root_or_single_segment(data_home):
         # Nested under home? Then the home collapse already covers it while
         # preserving the ``.kiro/crew/...`` tail, so do not register it apart.
@@ -263,13 +277,15 @@ def _home_prefixes() -> list[str]:
 
 # A home prefix only collapses when the login segment ENDS at the boundary --
 # i.e. the next character does not continue the segment. The guard is a
-# negative lookahead on segment-continuing characters (letters, digits,
-# underscore, hyphen), so only a LONGER login is protected from a shorter one
-# it is a strict prefix of. Every other following character ends the segment
-# and allows the collapse: a separator, a quote, whitespace, OR a delimiter
-# such as a PATH-list colon, a trailing comma, a closing paren or a
+# negative lookahead on segment-continuing characters (a letter or digit of
+# any script, underscore, hyphen, or a dot followed by a letter, digit or
+# underscore), so only a LONGER login -- ``john.doe`` beside ``john``, or an
+# accented login beside its unaccented prefix -- is protected from a shorter
+# one it is a strict prefix of. Every other following character ends the
+# segment and allows the collapse: a separator, a quote, whitespace, OR a
+# delimiter such as a PATH-list colon, a trailing comma, a closing paren or a
 # sentence-final dot.
-_PREFIX_BOUNDARY = r"(?![A-Za-z0-9_-])"
+_PREFIX_BOUNDARY = r"(?![\w-]|\.\w)"
 
 
 def _collapse_home_prefixes(text: str) -> tuple[str, int]:
@@ -282,7 +298,8 @@ def _collapse_home_prefixes(text: str) -> tuple[str, int]:
 
     The match is segment-aware and case-insensitive: a prefix collapses when
     the login segment ends -- i.e. the next character is not one that continues
-    the segment (a letter, digit, underscore or hyphen) -- so a login that is a
+    the segment (a letter or digit of any script, an underscore, a hyphen, or a
+    dot followed by a letter, digit or underscore) -- so a login that is a
     strict prefix of a longer one is not rewritten, while a delimiter such as a
     separator, quote, whitespace, ``:``, ``,``, ``)`` or a trailing ``.`` all
     allow the collapse. Case-insensitivity covers the Windows drive/user
@@ -290,14 +307,20 @@ def _collapse_home_prefixes(text: str) -> tuple[str, int]:
     """
     count = 0
     for prefix in _home_prefixes():
-        pattern = re.compile(re.escape(prefix) + _PREFIX_BOUNDARY, re.IGNORECASE)
+        # Between segments any run of separators matches, so every escaping depth
+        # collapses. A leading root stays one separator: a run there would swallow
+        # ``file://`` and rescan every position of a long run.
+        first, *rest = re.split(r"[\\/]+", prefix.rstrip("\\/"))
+        body = r"[\\/]+".join(re.escape(s) for s in rest)
+        lead = (re.escape(first) + r"[\\/]+" if rest else re.escape(first)) if first else r"[\\/]"
+        pattern = re.compile(lead + body + _PREFIX_BOUNDARY, re.IGNORECASE)
         text, n = pattern.subn("~", text)
         count += n
     return text, count
 
 
 def _scrub_bundle(text: str) -> tuple[str, int, int]:
-    """``_scrub`` plus a home-prefix collapse, for bundle text members only.
+    """``_scrub`` plus a home-prefix collapse and the host-name replacement.
 
     The bundle's stated destination is a public issue, so a text member must not
     carry the OS login: on Windows the login is embedded in nearly every
@@ -306,7 +329,7 @@ def _scrub_bundle(text: str) -> tuple[str, int, int]:
     protocol-log reader, whose output goes to a model context, not a public
     issue, so the extra pass is scoped to the bundle here.
 
-    The home collapse runs LAST, after ``_EXTRA_REDACTIONS``, so a credential
+    The home collapse runs after ``_EXTRA_REDACTIONS``, so a credential
     header sitting directly after a ``file:line:`` prefix is redacted by the
     credential rules first and never swallowed. The collapse replaces only the
     home and data-home PREFIX with ``~`` and keeps the rest of each path, so a
@@ -314,12 +337,20 @@ def _scrub_bundle(text: str) -> tuple[str, int, int]:
     and repo-relative frames are left intact.
 
     Returns ``(clean, secrets, path_collapses)``: the secret count and the
-    path-collapse count are kept apart so the issue body does not report a path
-    collapse as a "secret".
+    path-collapse count (host-name replacements included) are kept apart so the
+    issue body does not report either as a "secret".
     """
+    # The host pass runs only AFTER the credential scrub and the home collapse:
+    # replaced first, a host name that is also a word a credential rule keys on
+    # would hide that credential from the rule. The scrub strips hidden
+    # characters, which can join a short name onto the word in front of it, so
+    # those joins are read from the text before the scrub.
+    names = diagnostics_host_name.host_names()
+    joined = diagnostics_host_name.find_joined_host_words(text, names)
     text, secrets = _scrub(text)
     text, collapses = _collapse_home_prefixes(text)
-    return text, secrets, collapses
+    text, replaced = diagnostics_host_name.replace_host_names(text, names, joined)
+    return text, secrets, collapses + replaced
 
 
 def _kiro_log_dirs() -> list[Path]:
@@ -332,14 +363,19 @@ def _kiro_log_dirs() -> list[Path]:
     `process exited (rc=None)` class this collector exists for. Rather than
     guessing which one is authoritative per platform, try every candidate and
     take the first that actually exists; ``KIRO_CHAT_LOG_FILE`` overrides all of
-    them for anyone running a non-default layout.
+    them for anyone running a non-default layout. Windows sets ``TEMP``/``TMP``
+    and usually leaves ``TMPDIR`` unset, so those follow ``TMPDIR``. The fixed
+    ``/tmp`` candidate is POSIX-only: on Windows it names ``\\tmp`` at the root
+    of the current drive, which kiro-cli does not use and any local account can
+    create.
     """
     out: list[Path] = []
-    for env in ("XDG_RUNTIME_DIR", "TMPDIR"):
+    for env in ("XDG_RUNTIME_DIR", "TMPDIR", "TEMP", "TMP"):
         value = os.environ.get(env)
         if value:
             out.append(Path(value) / "kiro-log")
-    out.append(Path("/tmp") / "kiro-log")
+    if not platform_compat.IS_WINDOWS:
+        out.append(Path("/tmp") / "kiro-log")
     # Preserve order while dropping duplicates (TMPDIR is often /tmp), and drop
     # symlinked candidates: a symlinked `kiro-log` would resolve to off-tree
     # files that are not themselves symlinks, so the per-file guard would pass
@@ -381,6 +417,21 @@ def _usable_dir(p: Path) -> bool:
     return not platform_compat.is_link_or_junction(p) and p.is_dir()
 
 
+#: kiro-cli on Windows writes its logs one level deeper, under
+#: ``kiro-log\logs\``, while Linux and macOS write them in ``kiro-log/`` itself.
+_KIRO_LOG_NESTED_SUBDIR = "logs"
+
+
+def _kiro_log_levels(base: Path) -> list[Path]:
+    """The directories inside one ``kiro-log`` dir that may hold its logs.
+
+    The flat level comes first; the nested ``logs`` level is listed only when it
+    passes :func:`_usable_dir`, so a linked ``logs`` is never walked.
+    """
+    nested = base / _KIRO_LOG_NESTED_SUBDIR
+    return [base, nested] if _usable_dir(nested) else [base]
+
+
 def _kiro_cli_chat_log() -> Path | None:
     """Locate the kiro-cli chat log (``<runtime-or-tmp>/kiro-log/kiro-chat.log``)."""
     override = os.environ.get("KIRO_CHAT_LOG_FILE")
@@ -396,23 +447,25 @@ def _kiro_cli_chat_log() -> Path | None:
             return None
         return p if _usable_log(p) else None
     for base in _kiro_log_dirs():
-        p = base / "kiro-chat.log"
-        if _usable_log(p):
-            return p
+        for level in _kiro_log_levels(base):
+            p = level / "kiro-chat.log"
+            if _usable_log(p):
+                return p
     return None
 
 
 def _kiro_cli_extra_logs() -> list[Path]:
     out: list[Path] = []
     for base in _kiro_log_dirs():
-        for name in ("mcp.log", "lsp.log"):
-            p = base / name
-            if _usable_log(p) and p.stat().st_size > 0:
-                out.append(p)
-        if out:
-            # One kiro-log dir wins; do not mix members from two of them, or the
-            # zip would carry two different `mcp.log` entries under one name.
-            break
+        for level in _kiro_log_levels(base):
+            for name in ("mcp.log", "lsp.log"):
+                p = level / name
+                if _usable_log(p) and p.stat().st_size > 0:
+                    out.append(p)
+            if out:
+                # One log dir wins; do not mix members from two of them, or the
+                # zip would carry two different `mcp.log` entries under one name.
+                return out
     return out
 
 
@@ -421,8 +474,10 @@ def _scratch_kiro_chat_logs() -> list[Path]:
 
     On Linux and macOS ``agent_scratch.scratch_env`` pins the log of every
     kiro-cli Kiro Crew spawns to ``<scratch root>/<dir>/kiro-log/kiro-chat.log``,
-    which none of :func:`_kiro_log_dirs`' shared candidates reach. Each directory
-    level must pass :func:`_usable_dir` and the log :func:`_usable_log`, so a
+    which none of :func:`_kiro_log_dirs`' shared candidates reach. On Windows the
+    log is not pinned, and kiro-cli writes it to ``<dir>/kiro-log/logs/`` instead
+    (see :func:`_kiro_log_levels`); the flat path wins when both exist. Each
+    directory level must pass :func:`_usable_dir` and the log :func:`_usable_log`, so a
     linked scratch dir or ``kiro-log`` is skipped rather than walked out of the
     tree. Sorted by the log's mtime and capped at :data:`_MAX_SCRATCH_CHAT_LOGS`.
     A dead process's directory is swept once it has been idle about an hour
@@ -438,14 +493,33 @@ def _scratch_kiro_chat_logs() -> list[Path]:
     found: list[tuple[float, Path]] = []
     for child in children:
         log_dir = child / agent_scratch.KIRO_CLI_LOG_SUBDIR
-        log = log_dir / agent_scratch.KIRO_CLI_CHAT_LOG_NAME
         try:
-            if _usable_dir(child) and _usable_dir(log_dir) and _usable_log(log):
-                found.append((log.lstat().st_mtime, log))
+            if not (_usable_dir(child) and _usable_dir(log_dir)):
+                continue
+            for level in _kiro_log_levels(log_dir):
+                log = level / agent_scratch.KIRO_CLI_CHAT_LOG_NAME
+                if _usable_log(log):
+                    found.append((log.lstat().st_mtime, log))
+                    break
         except OSError:
             continue
     found.sort(key=lambda entry: entry[0], reverse=True)
     return [log for _, log in found[:_MAX_SCRATCH_CHAT_LOGS]]
+
+
+def _scratch_log_dir_name(log: Path) -> str:
+    """The scratch dir name for a log :func:`_scratch_kiro_chat_logs` returned.
+
+    The log sits at ``<dir>/kiro-log/kiro-chat.log`` or, on Windows,
+    ``<dir>/kiro-log/logs/kiro-chat.log``; both name the member for ``<dir>``.
+    """
+    log_dir = log.parent
+    if (
+        log_dir.name == _KIRO_LOG_NESTED_SUBDIR
+        and log_dir.parent.name == agent_scratch.KIRO_CLI_LOG_SUBDIR
+    ):
+        log_dir = log_dir.parent
+    return log_dir.parent.name
 
 
 # ── Live log reader (kiro_cli_logs MCP tool) ─────────────────────────────────
@@ -459,18 +533,22 @@ def _scratch_kiro_chat_logs() -> list[Path]:
 # writes are deliberately NOT read, for the same reason:
 #
 # * ``sessions/cli/<sid>.jsonl`` transcripts, and
-# * ``kiro-chat.log`` — one FIXED host path (see :func:`_kiro_cli_chat_log`),
-#   not a per-session file, so on a host running one gateway with many
-#   concurrent sessions (web, CLI, messaging, subagents, cron) it interleaves
-#   every session's request/response traffic.
+# * ``kiro-chat.log`` — never a per-session file. The shared one is one FIXED
+#   host path (see :func:`_kiro_cli_chat_log`), so on a host running one gateway
+#   with many concurrent sessions (web, CLI, messaging, subagents, cron) it
+#   interleaves every session's request/response traffic. The per-process one
+#   in each spawned kiro-cli's scratch dir (see :func:`_scratch_kiro_chat_logs`)
+#   is per RUNTIME, and one runtime can
+#   serve several sessions, so even the calling runtime's own log can carry
+#   sessions other than the caller.
 #
 # Both carry CONVERSATION PROSE across the session boundary, and ``_scrub`` is a
 # CREDENTIAL pass: it strips tokens/headers/cookies, not prose. There is no
 # per-session kiro-cli chat log to scope to and no reliable per-session
-# delimiter in the flat one, so an agent-callable read of it would hand session
+# delimiter in either one, so an agent-callable read of either would hand session
 # A's private conversation to session B with nothing to narrow it — and a
 # disclosure into a model context cannot be recalled. The bundle collector still
-# includes the chat log because that path is USER->USER (the user triggers the
+# includes the chat logs because that path is USER->USER (the user triggers the
 # collection and downloads it for their own machine); this tool is CROSS-SESSION
 # and therefore stays on the mcp/lsp protocol logs, which explain a rejected
 # turn without carrying the conversation.
@@ -486,7 +564,7 @@ def _scratch_kiro_chat_logs() -> list[Path]:
 #
 # THE PROPERTY THIS SCOPE DEPENDS ON, and how it is held. mcp.log / lsp.log are
 # safe to read here only while they record protocol TRAFFIC (method names, ids,
-# timings, errors) and not full frame BODIES. They share ``kiro-chat.log``'s
+# timings, errors) and not full frame BODIES. They have the shared ``kiro-chat.log``'s
 # single-fixed-path, all-sessions-interleaved shape, so payload content is the
 # ONLY thing separating them, and an MCP ``tools/call`` frame carries
 # conversation-derived arguments (search queries, message bodies, file contents).
@@ -840,17 +918,19 @@ def read_kiro_cli_logs(
     also writes:
 
     * ``sessions/cli/<sid>.jsonl`` transcripts, and
-    * ``kiro-chat.log``, which is ONE fixed host path rather than a per-session
-      file, so a host running one gateway with many concurrent sessions
-      interleaves every session's traffic into it.
+    * ``kiro-chat.log``, which is never a per-session file: the shared one is ONE
+      fixed host path, so a host running one gateway with many concurrent
+      sessions interleaves every session's traffic into it, and the per-process
+      one in agent scratch (:func:`_scratch_kiro_chat_logs`) holds every session
+      its runtime serves, the calling session's own runtime included.
 
-    Both are conversation content shared across every gateway session (including
+    Both are conversation content shared across gateway sessions (including
     incognito/temporary ones), and ``_scrub`` is a CREDENTIAL pass that does not
     narrow prose — so returning either would disclose another session's private
     conversation to the calling session, with no per-session delimiter available
     to filter on. This tool therefore stays on the mcp/lsp protocol logs, which
     are what explain a rejected turn. :func:`collect_bundle` still includes the
-    chat log because that path is user-to-user (the user triggers the collection
+    chat logs because that path is user-to-user (the user triggers the collection
     and downloads it themselves); this one is cross-session.
 
     Every source is byte-capped, line-tailed to ``tail`` (default
@@ -884,9 +964,7 @@ def read_kiro_cli_logs(
     sections: list[str] = []
     total_redactions = 0
 
-    # mcp/lsp only. `kiro-chat.log` is deliberately absent — see the docstring:
-    # it is one shared host file carrying every session's conversation prose,
-    # which `_scrub` (a credential pass) does not narrow.
+    # mcp/lsp only; no `kiro-chat.log`, shared or per-process — see the docstring.
     sources: list[tuple[str, Path]] = [(p.name, p) for p in _kiro_cli_extra_logs()]
 
     # Read the caps from the module at CALL time so a test can monkeypatch them.
@@ -942,10 +1020,10 @@ def read_kiro_cli_logs(
     if not sections:
         return (
             "No kiro-cli protocol logs found. kiro-cli writes mcp.log / lsp.log "
-            "under $XDG_RUNTIME_DIR|$TMPDIR/kiro-log/; none exist or are readable "
-            "here. (kiro-chat.log is a single shared host file carrying every "
-            "session's conversation, so it is deliberately not a source for this "
-            "tool.)"
+            "under $XDG_RUNTIME_DIR|$TMPDIR|%TEMP%/kiro-log/ (kiro-log/logs/ on "
+            "Windows); none exist or are readable "
+            "here. (kiro-chat.log can carry other sessions' conversations, so it "
+            "is deliberately not a source for this tool.)"
         )
     header = (
         f"kiro-cli logs (tail={tail}"
@@ -1115,7 +1193,18 @@ _INSTALL_OPTIONS = {
 _CHANNEL_OPTIONS = release_channel.CHANNEL_FORM_OPTIONS
 
 
-def _versions_text(note: str, identity: release_channel.Provenance) -> str:
+#: ``versions.txt``'s ``version_alignment:`` in a bundle the gateway collects: its own
+#: files are not the selected package of a side-by-side install (a promoted update
+#: whose restart was put off, a desktop update), so comparing them would read aligned.
+_ALIGNMENT_NOT_CHECKED = (
+    "not checked (collected inside the gateway, which cannot read a side-by-side"
+    " install's selected package; `kirocrew doctor --bundle` compares them)"
+)
+
+
+def _versions_text(
+    note: str, identity: release_channel.Provenance, version_alignment: str | None = None
+) -> str:
     # Private, so it keeps everything the public report may not: the raw stamp
     # (a repackager's build id), the distribution metadata it was weighed
     # against, and the channel record -- the evidence behind `channel:`.
@@ -1127,6 +1216,7 @@ def _versions_text(note: str, identity: release_channel.Provenance) -> str:
         f"distribution_version: {identity.distribution or 'unavailable'}",
         f"channel: {identity.channel or 'unknown'}",
         f"channel_record: {identity.recorded or 'absent'}",
+        f"version_alignment: {version_alignment or _ALIGNMENT_NOT_CHECKED}",
         f"kiro_cli_version: {_kiro_cli_version()}",
         f"kas_engine: {_kas_engine_version()}",
         f"python: {platform.python_version()}",
@@ -1210,6 +1300,7 @@ def _issue_url(result: BundleResult, note: str, *, prefill: bool = True) -> str:
                 f"{result.total_redactions} secret(s) auto-redacted"
                 + (
                     f" and {result.path_collapses} path(s) collapsed to `~`"
+                    " or host name(s) replaced"
                     if result.path_collapses
                     else ""
                 )
@@ -1286,8 +1377,8 @@ def terminal_issue_url(result: BundleResult, note: str = "") -> str:
     The dashboard renders `BundleResult.github_issue_url` out of a JSON response
     that no redactor scans, so it keeps the full pre-filled body. A link PRINTED
     to stdout has no such guarantee — it gets selected into chat, captured from a
-    shell tool, or relayed by an agent, and on those paths the pre-filled variant
-    is replaced wholesale by ``[REDACTED: suspicious URL to github.com]``. This
+    shell tool, or relayed by an agent, and on those paths a long pre-filled query
+    reads as data carried out (``security.exfil.scan_exfiltration_urls``). This
     variant trades the pre-filled body for a link that arrives intact. An edition
     tracker gets the same ``prefill=False`` signal and owns keeping its query short.
     """
@@ -1316,6 +1407,7 @@ def collect_bundle(
     note: str = "",
     include_logs: bool = True,
     output_dir: Path | None = None,
+    version_alignment: str | None = None,
 ) -> BundleResult:
     """Collect, redact, and zip a diagnostics bundle.
 
@@ -1325,6 +1417,9 @@ def collect_bundle(
         include_logs: when False, only versions + crash reports are bundled
             (no full gateway / chat logs) for a lighter, lower-sensitivity zip.
         output_dir: where to write the zip. Defaults to ``<data_home>/diagnostics``.
+        version_alignment: the running gateway's version against the selected
+            package's, as ``kirocrew doctor --bundle`` reads it. None, the
+            dashboard's collector, records it as not checked.
 
     Returns:
         :class:`BundleResult` with the zip path and a pre-filled issue URL.
@@ -1368,13 +1463,19 @@ def collect_bundle(
     text_sources: list[tuple[str, Path, bool]] = []
     if include_logs:
         text_sources.append(("gateway.log", home / "gateway.log", True))
-        text_sources.append(("gateway.log.prev", home / "gateway.log.prev", True))
+        # gateway.log.prev, then the older boots kept in logs/gateway-boots. Only
+        # boots that exist are listed; the loop below still refuses a symlink or
+        # non-file.
+        prev_log, *older_boot_logs = boot_log_paths(home / "gateway.log")
+        text_sources.append((prev_log.name, prev_log, True))
+        for boot_log in older_boot_logs:
+            text_sources.append((f"gateway-boots/{boot_log.name}", boot_log, True))
         chat = _kiro_cli_chat_log()
         if chat is not None:
             text_sources.append(("kiro-chat.log", chat, True))
         for log in _scratch_kiro_chat_logs():
             # Named for its scratch dir: every per-process log is `kiro-chat.log`.
-            text_sources.append((f"kiro-chat/{log.parent.parent.name}.log", log, True))
+            text_sources.append((f"kiro-chat/{_scratch_log_dir_name(log)}.log", log, True))
         for extra in _kiro_cli_extra_logs():
             text_sources.append((f"kiro-cli-{extra.name}", extra, True))
 
@@ -1382,9 +1483,22 @@ def collect_bundle(
     text_sources.append(("crash.log", home / "logs" / "crash.log", False))
     dumps_dir = home / "logs" / "crash-dumps"
     if _usable_dir(dumps_dir):
+        # The sweep keeps an unexplained exit's header on purpose, and a clean-exit
+        # marker is empty: neither may push a stall's stacks out of the bundle, so
+        # markers stay out and those headers only fill the slots left over.
+        try:
+            unexplained = set(crash_dump_store.unexplained_exits(dumps_dir))
+        except OSError:
+            unexplained = set()  # an ordering hint only; the bundle goes on without it
         dumps = sorted(
-            (p for p in dumps_dir.glob("*") if p.is_file() and not p.is_symlink()),
-            key=lambda p: p.stat().st_mtime,
+            (
+                p
+                for p in dumps_dir.glob("*")
+                if p.is_file()
+                and not p.is_symlink()
+                and not p.name.endswith(crash_dump_store.CLEAN_EXIT_SUFFIX)
+            ),
+            key=lambda p: (p not in unexplained, p.stat().st_mtime),
             reverse=True,
         )[:_MAX_CRASH_DUMPS]
         for d in dumps:
@@ -1408,7 +1522,7 @@ def collect_bundle(
     )
     with os.fdopen(_fd, "wb") as _raw, zipfile.ZipFile(_raw, "w", zipfile.ZIP_DEFLATED) as zf:
         # Generated members first.
-        versions = _versions_text(note, identity)
+        versions = _versions_text(note, identity, version_alignment)
         # ``versions.txt`` carries the absolute ``data_home`` path
         # unconditionally, which embeds the OS login. Run it through the bundle
         # scrub stack so the archive does not ship a local path in a file whose

@@ -16,12 +16,13 @@ cd website && npm run i18n:check
 
 | CI job | Step | What it runs |
 |---|---|---|
-| `frontend-lint` | Check i18n extraction, key references and plurals | `npm run i18n:check` (the runner below) |
+| `frontend-ratchets` | Check i18n extraction, key references and plurals | `npm run i18n:check` (the runner below). This job is off `lint-gate`'s path, so an i18n failure reds the pull request without skipping the heavy matrix |
 | `frontend-test` | Unit tests | `npx vitest run --coverage`, sharded across a matrix with each shard's coverage merged by `frontend-coverage-merge`; it includes the diff-scoped `localeFormatting.test.ts` gates and the catalog duplicate-key guard `duplicateKeys.test.ts` (see below) |
 | `i18n-render` | Render every surface under en-XA, head vs base | `npm run i18n:render` (`scripts/check-i18n-render.mjs --build`) |
 
 The render gate is its own job (`i18n Render Gate (en-XA, head vs base)`), on the
-default-size Linux runner, path-filtered like `frontend-lint` (skipped on a
+default-size Linux runner, path-filtered like `frontend-lint` and
+`frontend-ratchets` (skipped on a
 backend-only diff). It needs no gateway, no token and no backend: it serves the
 build over loopback and answers every `/api/**` call from fixtures, and the
 Chromium it installs is the same exact-version cached download the `e2e` job
@@ -38,7 +39,7 @@ ceiling on 27% of fork-PR runs, against 2.5% on the fleet's large instance.
 every check they contain in one table.
 
 An `&&` chain short-circuits. With this many checks that means a PR only ever learns
-about its **first** failure, fixes it, pushes, waits for another full frontend-lint
+about its **first** failure, fixes it, pushes, waits for another full frontend-ratchets
 round, and discovers the next — one round per check, over independent
 measurements of the same tree. The runner reports all of them once, and folds each
 script's raw output into its own collapsed CI group so nothing is lost.
@@ -55,7 +56,11 @@ Two structural properties of the runner:
   it owned had been classified as an unknown.
 - **A script that cannot run is exit 2, not a finding.** A spawn error, a signal
   kill, or a stdout-buffer overflow means the table would be built from truncated
-  text a regex might read as a pass, so the runner bails out instead.
+  text a regex might read as a pass, so the runner bails out instead. The same goes
+  for a script still running after five minutes (`SCRIPT_TIMEOUT_MS` in
+  `scripts/lib/i18n-run-script.mjs`; the slowest takes about a minute): it is killed
+  and its `FATAL` line names it, so a hung script ends the step within minutes
+  instead of holding it silent until the job's 20-minute cap.
   Symmetrically, a script that exits 0 while printing nothing a row recognises is
   `MISSING` and **fails** the step: a check that quietly stopped measuring is the
   defect the runner exists to remove.
@@ -176,11 +181,21 @@ The diff-scoped checks read the branch against a base ref, supplied as
 
 `actions/checkout` fetches depth 1, so the base is not present and a `git show`
 against it would fail. `.github/scripts/resolve-i18n-base.sh` fetches exactly that
-one ref, and the three call sites `|| exit 1` on it.
+one ref, and the three call sites `|| exit 1` on it. It fetches at depth 1 only when
+the checkout is already shallow, so a full clone (a local run, or a `fetch-depth: 0`
+job such as `frontend-ratchets`) and the worktrees sharing it keep their full history.
+On a `pull_request` run whose checkout is GitHub's test merge commit (its second
+parent is the PR head), the script measures from that commit's first parent instead
+of the `pull_request.base.sha` it was handed. A re-run keeps the event's base while
+the merge commit is built on the current base branch, and with no merge-base at
+depth 1 the gates would otherwise charge every base-branch change in between to the
+PR.
+The local form measures from the merge-base, as the local gate does:
+`I18N_BASE_REF="$(.github/scripts/resolve-i18n-base.sh "$(git merge-base HEAD origin/main)")"`.
 
 **A gate that cannot run must fail, not pass.** `check-source-strings.mjs` skips
-itself and exits 0 when the base ref is unreadable, and a failed fetch used to sail
-past the step with a printed "OK: skipped" while the new-key gate was silently
+itself and exits 0 when the base ref is unreadable, so a failed fetch would otherwise sail
+past the step with a printed "OK: skipped" while the new-key gate is silently
 disabled for the whole PR. An unavailable base ref is a CI problem to fix, not a
 reason to stop checking. The render scanner and the diff-scoped vitest gates exit
 non-zero on an unresolvable configured ref for the same reason.
@@ -356,13 +371,15 @@ Seven things to know before touching it:
 
 Known limits of the render gate, named rather than papered over:
 
-- **A PR whose base is not `main` never runs `ci.yml` at all**, because
-  `pull_request: branches: [main]` filters on the base branch. A stacked PR gets no
-  render gate until it is rebased.
-- **`main` verdicts are sampled, not per-commit, when `MERGE_QUEUE_ENABLED` is
-  not `'true'`.** The concurrency group permits one pending run and GitHub evicts
-  it when a newer one queues, so a commit whose run was evicted has its delta fall
-  between two `github.event.before` boundaries and is never diffed. With the merge
+- **A PR whose base is neither `main` nor a release branch never runs `ci.yml`
+  at all**, because `pull_request: branches: [main, "release/**"]` filters on the
+  base branch. A stacked PR gets no render gate until it is rebased.
+- **`main` verdicts are sampled, not per-commit, on a push the merge queue did
+  not land** (`MERGE_QUEUE_ENABLED` not `'true'`, or a push by anyone but
+  `github-merge-queue[bot]`). The concurrency group permits one pending run and
+  GitHub evicts it when a newer one queues, so a commit whose run was evicted has
+  its delta fall between two `github.event.before` boundaries and is never
+  diffed. With the merge
   queue on, each merge group is diffed against its own `base_sha` before it lands.
 - **Truncation measurement is not fully deterministic.** It compares a measured
   truncation ratio against a budget, so a label within roughly 10% of its budget can
@@ -401,11 +418,13 @@ Runs in `frontend-test`, outside the `i18n:check` runner above, because it is a
 plain vitest assertion over the catalog files rather than a diff-scoped gate.
 
 The same job also runs `src/i18n/destructiveConfirm.test.ts`, which is the
-convention detector for quoted operands on destructive confirms (#4821): every
-`confirm` key that interpolates a placeholder must be on the quoted-operand pin,
-an explicit key exemption, or interpolate only names in
+convention detector for quoted operands on destructive confirms: every
+`confirm` key that interpolates a placeholder is swept in and must quote its
+operand, unless it has an explicit key exemption or interpolates only names in
 `EXEMPT_CONFIRM_PLACEHOLDER_NAMES`. A brand-new confirm with a bare `{{name}}`
-fails that test even if nobody remembers to extend the pin.
+fails that test with no edit to the test; the hand list
+`QUOTED_OPERAND_CONFIRM_KEYS` holds only prompts whose key names the sweep
+cannot match.
 
 It fails on any key defined **twice inside one object** in any
 `src/i18n/locales/*.json`. Every catalog on disk is covered, so adding a language

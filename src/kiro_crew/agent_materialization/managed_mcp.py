@@ -19,8 +19,11 @@ import math
 from typing import Any
 
 from kiro_crew import agent as agent_mod
+from kiro_crew import kiro_cli
 from kiro_crew.env import sanitize_spec_env
+from kiro_crew.mcp_cleanup import CONTROL_PLANE_SERVERS
 from kiro_crew.platform.governance import CU_MCP_SERVER
+from kiro_crew.template_mcp_additions import MERGED_MARK
 
 
 def _managed_mcp_env() -> dict[str, str]:
@@ -43,15 +46,90 @@ def _managed_mcp_env() -> dict[str, str]:
     not propagated to children that would then disagree with the gateway in the
     other direction.
 
-    Returns ``{}`` on a default install, which keeps the emitted spec
-    byte-for-byte what it is today (``_prune_empty`` drops an empty ``env``).
-    That is safe only because a default-install child DERIVES the same home the
-    gateway did, from an inherited ``HOME``. Preserving a user's ``env`` puts
-    that inheritance in reach of a config, so the companion control lives in
-    ``_enforce_managed_mcp_ownership``: see ``_HOME_DERIVING_ENV_KEYS``.
+    Centrally governed children also receive cache-only policy markers, never
+    the source URL or request headers. Those markers let a managed server boot
+    its own platform context from the gateway's verified cache even when its
+    harness does not inherit the gateway environment. A default install with
+    no central ceiling still returns ``{}`` unless it needs the data-home pin;
+    that keeps the emitted spec free of an empty ``env`` block. Preserving a
+    user's ``env`` puts home inheritance in reach of a config, so the companion
+    control lives in ``_enforce_managed_mcp_ownership``: see
+    ``_HOME_DERIVING_ENV_KEYS``.
     """
     override = agent_mod._valid_override_home()
-    return {"KIROCREW_HOME": str(override)} if override else {}
+    env = {"KIROCREW_HOME": str(override)} if override else {}
+    env.update(policy_cache_only_env())
+    return env
+
+
+#: The env keys :func:`policy_cache_only_env` derives. A managed spec's own copies
+#: are never trusted: every reader replaces them from gateway state.
+POLICY_MARKER_KEYS = frozenset(
+    {
+        "KIROCREW_POLICY_CACHE_ONLY",
+        "KIROCREW_POLICY_MAX_CACHE_AGE_SECS",
+        "KIROCREW_POLICY_PROFILE_PIN",
+    }
+)
+
+
+def policy_cache_only_env() -> dict[str, str]:
+    """The cache-only policy markers for a child of a centrally governed gateway.
+
+    ``{}`` unless this process installed its ceiling from central distribution.
+    Never the source URL or its request headers: the child adopts the gateway's
+    verified cache and starts no fetch of its own. The gateway's profile pin is
+    forwarded when set: a cache-only child reads its profile only from that
+    variable, and an LTS cache recorded for a pinned profile is refused without it.
+    """
+    import os
+
+    from kiro_crew.platform.enterprise_policy_fetch import PROFILE_PIN_ENV
+    from kiro_crew.platform.policy_distribution import (
+        POLICY_CACHE_ONLY_ENV,
+        POLICY_MAX_AGE_ENV,
+        central_ceiling_installed,
+        effective_max_cache_age,
+    )
+
+    if not central_ceiling_installed():
+        return {}
+    env = {POLICY_CACHE_ONLY_ENV: "1"}
+    profile_pin = os.environ.get(PROFILE_PIN_ENV)
+    if profile_pin:
+        env[PROFILE_PIN_ENV] = profile_pin
+    max_cache_age = effective_max_cache_age()
+    if max_cache_age:
+        env[POLICY_MAX_AGE_ENV] = str(max_cache_age)
+    return env
+
+
+def drop_policy_markers(entry: dict[str, Any]) -> None:
+    """Remove a managed entry's own copies of the policy markers, in place.
+
+    Those copies come from a user-editable spec; :func:`add_policy_markers`
+    supplies the gateway's values instead. An ``env`` left empty is removed.
+    """
+    env = entry.get("env")
+    if not isinstance(env, dict):
+        return
+    kept = {k: v for k, v in env.items() if k not in POLICY_MARKER_KEYS}
+    if kept:
+        entry["env"] = kept
+    else:
+        entry.pop("env")
+
+
+def add_policy_markers(entry: dict[str, Any]) -> None:
+    """Put :func:`policy_cache_only_env` on a managed stdio entry's ``env``, in place.
+
+    A harness that starts the child with a minimal environment (KAS) gives it
+    only what the entry declares, so a centrally governed child needs the
+    markers here to adopt the gateway's verified cache.
+    """
+    policy_env = policy_cache_only_env()
+    if policy_env:
+        entry.setdefault("env", {}).update(policy_env)
 
 
 # Declaration discriminator kiro-cli reads for enterprise MCP governance. It is
@@ -59,17 +137,35 @@ def _managed_mcp_env() -> dict[str, str]:
 # carrying only env/headers/timeout overrides, and its command/url are ignored.
 _MCP_REGISTRY_TYPE = "registry"
 
+
+def _registry_marker_for(name: str, registry_mode: bool) -> bool:
+    """Whether managed server *name*'s entry carries the registry marker.
+
+    The declaration decides it, with one exception: the control plane
+    (``kirocrew-core``, ``kirocrew-cron``) stays a plain local server when it is
+    known that no admin registry can govern this sign-in. kiro-cli is then not in
+    registry mode and drops every marked entry, so marking the control plane
+    would remove ``spawn_run``, ``cron_add`` and ``learn_add`` from every session
+    while no registry is in force. Any doubt about the sign-in keeps the marker,
+    which is what a governed account needs.
+    """
+    if not registry_mode:
+        return False
+    if name not in CONTROL_PLANE_SERVERS:
+        return True
+    return not kiro_cli.registry_governance_known_unreachable()
+
+
 # Every key a managed MCP server's entry may carry. Derived from kiro-cli's
 # documented local-server schema rather than assembled by hand, so it can be
 # reviewed against an external source instead of against someone's memory:
 # docs/reference/kiro-cli/mcp/configuration.md lists command, args, env,
 # disabled, autoApprove and disabledTools for a local (stdio) server, and
-# url/headers for a REMOTE one. The remote pair is deliberately absent -- these
-# servers are stdio-only, a leftover ``url`` would shadow the command, and older
-# builds left both behind -- so they are dropped by the rule below rather than by
-# name. ``timeout`` is the one addition: not in that table, but emitted by base
-# and one of the customizations this rule preserves, so dropping it would
-# re-introduce the very bug this filter exists to prevent.
+# url/headers for a REMOTE one. The remote pair is deliberately absent: these
+# servers are stdio-only and a leftover ``url`` would shadow the command, so both
+# are dropped by the rule below rather than by name. ``timeout`` is the one
+# addition: not in that table, but emitted by base and one of the user
+# customizations this rule preserves.
 #
 # ``type`` is here, and only the ``registry`` VALUE is ours. A transport hint the
 # user wrote (``"type": "stdio"``) is theirs and kiro-cli tolerates it, which
@@ -78,8 +174,8 @@ _MCP_REGISTRY_TYPE = "registry"
 # below, rather than the whole key being treated as ours.
 #
 # Of the rest, three are OURS and are set on each pass (``command``, ``args``,
-# ``autoApprove``); the other four are the customizations a user may declare and
-# this fix exists to preserve. ``disabledTools`` is a user GUARD, not a
+# ``autoApprove``); the other four are customizations a user may declare, and
+# they are preserved. ``disabledTools`` is a user GUARD, not a
 # preference: dropping it would silently re-expose tools the user turned off,
 # which is why it is carried rather than re-derived (the custom-server PUT
 # endpoint round-trips it for the same reason).
@@ -126,9 +222,9 @@ _MANAGED_MCP_ENTRY_ITEM_TYPES: dict[str, type] = {
 # Delegating rather than restating is the point. This function exists so the
 # ownership rules live in one place: hand-synced copies drift, a local frozenset
 # of reserved NAMES would be a third copy of a rule env.py already owns, and a
-# name list fails open for the next KIROCREW_ variable somebody adds -- one
-# reachable case is KIROCREW_CLI, which mcp_cron._caller_is_cli() reads as
-# "skip per-session ownership entirely".
+# name list fails open for the next KIROCREW_ variable somebody adds -- and
+# that namespace carries caller identity: mcp_core._resolve_session_key_strict()
+# trusts KIROCREW_SESSION_KEY as a source only the gateway writes.
 # env.py states the reviewable property instead: a config cannot author our
 # namespace. KIROCREW_HOME is stripped by that same namespace rule and then
 # re-pinned below to the gateway's actual override, so ours is the only value
@@ -211,7 +307,7 @@ def _mcp_registry_mode() -> bool:
     change exists to prevent.
     """
     try:
-        # Function-local like the model resolver a few frames up: importing the
+        # Function-local like spec_build._background_agent_model's: importing the
         # loader at module scope closes an import cycle through the config plane.
         from kiro_crew.config.loader import KiroCrewConfig
 
@@ -393,17 +489,19 @@ def managed_mcp_spec_entry(name: str, *, include_opt_in: bool = False) -> dict[s
     ``spec_gate`` is closed — the same predicate the two spec writers use, so a
     caller cannot resurrect a server emission withholds.
 
-    ``include_opt_in`` resolves an ``opt_in`` entry's invocation anyway, and exists
-    for the ONE caller that is not asking the emission question:
-    ``mcp_gateway.gatewayd._spawns_own_control_plane``, which compares a spawn's
-    binary and argv against the invocation this name is DEFINED as. A closed
-    ``spec_gate`` still yields ``None`` under the flag; the branch below says why the
-    two disqualifiers part company there. It grants nothing on its own, because
-    neither spec writer passes it: an opt-in entry a writer omits is still omitted.
+    ``include_opt_in`` resolves an ``opt_in`` entry's invocation anyway, for callers
+    that are not asking the emission question: the control-plane check
+    (``mcp_gateway.gatewayd._spawns_own_control_plane``), which compares a spawn's
+    binary and argv against the invocation this name is DEFINED as, and the paths
+    that resolve a server a spec or grant already names (the app-agent copier in
+    ``apps/bridges_agents.py`` among them). A closed ``spec_gate`` still yields
+    ``None`` under the flag; the branch below says why the two disqualifiers part
+    company there. It grants nothing on its own: neither host spec writer passes it,
+    and the app-agent copier passes it only for a server the agent already names.
 
-    ``autoApprove`` is deliberately NOT carried, unlike the emit loop in
-    :func:`build_agent_config`. The flag is kiro-cli's local approval, and the
-    one caller here (the claude MCP translation, :mod:`kiro_crew.acp.session_mcp`)
+    ``autoApprove`` is deliberately NOT carried, unlike :func:`emit_managed_servers`
+    (the emit loop :func:`build_agent_config` runs). The flag is kiro-cli's local
+    approval, and one caller (the claude MCP translation, :mod:`kiro_crew.acp.session_mcp`)
     targets a backend whose nearest equivalent — a ``permissions.allow`` entry —
     means Claude never asks, so the call never reaches Crew's gate. Emitting the
     entry un-approved keeps every call gated.
@@ -445,6 +543,36 @@ def managed_mcp_spec_entry(name: str, *, include_opt_in: bool = False) -> dict[s
     if env:
         entry["env"] = env
     return entry
+
+
+def with_managed_launch(entry: Any, managed: Any) -> Any:
+    """*entry* launching the managed invocation *managed*, every other key its own.
+
+    For a reserved ``kirocrew-*`` declaration a session mounts as written: a KAS
+    agent-block entry that a ``timeout`` keeps out of the session-level array, or
+    an entry of a native skill view. The managed path names the installed version,
+    so a spec copied from ``kirocrew.json`` names a payload that a later upgrade
+    removes, and the server would fail to start. Only ``command`` and ``args`` are
+    replaced: the restrictions (``timeout``, ``disabled``, ``disabledTools``,
+    ``type``) and the ``env`` stay as the caller shaped them.
+
+    *entry* comes back unchanged when it is not an object, declares no ``command``
+    (a remote server), already launches *managed*, or *managed* has no command
+    (not managed, a closed ``spec_gate``, an unresolvable launcher). Pure: the
+    caller resolves *managed* (:func:`managed_mcp_spec_entry`).
+    """
+    if not isinstance(entry, dict) or "command" not in entry:
+        return entry
+    if not isinstance(managed, dict) or not managed.get("command"):
+        return entry
+    raw_args = managed.get("args")
+    launch = {
+        "command": str(managed["command"]),
+        "args": [str(a) for a in raw_args] if isinstance(raw_args, (list, tuple)) else [],
+    }
+    if all(entry.get(key) == value for key, value in launch.items()):
+        return entry
+    return {**entry, **launch}
 
 
 def _enforce_managed_mcp_ownership(
@@ -635,7 +763,9 @@ def managed_member_transport(name: str) -> dict[str, Any] | None:
     entry = managed_mcp_spec_entry(name)
     if entry is None or not isinstance(spec, dict):
         return None
-    _enforce_managed_mcp_ownership(entry, spec, _mcp_registry_mode(), auto_approve="own")
+    _enforce_managed_mcp_ownership(
+        entry, spec, _registry_marker_for(name, _mcp_registry_mode()), auto_approve="own"
+    )
     entry.pop("autoApprove", None)
     return entry
 
@@ -666,17 +796,20 @@ def emit_managed_servers(mcp: dict, *, gated_off: frozenset[str], registry_mode:
         else:
             cmd = spec.get("command") or spec["command_fn"]()
             args = list(spec["args"])
-        # The deep merge above may have supplied user-owned options such as a
-        # timeout or extra environment variables. Keep those on a clean build,
-        # while replacing the invocation and transport fields that define our
-        # trusted managed server. Ownership of every other field is enforced
-        # by the same helper the refresh path uses (_enforce_managed_mcp_ownership),
-        # so the two loops cannot silently diverge on what counts as "ours".
+        # The user override file merged into the base may have supplied user-owned
+        # options such as a timeout or extra environment variables. Keep those on a
+        # clean build, while replacing the invocation and transport fields that
+        # define our trusted managed server. Ownership of every other field is
+        # enforced by the same helper the refresh path uses
+        # (_enforce_managed_mcp_ownership), so the two loops cannot silently diverge
+        # on what counts as "ours".
         existing = mcp.get(name)
         entry = dict(existing) if isinstance(existing, dict) else {}
         entry["command"] = cmd
         entry["args"] = args
-        _enforce_managed_mcp_ownership(entry, spec, registry_mode, auto_approve="own")
+        _enforce_managed_mcp_ownership(
+            entry, spec, _registry_marker_for(name, registry_mode), auto_approve="own"
+        )
         mcp[name] = entry
 
 
@@ -735,26 +868,47 @@ def refresh_managed_servers(mcp: dict, *, gated_off: frozenset[str], registry_mo
         else:
             entry["command"] = spec.get("command") or spec["command_fn"]()
             entry["args"] = list(spec["args"])
+        # An opt-in set mounted from the mount-only record carries that record's
+        # stamp (``template_mcp_additions.MERGED_MARK``). The stamp is the only
+        # thing that lets ``reconcile_default_spec`` take the set away again once
+        # its record is gone, so the key strip below must not eat it. Only on an
+        # opt-in entry, the one kind a record can add; the stamp can only ever
+        # REMOVE the entry it sits on.
+        keep_mark = bool(spec.get("opt_in")) and entry.get(MERGED_MARK) is True
         # Strip any stale remote-transport fields from older builds, re-pin the
         # registry marker and data-home env, and seed autoApprove only for a
         # genuinely new entry — all via the same helper the fresh-build loop
         # uses, so the two ownership rules cannot hand-drift.
         _enforce_managed_mcp_ownership(
-            entry, spec, registry_mode, auto_approve="seed" if is_new else "preserve"
+            entry,
+            spec,
+            _registry_marker_for(name, registry_mode),
+            auto_approve="seed" if is_new else "preserve",
         )
+        if keep_mark:
+            entry[MERGED_MARK] = True
 
 
-def register_managed_refs(config: dict, *, fresh_install: bool, gated_off: frozenset[str]) -> None:
+def register_managed_refs(
+    config: dict,
+    *,
+    fresh_install: bool,
+    gated_off: frozenset[str],
+    mounted_aliases: dict[str, str],
+) -> None:
     """Reference the managed servers in ``tools`` and audit the ones a gate withholds."""
     valid_servers: dict[str, Any] = config["mcpServers"]
     # On fresh installs, ensure managed MCP tools are in tools (but NOT
     # allowedTools — new MCPs may have destructive tools; user opts in).
     # On existing configs, don't touch tools/allowedTools — user controls those.
+    # An edition server first supplied on an existing config gets its ref once
+    # from ``guide_platform.grant_edition_refs_once`` instead.
     if fresh_install:
         added_refs: list[str] = []
         # Managed servers + edition-contributed servers both get their @ref
         # registered so their tools are callable. Edition servers are injected
-        # into config['mcpServers'] via _extra_mcp_servers() above; their @ref
+        # into config['mcpServers'] by build_agent_config's _extra_mcp_servers()
+        # loop, which builds every fresh install's config; their @ref
         # must also be added to config['tools'], otherwise kiro-cli exposes the
         # server but not its tools. The public edition contributes none, so this
         # is a no-op there.
@@ -762,8 +916,9 @@ def register_managed_refs(config: dict, *, fresh_install: bool, gated_off: froze
             n for n in agent_mod._extra_mcp_servers() if n not in agent_mod._MANAGED_MCP_SERVERS
         ]
         for mcp_name in _register_names:
-            ref = f"@{mcp_name}"
-            if mcp_name in valid_servers and ref not in config.get("tools", []):
+            alias = mounted_aliases.get(mcp_name, mcp_name)
+            ref = f"@{alias}"
+            if alias in valid_servers and ref not in config.get("tools", []):
                 config.setdefault("tools", []).append(ref)
                 added_refs.append(ref)
         if added_refs:

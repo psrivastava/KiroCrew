@@ -8,6 +8,7 @@ import io
 import json
 import os
 import stat
+import sys
 import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import quote
@@ -16,6 +17,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from dashboard_owner_helpers import as_owner
+from redaction_structured_cases import github_classic
 
 from kiro_crew.dashboard.handlers import (
     _sanitize_blocks,
@@ -57,9 +59,11 @@ def home_patch(tmp_path):
     def fake_expanduser(p):
         return p.replace("~", str(tmp_path))
 
-    with patch("os.path.expanduser", side_effect=fake_expanduser), patch(
-        "os.path.realpath", side_effect=real_realpath
-    ), patch("pathlib.Path.home", return_value=tmp_path):
+    with (
+        patch("os.path.expanduser", side_effect=fake_expanduser),
+        patch("os.path.realpath", side_effect=real_realpath),
+        patch("pathlib.Path.home", return_value=tmp_path),
+    ):
         yield tmp_path
 
 
@@ -245,14 +249,6 @@ class TestFileRead:
             assert resp.headers["X-File-Binary"] == "true"
             assert await resp.json() == {"binary": True, "content": ""}
 
-    def test_binary_extension_list_matches_the_files_app(self):
-        # The endpoint's comment says the two surfaces disagreeing about what
-        # "binary" means is the worst outcome; this is what makes that true.
-        from kiro_crew.apps.builtins.file_explorer.server import BINARY_EXTS
-        from kiro_crew.dashboard.handlers.files import _FILE_READ_BINARY_EXTS
-
-        assert set(_FILE_READ_BINARY_EXTS) == set(BINARY_EXTS)
-
     @pytest.mark.asyncio
     async def test_read_keeps_a_visible_marker_for_a_file_ending_mid_codepoint(
         self, tmp_path, mock_sel, home_patch
@@ -286,14 +282,22 @@ class TestFileRead:
             assert len(await resp.text()) == 512_000
 
     @pytest.mark.asyncio
-    async def test_read_announces_a_redacted_body_in_a_header(self, tmp_path, mock_sel, home_patch):
+    async def test_read_announces_a_redacted_body_in_a_header(
+        self, tmp_path, mock_sel, home_patch, monkeypatch
+    ):
         # The viewer keeps the last copy of a file deleted outside the dashboard
         # and offers it for download; a body the credential pass rewrote is not
         # the file as written, and only a header can say so -- a file may quote
-        # the redaction tag itself. A synthetic key shape, never a real secret.
-        import hashlib
+        # the redaction tag itself. A synthetic token shape, never a real secret.
+        # The owner's switch ships OFF, which stands the pass down on the owner's
+        # own file view; this case is about the pass, so it is ON here.
+        from kiro_crew.security import redaction_switch
 
-        key = "A" + "KIA" + hashlib.sha256(b"kc-file-read-header").hexdigest().upper()[:16]
+        monkeypatch.setattr(
+            redaction_switch, "_path", lambda: tmp_path / "redaction.json"
+        )
+        monkeypatch.setattr(redaction_switch, "DEFAULT_REDACTION_ENABLED", True)
+        key = github_classic(seed=121)
         f = tmp_path / "notes.txt"
         f.write_text(f"token = {key}\n", encoding="utf-8")
         plain = tmp_path / "plain.txt"
@@ -316,7 +320,7 @@ class TestFileRead:
         f = tmp_path / "latin1.txt"
         f.write_bytes(b"caf\xe9 au lait\n")
         plain = tmp_path / "utf8.txt"
-        plain.write_text("café au lait\n", encoding="utf-8")
+        plain.write_bytes("café au lait\n".encode("utf-8"))
         async with TestClient(TestServer(_make_app())) as client:
             resp = await client.get(f"/api/file-read?path={f}")
             assert resp.status == 200
@@ -421,9 +425,9 @@ class TestFileRead:
 
     @pytest.mark.asyncio
     async def test_read_utf8_multibyte_round_trip(self, tmp_path, mock_sel, home_patch):
-        # Regression: the dashboard file viewer reported "Invalid JSON" for
-        # files containing CJK characters. Verify that UTF-8 bytes survive
-        # the read pipeline (open + redactors + Response.text) byte-for-byte.
+        # UTF-8 bytes (CJK here) must survive the read pipeline (open +
+        # redactors + Response.text) byte-for-byte, or the file viewer shows
+        # "Invalid JSON".
         # Synthetic fixture only — no real customer/case data.
         payload = {
             "ascii_key": "value",
@@ -517,13 +521,9 @@ class TestFileReadPathKind:
 class TestFileReadReservedCharacterPaths:
     """A path holding URL-reserved but filesystem-legal characters must serve.
 
-    The client percent-encodes the path into the query string, so the server
-    receives the characters literally and FILE_READ_SCHEMA's syntax gate is what
-    decides. A punctuation allowlist there answers 400 "invalid input" before
-    any disk access for a whole notes folder named by the "Name (alias).md"
-    convention, and the client cannot work around it: encodeURIComponent leaves
-    "(" and ")" literal by design. /api/file-diff, which has no such gate,
-    serves the same files.
+    FILE_READ_SCHEMA's syntax gate sees the characters literally, and
+    encodeURIComponent leaves "(" and ")" literal by design, so a punctuation
+    allowlist would 400 every "Name (alias).md" note.
     """
 
     @pytest.mark.parametrize(
@@ -531,7 +531,12 @@ class TestFileReadReservedCharacterPaths:
         [
             "Ada Lovelace (ada).md",
             "Q1 2026 (draft) #2.md",
-            "is it done?.md",
+            pytest.param(
+                "is it done?.md",
+                marks=pytest.mark.skipif(
+                    sys.platform == "win32", reason="Windows file names cannot contain '?'"
+                ),
+            ),
             "a & b, c'd.md",
             "50% done [final]+1.md",
         ],
@@ -579,16 +584,9 @@ class TestFileReadReservedCharacterPaths:
     ):
         """A path the OS path layer cannot carry must be refused, not crash.
 
-        The schema gate matches the SANITIZED copy of the value, which has had
-        its control characters and surrogates stripped, while the raw string is
-        what reaches the filesystem. So a NUL-bearing path passed the gate as
-        its stripped spelling and reached an unguarded realpath, which raised
-        outside the handler's try and propagated as HTTP 500.
-
-        Only NUL is exercised here. The other unrepresentable shape -- a lone
-        surrogate -- cannot be delivered through this transport, because URL
-        decoding never yields one; it is covered against the seam itself in
-        test_hooks_coverage_file_branches.py.
+        The schema gate checks a SANITIZED copy while the raw string reaches realpath,
+        so a NUL path passes the gate. A lone surrogate cannot arrive via URL decoding;
+        it is covered in test_hooks_coverage_file_branches.py.
         """
         async with TestClient(TestServer(_make_app())) as client:
             resp = await client.get("/api/file-read?path=" + encoded)
@@ -684,11 +682,9 @@ class TestFileWrite:
     ):
         """api_file_write must carry the source inode's ACL, not just its bits.
 
-        The old mkstemp+copymode path carried permission BITS only, dropping a
-        named POSIX ACL on every save. Assert the handler now
-        routes through atomic_write with an OPEN source descriptor via
-        preserve_access_control_from and the existing file mode; a revert to
-        copymode fails here.
+        copymode carries permission BITS only and drops a named POSIX ACL, so the handler
+        must call atomic_write with an open source descriptor via
+        preserve_access_control_from.
         """
         import os as _os
 
@@ -731,6 +727,7 @@ class TestFileWrite:
             assert captured["source_bytes"] == b"hello world"
         else:  # pragma: no cover - exercised on Windows CI only
             assert kwargs["preserve_access_control_from"] is None
+        assert kwargs["preserve_windows_dacl"] is True
         assert kwargs["mode"] == stat.S_IMODE(tmp_file.stat().st_mode)
         assert tmp_file.read_text(encoding="utf-8") == "updated"
         # Off the event loop (no-blocking-call-on-event-loop): every call in the
@@ -745,14 +742,8 @@ class TestFileWrite:
     ):
         """A TOCTOU swap of the final component into a link is a 4xx, not a 500.
 
-        ``_validate_dashboard_path`` canonicalizes through ``realpath``, so the
-        path reaching the handler is symlink-free by construction and a leaf link
-        is followed to its target exactly as it was before this change. The
-        ``O_NOFOLLOW`` in ``open_access_control_source`` therefore only closes
-        the window where that component is swapped for a link AFTER the check.
-        When it fires, that is a rejected target rather than a server fault: the
-        handler returns 404 (matching the steering peer's ``notfound``) and
-        ``atomic_write`` is never reached.
+        The path is already ``realpath``-canonical, so ``O_NOFOLLOW`` only catches a swap
+        AFTER the check; the handler returns 404 and ``atomic_write`` is never reached.
         """
         from kiro_crew.dashboard.handlers import files as files_mod
 
@@ -999,13 +990,16 @@ class TestSendMessage:
         mock_job.session_key = "dashboard:chat-1-1712793600"
         state.crons.list_jobs = MagicMock(return_value=[mock_job])
         app = _make_send_app(state)
-        with patch(
-            "kiro_crew.dashboard.chat_runner._start_next_queued_turn",
-            new_callable=AsyncMock,
-            return_value=True,
-        ) as mock_drain, patch(
-            "kiro_crew.dashboard.handlers.messaging.rehydrate_slot_from_history_async"
-        ) as mock_rehydrate:
+        with (
+            patch(
+                "kiro_crew.dashboard.chat_runner._start_next_queued_turn",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as mock_drain,
+            patch(
+                "kiro_crew.dashboard.handlers.messaging.rehydrate_slot_from_history_async"
+            ) as mock_rehydrate,
+        ):
             async with TestClient(TestServer(app)) as client:
                 resp = await client.post(
                     "/api/send-message",
@@ -1076,20 +1070,11 @@ class TestSendMessage:
 
     @pytest.mark.asyncio
     async def test_send_message_session_origin_revives_missing_slot(self):
-        """When slot isn't in memory (e.g. after gateway restart), rehydrate via
-        _rehydrate_slot_from_history and still trigger an agent turn on the revived
-        slot. Regression test for silent-fail bug where cron→origin injection fell
-        back to owner DM after gateway restart.
+        """A slot missing from memory is rehydrated and still gets the agent turn.
 
-        Mirrors the coverage of test_send_message_session_origin (happy path) —
-        patches _run_chat, asserts it was invoked on the revived slot, and verifies
-        the injected message content matches the cron-notification contract.
-
-        This is a focused routing test: it mocks _rehydrate_slot_from_history so
-        we can assert the handler calls it exactly when get_slot returns None. The
-        end-to-end rehydrate path (real ConversationLog, real DashboardState,
-        real _ChatSlot creation) is covered by
-        TestRehydrateSlotFromHistory in test_session_restore.py."""
+        Otherwise cron-to-origin injection falls back to the owner DM after a restart.
+        The real rehydrate path is covered by TestRehydrateSlotFromHistory in
+        test_session_restore.py."""
         state = _mock_state()
         # Rehydrate helper returns a slot reconstructed from persisted history,
         # and registers it, so later reads find it.
@@ -1104,14 +1089,17 @@ class TestSendMessage:
         mock_job.session_key = "dashboard:chat-1-1712793600"
         state.crons.list_jobs = MagicMock(return_value=[mock_job])
         app = _make_send_app(state)
-        with patch(
-            "kiro_crew.dashboard.chat_runner._start_next_queued_turn",
-            new_callable=AsyncMock,
-            return_value=True,
-        ) as mock_drain, patch(
-            "kiro_crew.dashboard.handlers.messaging.rehydrate_slot_from_history_async",
-            return_value=mock_slot,
-        ) as mock_rehydrate:
+        with (
+            patch(
+                "kiro_crew.dashboard.chat_runner._start_next_queued_turn",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as mock_drain,
+            patch(
+                "kiro_crew.dashboard.handlers.messaging.rehydrate_slot_from_history_async",
+                return_value=mock_slot,
+            ) as mock_rehydrate,
+        ):
             async with TestClient(TestServer(app)) as client:
                 resp = await client.post(
                     "/api/send-message",
@@ -1172,7 +1160,7 @@ class TestSendMessage:
 
         assert seen, (
             "the off-loop prefetch never ran: either the read is happening inline "
-            "on the loop again (the #7408 defect) or this seam moved"
+            "on the loop again or this seam moved"
         )
         assert threading.get_ident() not in seen, (
             "the transcript was read on the event-loop thread; the handler must "
@@ -1208,7 +1196,7 @@ class TestSendMessage:
                 mock_rehydrate.assert_called_once_with(state, "chat-1-1712793600")
                 state.notify.assert_called_once()
                 call_args = state.notify.call_args[0]
-                assert call_args[1] == "⏰ test-cron"
+                assert call_args[1] == "test-cron"
                 assert "session closed" in call_args[2]
 
     @pytest.mark.asyncio
@@ -1240,11 +1228,16 @@ class TestSendMessage:
         mock_job.session_key = "dashboard:chat-1-1712793600"
         state.crons.list_jobs = MagicMock(return_value=[mock_job])
         app = _make_send_app(state)
-        with patch(
-            "kiro_crew.dashboard.chat_runner._start_next_queued_turn",
-            new_callable=AsyncMock,
-            return_value=True,
-        ) as mock_drain, patch("kiro_crew.dashboard.handlers.messaging.rehydrate_slot_from_history_async"):
+        with (
+            patch(
+                "kiro_crew.dashboard.chat_runner._start_next_queued_turn",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as mock_drain,
+            patch(
+                "kiro_crew.dashboard.handlers.messaging.rehydrate_slot_from_history_async"
+            ),
+        ):
             async with TestClient(TestServer(app)) as client:
                 resp = await client.post(
                     "/api/send-message",

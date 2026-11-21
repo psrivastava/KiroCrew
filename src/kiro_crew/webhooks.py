@@ -48,6 +48,7 @@ from typing import Any, Iterator
 from kiro_crew import platform_compat
 from kiro_crew.atomic_write import atomic_write, read_bytes_with_retry
 from kiro_crew.config.loader import config_dir
+from kiro_crew.user_json import loads_user_json
 from kiro_crew.validation import sanitize_string
 from kiro_crew.webhook_sources import SOURCE_AGENT, source_refusal
 
@@ -151,6 +152,10 @@ VALID_OUTCOMES = frozenset(
     }
 )
 
+#: How an accepted turn ended: what a caller reads back by session key. The
+#: other outcomes answer the request itself, which the caller already got.
+TURN_OUTCOMES = frozenset({OUTCOME_COMPLETED, OUTCOME_DEGRADED, OUTCOME_TIMEOUT, OUTCOME_ERROR})
+
 # ── Request counter outcomes ──
 #
 # ``kirocrew.webhook.requests`` counts every inbound request the endpoint
@@ -201,8 +206,9 @@ METRIC_REFUSAL_OUTCOMES = frozenset(
 METRIC_OUTCOME_OTHER = "other"
 
 #: Every value ``outcome`` can carry on ``kirocrew.webhook.requests``: the
-#: recorded-run outcomes, the refusal outcomes, and the remainder. Pinned by a
-#: test, so widening either half without restating it in the metrics doc fails.
+#: recorded-run outcomes, the refusal outcomes, and the remainder. A test pins the
+#: union and the refusal half; the recorded-run half is ``VALID_OUTCOMES``, and no test
+#: checks it against the metrics doc.
 METRIC_OUTCOMES = frozenset(
     VALID_OUTCOMES | METRIC_REFUSAL_OUTCOMES | {METRIC_OUTCOME_OTHER}
 )
@@ -285,7 +291,7 @@ def registered_context_count(path: Path | None = None) -> tuple[int, bool]:
     """
     target = path if path is not None else context_registrations_path()
     try:
-        raw = json.loads(read_bytes_with_retry(target).decode("utf-8"))
+        raw = loads_user_json(read_bytes_with_retry(target).decode("utf-8"))
     except FileNotFoundError:
         return 0, True
     except (ValueError, OSError):
@@ -383,7 +389,7 @@ def _read_json(path: Path, default: Any) -> Any:
     to inspect or restore, at the cost of erroring the surface until they do.
     """
     try:
-        return json.loads(read_bytes_with_retry(path).decode("utf-8"))
+        return loads_user_json(read_bytes_with_retry(path).decode("utf-8"))
     except FileNotFoundError:
         return default
     except (ValueError, OSError) as exc:
@@ -474,8 +480,8 @@ class WebhookTokenStore:
 
     def is_switch_on(self) -> bool:
         # The ``webhooks`` governance scope outranks the stored switch: a source the
-        # policy refuses reads as off (in an enterprise build, every source until a
-        # policy names it -- RFC enterprise edition, Red "Webhooks by source").
+        # policy refuses reads as off (in an LTS build, every source until a
+        # policy names it -- RFC LTS edition, Red "Webhooks by source").
         if source_refusal(SOURCE_AGENT):
             return False
         raw = _read_json(self.path, {})
@@ -921,6 +927,21 @@ class WebhookRunStore:
         """
         return [r for r in self._load() if r.get("outcome") in VALID_OUTCOMES]
 
+    def latest_turn(self, session_key: str, token_id: str) -> dict[str, Any] | None:
+        """The newest finished turn *token_id* started under *session_key*, or ``None``.
+
+        Another source's run answers ``None`` exactly as an unknown key does, so a
+        token cannot learn whether some other caller used that key.
+        """
+        for run in self.list_runs():
+            if (
+                run.get("outcome") in TURN_OUTCOMES
+                and run.get("session_key") == session_key
+                and run.get("token_id") == token_id
+            ):
+                return run
+        return None
+
     def record(
         self,
         *,
@@ -934,6 +955,7 @@ class WebhookRunStore:
         token_id: str | None = None,
         delivered: bool = False,
         detail: str = "",
+        missing_servers: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         """Append a run record, evicting the oldest beyond :data:`MAX_RUNS`."""
         if outcome not in VALID_OUTCOMES:
@@ -950,6 +972,7 @@ class WebhookRunStore:
             "token_id": token_id,
             "delivered": bool(delivered),
             "detail": detail,
+            "missing_servers": list(missing_servers),
         }
         path = self.path
         try:

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -187,11 +188,9 @@ class TestPermissionProbe:
     async def test_a_successful_probe_is_parsed(self, monkeypatch):
         payload = json.dumps(
             {
-                "permissions": {
-                    "accessibility": "missing",
-                    "screen_recording": PERMISSION_GRANTED,
-                    "responsible_hint": "Grant them to Terminal",
-                }
+                "accessibility": "missing",
+                "screen_recording": PERMISSION_GRANTED,
+                "responsible_hint": "Grant them to Terminal",
             }
         ).encode()
         proc = MagicMock()
@@ -203,9 +202,11 @@ class TestPermissionProbe:
         proc.communicate = _communicate
 
         async def _spawn(*argv, **_kw):
-            # Fixed argv, no shell, nothing request-derived.
-            expected = (cu_api.DOCTOR_SUBCOMMAND, *cu_api.DOCTOR_ARGS)
-            assert argv[-len(expected) :] == expected
+            # Fixed argv, no shell, nothing request-derived: this interpreter running
+            # the probe module, never the ``kirocrew`` CLI, whose start-up alone can
+            # outlast the probe timeout.
+            assert argv[0] == sys.executable
+            assert argv[-2:] == ("-m", cu_api.PERMISSION_PROBE_MODULE)
             return proc
 
         monkeypatch.setattr("asyncio.create_subprocess_exec", _spawn)
@@ -307,6 +308,83 @@ class TestConfigSave:
         assert data["agent"]["model"] == "keep-me"
         assert data["her_section"] == {"x": 1}
         assert data["computer_use"]["text_limit"] == 42
+
+    def test_limits_write_waits_for_a_concurrent_locked_writer(
+        self, config_file: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A limits save takes the ``config.json.lock`` sidecar.
+
+        A second writer holds ``update_config_locked`` after its read. Without the
+        sidecar, ``_write_limits`` lands at once and the holder's rename of its
+        older snapshot then reverts the limit. With it, the limits write waits and
+        both changes survive.
+
+        Ordered by events, not by sleeps: the holder keeps the lock until the
+        limits thread has either asked for the sidecar lock or finished without
+        asking.
+        """
+        import threading
+
+        from kiro_crew import platform_compat
+        from kiro_crew.config.loader import update_config_locked
+
+        config_file.write_text(
+            json.dumps({"unrelated_setting": "keep", "computer_use": {"max_tree_depth": 3}}),
+            encoding="utf-8",
+        )
+        holder_read = threading.Event()
+        # Set when the limits thread either asks for the sidecar lock or finishes.
+        limits_moved = threading.Event()
+        limits_done = threading.Event()
+        limits_done_while_held: list[bool] = []
+        errors: list[BaseException] = []
+        real_file_lock = platform_compat.file_lock
+
+        def _file_lock(*args, **kwargs):
+            if threading.current_thread().name == "limits":
+                limits_moved.set()
+            return real_file_lock(*args, **kwargs)
+
+        monkeypatch.setattr(platform_compat, "file_lock", _file_lock)
+
+        def _hold(data: dict) -> dict:
+            data["probe_holder"] = 1
+            holder_read.set()
+            limits_moved.wait(30)
+            limits_done_while_held.append(limits_done.is_set())
+            return data
+
+        def _run(fn, done: threading.Event | None = None) -> None:
+            try:
+                fn()
+            except BaseException as exc:  # surfaced by the assertion below
+                errors.append(exc)
+            finally:
+                if done is not None:
+                    done.set()
+                    limits_moved.set()
+
+        holder = threading.Thread(
+            target=_run, args=(lambda: update_config_locked(config_file, mutate=_hold),)
+        )
+        holder.start()
+        assert holder_read.wait(30)
+        limits = threading.Thread(
+            target=_run,
+            args=(lambda: cu_api._write_limits({"max_tree_depth": 7}), limits_done),
+            name="limits",
+        )
+        limits.start()
+        holder.join(30)
+        limits.join(30)
+        assert not holder.is_alive() and not limits.is_alive()
+        assert not errors
+        # The limits write must not finish while another writer holds the lock.
+        assert limits_done_while_held == [False]
+        data = json.loads(config_file.read_text(encoding="utf-8"))
+        assert data["probe_holder"] == 1
+        assert data["unrelated_setting"] == "keep"
+        assert data["computer_use"]["max_tree_depth"] == 7
 
     @pytest.mark.asyncio
     async def test_app_lists_are_lowercased_and_deduped(self, state_file: Path):
@@ -796,8 +874,11 @@ class TestErrorCodes:
     def test_the_ratchet_can_actually_fail(self) -> None:
         """Self-check: a scan matching nothing would pass the assertion above vacuously."""
         coded = [f for f in self._findings() if f.bucket == "compliant"]
-        assert len(coded) == 21, f"scanner reached {len(coded)} coded sites, expected 21"
-        assert all(f.code_value for f in coded)
+        assert len(coded) == 20, f"scanner reached {len(coded)} coded sites, expected 20"
+        # The PUT's keystone-field refusal answers with the code ``keystone_patch``
+        # raised (``KeystoneFieldRefused.code``), and its pending-file refusal with
+        # ``PendingEditBlocksSave.code``, so those two sites have no literal.
+        assert sum(1 for f in coded if not f.code_value) == 2
 
     # -- PUT /api/computer-use/config --
 

@@ -1,5 +1,6 @@
 import { useCallback, useMemo, useSyncExternalStore } from 'react'
 import type { Artifact } from '../types'
+import type { PartialCause } from '../utils/fileReadQuery'
 import { i18nT } from '../i18n/t'
 import { safeSetItem } from '../utils/safeStorage'
 import { secureRandomId } from '../utils/secureId'
@@ -134,15 +135,21 @@ export interface PanelTab {
    *  `content` whose absence it explains, and re-established by the same
    *  hydration read that refills the buffer. */
   binary?: boolean
-  /** The read that filled this buffer did not hand over the whole file: the
-   *  gateway cut it at its cap (`X-Truncated`) or rewrote credentials in it
-   *  (`X-Redacted`). Owned HERE, not derived from the body, so it survives a
-   *  panel remount and a file deleted meanwhile is offered for download as
-   *  the partial copy it is, never under the file's own name as if whole.
+  /** Why the read that filled this buffer did not hand over the whole file
+   *  (`partialReadCause`), `false` or absent when it did. Owned HERE, not
+   *  derived from the body, so it survives a panel remount and a file deleted
+   *  meanwhile is offered for download as the partial copy it is, never under
+   *  the file's own name as if whole.
    *  TRANSIENT like `binary`: stripped in `serializeBucket`, re-established by
    *  the hydration read that refills the buffer, and moved by every
    *  disk-originated refresh alongside `content`. */
-  partial?: boolean
+  partial?: PartialCause | false
+  /** The buffer is the host's "file not found" sentence, seeded because the
+   *  read answered 404, not a copy of the file. Carried as a flag because the
+   *  sentence is localized: a language switch repaints the tab without
+   *  re-seeding it. TRANSIENT like `binary`; set by the read that seeds the
+   *  sentence, cleared by an edit and by any read that lands a body. */
+  placeholder?: boolean
   original?: string
   modified?: string
   /** Last selected working-tree diff view for file tabs. Persisted with the
@@ -484,6 +491,7 @@ function mutateSlot(key: string, fn: (b: Bucket) => Bucket, unfocusedShows: stri
   if (opts?.choice) {
     tabChoices.set(key, (tabChoices.get(key) ?? 0) + 1)
     stoppedAt.set(key, null)
+    heldViews.delete(key)
   }
   const prev = store[key] ?? { tabs: [], activeId: null }
   const changed = fn(prev)
@@ -517,11 +525,15 @@ const tabChoices = new Map<string, number>()
  *  checked but did not land. No entry means the strip has not been shown in
  *  this page session, which is a plain open. */
 const stoppedAt = new Map<string, number | 'landed' | null>()
+/** Per strip, a tab opened with `hold: true` (`openPanelView`, or a folder via
+ *  `openFolder`) that a discovery open may not take the focus from (see there). */
+const heldViews = new Map<string, string>()
 /** Ends the show of `slot`'s strip: the panel closed, or it shows another chat
  *  (see `notePanelShown`). */
 export function notePanelStoppedShowing(slot: string | null): void {
   const key = bucketKey(slot)
   stoppedAt.set(key, tabChoices.get(key) ?? 0)
+  heldViews.delete(key)
 }
 /** Take this show's landing: true once per show, when nothing has asked for a
  *  tab in `slot`'s strip since the panel last stopped showing it. A successful
@@ -634,8 +646,37 @@ export function offerPanelView(slotKey: string | null, kind: ViewKind): void {
   })
 }
 
-export function openPanelView(slotKey: string | null, kind: ViewKind): void {
-  mutateSlot(bucketKey(slotKey), b => upsertInBucket(b, { id: kind, kind, title: viewTitle(kind) }), null, { choice: true })
+/** What *slotKey*'s strip holds now: its tab ids and the tab in front. Read
+ *  before a change that may have to be undone (a failed conductor mode turn-on). */
+export function panelStripOf(slotKey: string | null): { ids: readonly string[], activeId: string | null } {
+  const b = store[bucketKey(slotKey)] ?? EMPTY_BUCKET
+  return { ids: b.tabs.map(t => t.id), activeId: b.activeId }
+}
+
+/** remove views a turned-off (or failed) conductor mode put on a strip. When the tab
+ *  in front goes, or is one of `restore.over` (a tab the caller itself put in
+ *  front), `restore.focus` comes back to the front if it is still there; a tab
+ *  in front that went falls back to the first tab. */
+export function dropPanelViews(slotKey: string | null, kinds: readonly ViewKind[], restore?: { focus: string | null, over: readonly ViewKind[] }): void {
+  mutateSlot(bucketKey(slotKey), b => {
+    const tabs = b.tabs.filter(t => !(kinds as readonly string[]).includes(t.id))
+    const keep = (id: string | null) => !!id && tabs.some(t => t.id === id)
+    const refocus = !!restore && keep(restore.focus) && (!keep(b.activeId) || (restore.over as readonly (string | null)[]).includes(b.activeId))
+    const activeId = refocus ? restore!.focus : keep(b.activeId) ? b.activeId : (tabs[0]?.id ?? null)
+    if (tabs.length === b.tabs.length && activeId === b.activeId) return b
+    return { tabs, activeId }
+  })
+}
+
+export function openPanelView(slotKey: string | null, kind: ViewKind, opts?: { hold?: boolean }): void {
+  const key = bucketKey(slotKey)
+  mutateSlot(key, b => upsertInBucket(b, { id: kind, kind, title: viewTitle(kind) }), null, { choice: true })
+  // `hold`: a discovery open (Changes for a link the chat's history turns out
+  // to hold) keeps this view in front until the next tab choice or the end of
+  // this show. The conductor mode board opens a worker with Workers in front, and
+  // the worker's history loads after it: without the hold, its PR link took
+  // the focus and hid the panel's way back to the root.
+  if (opts?.hold) heldViews.set(key, kind)
 }
 
 /** Drop every document body the panel holds in memory, in EVERY slot, so the
@@ -665,8 +706,17 @@ export function openPanelView(slotKey: string | null, kind: ViewKind): void {
 let documentBodyEpoch = 0
 export function documentBodyEpochNow(): number { return documentBodyEpoch }
 
+/** Bodies held outside the tab store (the file pop-out window's own copy) drop a
+ *  clean copy on every `evictDocumentBodies`, by the same rule as a file tab. */
+const evictionListeners = new Set<() => void>()
+export function onDocumentBodiesEvicted(listener: () => void): () => void {
+  evictionListeners.add(listener)
+  return () => { evictionListeners.delete(listener) }
+}
+
 export function evictDocumentBodies(): number {
   documentBodyEpoch++
+  for (const listener of evictionListeners) listener()
   let touched = 0
   for (const key of Object.keys(store)) {
     mutateSlot(key, b => {
@@ -783,7 +833,7 @@ export function closePanelTerminalTabs(sessionId: string): void {
 function serializeBucket(b: Bucket): string {
   const tabs = b.tabs
     .filter(t => t.kind !== 'diff' && t.kind !== 'app')
-    .map(t => { const copy = { ...t }; delete copy.content; delete copy.savedContent; delete copy.binary; delete copy.partial; delete copy.revealLine; return copy })
+    .map(t => { const copy = { ...t }; delete copy.content; delete copy.savedContent; delete copy.binary; delete copy.partial; delete copy.placeholder; delete copy.revealLine; return copy })
   // If the focused tab was a DROPPED diff/app tab, refocus a surviving tab.
   // Only then: a focus that names no stored tab at all is one of the host's
   // leading tabs (`usePanelTabs(…, { leadingIds })` — the Crewmates page's Notes /
@@ -869,6 +919,7 @@ export function __resetPanelTabs(): void {
   autoOpenedApps.clear()
   tabChoices.clear()
   stoppedAt.clear()
+  heldViews.clear()
   shownPanelSlot = null
   clearTimeout(persistTimer)
   dirtySlots.clear()
@@ -925,10 +976,17 @@ export function usePanelTabs(
      *  for not being a stored tab. Pass a module constant: the array is a
      *  dependency of the strip callbacks. */
     leadingIds?: readonly string[]
+    /** A conductor mode chat (a crew root or one of its workers): the Board leads
+     *  the strip and only a person moves the focus. An `automatic` open (a PR
+     *  or issue link found, Pin Summary's landing, an app render opening on its
+     *  own, the Git tab) adds or updates its tab and leaves the focus where it
+     *  is: on the Board, or on the tab the person last clicked. */
+    boardFirst?: boolean
   },
 ) {
   const key = bucketKey(slotKey)
   const leadingIds = opts?.leadingIds
+  const boardFirst = !!opts?.boardFirst
   const defaultLeadingId = leadingIds?.[0] ?? null
   const bySlot = useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
   const { tabs: storedTabs, activeId } = bySlot[key] ?? EMPTY_BUCKET
@@ -1002,9 +1060,10 @@ export function usePanelTabs(
       const next = upsertInBucket(b, { id: kind, kind, title: viewTitle(kind) })
       const keepSummary = automatic && stoppedAt.get(key) === 'landed'
         && b.activeId === 'summary' && b.tabs[0]?.id === 'summary'
-      return keepSummary ? { ...next, activeId: b.activeId } : next
+      const keepHeld = automatic && b.activeId !== null && heldViews.get(key) === b.activeId
+      return keepSummary || keepHeld || (automatic && boardFirst) ? { ...next, activeId: b.activeId } : next
     }, { choice: !automatic })
-  }, [key, update])
+  }, [key, update, boardFirst])
 
   /** Open an app-contributed body-owning tab (one instance per kind, like a
    *  view). Persists the metadata (`appName`/`appTabId`) needed to re-mount the
@@ -1070,7 +1129,7 @@ export function usePanelTabs(
     })
   }, [update, leadingIds])
 
-  const openFile = useCallback((path: string, content: string, slot: string | null = null, opts?: { replaceId?: string; line?: number; endLine?: number; diffMode?: boolean; binary?: boolean; partial?: boolean }) => {
+  const openFile = useCallback((path: string, content: string, slot: string | null = null, opts?: { replaceId?: string; line?: number; endLine?: number; diffMode?: boolean; binary?: boolean; partial?: PartialCause | false; placeholder?: boolean; hold?: boolean }) => {
     // `revealLine` is always present in the object, `undefined` when absent:
     // `upsert` merges onto an existing tab with a spread, which only overwrites
     // keys the incoming object HAS. Omitting it would leave a previous chip's
@@ -1117,10 +1176,14 @@ export function usePanelTabs(
         // a tab whose file has since been replaced by a text one.
         binary: opts?.binary,
         partial: opts?.partial,
+        placeholder: opts?.placeholder,
         revealLine: reveal,
         ...(opts?.diffMode != null ? { diffMode: opts.diffMode } : {}),
       }, opts?.replaceId)
     }, target === key ? defaultLeadingId : null, { choice: true })
+    // `hold`: as in `openFolder` — a split pane opens this in its own chat's
+    // strip while the panel switches to that chat, whose history loads after.
+    if (opts?.hold) heldViews.set(target, `file:${path}`)
   }, [key, defaultLeadingId])
 
   /** Open (and focus) a file's WORKING-TREE DIFF as its own tab, keyed
@@ -1136,7 +1199,7 @@ export function usePanelTabs(
    *  no in-tab flip to an editable view), so it is never dirty. The `file:` tab
    *  is the one editable buffer per path. A re-open FOCUSES the existing tab and
    *  refreshes its disk content, since there are no unsaved edits to preserve. */
-  const openWorkingTreeDiff = useCallback((path: string, content: string, slot: string | null = null, opts?: { binary?: boolean; partial?: boolean }) => {
+  const openWorkingTreeDiff = useCallback((path: string, content: string, slot: string | null = null, opts?: { binary?: boolean; partial?: PartialCause | false; placeholder?: boolean }) => {
     // Same slot/bucket routing as openFile (see its note): the stamp and the
     // bucket must name the same slot, and a `null` slot keeps the bound key.
     const target = slot !== null ? bucketKey(slot) : key
@@ -1156,6 +1219,7 @@ export function usePanelTabs(
       savedContent: content,
       binary: opts?.binary,
       partial: opts?.partial,
+      placeholder: opts?.placeholder,
       diffMode: true,
     }), target === key ? defaultLeadingId : null, { choice: true })
   }, [key, defaultLeadingId])
@@ -1167,9 +1231,17 @@ export function usePanelTabs(
   /** Open a directory listing as its own tab. Keyed `folder:${path}` so a
    *  directory and a same-named file never collide on id, and so re-opening the
    *  same directory focuses the existing tab instead of stacking duplicates. */
-  const openFolder = useCallback((path: string, slot: string | null = null) => {
-    upsert({ id: `folder:${path}`, kind: 'folder', title: basename(path), path, slot })
-  }, [upsert])
+  const openFolder = useCallback((path: string, slot: string | null = null, opts?: { hold?: boolean }) => {
+    // Same slot/bucket routing as openFile (see its note).
+    const target = slot !== null ? bucketKey(slot) : key
+    const id = `folder:${path}`
+    mutateSlot(target, b => upsertInBucket(b, {
+      id, kind: 'folder', title: basename(path), path, slot,
+    }), target === key ? defaultLeadingId : null, { choice: true })
+    // `hold`: as in `openPanelView` — a split pane opens this in its own chat's
+    // strip just before switching to it, and that chat's history loads after.
+    if (opts?.hold) heldViews.set(target, id)
+  }, [key, defaultLeadingId])
 
   /** Open (or refocus) the app tab hosting one MCP App render. Keyed by
    *  tool-call id, so a re-render of the same app reuses its tab instead of
@@ -1181,15 +1253,17 @@ export function usePanelTabs(
    *  render, so two same-tick opens would both read a stale pre-insert `tabs` and
    *  each conclude there was room. The currently-focused tab is never a candidate
    *  (belt-and-braces: focus stamping already sorts it last). */
-  const openApp = useCallback((toolCallId: string, title: string, slot: string | null = null) => {
+  const openApp = useCallback((toolCallId: string, title: string, slot: string | null = null, opts?: { automatic?: boolean }) => {
     const id = `app:${toolCallId}`
+    // A conductor mode chat keeps its focus when a render opens on its own (see `boardFirst`).
+    const keepFocus = !!opts?.automatic && boardFirst
     update(b => {
       const now = Date.now()
       const i = b.tabs.findIndex(t => t.id === id)
       if (i !== -1) {
         const next = b.tabs.slice()
         next[i] = { ...next[i], title, appToolCallId: toolCallId, slot, appActiveAt: now }
-        return { tabs: next, activeId: id }
+        return { tabs: next, activeId: keepFocus ? b.activeId : id }
       }
       let kept = b.tabs
       // Count EVERY app tab toward the budget (including the focused one), but
@@ -1221,9 +1295,9 @@ export function usePanelTabs(
         kept = kept.filter(t => !doomed.has(t.id))
       }
       const tab: PanelTab = { id, kind: 'app', title, appToolCallId: toolCallId, slot, appActiveAt: now }
-      return { tabs: [...kept, tab], activeId: id }
-    }, { choice: true })
-  }, [update])
+      return { tabs: [...kept, tab], activeId: keepFocus ? b.activeId : id }
+    }, { choice: !keepFocus })
+  }, [update, boardFirst])
 
   const openArtifact = useCallback((art: { slug: string; kind: Artifact['kind']; title?: string }, content: string, slot: string | null = null) => {
     upsert({ id: `artifact:${art.slug}`, kind: 'artifact', title: art.title ?? art.slug, artifactSlug: art.slug, artifactKind: art.kind, content, slot })
@@ -1340,5 +1414,6 @@ export function usePanelTabs(
     openView, openPanelTab, openTerminal, openFile, openWorkingTreeDiff, openDiff, openArtifact, openFolder, openApp,
     patchTab, closeTab, closeAll, setActive, setOrder, syncPinned,
     hasTabs: tabs.length > 0,
-  }), [tabs, effectiveActiveId, activeTab, openView, openPanelTab, openTerminal, openFile, openWorkingTreeDiff, openDiff, openArtifact, openFolder, openApp, patchTab, closeTab, closeAll, setActive, setOrder, syncPinned])
+    boardFirst,
+  }), [boardFirst, tabs, effectiveActiveId, activeTab, openView, openPanelTab, openTerminal, openFile, openWorkingTreeDiff, openDiff, openArtifact, openFolder, openApp, patchTab, closeTab, closeAll, setActive, setOrder, syncPinned])
 }

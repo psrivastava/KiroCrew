@@ -1,32 +1,16 @@
 """Tests for Issue Radar's Tagging dashboard backend: the tagging queue.
 
-Four deterministic, subprocess-free surfaces:
-
-  * **store tagging cache** — merge semantics (a batch wins for the issues it
-    covers, everything else survives), prune-on-apply, schema guard, and the
-    tolerant normalizer.
-  * **queue selection** (``routes._untagged``) — the strict "zero labels"
-    definition and newest-first order.
-  * **model-output validation** (``routes._compute_tagging_suggestions``) — the
-    security-relevant half: a label the repo doesn't define, or an issue number
-    that wasn't in the batch, must never survive, because the issue text fed to
-    the model is attacker-controlled.
-  * **bulk apply route** — the unknown-label pre-check fires before ANY write,
-    partial failure is reported rather than swallowed, and only the issues that
-    actually got labelled leave the queue.
-
-Beside them sit the label-recommendation helpers: the short rationale, and a prompt
-that presets no label naming convention. Then the first correctness controls, on the
-queue's own paths: the tagging cache lock, ``GET /tagging``, ``POST /tagging`` and the
-prune a single apply makes. The remaining controls are in ``test_issue_radar_tagging.py``.
+Covers the tagging cache, queue selection (``routes._untagged``), model-output validation
+(``routes._compute_tagging_suggestions``) and bulk apply. The issue text fed to the model
+is attacker-controlled, so an unknown label or an issue outside the batch never survives,
+and the unknown-label check runs before ANY write. Also the recommendation helpers and
+the queue's own controls; the rest are in ``test_issue_radar_tagging.py``.
 """
 
 import contextlib
 import json
-import shutil
-import tempfile
+import time
 import unittest
-from pathlib import Path
 from unittest import mock
 from unittest.mock import AsyncMock, MagicMock
 
@@ -36,28 +20,31 @@ from dashboard_owner_helpers import NoConfiguredOwner
 
 from kiro_crew.apps.builtins.issue_radar.backend import github_client as gh
 from kiro_crew.apps.builtins.issue_radar.backend import routes, store
+from kiro_crew.testing.wait import default_timeout
 
 
 def _merge(*args, ui_language: str = "", **kwargs):
     """``store.merge_tagging_suggestions`` with an AGREEING in-lock verifier.
 
-    The verifier is required in production -- there is one caller and it always has
-    a language to check against, so an optional one would only offer a way to write
-    without the guard that makes writing safe. Most tests here are not about the
-    language, so they pass a verifier that agrees: the guard is exercised on its
-    pass path rather than bypassed. The tests that ARE about it pass their own,
-    which `setdefault` leaves alone.
+    The verifier is required in production, so tests not about language pass one that
+    agrees (the guard runs on its pass path); language tests pass their own.
     """
     kwargs.setdefault("verify_language", lambda: ui_language)
     return store.merge_tagging_suggestions(*args, ui_language=ui_language, **kwargs)
 
 
 class TestTaggingCache(unittest.TestCase):
-    def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+    @pytest.fixture(autouse=True)
+    def _per_test_dirs(self, tmp_path):
+        """Hand ``setUp`` pytest's per-test directory for the radar store root.
 
-    def tearDown(self):
-        shutil.rmtree(self.tmp, ignore_errors=True)
+        The store ``mkdir``s its root on read, so a late reader can re-create a
+        self-removed directory after cleanup; pytest owns ``tmp_path``.
+        """
+        self._tmp_path = tmp_path
+
+    def setUp(self):
+        self.tmp = self._tmp_path
 
     def test_absent_returns_none(self):
         self.assertIsNone(store.read_tagging_cache("o", "r", self.tmp))
@@ -348,9 +335,7 @@ class TestRecoPromptIsStyleNeutral(unittest.TestCase):
     Real repos are split across mutually incompatible styles — flat (`bug`),
     slash namespaces (`kind/bug`), colon+space (`Type: Bug`), hyphen prefixes
     (`type-bug`), single-letter codes (`A-diagnostics`) — so any house style
-    baked into the prompt is wrong for most repos. The earlier version told the
-    model to "use conventional names (`priority: high`, `area: <x>`, …)", which
-    made it propose prefixed names for repos whose whole label set is flat.
+    baked into the prompt is wrong for most repos.
     """
 
     FLAT_REPO_LABELS = [
@@ -588,17 +573,23 @@ class TestTaggingCacheLockSerializesWriters(unittest.TestCase):
     issue whose labels were just applied. This drives real thread contention
     rather than asserting the lock exists, so deleting the lock fails it."""
 
+    @pytest.fixture(autouse=True)
+    def _per_test_dirs(self, tmp_path):
+        """Hand ``setUp`` pytest's per-test directory for the radar store root.
+
+        The store ``mkdir``s its root on read, so a late reader can re-create a
+        self-removed directory after cleanup; pytest owns ``tmp_path``.
+        """
+        self._tmp_path = tmp_path
+
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = self._tmp_path
         _merge(
             "o",
             "r",
             {str(n): [{"name": "bug", "reason": ""}] for n in range(1, 21)},
             root=self.tmp,
         )
-
-    def tearDown(self):
-        shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_concurrent_merge_and_prune_both_survive(self):
         import threading
@@ -608,8 +599,9 @@ class TestTaggingCacheLockSerializesWriters(unittest.TestCase):
 
         def merge():
             try:
-                # flake-ok: pre-existing 5 s barrier bound; an expiry raises into errors, which the test asserts empty, moved verbatim; tracked for a de-flake pass
-                start.wait(timeout=5)
+                # The suite's shared lost-run ceiling: both workers reach the barrier
+                # long before it, and an expiry raises into errors.
+                start.wait(timeout=default_timeout())
                 for n in range(100, 120):
                     _merge("o", "r", {str(n): [{"name": "docs", "reason": ""}]}, root=self.tmp)
             except BaseException as exc:  # pragma: no cover - surfaced below
@@ -617,8 +609,9 @@ class TestTaggingCacheLockSerializesWriters(unittest.TestCase):
 
         def prune():
             try:
-                # flake-ok: pre-existing 5 s barrier bound; an expiry raises into errors, which the test asserts empty, moved verbatim; tracked for a de-flake pass
-                start.wait(timeout=5)
+                # The suite's shared lost-run ceiling: both workers reach the barrier
+                # long before it, and an expiry raises into errors.
+                start.wait(timeout=default_timeout())
                 for n in range(1, 21):
                     store.drop_tagging_suggestions("o", "r", [n], root=self.tmp)
             except BaseException as exc:  # pragma: no cover - surfaced below
@@ -627,9 +620,13 @@ class TestTaggingCacheLockSerializesWriters(unittest.TestCase):
         threads = [threading.Thread(target=merge), threading.Thread(target=prune)]
         for t in threads:
             t.start()
+        # One deadline for both joins: if both workers hang, the waits must not add up past
+        # the runner's timeout, or it kills the test before the assertion names them.
+        deadline = time.monotonic() + default_timeout()
         for t in threads:
-            # flake-ok: pre-existing 30 s join bound whose expiry is silent before the errors check, moved verbatim; tracked for a de-flake pass
-            t.join(timeout=30)
+            t.join(timeout=max(0.0, deadline - time.monotonic()))
+        hung = [t.name for t in threads if t.is_alive()]
+        assert not hung, f"worker thread(s) still running past the lost-run ceiling: {hung}"
         self.assertEqual(errors, [])
 
         final = store.read_tagging_cache("o", "r", self.tmp)
@@ -661,6 +658,15 @@ class TestUntaggedQueueRoute(unittest.IsolatedAsyncioTestCase):
             "author": "bob",
         },
     ]
+
+    @pytest.fixture(autouse=True)
+    def _per_test_dirs(self, tmp_path):
+        """Hand the tests pytest's per-test directory for a radar store root.
+
+        The store ``mkdir``s its root on read, so a late reader can re-create a
+        self-removed directory after cleanup; pytest owns ``tmp_path``.
+        """
+        self._tmp_path = tmp_path
 
     def _req(self, query: str = "owner=o&repo=r"):
         return make_mocked_request("GET", f"/api/apps/issue-radar/tagging?{query}")
@@ -780,28 +786,23 @@ class TestUntaggedQueueRoute(unittest.IsolatedAsyncioTestCase):
         # Locking only the write loses data rather than ordering it: a patch that
         # lands between the fetch and the write is overwritten by the pre-write
         # snapshot, so a just-applied label vanishes from the dashboard.
-        tmp = Path(tempfile.mkdtemp())
-        try:
-            held: list[bool] = []
+        tmp = self._tmp_path
+        held: list[bool] = []
 
-            def fetch() -> list[dict]:
-                # Inside `refresh_issues_cache`, so the lock must already be ours.
-                # A second acquisition from this thread would deadlock, so assert
-                # on the lock FILE existing instead.
-                held.append(
-                    store.issues_cache_path("o", "r", tmp, "open")
-                    .with_suffix(".json.lock")
-                    .is_file()
-                )
-                return [{"number": 1, "labels": []}]
-
-            store.refresh_issues_cache("o", "r", fetch, root=tmp, state="open")
-            self.assertEqual(held, [True])
-            self.assertEqual(
-                store.read_issues_cache("o", "r", tmp, state="open"), [{"number": 1, "labels": []}]
+        def fetch() -> list[dict]:
+            # Inside `refresh_issues_cache`, so the lock must already be ours.
+            # A second acquisition from this thread would deadlock, so assert
+            # on the lock FILE existing instead.
+            held.append(
+                store.issues_cache_path("o", "r", tmp, "open").with_suffix(".json.lock").is_file()
             )
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
+            return [{"number": 1, "labels": []}]
+
+        store.refresh_issues_cache("o", "r", fetch, root=tmp, state="open")
+        self.assertEqual(held, [True])
+        self.assertEqual(
+            store.read_issues_cache("o", "r", tmp, state="open"), [{"number": 1, "labels": []}]
+        )
 
     async def test_serves_label_counts_and_titles_over_the_open_set(self):
         # Counts and titles come over the open set, not the frontend's shared

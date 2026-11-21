@@ -19,14 +19,14 @@
  * cannot act on is just a picture of an app, and the collection card exists to
  * be acted on.
  */
-import { useState } from 'react'
+import { useId, useState } from 'react'
 import { BadgeCheck, Check, ChevronRight, Download, Monitor, Package, Power } from 'lucide-react'
 import { Btn } from '../ui'
 import { Dialog, DialogBody, DialogContent, DialogTitle } from '../ui/dialog'
 import Clickable from '../Clickable'
 import AppIcon from '../AppIcon'
 import { gradientFor } from './gradient'
-import { categoryFor } from './categories'
+import { categoryFor, categoryLabel } from './categories'
 import { useHeroArt, type InstalledArtSource } from './useHeroArt'
 import { useEditorialArt, type EditorialArtwork } from './useEditorialArt'
 import { isVerified, type RegistryApp } from './types'
@@ -35,6 +35,7 @@ import { appDisplayName, appDescription } from './appManifest'
 import { needsDesktopApp } from '../../lib/electron'
 
 import { i18nT } from '../../i18n/t'
+import { offlineProps } from '../../utils/offline'
 
 /**
  * One app inside a featured card: icon, name, a secondary line, and the control
@@ -57,6 +58,7 @@ function FeaturedAppRow({
   sources,
   secondary,
   busy,
+  connected,
   onOpen,
   onGet,
   onEnable,
@@ -66,6 +68,8 @@ function FeaturedAppRow({
   /** The line under the name. The app's description, or its provenance meta. */
   secondary: string
   busy?: boolean
+  /** The gateway connection flag: offline, Enable is refused. */
+  connected: boolean
   /** Omit when an ancestor already opens this app, so the row stays inert. */
   onOpen?: (e?: React.MouseEvent | React.KeyboardEvent) => void
   onGet: () => void
@@ -74,6 +78,7 @@ function FeaturedAppRow({
   // A built-in that is installed but disabled needs enabling, not installing:
   // the bytes are already present, so offering "Get" would be a no-op.
   const hiddenBuiltin = app.origin === 'builtin' && app.installed && !app.enabled
+  const desktopHintId = useId()
 
   const identity = (
     <>
@@ -129,25 +134,26 @@ function FeaturedAppRow({
           /* A desktop-only builtin is still ENABLE-able from a browser (the
              state change is server-side; only its UI needs the desktop shell).
              Same contract as AppListRow: the Monitor badge's hint lives in a
-             hover title, so the button's accessible name carries the same hint
-             for keyboard / screen-reader users. Stacked vertically like
-             AppListRow's action column -- side by side, the pair overflows a
-             narrow card in locales with long translations. */
+             hover title, so the button's accessible description carries the
+             same hint for keyboard / screen-reader users, and its name stays the
+             visible label. Stacked vertically like AppListRow's action column --
+             side by side, the pair overflows a narrow card in locales with long
+             translations. */
           <span className="flex flex-col items-end gap-1">
             <Btn
               primary
               className="rounded-full px-3.5 py-1 font-semibold"
-              disabled={busy}
+              disabled={busy || !connected}
               onClick={onEnable}
-              aria-label={needsDesktopApp(app)
-                ? `${i18nT('components.appstore.featuredSpotlight.enable')}. ${i18nT('components.appstore.featuredSpotlight.desktop_app_hint')}`
-                : undefined}
+              aria-describedby={needsDesktopApp(app) ? desktopHintId : undefined}
+              {...offlineProps(connected, i18nT('utils.offline.manage_apps'), i18nT('components.appstore.featuredSpotlight.enable'))}
             >
               <Power size={13} /> {i18nT('components.appstore.featuredSpotlight.enable')}
             </Btn>
             {needsDesktopApp(app) && (
               <span className="inline-flex items-center gap-1 text-[12px] text-muted" title={i18nT('components.appstore.featuredSpotlight.desktop_app_hint')}>
                 <Monitor size={12} /> {i18nT('components.appstore.featuredSpotlight.desktop_app')}
+                <span id={desktopHintId} className="sr-only">{i18nT('components.appstore.featuredSpotlight.desktop_app_hint')}</span>
               </span>
             )}
           </span>
@@ -178,6 +184,7 @@ export default function FeaturedSpotlight({
   onGet,
   onEnable,
   busyName,
+  connected,
 }: {
   /** Which shape this is. `app` carries one entry in `apps`; `collection` two or more. */
   type: 'app' | 'collection'
@@ -242,6 +249,8 @@ export default function FeaturedSpotlight({
   onEnable: (name: string) => void
   /** Name of the app with an action in flight, so only its own control disables. */
   busyName?: string | null
+  /** The gateway connection flag: offline, each row's Enable is refused. */
+  connected: boolean
 }) {
   // The lead app anchors the fallback art and the single-app heading. For a
   // collection it is only the art fallback: the heading is the curator's theme,
@@ -429,9 +438,10 @@ export default function FeaturedSpotlight({
             secondary={
               isCollection
                 ? appDescription(a)
-                : `${a.author} · ${categoryFor(a.tags)} · ${i18nT('components.appstore.featuredSpotlight.v')}${a.installedVersion || a.version}`
+                : `${a.author} · ${categoryLabel(categoryFor(a.tags))} · ${i18nT('components.appstore.featuredSpotlight.v')}${a.installedVersion || a.version}`
             }
             busy={busyName === a.name}
+            connected={connected}
             /* Only a collection's rows are interactive; on a single-app card the
                card itself is the target, so passing a handler here would open
                the app twice. */
@@ -558,6 +568,7 @@ export default function FeaturedSpotlight({
                     sources={sources}
                     secondary={appDescription(a)}
                     busy={busyName === a.name}
+                    connected={connected}
                     onOpen={e => onOpenApp(a.name, e)}
                     onGet={() => onGet(a.name)}
                     onEnable={() => onEnable(a.name)}

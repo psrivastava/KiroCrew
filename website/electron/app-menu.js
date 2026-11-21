@@ -14,6 +14,8 @@
 // and the click wiring are unit-testable without a display server.
 // Menu.buildFromTemplate stays in main.js.
 
+const { applyWindowControl } = require("./linux-frame");
+
 function buildMenuTemplate(deps) {
   const {
     isMac,
@@ -48,14 +50,23 @@ function buildMenuTemplate(deps) {
   // sees it and a CJK user cannot type a comma at all. `isMac` is the single
   // "this platform can hold Ctrl+," predicate shared by both surfaces; the
   // caption is what tells a user reaching for Ctrl+, where the chord now lives.
+  // Ids are load-bearing for the LOCAL_ONLY_ITEM_IDS fence in
+  // windows-menu-model.js: both items' click handlers use
+  // `focusedDashboardWindow()` and mutate its OS state (restore/show/focus),
+  // then navigate its SPA — so a remote sender must never reach them.
   const settingsItem = {
     label: "Settings…",
+    id: "settings",
     ...(isMac
       ? { accelerator: "CmdOrCtrl+," }
       : { accelerator: "Alt+,", registerAccelerator: false }),
     click: openSettings,
   };
-  const aboutItem = { label: `About ${appName}`, click: openAbout };
+  const aboutItem = {
+    label: `About ${appName}`,
+    id: "about",
+    click: openAbout,
+  };
 
   return [
     ...(isMac
@@ -93,13 +104,22 @@ function buildMenuTemplate(deps) {
       label: "View",
       submenu: [
         // Explicit handlers, not { role: ... }: the roles target the focused
-        // window's own webContents, which BaseWindow doesn't have.
-        { label: "Reload", accelerator: "CmdOrCtrl+R", click: reload },
-        { label: "Force Reload", accelerator: "CmdOrCtrl+Shift+R", click: forceReload },
+        // window's own webContents, which BaseWindow doesn't have. Ids are
+        // load-bearing for LOCAL_ONLY_ITEM_IDS in windows-menu-model.js —
+        // their custom-click handlers resolve to `focusedDashboardWebContents()`
+        // which returns the LOCAL user's focused dashboard regardless of who
+        // fired the IPC, so a remote sender in an unfocused connection window
+        // could otherwise reach the LOCAL dashboard through them. Fenced at
+        // the IPC boundary; the physical accelerator (Ctrl+R, Ctrl+=, etc.)
+        // still fires through Electron's own native dispatch. The drift-pin
+        // test walks this template and asserts every reachable leaf is
+        // classified in exactly one direction.
+        { label: "Reload", id: "reload", accelerator: "CmdOrCtrl+R", click: reload },
+        { label: "Force Reload", id: "force-reload", accelerator: "CmdOrCtrl+Shift+R", click: forceReload },
         { type: "separator" },
-        { label: "Actual Size", accelerator: "CmdOrCtrl+0", click: zoomActualSize },
-        { label: "Zoom In", accelerator: "CmdOrCtrl+=", click: zoomIn },
-        { label: "Zoom Out", accelerator: "CmdOrCtrl+-", click: zoomOut },
+        { label: "Actual Size", id: "zoom-actual", accelerator: "CmdOrCtrl+0", click: zoomActualSize },
+        { label: "Zoom In", id: "zoom-in", accelerator: "CmdOrCtrl+=", click: zoomIn },
+        { label: "Zoom Out", id: "zoom-out", accelerator: "CmdOrCtrl+-", click: zoomOut },
         { type: "separator" },
         { role: "togglefullscreen" },
         // Focus mode hides the dashboard's top bar, which holds its own toggle,
@@ -151,21 +171,44 @@ function buildMenuTemplate(deps) {
         { label: "Rename Window…", click: renameCurrentWindow },
         { type: "separator" },
         { label: "Set Remote Host…", click: promptRemoteHost },
-        { label: "Refresh Token", accelerator: "CmdOrCtrl+Shift+T", click: refreshToken },
+        // Was CmdOrCtrl+Shift+T, which is "reopen closed session" in the
+        // renderer (src/lib/shortcutRegistry.ts, #18969) — the browser
+        // reopen-closed-tab chord. Moved to an Alt variant, like New
+        // Connection Window… above, so the menu does not take the keystroke.
+        // Not CmdOrCtrl+Alt+T either: on GNOME/Ubuntu Ctrl+Alt+T opens a
+        // terminal system-wide, so Linux (and Windows) add Shift.
+        { label: "Refresh Token", accelerator: isMac ? "Cmd+Alt+T" : "Ctrl+Alt+Shift+T", click: refreshToken },
         { label: "Open Config File", click: openConfigFile },
       ],
     },
-    // macOS keeps the stock Window menu (Minimize, Zoom, Front — no Close entry,
-    // so Cmd+W reaches the renderer). Windows/Linux write it out: the stock role
-    // puts "Close" on Ctrl+W, which is "close session" in the renderer, so the
-    // window close moves to Ctrl+Shift+W — the VS Code / Chrome convention (Ctrl+W
-    // closes a tab, Ctrl+Shift+W the window; Alt+F4 still works).
+    // Both platforms write the Window menu out: Cmd/Ctrl+W is "close session" in
+    // the renderer, so the window close sits on Cmd/Ctrl+Shift+W, the VS Code /
+    // Chrome convention (Ctrl+W closes a tab, Ctrl+Shift+W the window; Alt+F4
+    // still works). macOS keeps the windowMenu role so AppKit still lists the open
+    // windows; the stock Windows/Linux role would put Close on Ctrl+W.
     isMac
-      ? { id: "window-menu", role: "windowMenu" }
+      ? {
+          id: "window-menu",
+          role: "windowMenu",
+          submenu: [
+            { role: "minimize" },
+            { role: "zoom" },
+            { type: "separator" },
+            { role: "front" },
+            { type: "separator" },
+            { role: "close", accelerator: "Cmd+Shift+W" },
+          ],
+        }
       : {
           id: "window-menu",
           label: "Window",
-          submenu: [{ role: "minimize" }, { role: "zoom" }, { role: "close", accelerator: "Ctrl+Shift+W" }],
+          // Electron's `zoom` role acts only on macOS (AppKit's performZoom:), so
+          // off macOS Zoom is spelled out as the maximize toggle it stands for.
+          submenu: [
+            { role: "minimize" },
+            { id: "window-zoom", label: "Zoom", click: (_item, win) => applyWindowControl(win, "maximize-toggle") },
+            { role: "close", accelerator: "Ctrl+Shift+W" },
+          ],
         },
     // Windows/Linux home for About (Help > About <app>).
     ...(isMac ? [] : [{ id: "help-menu", label: "Help", submenu: [aboutItem] }]),

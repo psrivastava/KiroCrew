@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from crew_log_drain import assert_drained
 from turn_harness import Do, ScriptedProvider, SlotSpec, TurnScript, run_turn
 
 from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK, STOP_REASON_END_TURN, AcpEvent
@@ -161,20 +162,13 @@ def test_a_restored_slot_s_first_turn_seeds_before_it_reads():
 async def test_a_restored_child_that_never_ran_writes_no_creator_into_its_first_log():
     """The nesting a just-dispatched child gets is IN MEMORY, and a restart ends it.
 
-    The sidebar nests such a child from the row's own ``created_by``, gated on
-    ``lineage_minted`` -- a witness this process holds and never persists. After a
-    restart the slot comes back with the claim and without the witness, so it nests
-    nowhere and its first ``session/opened`` cites no creator.
-
-    That is base behaviour and it is pinned here on purpose, because the obvious
-    improvement is unsafe: the claim is restored from a transcript an agent's file
-    tools can edit, and a slot KEY is reusable, so promoting it would let a fenced
-    caller that forged an archived tab's ``created_by`` be recorded as that tab's
-    creator in an append-only entry -- which is what
-    ``session_control.revive_session``'s ownership check then reads.
+    Nesting is gated on ``lineage_minted``, which is never persisted, so after a restart
+    the first ``session/opened`` cites no creator. That is deliberate: ``created_by`` is
+    restored from an editable transcript, and trusting it would let a forged claim pass
+    ``session_control.revive_session``'s ownership check.
     """
     emit.on_session_opened("s-lead", agent="kirocrew-lead", slot="lead")
-    assert emit.flush(timeout=5.0) is True
+    assert_drained()
     stp.reset_for_tests()
     emit.reset_caches()
 
@@ -216,7 +210,7 @@ def test_a_restored_child_with_no_predecessor_inherits_from_the_spawn():
 
     emit.on_session_opened("s-lead", agent="kirocrew-lead", slot="lead")
     emit.on_session_spawned("s-lead", creator_slot="lead", child_slot="worker")
-    assert emit.flush(timeout=5.0) is True
+    assert_drained()
     stp.reset_for_tests()
     emit.reset_caches()
 
@@ -521,13 +515,10 @@ def test_a_removed_lead_re_states_its_pending_child_as_orphaned(state):
 
 
 def test_a_removed_conductor_re_states_its_workers_under_the_lead(state):
-    """The close that re-parents: a lead, a conductor under it, two workers under the
-    conductor, and the conductor goes.
+    """Closing a conductor re-parents its workers to the lead.
 
-    The removal patch must carry the workers' NEW parent -- the lead, with
-    ``ancestor`` -- and not only rows whose key went null. Left out, the client keeps
-    the closed conductor's key and every worker renders top-level with the orphan
-    glyph until a full frame arrives.
+    The removal patch must carry the workers' NEW parent with ``ancestor``, or the
+    client renders them top-level with the orphan glyph until a full frame arrives.
     """
     for key in ("lead", "worker-a", "worker-b"):
         state.get_or_create_slot(key, origin=SlotOrigin.USER)
@@ -796,8 +787,9 @@ async def test_a_cancel_requested_while_the_class_is_read_finds_the_log_opened(m
     assert record.calls("stream") == []
 
 
-def test_a_replay_marks_every_unit_whose_decision_it_did_not_read(monkeypatch):
-    """Past the cap the replay keeps records it reads no decision for; those are suspect."""
+def test_a_replay_past_the_cap_keeps_one_capped_population(monkeypatch):
+    """Past the cap the replay drops the checkpoint units it ranks last, so the records it
+    returns and the ones it reads decisions for are the same set."""
     from kiro_crew.crew_log.session_tree import _ScanFaults
 
     emit.on_session_opened("s-a", agent="kirocrew-worker", slot="a")
@@ -814,6 +806,4 @@ def test_a_replay_marks_every_unit_whose_decision_it_did_not_read(monkeypatch):
 
     records, *_ = proj._replay_tail(loaded, {}, faults=faults)
 
-    unread = [r.sid for r in list(records.values())[2:]]
-    assert unread
-    assert set(unread) <= set(faults.sids)
+    assert len(records) == 2

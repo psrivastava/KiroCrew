@@ -30,8 +30,9 @@ second press on a turn that already ended finds it idle and only re-settles the
 status. A Stop for a thread this bot has no session in calls nothing at all -- not
 even ``setStatus``, which would create a session there.
 
-A Stop with no ``thread_ts`` (a whole-channel session) belongs to no feature
-here and is ignored.
+A whole-channel session (a code channel) carries no ``thread_ts``. Those Stops go
+to the handlers registered with :func:`register_channel_stop_handler`; with none
+claiming the channel, the Stop is resolved like any other.
 """
 
 from __future__ import annotations
@@ -41,7 +42,7 @@ import contextlib
 import logging
 import math
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew.loop_lock import LoopBoundLock
@@ -59,6 +60,7 @@ from kiro_crew.slack.agent_sessions import fence
 from kiro_crew.slack.agent_sessions.status import clearing_driver, driver_of
 from kiro_crew.slack.channel_policy import channel_refusal
 from kiro_crew.slack.events_inbound import SeenCache
+from kiro_crew.slack.shared_access import prime_shared_user
 
 if TYPE_CHECKING:
     from kiro_crew.slack.gateway import GatewayOrchestrator
@@ -92,6 +94,58 @@ _TITLE_LOCKS: dict[tuple[str, str], list[Any]] = {}
 #: Bounded like ``_SEEN_EVENTS``.
 _NEWEST_TITLE_TS: OrderedDict[tuple[str, str], float] = OrderedDict()
 
+#: What a whole-channel Stop handler made of a press on its channel: it stopped the
+#: session, or it refused the press (and audited the refusal itself).
+CHANNEL_STOP_STOPPED = "stopped"
+CHANNEL_STOP_DENIED = "denied"
+
+#: ``async (orch, event, user_id) -> str | None``: handle a whole-channel Stop.
+#: :data:`CHANNEL_STOP_STOPPED` or :data:`CHANNEL_STOP_DENIED` when the channel was
+#: the handler's; None when it was not, so the Stop resolves normally.
+ChannelStopHandler = Callable[["GatewayOrchestrator", dict, str], Awaitable[str | None]]
+_channel_stop_handlers: list[ChannelStopHandler] = []
+#: ``(channel_id) -> bool``: whether a handler's session in that channel is
+#: running now, so its Stop is admitted after the feature went off mid-turn.
+_channel_stop_running: dict[ChannelStopHandler, Callable[[str], bool]] = {}
+
+
+def register_channel_stop_handler(
+    callback: ChannelStopHandler, *, running: Callable[[str], bool] | None = None
+) -> None:
+    """Route Stops on whole-channel sessions (no ``thread_ts``) to *callback*.
+
+    For the code-channel runtime, whose channel IS the session. Called with the
+    orchestrator, the raw event and the presser AFTER the origin and permission
+    checks above have passed; it returns :data:`CHANNEL_STOP_STOPPED` or
+    :data:`CHANNEL_STOP_DENIED` when the channel was its own (it then owns the
+    stop, the status and the refusal's audit row), None to let the Stop resolve
+    normally. *running*, when given, says whether the handler's session in a
+    channel is working right now: a Stop there is admitted even with the
+    feature switched off, as the thread path admits one for a turn it left
+    working, or Slack shows a dead Stop on "Working..." until the turn ends.
+    Register at import time. Idempotent per callback.
+    """
+    if callback not in _channel_stop_handlers:
+        _channel_stop_handlers.append(callback)
+    if running is not None:
+        _channel_stop_running[callback] = running
+
+
+def unregister_channel_stop_handler(callback: ChannelStopHandler) -> None:
+    if callback in _channel_stop_handlers:
+        _channel_stop_handlers.remove(callback)
+    _channel_stop_running.pop(callback, None)
+
+
+def _channel_session_running(channel: str) -> bool:
+    for running in list(_channel_stop_running.values()):
+        try:
+            if running(channel):
+                return True
+        except Exception:
+            logger.debug("channel stop running check failed for %s", channel, exc_info=True)
+    return False
+
 
 def _audit(caller: str, operation: str, outcome: str, **kw: Any) -> None:
     try:
@@ -109,23 +163,35 @@ def dispatch(orch: GatewayOrchestrator, payload: dict, event: dict) -> None:
     event body carries none for a Stop), so the envelope id wins, as on the
     message path. An event with no workspace id at all is refused.
     """
+    event_type = str(event.get("type") or "")
+    if event_type not in AGENT_SESSION_EVENTS or not admits(orch, payload, event):
+        return
+    handler = handle_stopped if event_type == EVENT_STOPPED else handle_title_changed
+    task = asyncio.create_task(handler(orch, event))
+    orch._handler_tasks.add(task)
+    task.add_done_callback(orch._handler_tasks.discard)
+
+
+def admits(orch: GatewayOrchestrator, payload: dict, event: dict) -> bool:
+    """The checks :func:`dispatch` asks before handling *event*: its feature
+    (:func:`_feature_on`) and its workspace. Also what the context bar's Stop
+    asks before :func:`handle_stopped`, so it is the same Stop."""
     from kiro_crew.slack import events as _events
 
     event_type = str(event.get("type") or "")
-    if event_type not in AGENT_SESSION_EVENTS:
-        return
     if not _feature_on(orch, event):
         # Off means off: the subscription can outlive the switch (an app installed
-        # while it was on), and these events were ignored before this runtime existed.
+        # while it was on, or code channels subscribing the Stop event), and these
+        # events were ignored before this runtime existed.
         logger.debug("%s ignored: the Slack feature it belongs to is off", event_type)
-        return
+        return False
     caller = str(event.get("user") or "")
     team_id = str(payload.get("team_id") or event.get("team_id") or event.get("team") or "")
     channel = str(event.get("channel") or "")
     if not team_id:
         logger.warning("%s rejected: no team_id on the event or its envelope", event_type)
         _audit(caller, f"slack.{event_type}", "denied", error="missing_team_id")
-        return
+        return False
     if not _events.current_context().slack_gate.check_message_origin(team_id):
         logger.error("%s rejected: team_id=%s is not an allowed workspace", event_type, team_id)
         _audit(
@@ -135,21 +201,23 @@ def dispatch(orch: GatewayOrchestrator, payload: dict, event: dict) -> None:
             resources=f"team_id={team_id} channel={channel}",
             error="enterprise_origin_mismatch",
         )
-        return
-    handler = handle_stopped if event_type == EVENT_STOPPED else handle_title_changed
-    task = asyncio.create_task(handler(orch, event))
-    orch._handler_tasks.add(task)
-    task.add_done_callback(orch._handler_tasks.discard)
+        return False
+    return True
 
 
 def _feature_on(orch: GatewayOrchestrator, event: dict) -> bool:
     """Thread sessions need ``slack.agent_sessions``; a whole-channel Stop (no
-    ``thread_ts``) belongs to no feature here, so it stays ignored."""
-    from kiro_crew.slack.features import agent_sessions_enabled
+    ``thread_ts``) belongs to code channels and needs ``slack.code_channels``,
+    unless that channel's session is still running (the feature went off
+    mid-turn): that Stop still stops the turn."""
+    from kiro_crew.slack.features import agent_sessions_enabled, code_channels_enabled
 
+    cfg = getattr(orch, "_cfg", None)
     if event.get("type") == EVENT_STOPPED and not event.get("thread_ts"):
-        return False
-    if agent_sessions_enabled(getattr(orch, "_cfg", None)):
+        return code_channels_enabled(cfg) or _channel_session_running(
+            str(event.get("channel") or "")
+        )
+    if agent_sessions_enabled(cfg):
         return True
     # Off now, but a Stop on a session this process left working (the feature
     # went off mid-turn) still stops the turn and settles the session, or Slack
@@ -173,7 +241,38 @@ def _first_delivery(channel: str, thread_ts: str, event_ts: str) -> bool:
 def _may_use_bot(user: str) -> bool:
     from kiro_crew.slack import events as _events
 
-    return bool(user) and (_events.is_owner(user) or _events.is_allowed_user(user))
+    return bool(user) and (
+        _events.is_owner(user) or _events.is_allowed_user(user) or _events.is_shared_user(user)
+    )
+
+
+async def _shared_user_in_code_channel(
+    user: str, channel: str, thread_ts: str = "", session: str = "", *, orch: Any = None
+) -> bool:
+    """Whether *user* is a shared user (slack.shared_access) acting where a code channel
+    is the owner's, with Slack Code on or off: in the channel itself, or in a thread
+    whose session is a code channel's (a bound or revoked channel's anchor included).
+    With *orch*, also a code channel of ours Slack's UI opened that is not bound yet."""
+    from kiro_crew.slack import handler
+    from kiro_crew.slack.code_channels.routing import (
+        shared_user_refused_for_slot,
+        shared_user_refused_in,
+        shared_user_refused_unbound,
+    )
+
+    if not handler.is_shared_listed(user):
+        return False
+
+    def _refused() -> bool:
+        return shared_user_refused_in(channel) or (
+            bool(session or thread_ts) and shared_user_refused_for_slot(session, thread_ts)
+        )
+
+    if await asyncio.to_thread(_refused):
+        return True
+    return orch is not None and await shared_user_refused_unbound(
+        getattr(orch, "slack", None), channel
+    )
 
 
 def _entry_thread(kwargs: Any) -> str:
@@ -254,7 +353,8 @@ async def handle_stopped(orch: GatewayOrchestrator, event: dict) -> str | None:
 
     Outcomes are ``stop_turn``'s (``soft`` / ``hard`` / ``idle`` / ``compacting``)
     plus ``error`` (the session stop raised; the turn's task is cancelled anyway),
-    ``denied``, ``duplicate`` and ``not_ours``. Never raises.
+    ``denied``, ``duplicate``, ``not_ours`` and ``channel`` (a registered
+    whole-channel handler took it). Never raises.
     """
     from kiro_crew.slack import events as _events
 
@@ -265,6 +365,7 @@ async def handle_stopped(orch: GatewayOrchestrator, event: dict) -> str | None:
     if not _first_delivery(channel, thread_ts or "", str(event.get("event_ts") or "")):
         logger.debug("agent_session_stopped redelivered for %s/%s; ignored", channel, thread_ts)
         return "duplicate"
+    await prime_shared_user(user, orch)
     if not _may_use_bot(user):
         _audit(
             user,
@@ -276,7 +377,46 @@ async def handle_stopped(orch: GatewayOrchestrator, event: dict) -> str | None:
         return "denied"
     if not channel or orch.sessions is None:
         return None
+    if thread_ts is not None and await _shared_user_in_code_channel(
+        user, channel, thread_ts, orch=orch
+    ):
+        # A thread there leads to the owner's code-channel session (slack.shared_access).
+        _audit(
+            user,
+            "slack.agent_session_stopped",
+            "denied",
+            resources=f"{channel}:{thread_ts}",
+            error="code channel is owner-only",
+        )
+        return "denied"
+    if thread_ts is None:
+        for claim in list(_channel_stop_handlers):
+            try:
+                claimed = await claim(orch, event, user)
+                if claimed == CHANNEL_STOP_DENIED:
+                    # Refused by the channel's own rule, which audited it: no
+                    # "allowed" row for a stop that never ran.
+                    return "denied"
+                if claimed == CHANNEL_STOP_STOPPED:
+                    _audit(user, "slack.agent_session_stopped", "allowed", resources=channel)
+                    return "channel"
+            except Exception:
+                logger.warning("channel stop handler failed for %s", channel, exc_info=True)
     keys = resolve_session(orch, channel, thread_ts)
+    if (
+        thread_ts is not None
+        and keys is not None
+        and await _shared_user_in_code_channel(user, channel, thread_ts, keys[1])
+    ):
+        # The thread's session is a code channel's (slack.shared_access).
+        _audit(
+            user,
+            "slack.agent_session_stopped",
+            "denied",
+            resources=f"{channel}:{thread_ts}",
+            error="code channel is owner-only",
+        )
+        return "denied"
     if keys is None or not _is_ours(orch, channel, thread_ts, keys):
         # Nothing of this bot's runs there: no stop, and no setStatus, which would
         # create a session in a thread the bot never answered.
@@ -384,9 +524,10 @@ async def handle_stopped(orch: GatewayOrchestrator, event: dict) -> str | None:
                     cancelled = _cancel_task()
                 else:
                     if outcome != "compacting":
-                        if outcome == "hard" and not force:
+                        if outcome == "hard" and not force and not _events.is_shared_listed(user):
                             # An escalated stop reset the session: as ``!stop``'s,
-                            # what was queued at the press goes for everybody.
+                            # what was queued at the press goes for everybody. A
+                            # shared user's (slack.shared_access) drops only their own.
                             went_through(reset=True)
                         elif not (force and outcome == "hard"):
                             # A forced reset is aimed at the compaction, not the
@@ -538,6 +679,7 @@ async def _apply_title_change(
         # A retried rename Slack sent before one already applied here: the newer
         # title stands.
         return "stale"
+    await prime_shared_user(user, orch)
     if not _may_use_bot(user):
         _audit(
             user,
@@ -572,6 +714,16 @@ async def _apply_title_change(
         # Slack titles each thread's session: one thread's name is not the DM's.
         return "ignored"
     session_key = _title_key(keys[1], thread_ts)
+    if await _shared_user_in_code_channel(user, channel, thread_ts, session_key, orch=orch):
+        # A code channel's session is the owner's (slack.shared_access).
+        _audit(
+            user,
+            "slack.agent_session_title_changed",
+            "denied",
+            resources=f"{channel}:{thread_ts}",
+            error="code channel is owner-only",
+        )
+        return "denied"
     # The durable incognito/temporary record first: after a restart the in-memory
     # trackers start empty, and a rename can arrive before any message restores them.
     await privacy_mode.hydrate_inbound(orch.sessions, session_key)

@@ -120,6 +120,18 @@ LEGIT_OAUTH_URLS: list[tuple[str, str]] = [
         "&state=abc123xyz"
         "&team=T9TK3CUKW",
     ),
+    # Slack MCP user-token consent (PKCE, localhost redirect), the
+    # authorization_endpoint at mcp.slack.com/.well-known/oauth-authorization-server.
+    (
+        "slack-mcp",
+        "https://slack.com/oauth/v2_user/authorize"
+        "?response_type=code&client_id=3336676.569200954261"
+        "&redirect_uri=http%3A%2F%2Flocalhost%3A48106%2Fcallback"
+        "&scope=search%3Aread.public%20channels%3Ahistory"
+        "&state=2tYwq0fXkC8L1v9Zr6pHsJ3mN5bQ7dEaUiOgTyRx_Ao"
+        "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        "&code_challenge_method=S256",
+    ),
     # Linear (a common MCP server) — generic OAuth 2.0 authorize shape.
     (
         "linear",
@@ -408,6 +420,55 @@ LEGIT_OAUTH_URLS: list[tuple[str, str]] = [
         "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
         "&code_challenge_method=S256"
         "&state=" + ("a1B2c3D4" * 16),
+    ),
+    # TickTick (Connections registry, launch-gated). Endpoint is the
+    # ``authorization_endpoint`` from https://ticktick.com's RFC 8414 document,
+    # reached via RFC 9728 discovery from https://mcp.ticktick.com. The scope
+    # pair is the one the registry entry requests, space-delimited per RFC 6749
+    # section 3.3; it is also the whole ``scopes_supported`` list the resource
+    # metadata publishes.
+    (
+        "ticktick-mcp",
+        "https://ticktick.com/oauth/authorize"
+        "?client_id=0123456789abcdef0123456789abcdef"
+        "&response_type=code"
+        "&redirect_uri=http%3A%2F%2F127.0.0.1%3A33418%2Fcallback"
+        "&scope=tasks%3Aread%20tasks%3Awrite"
+        "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        "&code_challenge_method=S256"
+        "&state=" + ("f6E5d4C3" * 16),
+    ),
+    # Railway (Connections registry, launch-gated). Endpoint is the
+    # ``authorization_endpoint`` from https://backboard.railway.com's RFC 8414
+    # document, reached via RFC 9728 discovery from https://mcp.railway.com; the
+    # advertised endpoint already carries its own ``resource`` parameter. The
+    # scope is the one the registry entry requests.
+    (
+        "railway-mcp",
+        "https://backboard.railway.com/oauth/auth"
+        "?resource=https%3A%2F%2Fmcp.railway.com"
+        "&client_id=0123456789abcdef0123456789abcdef"
+        "&response_type=code"
+        "&redirect_uri=http%3A%2F%2F127.0.0.1%3A33418%2Fcallback"
+        "&scope=workspace%3Amember"
+        "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        "&code_challenge_method=S256"
+        "&state=" + ("R4w5Y6z7" * 16),
+    ),
+    # Quo (Connections registry, launch-gated). Endpoint is the
+    # ``authorization_endpoint`` from https://mcp.quo.com's RFC 8414 document,
+    # reached via RFC 9728 discovery from https://mcp.quo.com/mcp. The scopes are
+    # the three read scopes the registry entry requests.
+    (
+        "quo-mcp",
+        "https://mcp.quo.com/authorize"
+        "?client_id=0123456789abcdef0123456789abcdef"
+        "&response_type=code"
+        "&redirect_uri=http%3A%2F%2F127.0.0.1%3A33418%2Fcallback"
+        "&scope=read%3Aaccount%20read%3Aconversations%20read%3Acalls"
+        "&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        "&code_challenge_method=S256"
+        "&state=" + ("Q7r8S9t0" * 16),
     ),
 ]
 

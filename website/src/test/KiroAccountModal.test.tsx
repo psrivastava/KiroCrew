@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { fireEvent, screen, waitFor, within } from '@testing-library/react'
+import { act, fireEvent, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import KiroAccountModal, { type KiroAccountUsage } from '../components/KiroAccountModal'
@@ -34,12 +34,25 @@ vi.mock('../api/client', async importOriginal => {
       ...mod.api,
       sessionsUsageRefresh: vi.fn(),
       kiroUsage: vi.fn(async () => KIRO_USAGE_EMPTY),
+      // The sign-out link's harness read; its own cases live in
+      // KiroAccountModal.signOutLink.test.tsx.
+      kirocrewConfig: vi.fn(async () => ({ agent: { acp_backend: 'kas' } })),
+      kasLoginStatus: vi.fn(async () => ({ authenticated: true, provider: 'Google', identity: 'social' })),
     },
   }
 })
 
 const refreshMock = vi.mocked(api.sessionsUsageRefresh)
 const kiroUsageMock = vi.mocked(api.kiroUsage)
+/** The next config read names the kiro-cli harness, whose sign-in-required state
+ *  sends the user to `kiro-cli login`. On KAS that state names Crew's own sign-in
+ *  instead (KiroAccountModal.signOutLink.test.tsx). */
+const onKiroCliHarness = () =>
+  vi.mocked(api.kirocrewConfig).mockResolvedValueOnce({ agent: { acp_backend: 'kiro' } } as never)
+// A queued answer a test left unread must not reach the next test: back to the KAS default.
+beforeEach(() => {
+  vi.mocked(api.kirocrewConfig).mockReset()
+})
 
 const BASE_USAGE: KiroCreditUsage = {
   used: 10,
@@ -260,7 +273,7 @@ describe('KiroAccountModal', () => {
 
     const email = await screen.findByText('owner@example.com')
     expect(email).toHaveClass('blur-[5px]')
-    expect(localStorage.getItem('kirocrew:account-email-hidden')).toBeNull()
+    expect(localStorage.getItem('kirocrew:account-email-hidden')).not.toBe('0')
     fireEvent.click(screen.getByRole('button', { name: 'Show email' }))
     expect(email).not.toHaveClass('blur-[5px]')
     expect(localStorage.getItem('kirocrew:account-email-hidden')).toBe('0')
@@ -376,6 +389,25 @@ describe('KiroAccountModal', () => {
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()
   })
 
+  // The sessions run on a KIRO_API_KEY while kiro-cli's login is another
+  // account, so the balance the login would show is not what the chats spend.
+  // The modal says whose credits are used and offers no Refresh, which would
+  // answer the same until the key is removed.
+  it('explains that credits are spent on the API key, with no Refresh and no alert', async () => {
+    const usage = parseKiroUsagePayload({ usage: { available: false, reason: 'api_key' } })
+    expect(usage).toBe('api-key')
+    renderWithProviders(<KiroAccountModal open onClose={vi.fn()} usage={usage} />)
+
+    const notice = i18nT('components.kiroAccountModal.credit_usage_api_key')
+    expect(notice).toContain('KIRO_API_KEY')
+    expect(await screen.findByText(notice)).toBeInTheDocument()
+    expect(screen.queryByText('Could not read your balance.')).not.toBeInTheDocument()
+    expect(screen.queryByText('No balance reading is available for this account yet.')).not.toBeInTheDocument()
+    expect(screen.queryByText(/Remaining credit balance/)).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Refresh/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
   // The gateway always sends the type for this state. A state that arrives
   // without one still names a provider in the notice, so the sentence never
   // reads "this  sign-in".
@@ -420,7 +452,7 @@ describe('KiroAccountModal', () => {
     renderWithProviders(<KiroAccountModal open onClose={onClose} usage="failed" />)
 
     const dialog = await screen.findByRole('dialog', { name: 'Kiro Account' })
-    const alert = within(dialog).getByRole('alert')
+    const alert = within(dialog).getByRole('status')
     expect(alert).toHaveTextContent('Could not read your balance.')
     expect(within(dialog).getByRole('button', { name: /^Refresh$/ })).toBeEnabled()
     const handoff = within(dialog).getByRole('button', { name: /Ask the agent/i })
@@ -438,6 +470,7 @@ describe('KiroAccountModal', () => {
   it('tells the user to sign in again and offers no Refresh for it', async () => {
     // 'signin-required' is terminal until the user re-authenticates. The /usage
     // read needs the same sign-in, so a Refresh here could only fail again.
+    onKiroCliHarness()
     renderWithProviders(<KiroAccountModal open onClose={vi.fn()} usage="signin-required" />)
 
     expect(await screen.findByText(/Sign in to Kiro again/)).toBeInTheDocument()
@@ -454,6 +487,7 @@ describe('KiroAccountModal', () => {
     // (AUTOSDE errors-use-error-notice). The hand-off opens the chat this modal
     // sits over, so the modal must close with it: a hand-off the user cannot see
     // reads as a dead button.
+    onKiroCliHarness()
     const onClose = vi.fn()
     renderWithProviders(
       <KiroAccountModal open onClose={onClose} usage="signin-required" />,
@@ -544,7 +578,7 @@ describe('KiroAccountModal refresh', () => {
     fireEvent.click(within(dialog).getByRole('button', REFRESH))
     await waitFor(() => expect(refreshMock).toHaveBeenCalledTimes(1))
     expect(await within(dialog).findByRole('button', REFRESH)).toBeEnabled()
-    expect(within(dialog).getAllByRole('alert')).toHaveLength(1)
+    expect(within(dialog).getAllByRole('status')).toHaveLength(1)
   })
 
   it('reports an unreadable gateway config through ErrorNotice and retries the config read', async () => {
@@ -563,7 +597,7 @@ describe('KiroAccountModal refresh', () => {
     rerender(<KiroAccountModal open onClose={onClose} usage="config-unreadable" />)
     await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: ['kirocrewConfig'] }))
     const dialog = screen.getByRole('dialog', { name: 'Kiro Account' })
-    const alert = within(dialog).getByRole('alert')
+    const alert = within(dialog).getByRole('status')
     expect(alert).toHaveTextContent('Could not load settings, so your balance can’t be shown.')
     expect(within(alert).getByRole('button', { name: /Ask the agent/i })).toBeInTheDocument()
     expect(within(dialog).queryByRole('progressbar')).not.toBeInTheDocument()
@@ -633,39 +667,41 @@ describe('KiroAccountModal refresh', () => {
     await screen.findByRole('progressbar', { name: 'Kiro credit usage' })
   })
 
-  // #23655: the label swap used to resize the button while `transition-all`
-  // animated it, which left a second, stale button painted over it on mobile
-  // WebKit. Both labels now always occupy the button, so its width never
-  // depends on the state, and only colors transition.
-  it('keeps one button the same size while it flips to refreshing and back (#23655)', async () => {
+  // #23655: the label swap resized the button while `transition-all` animated
+  // it, which left a second, stale button painted over it on mobile WebKit. The
+  // residue came from animating the resize, not from the resize -- so only
+  // colors transition, and the button is free to be the width of the label it
+  // shows. #25265 froze the width instead, by holding both labels in one grid
+  // cell; that padded the idle button out to "Refreshing…" in every locale and
+  // left dead space after "Refresh", so the width change is taken deliberately
+  // and the slack is what this pins against.
+  it('swaps the single label it carries, with only colors transitioning (#23655)', async () => {
     let settle: (v: { usage: Record<string, unknown> }) => void = () => {}
     refreshMock.mockImplementation(() => new Promise(resolve => { settle = resolve }))
     renderWithProviders(<QueryFedModal initial={{ ...BASE_USAGE }} />)
     const dialog = await screen.findByRole('dialog', { name: 'Kiro Account' })
-    const labels = [i18nT('components.kiroAccountModal.refresh_balance'), i18nT('components.kiroAccountModal.refreshing_balance')]
-    // Every label the button can show sits in it, and only the shown one is
-    // visible and named.
-    const expectSized = (button: HTMLElement, shown: string) => {
+    const idleLabel = i18nT('components.kiroAccountModal.refresh_balance')
+    const pendingLabel = i18nT('components.kiroAccountModal.refreshing_balance')
+    // Exactly one label is in the button, so its width is that label's own and
+    // carries no room reserved for the other. The name is that same text, which
+    // rules out an `aria-label` carrying a state the button does not show.
+    const expectOneLabel = (button: HTMLElement, shown: string) => {
       expect(button.className).not.toMatch(/\btransition-all\b/)
       expect(button.className).toMatch(/\btransition-colors\b/)
-      for (const text of labels) {
-        const span = within(button).getByText(text)
-        const hidden = text !== shown
-        expect(span.classList.contains('invisible')).toBe(hidden)
-        expect(span.getAttribute('aria-hidden') === 'true').toBe(hidden)
-      }
+      expect(button.textContent).toBe(shown)
+      expect(button).toHaveAccessibleName(shown)
     }
 
     const idle = within(dialog).getByRole('button', REFRESH)
-    expectSized(idle, labels[0])
+    expectOneLabel(idle, idleLabel)
     fireEvent.click(idle)
     const pending = await within(dialog).findByRole('button', REFRESHING)
     expect(pending).toBe(idle)
-    expectSized(pending, labels[1])
+    expectOneLabel(pending, pendingLabel)
 
     settle({ usage: { credits_plan: 1000, credits_used: 41 } })
     const settled = await within(dialog).findByRole('button', REFRESH)
-    expectSized(settled, labels[0])
+    expectOneLabel(settled, idleLabel)
   })
 
   it('renders the meter from the refreshed payload and keeps Refresh beside it', async () => {
@@ -728,7 +764,7 @@ describe('KiroAccountModal refresh', () => {
       // The click retries the forecast's Usage report; the pill's reading is
       // not re-read until the other refresh has had time to finish.
       expect(invalidate).not.toHaveBeenCalledWith({ queryKey: ['kiro-usage'] })
-      await vi.advanceTimersByTimeAsync(3100)
+      await act(async () => { await vi.advanceTimersByTimeAsync(3100) })
       expect(invalidate).toHaveBeenCalledWith({ queryKey: ['kiro-usage'] })
       // The re-read has landed: the notice has done its job and Refresh is offered again.
       await waitFor(() => expect(within(dialog).queryByRole('alert')).not.toBeInTheDocument())
@@ -803,7 +839,7 @@ describe('KiroAccountModal refresh', () => {
     refreshMock.mockRejectedValue(REFUSAL(500, 'boom'))
     renderWithProviders(<QueryFedModal initial="failed" />)
     const dialog = await screen.findByRole('dialog', { name: 'Kiro Account' })
-    expect(within(dialog).getByRole('alert')).toHaveTextContent('Could not read your balance.')
+    expect(within(dialog).getByRole('status')).toHaveTextContent('Could not read your balance.')
 
     fireEvent.click(within(dialog).getByRole('button', REFRESH))
 
@@ -825,7 +861,7 @@ describe('KiroAccountModal refresh', () => {
     refreshMock.mockRejectedValue(REFUSAL(409, '{"code":"refresh_in_flight"}'))
     renderWithProviders(<QueryFedModal initial="failed" />)
     const dialog = await screen.findByRole('dialog', { name: 'Kiro Account' })
-    expect(within(dialog).getByRole('alert')).toHaveTextContent('Could not read your balance.')
+    expect(within(dialog).getByRole('status')).toHaveTextContent('Could not read your balance.')
 
     fireEvent.click(within(dialog).getByRole('button', REFRESH))
 
@@ -912,6 +948,7 @@ describe('KiroAccountModal refresh', () => {
     // signin_required. The pill's query must hold that state NOW -- not after
     // its next poll -- so neither the modal nor the pill keeps showing A.
     refreshMock.mockResolvedValue({ usage: { available: false, reason: 'signin_required' } })
+    onKiroCliHarness()
     const { queryClient } = renderWithProviders(<QueryFedModal initial={BASE_USAGE} />)
     expect(screen.getByText('owner@example.com')).toBeInTheDocument()
 

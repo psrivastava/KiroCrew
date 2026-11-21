@@ -8,7 +8,9 @@ the DOM calls visible that a person cannot click, a theme switch that changed a 
 name and not the pixels, a horizontal scrollbar, a spinner that never stops. Tracking
 issue: [#9578](https://github.com/kirodotdev/KiroCrew/issues/9578).
 
-The lane runs on the nightly schedule and on `workflow_dispatch` only; its job status is
+The lane runs on `workflow_dispatch` only (its nightly schedule is commented out in the
+workflow until the failing scenarios tracked in
+[#22733](https://github.com/kirodotdev/KiroCrew/issues/22733) are fixed); its job status is
 the verdict. It is not a pull-request check: a PR lane would run the PR's own harness
 with an assumed cloud role, and any write collaborator can open a same-repo PR, which
 makes "code write" reach "cloud credential" however the job is gated. The PR-advisory
@@ -23,7 +25,7 @@ while the code holding credentials is not. `pr-readiness.yml` does not read this
 |---|---|
 | `.github/workflows/gui-user-test.yml` | Triggers, boot, run, artifact, run summary, nightly issue, lane status. |
 | `scripts/gui-user-test/boot.sh` | Xvfb -> `seed_home.py` -> `python -m kiro_crew gateway --test-mode --approval yolo --no-crons` on the packaged fake ACP backend -> Chromium at the dashboard URL. Writes `target.env` (origin, one-time token and the gateway session cookie, mode 0600) and `pids`. Also stages the sample notes folder and the sample project at a fixed path (see "Seeds" below). |
-| `scripts/gui-user-test/seed_home.py` | Copies a fixture into `$KIROCREW_HOME` through `kiro_crew.seed`, marks the install onboarded (including `dashboard.crewmates_onboarded`), writes `config.agents.default` and then `config.agents.<slug>` for each `--member` so the Mates page has a roster, and with `--project` gives the pinned starter session (`dashboard_starter.jsonl`) the staged sample project. |
+| `scripts/gui-user-test/seed_home.py` | Copies a fixture into `$KIROCREW_HOME` through `kiro_crew.seed`, marks the install onboarded (including `dashboard.crewmates_onboarded`), writes `config.agents.default` and then `config.agents.<slug>` for each `--member` so the Bots page has a roster, and with `--project` gives the pinned starter session (`dashboard_starter.jsonl`) the staged sample project. |
 | `scripts/gui-user-test/teardown.sh` | Kills the three process groups and removes the scratch home, the browser profile and the staged sample folders. |
 | `test/gui_user/harness.py` | The screenshot -> Bedrock Messages API -> action loop with the step, time and budget gates. |
 | `test/gui_user/x11.py` | Screenshots (Pillow `ImageGrab`) and input (`xdotool`); coordinate scaling, key aliases and argv building are pure and unit-tested. |
@@ -180,7 +182,7 @@ in the same PR as the UI and re-run it on demand (below) before merging.
 needs and must agree with that boot, because the target is booted once per run.
 
 Nothing resets the target between scenarios, so a scenario sees whatever earlier
-ones wrote: a mate chat posts a notification and a create scenario adds a
+ones wrote: a Bot chat posts a notification and a create scenario adds a
 mate. A scenario that reads the boot state (an empty inbox, a one-card roster)
 sets `preconditions.fresh_target: true` and must not write anything itself.
 `scenarios.select` runs every such scenario first, before the rest in file-name
@@ -206,7 +208,7 @@ isolated agent home) -- or through content the gateway itself installs at boot, 
 the packaged built-in skills the Skills tab lists.
 
 The home is a `mktemp` directory, so no scenario can spell its path. Where a flow needs
-the tester to TYPE a path -- the Knowledge "Add Source > Local Folder" form, whose
+the tester to TYPE a path -- the Knowledge "Add Source > Add folder by path" form, whose
 native picker is macOS-only -- `boot.sh` stages the three markdown files under
 `scripts/gui-user-test/knowledge-notes/` at the fixed path
 `/tmp/kirocrew-gui-user-test/team-notes`: mode 0700, recorded in `target.paths` as
@@ -235,13 +237,13 @@ the whole root, sample project included.
 
 One boot also means one roster: every scenario meets the members `GUI_MEMBERS` seeded
 plus whatever an earlier scenario created. A seeded member has an empty DM thread, and
-the Mates page lists a mate unasked only once its thread holds a message or the
+the Bots page lists a Bot unasked only once its thread holds a message or the
 user starred it (`docs/request-for-change/rfc-session-template-vs-crewmate.md`, rule 3);
 until then the roster search is the one door to it. A scenario that opens a seeded
 member's card therefore tells the tester to type its name into the search box first,
-exactly as a person reaches an unused mate; the seed does not pretend the user
+exactly as a person reaches an unused Bot; the seed does not pretend the user
 already chatted with it. So a flow that exists only for an EMPTY
-roster -- the empty Mates page's hero, shown while `config.agents` holds
+roster -- the empty Bots page's hero, shown while `config.agents` holds
 nothing beyond `default` -- cannot be reached in this lane and has no scenario;
 `seed_home.py` also sets the legacy `dashboard.crewmates_onboarded` flag, which
 nothing reads any more. Giving
@@ -269,7 +271,7 @@ navigation lands on the browser's "Leave site?" prompt over that form. The same 
 profile, so a per-device switch (Show Timestamps, a feature preview)
 that a scenario flips is still flipped when the next scenario starts. A scenario that
 flips one either puts it back before it ends or leaves a state nothing later depends on
-(on older builds the members scenarios leave the Mates preview on), and it words each switch step
+(on older builds the members scenarios leave the Bots preview on), and it words each switch step
 as the position to leave the switch in ("make sure it is ON -- click it once if it is
 off") rather than as a click, so a retry that starts from a half-finished attempt
 converges instead of inverting it.
@@ -379,8 +381,8 @@ logged, or fail with none.
   `configure-aws-credentials` -- verify branch changes through the nightly after merge
   or through a lane-scoped role that trusts the branch.
 - **On a PR**: not yet -- see the note at the top and phase 2 of the tracking issue.
-- **Nightly**: `20 9 * * *` UTC on `main`, full tier (currently 32 smoke plus
-  8 nightly-only scenarios). A non-PASS night opens or updates the single open
+- **Nightly** (paused: the `schedule:` block in the workflow is commented out): `20 9 * * *`
+  UTC on `main`, full tier (currently 33 smoke plus 11 nightly-only scenarios). A non-PASS night opens or updates the single open
   issue labelled `gui-test-report`.
 
 ### Locally
@@ -420,7 +422,7 @@ owning server is not a virtual one.
   `--budget-usd` (default $60 everywhere: the `budget_usd` dispatch input, the
   nightly schedule's fixed value, and the harness's own fallback when the flag is
   omitted -- the full nightly tier on Opus spends about $45 with retries) and
-  marks the remaining scenarios `SKIPPED`; the job's 90-minute timeout is the
+  marks the remaining scenarios `SKIPPED`; the job's 110-minute timeout is the
   backstop for a hung target, not the budget. Keep the nightly bill well under the
   $60 cap: when a new batch would push a night toward it, move the lowest-value
   scenarios to a cheaper cadence (a `weekly` tier is a schema + workflow change)

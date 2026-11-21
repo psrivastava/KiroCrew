@@ -57,6 +57,10 @@ SLOT_CREATORS: dict[tuple[str, str], str] = {
     ("apps/builtins/spec_builder/backend/runtime.py", "_ensure_worker_slot"): (
         "excluded: app=APP_NAME ('spec-builder') at birth"
     ),
+    ("apps/chat_slot_sdk.py", "open"): (
+        "excluded: app=self._app at birth, non-empty because ChatSlotSDK refuses an empty "
+        "app name"
+    ),
     ("apps/worker_slots.py", "acquire_worker_slot"): (
         "excluded: app=app at birth, non-empty by _require_app(app)"
     ),
@@ -115,6 +119,11 @@ SLOT_CREATORS: dict[tuple[str, str], str] = {
     ("dashboard/workflow_inject.py", "inject_bound_workflow_result"): (
         "excluded: linked_session_key=origin at birth"
     ),
+    ("slack/code_channels/binding.py", "create_bound_session"): (
+        "person: a code channel an allowed Slack user's request opened; model=spec.model is "
+        "the Slack Code default model ('' when unset, so it follows the default); a set one "
+        "is a kept pick the press counts and clears, like a New chat tab's"
+    ),
     ("slack/gateway_runtime/result_egress.py", "_deliver_result"): (
         "no kept model: a heartbeat delivery appends one assistant row and runs no turn, so "
         "slot.model stays '' until a person picks one"
@@ -127,6 +136,7 @@ SLOT_CREATORS: dict[tuple[str, str], str] = {
 
 #: Sites holding more than one creator call; every other site holds exactly one.
 _CALLS_PER_SITE: dict[tuple[str, str], int] = {
+    ("apps/chat_slot_sdk.py", "open"): 2,
     ("dashboard/handlers/cron_runs.py", "api_cron_to_chat"): 2,
     ("dashboard/handlers/taskrunner.py", "_open_result_slot"): 2,
     ("dashboard/openai_compat.py", "api_completions"): 2,

@@ -26,6 +26,18 @@ describe('workerKitErrorText', () => {
     expect(text).not.toContain(code)
   })
 
+  const named = (code: string, detail: string) =>
+    new ApiError(409, code, JSON.stringify({ error: code, code, detail }))
+
+  it.each([
+    ['template_restrictions_uncarried', 'toolsSettings.execute_bash', 'crewWorkerKit.error_template_restrictions_uncarried_named', 'fields'],
+    ['template_policy_backend_unsupported', 'hooks, permissions', 'crewWorkerKit.error_template_policy_backend', 'fields'],
+  ])('names the field a %s refusal is about', (code, detail, key, slot) => {
+    const text = workerKitErrorText(named(code, detail))
+    expect(text).toBe(i18nT(key, { [slot]: detail }))
+    expect(text).toContain(detail)
+  })
+
   it('points at the preview on screen, not at a button', () => {
     expect(workerKitErrorText(refusal('stale_revision'))).toContain('The changes below are up to date')
     expect(workerKitErrorText(refusal('revision_required'))).toBe('Check the changes below first, then add them.')
@@ -43,5 +55,17 @@ describe('workerKitErrorText', () => {
   it('has nothing to say without an error', () => {
     expect(workerKitErrorText(null)).toBeNull()
     expect(workerKitErrorText(undefined)).toBeNull()
+  })
+
+  it('says a read past either deadline ran out of time, and an unreadable one only failed', () => {
+    const timedOut = new ApiError(503, 'capabilities_unavailable', JSON.stringify({
+      error: 'capabilities_unavailable', code: 'capabilities_unavailable', detail: '', reason: 'timed_out',
+    }))
+    const deadline = Object.assign(new Error('deadline exceeded'), { name: 'TimeoutError' })
+    expect(workerKitErrorText(timedOut)).toBe(i18nT('crewEditorNext.load_error_timed_out'))
+    expect(workerKitErrorText(deadline)).toBe(i18nT('crewEditorNext.load_error_timed_out'))
+    expect(workerKitErrorText(new ApiError(503, 'capabilities_unavailable', JSON.stringify({
+      error: 'capabilities_unavailable', code: 'capabilities_unavailable', detail: '',
+    })))).toBe(i18nT('crewEditorNext.load_error'))
   })
 })

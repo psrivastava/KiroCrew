@@ -6,6 +6,7 @@ import logging as _logging
 from typing import TYPE_CHECKING, Any
 
 from .._component import ManagerComponent
+from . import pump_parent_end as _pump_parent_end
 from .types import MIN_RECHECK_DELAY_SECS, ClaimPoint
 
 _glue_logger = _logging.getLogger("kiro_crew.subagent_manager.admission")
@@ -18,8 +19,8 @@ if TYPE_CHECKING:
     from ...subagent import (
         _RELEASE_REPUMP_SECS,
         DENY_CAUSE_APPROVAL_UNDELIVERABLE,
-        DENY_CAUSE_HOOK_ERROR,
         MEMORY_PRESSURE_NEVER_STARTED,
+        HostSpawnDecision,
         SpawnAdmissionCoordinator,
         SpawnApprovalUnreachable,
         Stats,
@@ -46,6 +47,7 @@ class _PumpMixin(ManagerComponent):
         def taskq_admit_wait_secs(self) -> float: ...
 
         async def taskq_child_registered_async(self, info: "SubagentInfo") -> None: ...
+        async def await_pending_defer(self, agent_id: str, *, dispatch: bool = False) -> bool: ...
 
         @staticmethod
         def _release_taken_start(
@@ -225,16 +227,26 @@ class _PumpMixin(ManagerComponent):
         """Retry one held generation before the pump considers queued rows."""
         retained = self._manager._retained_claims
         try:
-            agent_id, entry = next(iter(retained.items()))
+            agent_id = next(iter(retained))
         except StopIteration:
             return
-        retained.pop(agent_id, None)
+        # Read before the entry is taken, so a cancel during the read leaves the
+        # claim retained. The teardown mark that also says the parent ended ages
+        # out, and a retry can come after it has.
+        parent_end_recorded = await self._parent_end_recorded(agent_id)
+        entry = retained.pop(agent_id, None)
+        if entry is None:
+            # A stop settled the claim while the record was read.
+            if retained:
+                self._schedule_retained_claim_retry()
+            return
         point, generation, reenter, stop_params = entry
         result = await self.claim_and_start(
             point,
             reenter,
             stop_params=stop_params,
             retained_generation=generation,
+            parent_end_recorded=parent_end_recorded,
         )
         if result is not None and not result.done and result.id in self._manager._agents:
             await self.taskq_child_registered_async(result)
@@ -501,6 +513,17 @@ class _PumpMixin(ManagerComponent):
                 # durably parked -- or refused for want of a row -- before any
                 # caller can read the answer as a queued handle.
                 first = await admission.finish_parked_defer(first)
+                # A refusal fired on this branch (the gate's commit-point
+                # re-check, an agent name that fails validation at dispatch)
+                # posted its row's FAILED write on the way out. Await it -- and
+                # verify it landed -- before the answer is returned: this
+                # branch runs under neither ``spawn_async``'s accept ``finally``
+                # nor ``claim_and_start``. The wait is the dispatcher's bounded
+                # one: this loop runs the picked rows one at a time, so a write
+                # the store refuses for this row alone must not stop the rest;
+                # past the read bound the row stays excluded and unregistered
+                # while its settle keeps retrying (``await_pending_defer``).
+                await admission.await_pending_defer(first.id, dispatch=True)
             # A re-queued (or, without a store, started) row: the W3 branch
             # runs here, awaited, instead of inline in ``spawn_impl``.
             if (
@@ -534,6 +557,7 @@ class _PumpMixin(ManagerComponent):
         *,
         stop_params: "Mapping[str, Any] | None" = None,
         retained_generation: int | None = None,
+        parent_end_recorded: bool = False,
     ) -> "SubagentInfo | None":
         """Claim a reserved row, take its start in the store, then register it.
 
@@ -597,6 +621,19 @@ class _PumpMixin(ManagerComponent):
                     # whether or not its own store cancel has landed yet (a
                     # claim retained across an outage). The row is not ours
                     # to start, and the store is not asked.
+                    claimed = (generation, False, self.CLAIM_REFUSED)
+                elif parent_end_recorded or self._parent_ended(point.agent_id):
+                    # The parent conversation ended while the claim was in
+                    # flight, or a retained claim's run folder records that it
+                    # did. Its teardown leaves a claimed row to this claimer,
+                    # so this claimer is the one that ends it.
+                    if not await self._cancel_torn_down_claim(store, point.agent_id, generation):
+                        self._retain_claim(point, generation, reenter, stop_params)
+                        claim_retained = True
+                        if retained_generation is None:
+                            result = reenter((generation, False, self.CLAIM_RETAINED))
+                        await self._record_parent_end(point, generation)
+                        return result
                     claimed = (generation, False, self.CLAIM_REFUSED)
                 else:
                     starting = _asyncio.get_running_loop().create_future()
@@ -664,6 +701,24 @@ class _PumpMixin(ManagerComponent):
                         # a reconcile, or ended. Whoever moved it wrote its
                         # state; nothing here starts or writes.
                         claimed = (generation, False, self.CLAIM_REFUSED)
+                    elif self._parent_ended(point.agent_id):
+                        # The teardown landed while the start write was in
+                        # flight: it found the row claimed and left it here.
+                        # The taken start is ended, not released for a retry,
+                        # so no later pump pass starts it either.
+                        start_taken = False
+                        if not await self._cancel_torn_down_claim(
+                            store, point.agent_id, generation
+                        ):
+                            # Retained like a start-write outage: the retry
+                            # re-reads the mark and cancels the row again.
+                            self._retain_claim(point, generation, reenter, stop_params)
+                            claim_retained = True
+                            if retained_generation is None:
+                                result = reenter((generation, False, self.CLAIM_RETAINED))
+                            await self._record_parent_end(point, generation)
+                            return result
+                        claimed = (generation, False, self.CLAIM_REFUSED)
             # No await between a taken start and registration: nothing can
             # interleave after the write a registered start relies on. A
             # refused claim may await its terminal store write because it
@@ -722,6 +777,18 @@ class _PumpMixin(ManagerComponent):
                 self._manager.__dict__.get("_starting_claim_parents", {}).pop(point.agent_id, None)
                 if not starting.done():
                     starting.set_result(registered)
+            if not registered and not claim_retained:
+                # A claim that was refused at the gate's commit point (the
+                # conversation-busy re-check) posted its row's FAILED write on
+                # the way out. Await it here -- and verify it landed -- before
+                # the refusal is returned: this is the one re-entry path that
+                # does not run under ``spawn_async``'s accept ``finally``, and a
+                # refusal published while its durable failure is still in
+                # flight would let a lost write leave the claimed row ADMITTED
+                # for the next incarnation's reconcile to requeue and run. The
+                # dispatcher's bounded wait, as on the drained branch above;
+                # after the start's answer above, which no await may precede.
+                await self.await_pending_defer(point.agent_id, dispatch=True)
             if registered:
                 # Every registered start re-publishes the parent's queued depth.
                 # A direct spawn owes nothing to the count, so its emit reports
@@ -883,6 +950,12 @@ class _PumpMixin(ManagerComponent):
         """
         waiting = self._manager._agents.get(agent_id)
         return waiting is not None and bool(waiting.done or waiting.user_stopped or waiting.reaped)
+
+    # The claimer's half of a parent-end teardown: ``pump_parent_end``.
+    _parent_ended = _pump_parent_end._parent_ended
+    _parent_end_recorded = _pump_parent_end._parent_end_recorded
+    _record_parent_end = _pump_parent_end._record_parent_end
+    _cancel_torn_down_claim = _pump_parent_end._cancel_torn_down_claim
 
     def release_reservation(self, agent_id: str) -> None:
         """Give back the slot a ``ClaimPoint`` reserved for a row that did not start."""
@@ -1125,10 +1198,21 @@ class _PumpMixin(ManagerComponent):
             and not drained.batch_id
             and self._manager._on_done
         ):
+            # The announce is the refusal PUBLISHED to the parent, and the
+            # dispatcher's own wait on the row's settle is bounded
+            # (``await_pending_defer(dispatch=True)``), so this task waits for
+            # the write itself -- the caller-style hold, as the batch announce
+            # in ``_announce_rejection`` does -- and the dispatcher moves on.
+            refused = drained
+
+            async def _settled_then_announce() -> None:
+                await self._manager._admission.await_pending_defer(refused.id)
+                await self._manager._safe_announce(refused)
+
             try:
                 self._hold_announce_task(
                     f"reject-{drained.id}",
-                    asyncio.ensure_future(self._manager._safe_announce(drained)),
+                    asyncio.ensure_future(_settled_then_announce()),
                 )
             except RuntimeError:
                 pass  # no running loop (sync/test context)
@@ -1187,6 +1271,9 @@ class _PumpMixin(ManagerComponent):
         _log_decision: str = "rejected"
         _log_by: str = "host"
         _log_cause: str = ""
+        _trace_approval: Any = None
+        from kiro_crew.tracing import steps as trace_steps
+
         try:
             try:
                 from kiro_crew.security import (
@@ -1225,17 +1312,24 @@ class _PumpMixin(ManagerComponent):
                 _log_origin = self._record_crew_log_spawn_approval_requested(
                     info, approval_id=request_id, reason=f"spawn_run({task_preview})"
                 )
+                # Its span, under the parent's spawn tool span (tracing/steps.py).
+                _trace_approval = trace_steps.approval_opened(
+                    request_id, subagent_id=info.id, spawn=True
+                )
                 try:
-                    approved: bool = await self._manager._on_spawn_approval(
+                    answer = await self._manager._on_spawn_approval(
                         request_id, f"spawn_run({task_preview})", info.parent_session_key
                     )
                 finally:
                     info._awaiting_approval = False
-                # A person answered, at a surface this site cannot name, so the
-                # entry asserts neither who decided nor why.
+                if isinstance(answer, HostSpawnDecision):
+                    # The callback decided on its own, with nobody asked.
+                    approved, _log_by, _log_cause = answer.approved, "host", answer.cause
+                else:
+                    # A person answered, at a surface this site cannot name, so the
+                    # entry asserts neither who decided nor why.
+                    approved, _log_by, _log_cause = answer, "", ""
                 _log_decision = "approved" if approved else "rejected"
-                _log_by = ""
-                _log_cause = ""
             except SpawnApprovalUnreachable as unreachable:
                 # Not a refusal: nobody was there to refuse. Ordered ABOVE the
                 # generic handler below, which would otherwise flatten this into the
@@ -1287,7 +1381,9 @@ class _PumpMixin(ManagerComponent):
                     exc_info=info.memory_mode == "persistent",
                 )
                 approved = False
-                _log_cause = DENY_CAUSE_HOOK_ERROR
+                # The approval callback itself raised; no hook ran, so the cause
+                # is a failure to deliver the prompt, not a hook error.
+                _log_cause = DENY_CAUSE_APPROVAL_UNDELIVERABLE
         finally:
             # The request's answer, on every exit including the cancelled one.
             # A no-op when no request was written, so the two are all-or-nothing.
@@ -1297,6 +1393,11 @@ class _PumpMixin(ManagerComponent):
                 decision=_log_decision,
                 by=_log_by,
                 cause=_log_cause,
+            )
+            trace_steps.approval_closed(
+                _trace_approval,
+                approved=_log_decision == "approved",
+                by=trace_steps.decided_by(host=_log_by == "host", cause=_log_cause),
             )
 
         if not approved:
@@ -1685,6 +1786,8 @@ class _PumpMixin(ManagerComponent):
                 context_groups=_context_groups_field(info),
                 delegation=info.delegation,
                 backend=info.backend,
+                depth=info.depth,
+                silent=info.silent,
                 memory_store=info.memory_store,
                 execution_context=info.execution_context,
                 memory_mode=info.memory_mode,

@@ -1,24 +1,13 @@
 """Fresh start on a crewmate's pinned DM: one press, a clean context, same slot.
 
-``POST /api/members/{slug}/fresh-start`` runs three existing mechanisms in a
-fixed order and adds none of its own:
-
-1. stop the running turn (``stop_slot_turn``; a second call while the first is
-   still pending is that function's own hard-kill escalation, which is what
-   frees a stuck process);
-2. clear the conversation through the typed ``/clear`` path, so the next
-   turn cold-starts with no history and the transcript records the reset;
-3. nothing else: the discard tears the agent process down, so the next turn
-   starts a fresh one under the SAME slot key.
-
-The slot key never changes: monitor loops, the work ledger and the crew log are
-bound to it. The route is the owner's only, gated exactly like the other
-member routes.
+``POST /api/members/{slug}/fresh-start`` stops the turn (``stop_slot_turn``; a second
+press hard-kills) and clears through the typed ``/clear`` path. The slot key never
+changes, because monitor loops, the work ledger and the crew log are bound to it.
 """
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
@@ -29,6 +18,8 @@ import kiro_crew.dashboard.chat_handlers as ch
 from kiro_crew import members
 from kiro_crew.dashboard.chat_utils import effective_session_key
 from kiro_crew.dashboard.handlers import members as m
+from kiro_crew.dashboard.responsive_chat import QUEUED_ROW_META_KEY
+from kiro_crew.dashboard.slot_queue_repository import RESTORED_QUEUE_KEY, RESTORED_SEND_CHOSEN_KEY
 from kiro_crew.eventlog import types as eventlog_types
 from kiro_crew.eventlog.service import get_service, set_service
 from kiro_crew.members import DM_SLOT_MODE, member_slot_key, write_dm_binding
@@ -39,14 +30,10 @@ MEMBER = "code-reviewer"
 
 @pytest.fixture(autouse=True)
 def _fresh_eventlog(tmp_path, _floor_monkeypatch):
-    """Re-root the member event log at tmp_path, same fixture as
-    test_members_eventlog_wiring.py: ``get_service()`` is a singleton, so a
-    test observing it must drop any instance a prior test built elsewhere.
+    """Re-root the member event log at tmp_path; ``get_service()`` is a singleton.
 
-    Patches through ``_floor_monkeypatch``, not the shared ``monkeypatch``: this
-    fixture is autouse, so every test in the file depends on the re-root
-    staying in place, and a test that calls ``monkeypatch.undo()`` mid-way
-    would otherwise lift it early.
+    Uses ``_floor_monkeypatch`` so a test calling ``monkeypatch.undo()`` cannot lift
+    this autouse re-root early.
     """
     _floor_monkeypatch.setattr(members, "data_home", lambda: tmp_path)
     set_service(None)
@@ -130,7 +117,7 @@ class TestOrder:
         assert status == 200
         assert order == ["discard"]
         state.sessions.discard_conversation.assert_awaited_once_with(
-            effective_session_key(slot), replay=False, skip_if_busy=True
+            effective_session_key(slot), replay=False, skip_if_busy=True, refuse_if=ANY
         )
         assert body["slot"] == slot.key
         assert body["reset_at"]
@@ -243,6 +230,80 @@ class TestOrder:
         assert status == 200
         assert state._slots == before
         assert state._slots[member_slot_key(SLUG)] is slot
+
+
+def _held_entry(slot, queue_id: str, content: str, *, written: bool) -> None:
+    """A queue entry restored after a restart that nobody chose (held).
+
+    ``written`` adds the user row its send wrote before the restart, which is
+    what makes its cancel refused (``queue_item_already_sent``).
+    """
+    slot._queue.append({"id": queue_id, "content": content, RESTORED_QUEUE_KEY: True})
+    if written:
+        slot.messages.append(
+            {"role": "user", "content": content, "meta": {QUEUED_ROW_META_KEY: queue_id}}
+        )
+
+
+class TestHeldQueue:
+    """A held restored message never sends on its own, so it does not refuse a reset."""
+
+    @pytest.mark.asyncio
+    async def test_a_held_message_does_not_refuse_the_reset(self, tmp_path, fast_waits):
+        state = _make_state(tmp_path)
+        slot = _bound_slot(state)
+        _held_entry(slot, "q-held", "am I prepped?", written=True)
+        order: list[str] = []
+        _record_discard(state, order)
+        status, body = await _press(state)
+        assert status == 200, body
+        assert body["outcome"] == "cleared"
+        assert order == ["discard"]
+
+    @pytest.mark.asyncio
+    async def test_the_reset_drops_a_held_message_already_in_the_transcript(
+        self, tmp_path, fast_waits
+    ):
+        """Its cancel is refused, so only the reset can remove it; its row stays."""
+        state = _make_state(tmp_path)
+        slot = _bound_slot(state)
+        _held_entry(slot, "q-written", "am I prepped?", written=True)
+        _held_entry(slot, "q-unwritten", "run diagnostics", written=False)
+        state.broadcast_ws = MagicMock()
+        _record_discard(state, [])
+        status, _ = await _press(state)
+        assert status == 200
+        assert [item["id"] for item in slot._queue] == ["q-unwritten"]
+        state.broadcast_ws.assert_any_call(
+            "queue_cancel", {"slot": slot.key, "queue_id": "q-written"}
+        )
+        assert any(row.get("content") == "am I prepped?" for row in slot.messages)
+
+    @pytest.mark.asyncio
+    async def test_a_queued_reset_keeps_the_held_message(self, tmp_path, fast_waits):
+        """A clear that has not happened yet drops nothing."""
+        state = _make_state(tmp_path)
+        slot = _bound_slot(state)
+        _held_entry(slot, "q-written", "am I prepped?", written=True)
+        state.sessions.discard_conversation = AsyncMock(return_value=False)
+        status, body = await _press(state)
+        assert status == 200
+        assert body["outcome"] == "queued"
+        assert [item["id"] for item in slot._queue] == ["q-written"]
+
+    @pytest.mark.asyncio
+    async def test_a_restored_message_the_person_chose_still_refuses(self, tmp_path, fast_waits):
+        """Chosen with "run this next", it will run, so it holds the reset back."""
+        state = _make_state(tmp_path)
+        slot = _bound_slot(state)
+        _held_entry(slot, "q-chosen", "am I prepped?", written=True)
+        slot._queue[0][RESTORED_SEND_CHOSEN_KEY] = True
+        order: list[str] = []
+        _record_discard(state, order)
+        status, body = await _press(state)
+        assert status == 409
+        assert body["code"] == "slot_queue_pending"
+        assert order == []
 
 
 class TestResetPersists:

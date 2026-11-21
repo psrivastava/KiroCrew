@@ -15,6 +15,7 @@ import logging
 import os
 import shutil
 import stat
+import tempfile
 from pathlib import Path
 from typing import Callable
 
@@ -22,12 +23,20 @@ from kiro_crew import pinned_fs
 from kiro_crew.atomic_write import replace_with_retry
 from kiro_crew.frontmatter import SKILL_LOADER, parse_frontmatter
 from kiro_crew.hooks import FileTooLargeError, safe_read_file, safe_read_file_bytes_nolink
-from kiro_crew.platform_compat import ensure_owner_rwx_dirs, is_link_or_junction, rmtree_force
+from kiro_crew.owner_only_files import ensure_directory
+from kiro_crew.platform_compat import (
+    ensure_owner_rwx_dirs,
+    is_link_or_junction,
+    publish_dir_noreplace,
+    rmtree_force,
+)
 from kiro_crew.skill_runtime import authoring as _authoring
 from kiro_crew.skills_builtin_provenance import (
     _FINGERPRINT_MAX_ENTRIES,
     _PROVENANCE_MARKER,
     _recorded_fingerprint,
+    _released_skill_owners,
+    _ships_for_released_app,
     _skill_tree_fingerprint,
     _tree_entries,
     _verified_unchanged_fingerprint,
@@ -444,8 +453,13 @@ def _copy_with_carried_skill_md(dest_dir: Path, carried: bytes) -> Callable[[str
     return _copy
 
 
-def _ensure_builtin_skills(base: Path) -> None:
+def _ensure_builtin_skills(base: Path) -> list[tuple[str, Path]]:
     """Sync built-in skills: copy new/updated, remove known-stale ones.
+
+    Returns ``(name, path)`` for each diverged skill directory (a user skill
+    sharing a builtin's name, or a locally edited builtin) moved aside so the
+    packaged copy could take its name, so the caller can tell the user where
+    it went.
 
     Supports nested directories (e.g. ``utils/tiny-url/SKILL.md``).
     Copies the entire skill directory (scripts, assets, etc.), not just SKILL.md.
@@ -469,6 +483,8 @@ def _ensure_builtin_skills(base: Path) -> None:
     """
     source_names: set[str] = set()
     supplied: set[str] = set()
+    set_aside: list[tuple[str, Path]] = []
+    released = _released_skill_owners()
     for src_root in (_project_skills_dir(), _BUILTIN_SKILLS_DIR):
         if not src_root or not src_root.exists():
             continue
@@ -484,6 +500,12 @@ def _ensure_builtin_skills(base: Path) -> None:
             if name in supplied:
                 continue
             supplied.add(name)
+            if _ships_for_released_app(src_file, released):
+                # Neither installed nor updated: the adopted app's own skills
+                # replace it, and an update here would claim, and quarantine,
+                # a directory that app's namespace may share. An installed copy
+                # stays in place; the catalog withholds it.
+                continue
             src_dir = src_file.parent
             dest_dir = base / name
             dest_file = dest_dir / "SKILL.md"
@@ -569,6 +591,7 @@ def _ensure_builtin_skills(base: Path) -> None:
                     # A failed finalize leaves the data at the dot-prefixed
                     # claim path (hidden but intact); installing the packaged
                     # version is still correct either way.
+                    set_aside.append((name, backup if backup is not None else claim))
                     logger.warning(
                         "Skill directory %s does not match the copy this sync "
                         "installed (user-authored or locally edited); preserved "
@@ -587,21 +610,61 @@ def _ensure_builtin_skills(base: Path) -> None:
             # written by the copy itself, so the published file is created
             # once, with the packaged mode, and never read back and rewritten.
             carried = _carried_skill_md(src_dir) if carry_opt_out else None
+            ensure_directory(base)  # copytree would create the skills root at the umask default
+            # Copy into a private, dot-prefixed staging sibling and publish it
+            # with one rename only once the copy is complete. A failed copy
+            # then costs this one skill and leaves nothing at the skill's name
+            # (no half tree that loads, counts as a relocation target, or reads
+            # as up to date), and the cleanup removes only the staging tree.
+            # ``mkdtemp`` creates the stage atomically under a name no other
+            # process can pick, so a second sync of the same home never copies
+            # into, or removes, this one's stage. Discovery skips dot-entries.
+            try:
+                dest_dir.parent.mkdir(parents=True, exist_ok=True)
+                stage = Path(
+                    tempfile.mkdtemp(prefix=f".{dest_dir.name}.sync-stage.", dir=dest_dir.parent)
+                )
+            except OSError as exc:
+                logger.warning("Could not install skill %s at %s: %s", name, dest_dir, exc)
+                continue
             try:
                 if carried is None:
-                    shutil.copytree(src_dir, dest_dir)
+                    shutil.copytree(src_dir, stage, dirs_exist_ok=True)
                 else:
                     shutil.copytree(
                         src_dir,
-                        dest_dir,
-                        copy_function=_copy_with_carried_skill_md(dest_dir, carried),
+                        stage,
+                        dirs_exist_ok=True,
+                        copy_function=_copy_with_carried_skill_md(stage, carried),
                     )
-            except FileExistsError:
-                # Another process (gateway + CLI syncing the same home) won
-                # the install race after our claim; its copy of the same
-                # packaged skill is the destination now. Losing must not
-                # crash the sync.
-                logger.info("Skill %s installed concurrently elsewhere; keeping it", name)
+            except OSError as exc:
+                # A full disk, a permission error or an over-long path costs
+                # this one skill, not every skill after it in the order.
+                logger.warning("Could not install skill %s at %s: %s", name, dest_dir, exc)
+                if not rmtree_force(stage):
+                    logger.warning("could not remove staged skill copy %s", stage)
+                continue
+            try:
+                # copytree copied the packaged root's mode onto the stage, and
+                # macOS refuses to rename a directory its owner cannot write
+                # (a 0o555 or 0o455 source). Owner rwx is what the repair after
+                # the publish adds anyway, so the fingerprint is unchanged.
+                os.chmod(stage, stat.S_IMODE(os.lstat(stage).st_mode) | stat.S_IRWXU)
+                # No-replace publish: a destination that appeared while the
+                # copy ran (even an empty directory) is never overwritten.
+                publish_dir_noreplace(stage, dest_dir)
+            except OSError:
+                if os.path.lexists(dest_dir):
+                    # Another process (gateway + CLI syncing the same home) won
+                    # the install race after our claim; its copy of the same
+                    # packaged skill is the destination now.
+                    logger.info("Skill %s installed concurrently elsewhere; keeping it", name)
+                else:
+                    logger.warning(
+                        "Could not publish skill %s at %s", name, dest_dir, exc_info=True
+                    )
+                if not rmtree_force(stage):
+                    logger.warning("could not remove staged skill copy %s", stage)
                 continue
             # copytree preserves source modes verbatim, so a read-only
             # install source (0o555 -- a Nix store path, a read-only mount)
@@ -740,6 +803,7 @@ def _ensure_builtin_skills(base: Path) -> None:
                         old_skill_md,
                         exc_info=True,
                     )
+    return set_aside
 
 
 #: SHA-256 of the static outputs from the retired conductor skill generator.
@@ -904,13 +968,14 @@ def remove_retired_conductor_skill() -> bool:
         os.close(root_fd)
 
 
-def sync_builtins(self) -> None:
+def sync_builtins(self) -> list[tuple[str, Path]]:
     """Run the builtin-skill sync for this loader's directory.
 
     The explicit seam for callers that own an off-loop context (the
     gateway runs this in a worker thread as a background task after the
     dashboard socket binds). Construction-time sync skips itself on a
     running event loop, so without this seam a loop-thread process would
-    have no way to sync at all.
+    have no way to sync at all. Returns the skills it set aside, as
+    ``_ensure_builtin_skills`` does.
     """
-    _ensure_builtin_skills(self._dir)
+    return _ensure_builtin_skills(self._dir)

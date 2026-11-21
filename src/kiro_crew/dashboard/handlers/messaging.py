@@ -23,21 +23,9 @@ from typing import Any, Callable, cast  # noqa: F401
 
 from aiohttp import web
 
-from kiro_crew import platform_compat  # noqa: F401
+from kiro_crew import platform_compat, redaction_seams, sdk_extras  # noqa: F401
 from kiro_crew._facade_compose import compose as _facade_compose
 from kiro_crew.agent_sdk.drivers.acp_vocab import NATIVE_CHILD_NOT_RESUMABLE  # noqa: F401
-from kiro_crew.browser.command_bus import (  # noqa: F401
-    DEFAULT_COMMAND_TIMEOUT_MS,
-    DEFAULT_DRAIN_WAIT_MS,
-    NoPanelError,
-    QueueFullError,
-    get_command_bus,
-)
-from kiro_crew.browser_cli import install as browser_cli_install  # noqa: F401
-from kiro_crew.browser_cli import install_job as browser_install_job  # noqa: F401
-from kiro_crew.browser_cli import launcher as browser_cli_launcher  # noqa: F401
-from kiro_crew.browser_cli import token as browser_cli_token  # noqa: F401
-from kiro_crew.browser_cli import view as browser_cli_view  # noqa: F401
 from kiro_crew.config import live  # noqa: F401
 from kiro_crew.config import loader as _loader
 from kiro_crew.config.loader import (  # noqa: F401
@@ -47,8 +35,15 @@ from kiro_crew.config.loader import (  # noqa: F401
     config_path,
     read_config_text,
 )
-from kiro_crew.constants import CHANNEL_SEND_NAMESPACES, SUBAGENT_COMPLETION_META_KEY  # noqa: F401
+from kiro_crew.constants import (  # noqa: F401
+    CHANNEL_SEND_NAMESPACES,
+    MAX_SHORT_STRING,
+    SUBAGENT_COMPLETION_META_KEY,
+)
 from kiro_crew.cron import CronStoreBusy, CronStoreUnreadable  # noqa: F401
+from kiro_crew.dashboard.app_token_refusal import (  # noqa: F401 -- read by messaging_api.run_control
+    app_token_refusal,
+)
 from kiro_crew.dashboard.body_numbers import body_int  # noqa: F401
 from kiro_crew.dashboard.channel_folders import (  # noqa: F401
     CHANNEL_CONFIG_SECTIONS,
@@ -73,6 +68,11 @@ from kiro_crew.dashboard.chat_utils import (  # noqa: F401
     slot_history_key,
     subagent_event_slot,
 )
+from kiro_crew.dashboard.cron_note_ack import (  # noqa: F401
+    clear_cron_item_recorded,
+    cron_note_transition,
+    recorded_cron_item,
+)
 from kiro_crew.dashboard.handlers._shared import (  # noqa: F401
     _pip_install_channel_available,
     body_not_object_error,
@@ -81,14 +81,15 @@ from kiro_crew.dashboard.handlers._shared import (  # noqa: F401
     pip_extra_install_command,
     read_bounded_json,
     spawn_parent_claim,
+    string_field_error,
 )
-from kiro_crew.dashboard.handlers.browser_view_relay import ROUTE_PREFIX  # noqa: F401
 from kiro_crew.dashboard.handlers.core import _hot_apply_after_write  # noqa: F401
-from kiro_crew.dashboard.kiro_relay.caller import is_relay_teammate  # noqa: F401
-from kiro_crew.dashboard.kiro_relay.ingress import refuse_relayed  # noqa: F401
-from kiro_crew.dashboard.kiro_relay.limits import APPS_OFF_FOR_TEAMMATES  # noqa: F401
+from kiro_crew.dashboard.handlers.spawn_resume import (  # noqa: F401
+    INVALID_WAIT_CODE,
+    MAX_HOLD_SECS,
+    _wait_secs,
+)
 from kiro_crew.dashboard.messaging_api import agent_push as _owner_agent_push
-from kiro_crew.dashboard.messaging_api import browser_routes as _owner_browser_routes
 from kiro_crew.dashboard.messaging_api import channel_config_writes as _owner_channel_config_writes
 from kiro_crew.dashboard.messaging_api import channel_delivery as _owner_channel_delivery
 from kiro_crew.dashboard.messaging_api import (
@@ -101,6 +102,7 @@ from kiro_crew.dashboard.messaging_api import notifications as _owner_notificati
 from kiro_crew.dashboard.messaging_api import proactive_send as _owner_proactive_send
 from kiro_crew.dashboard.messaging_api import run_control as _owner_run_control
 from kiro_crew.dashboard.messaging_api import run_views as _owner_run_views
+from kiro_crew.dashboard.messaging_api import slack_owner_claim as _owner_slack_owner_claim
 from kiro_crew.dashboard.messaging_api import slack_settings as _owner_slack_settings
 from kiro_crew.dashboard.messaging_api import slack_workspace as _owner_slack_workspace
 from kiro_crew.dashboard.messaging_api import spawn as _owner_spawn
@@ -109,33 +111,16 @@ from kiro_crew.dashboard.messaging_api import telegram_settings as _owner_telegr
 from kiro_crew.dashboard.messaging_api import webex_settings as _owner_webex_settings
 from kiro_crew.dashboard.messaging_api import wecom_settings as _owner_wecom_settings
 from kiro_crew.dashboard.messaging_api.agent_push import (  # noqa: F401
+    _refuse_redactable_key,
+    _refuse_unattributable_caller,
+    api_notification_agent_dismiss,
     api_notification_agent_push,
-)
-from kiro_crew.dashboard.messaging_api.browser_routes import (  # noqa: F401
-    _browser_install_active,
-    _browser_install_conflict,
-    _browser_install_job,
-    _browser_install_status,
-    _browser_view_payload,
-    _deny_non_owner_browser_request,
-    _start_browser_install_job,
-    _terminate_install_scope,
-    api_browser_command,
-    api_browser_command_drain,
-    api_browser_command_result,
-    api_browser_engine_install,
-    api_browser_install_get,
-    api_browser_install_start,
-    api_browser_open,
-    api_browser_token_put,
-    api_browser_view_get,
-    api_browser_view_start,
-    stop_browser_install,
 )
 from kiro_crew.dashboard.messaging_api.channel_config_writes import (  # noqa: F401
     _clean_id_list,
     _LockedSectionWrite,
     _mask_secret,
+    _stored_threshold_pct,
     _threshold_pct_rejection,
     _wide_env_refusal,
     _write_env_or_roll_back,
@@ -148,8 +133,11 @@ from kiro_crew.dashboard.messaging_api.channel_delivery import (  # noqa: F401
     _cron_job_for,
     _deliver_channel_dm,
     _deliver_to_channel,
+    _fresh_governance,
+    _generation_now,
     _owner_dm_target,
     _send_to_channel_target,
+    _vet_app_messaging,
     _vet_channel_send,
 )
 from kiro_crew.dashboard.messaging_api.channel_folder_backfill import (  # noqa: F401
@@ -167,6 +155,7 @@ from kiro_crew.dashboard.messaging_api.feishu_settings import (  # noqa: F401
     _is_valid_feishu_id,
     api_feishu_config_get,
     api_feishu_config_save,
+    api_feishu_sdk_install,
 )
 from kiro_crew.dashboard.messaging_api.imessage_settings import (  # noqa: F401
     _clean_imessage_path,
@@ -175,8 +164,10 @@ from kiro_crew.dashboard.messaging_api.imessage_settings import (  # noqa: F401
     api_imessage_config_get,
 )
 from kiro_crew.dashboard.messaging_api.notifications import (  # noqa: F401
-    _is_app_note,
-    _refuse_hidden_note,
+    _audit_withheld,
+    _persist_failed,
+    _refuse_owner_only_note,
+    _withheld_from,
     api_notification_ack,
     api_notification_channel_settings,
     api_notification_channels,
@@ -193,9 +184,11 @@ from kiro_crew.dashboard.messaging_api.proactive_send import (  # noqa: F401
     _deliver_send_message_fallback,
     _post_send_message_to_slack,
     _proactive_source_line,
+    _published_blocks_refusal,
     _publishing_session_meta,
     _read_send_message,
     _redact_all,
+    _reserved_action_refusal,
     _resolve_session_link_url,
     _resolve_session_target,
     _sanitize_blocks,
@@ -205,11 +198,15 @@ from kiro_crew.dashboard.messaging_api.proactive_send import (  # noqa: F401
     _session_link_blocks,
     _slack_rate_limited,
     _slack_rejected_outright,
+    _update_message,
     _with_source_line,
     api_delete_message,
-    api_update_message,
 )
 from kiro_crew.dashboard.messaging_api.run_control import (  # noqa: F401
+    _app_token_batch_refusal,
+    _app_token_caller,
+    _app_token_parent_refusal,
+    _flag_collected_inline,
     _log_panel_dismissal,
     _native_child_refusal,
     _queue_unreadable,
@@ -219,6 +216,7 @@ from kiro_crew.dashboard.messaging_api.run_control import (  # noqa: F401
     _queued_run_payload,
     _queued_runs,
     _retry_failed_run,
+    _settle_collected_on_slot,
     _spawn_scope_refusal,
     api_spawn_delete,
     api_spawn_lost,
@@ -231,20 +229,36 @@ from kiro_crew.dashboard.messaging_api.run_control import (  # noqa: F401
 from kiro_crew.dashboard.messaging_api.run_views import (  # noqa: F401
     _apply_result_view,
     _awaiting_spawn_approval,
+    _failover_fields,
+    _parent_turn_holding,
     _redact,
+    _session_turn_holding,
     _spawn_result_view,
     api_spawn_list,
     api_spawn_status,
 )
+from kiro_crew.dashboard.messaging_api.slack_owner_claim import (  # noqa: F401
+    _owner_claim_gate,
+    _owner_claim_refused,
+    api_slack_owner_claim_cancel,
+    api_slack_owner_claim_confirm,
+    api_slack_owner_claim_get,
+    api_slack_owner_claim_start,
+)
 from kiro_crew.dashboard.messaging_api.slack_settings import (  # noqa: F401
+    _save_code_channel_dispatch_locked,
     _slack_config_save_locked,
     _validate_slack_token,
+    api_slack_code_channel_agents,
     api_slack_config_get,
     api_slack_config_save,
     api_slack_manifest_status,
+    api_slack_reconnect,
+    save_code_channel_dispatch,
 )
 from kiro_crew.dashboard.messaging_api.slack_workspace import (  # noqa: F401
     _missing_scope_message,
+    api_slack_history,
     api_slack_manifest,
     api_slack_pins,
     api_slack_profile,
@@ -252,7 +266,16 @@ from kiro_crew.dashboard.messaging_api.slack_workspace import (  # noqa: F401
 )
 from kiro_crew.dashboard.messaging_api.spawn import (  # noqa: F401
     STOPPED_BEFORE_START_CODE,
+    _app_bot_spawn_refusal,
+    _app_token_spawn_refusal,
+    _backend_name,
+    _chain_note,
     _continue_on_loop,
+    _failover_backend,
+    _inherited_backend_name,
+    _light_tier_pins,
+    _lts_kiro_successor,
+    _parent_run_is_silent,
     _qualified_model_refusal,
     _requested_backend,
     _slot_for_parent,
@@ -289,34 +312,38 @@ from kiro_crew.dashboard.messaging_api.wecom_settings import (  # noqa: F401
     api_wecom_config_get,
     api_wecom_config_save,
 )
+from kiro_crew.dashboard.notification_coordinator import unread_count  # noqa: F401
 from kiro_crew.dashboard.origin import is_direct_local_request, is_proxied_request  # noqa: F401
+from kiro_crew.dashboard.slot_ownership import (  # noqa: F401 -- read by messaging_api.run_control, .spawn
+    _record_isolation_denial,
+)
 from kiro_crew.dashboard.state import (  # noqa: F401
     CRON_NOTIFY_END,
     CRON_NOTIFY_PREFIX,
     PERSISTED_SUBAGENT_REPLAY_KEEP,
     PERSISTED_SUBAGENT_REPLAY_MAX_AGE_SECS,
     DashboardState,
+    _redact_note_value,
     load_window_off_loop,
 )
 from kiro_crew.dashboard.token_auth import (  # noqa: F401
     LINK_WINDOW_SECS,
     caller_names_a_missing_slot,
+    effective_request_app,
     generate_token,
 )
 from kiro_crew.dashboard.ws_event_scope import (  # noqa: F401
     _audit_allow,
     _audit_deny,
-    audit_teammate_withheld,
-    is_app_channel,
-    notification_source_app,
     persisted_replay_denial_reason,
     persisted_snapshot_denial_reason,
     slot_owner_snapshot,
 )
 from kiro_crew.hidden_leaf_staging import EnvStagingRefused, publish_env  # noqa: F401
+from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.members import attributable_session_key, member_identity_for_session  # noqa: F401
 from kiro_crew.messaging.display_safety import redact_for_display
-from kiro_crew.messaging.link import SLACK_NAMESPACE, ChannelLink  # noqa: F401
+from kiro_crew.messaging.link import SLACK_NAMESPACE, ChannelLink, canonical_key  # noqa: F401
 from kiro_crew.messaging.renderer import (  # noqa: F401
     chunk_for_transport,
     chunk_text,
@@ -329,10 +356,12 @@ from kiro_crew.messaging.transport import (  # noqa: F401
     delivery_confirmed,
     sole_direct_target,
 )
+from kiro_crew.milestones import record_when as record_milestone_when  # noqa: F401
 from kiro_crew.notifications.bus import (  # noqa: F401
     NotificationPayload,
     NotificationValidationError,
 )
+from kiro_crew.parent_turns import ledger_of  # noqa: F401
 from kiro_crew.platform.context import redact_via_context  # noqa: F401
 from kiro_crew.platform.governance_profiles import HOST_SESSION_KEY  # noqa: F401
 from kiro_crew.platform_compat import IS_MACOS  # noqa: F401
@@ -361,6 +390,8 @@ from kiro_crew.subagent import (  # noqa: F401
     effort_pending_note,
     parent_project_dirs,
     parent_template_allowlists,
+    parent_template_spawn_policy,
+    wait_done,
 )
 from kiro_crew.subagent_manager.admission.types import (  # noqa: F401
     QueuedReadUnavailable,
@@ -372,6 +403,7 @@ from kiro_crew.subagent_persistence import (  # noqa: F401
     DISMISSAL_NO_FOLDER,
     PanelRecords,
     _agent_dir,
+    agent_dir_for_display,
     classify_persisted_ending,
     read_panel_records,
     read_state,
@@ -596,6 +628,13 @@ _SLACK_ONLY_BODY_FIELDS = (
 _SLACK_SECTION_TEXT_MAX = 3000
 
 
+@redaction_seams.in_seam(redaction_seams.CHANNELS)
+async def api_update_message(request: web.Request) -> web.Response:
+    """POST /api/update-message: :func:`_update_message` inside the channel egress seam."""
+    return await _update_message(request)
+
+
+@redaction_seams.in_seam(redaction_seams.CHANNELS)
 async def api_send_message(request: web.Request) -> web.Response:
     """POST /api/send-message — send a message to a chat surface and/or dashboard.
 
@@ -654,6 +693,9 @@ async def api_send_message(request: web.Request) -> web.Response:
         blocks = _sanitize_blocks(
             blocks, redact_exfiltration_urls, redact_credentials, display_form=True
         )
+        # Every Block Kit guard again, on the tree that is published.
+        if (refused := _published_blocks_refusal(blocks)) is not None:
+            return refused
 
     # render [OPTIONS: ...] tags as interactive buttons on the
     # plain-text path (when the caller did not supply explicit blocks — those
@@ -845,6 +887,7 @@ async def api_send_message(request: web.Request) -> web.Response:
                 attribution_session=await asyncio.to_thread(attributable_session_key, request),
                 is_cron_caller=is_cron_caller,
                 send_to_slack=send_to_slack,
+                request_app=effective_request_app(state, request),
             )
     finally:
         _audit_send_message(
@@ -865,7 +908,9 @@ async def api_send_message(request: web.Request) -> web.Response:
     )
 
 
-async def _write_env_off_loop(updates: dict[str, str | None]) -> None:
+async def _write_env_off_loop(
+    updates: dict[str, str | None], *, check: Callable[[str], None] | None = None
+) -> None:
     """Run the blocking ``.env`` write on a worker, drained under the config lock.
 
     Every caller holds ``_get_config_lock()`` across this, and a thread cannot be
@@ -895,7 +940,11 @@ async def _write_env_off_loop(updates: dict[str, str | None]) -> None:
     this through :func:`_write_env_or_roll_back`, which rolls the config write
     back on any failure, so on every channel the 409 means nothing was saved.
     """
-    fut = asyncio.ensure_future(asyncio.to_thread(_write_env_updates, updates))
+    fut = asyncio.ensure_future(
+        asyncio.to_thread(_write_env_updates, updates)
+        if check is None
+        else asyncio.to_thread(_write_env_updates, updates, check)
+    )
     try:
         await asyncio.shield(fut)
     except asyncio.CancelledError:
@@ -1060,6 +1109,10 @@ async def api_imessage_config_save(request: web.Request) -> web.Response:
 # SDK is importable by this gateway process and the exact command that installs
 # it into this interpreter. Every panel that reports these renders the shared
 # optional-SDK card instead of a bare ``pip install`` line.
+#: One optional-SDK install at a time (``api_feishu_sdk_install``); a second press
+#: while one runs gets 409.
+_SDK_INSTALL_LOCK = LoopBoundLock()
+
 _CHANNEL_SDK_EXTRA: dict[str, tuple[str, str]] = {
     "feishu": ("lark_oapi", "feishu"),
     # PyJWT installs as the ``jwt`` package (teams/client.py imports ``jwt``).
@@ -1083,6 +1136,7 @@ _facade_compose(
         _owner_proactive_send,
         _owner_channel_delivery,
         _owner_slack_settings,
+        _owner_slack_owner_claim,
         _owner_discord_settings,
         _owner_telegram_settings,
         _owner_teams_settings,
@@ -1090,7 +1144,6 @@ _facade_compose(
         _owner_imessage_settings,
         _owner_wecom_settings,
         _owner_feishu_settings,
-        _owner_browser_routes,
         _owner_channel_config_writes,
         _owner_slack_workspace,
         _owner_channel_folder_backfill,

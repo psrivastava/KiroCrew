@@ -34,6 +34,12 @@ Prompt-driven behaviour on ``session/prompt`` (the reply is always sent last):
   for pre-approved tools. The emitted ``rawInput`` carries the reserved purpose
   argument under its camelCase spelling (see ``_TOOL_PURPOSE``), so the pill's
   concise-label path is covered by the harness.
+* ``[[BROWSER]]`` in the prompt -> emit a ``browser`` MCP tool call
+  (``_meta.kiro`` names ``kirocrew-core`` / ``browser``, the identity the live
+  browser card keys its turn on) plus its completed update. The fake drives no
+  browser itself: a smoke test posts the real ops to ``/api/browser/op`` for the
+  same slot while a ``[[SLOW_HOLD:...]]`` keeps the turn open, and the card in
+  the transcript shows the stream exactly as a real turn would.
 * ``[[PERMISSION]]`` in the prompt -> the ``[[TOOL]]`` sequence PLUS a
   server->client ``session/request_permission`` (to surface the approval
   modal). This is **fire-and-forget**: the fake does not gate its own
@@ -77,6 +83,10 @@ Prompt-driven behaviour on ``session/prompt`` (the reply is always sent last):
   ``session/cancel`` during the hold acks with ``stopReason: "cancelled"``.
 * ``[[ERROR]]`` -> reply with a JSON-RPC error instead of a result.
 * ``[[MAXTOKENS]]`` / ``[[REFUSAL]]`` -> alternate terminal ``stopReason``.
+
+With ``KIROCREW_FAKE_ACP_SCRIPT`` naming a JSON file, a chat prompt the script
+answers gets the script's reply instead of any of the above
+(:mod:`kiro_crew.testing.scripted_replies` documents the file).
 
 Observing a cancel mid-turn requires reading stdin while a prompt is streaming,
 so ``main()`` reads on a background thread into a queue rather than looping
@@ -154,6 +164,8 @@ FAKE_MODEL_CATALOG: dict[str, Any] = {
 
 # Prompt sentinels. Absent by default so a plain prompt stays text-only.
 TOOL_TRIGGER = "[[TOOL]]"
+# Emits a ``browser`` MCP tool call (see the module docstring).
+BROWSER_TRIGGER = "[[BROWSER]]"
 PERMISSION_TRIGGER = "[[PERMISSION]]"
 # Permission that actually GATES: the fake waits for the host's answer and
 # reflects it in the tool_call_update status. Distinct from PERMISSION_TRIGGER,
@@ -218,6 +230,14 @@ _POLL_INTERVAL_SECS = 0.02
 ERROR_CODE = -32603
 ERROR_MESSAGE = "fake ACP backend: injected failure"
 
+#: Names the reply script (``kiro_crew.testing.scripted_replies.SCRIPT_ENV``,
+#: spelled here so this module stays stdlib-only at import time).
+SCRIPT_ENV = "KIROCREW_FAKE_ACP_SCRIPT"
+_SCRIPT_TOOL_IDS = itertools.count(1)
+#: Characters per scripted message chunk. A character grows to at most 12 bytes
+#: once JSON-escaped, so a chunk stays near 3 MiB, well under the 10 MiB line
+#: limit of the transports that read these frames.
+_SCRIPT_CHUNK_CHARS = 256 * 1024
 _SESSION_IDS = itertools.count(1)
 _SESSION_ID = "fake-1"
 _SESSIONS: dict[str, tuple[list[dict[str, Any]], str]] = {}
@@ -306,6 +326,7 @@ _MCP_CLIENT_ORIGIN = {
     "kiro": {"resource": {"resourceType": "mcpServer", "source": {"origin": "client"}}}
 }
 _TOOL_CALL_ID = "fake-tool-1"
+_BROWSER_TOOL_CALL_ID = "fake-browser-1"
 # The agent-authored purpose line, carried as a reserved tool argument. kiro-cli
 # echoes it back in ``rawInput`` under EITHER spelling; the fake emits the
 # camelCase one so the harness exercises the shape the dashboard's concise tool
@@ -417,17 +438,10 @@ def _report_mcp_ready(session_id: str, mode_id: str | None = None) -> None:
     )
 
 
-# --------------------------------------------------------------------------- #
-# Mid-turn inbox
-#
-# main() reads stdin on a background thread and pushes into this queue, so a
-# handler can poll for cancels / permission answers while a session/prompt is
-# still streaming. A strict read -> handle loop cannot observe a session/cancel
-# arriving DURING a session/prompt until the turn has already finished.
-#
-# Direct _handle() callers (the unit tests) leave the queue empty: every wait
-# below then simply times out and the default behaviour is unchanged.
-# --------------------------------------------------------------------------- #
+# Mid-turn inbox: main() reads stdin on a background thread into this queue, so a
+# handler can see a session/cancel or permission answer while a session/prompt is
+# still streaming. Direct _handle() callers (the unit tests) leave it empty, so
+# every wait below times out and behaviour is unchanged.
 _INBOX: queue.Queue[dict[str, Any] | None] = queue.Queue()
 
 
@@ -588,6 +602,30 @@ def _emit_tool_call(session_id: str, *, with_permission: bool, gated: bool = Fal
     )
 
 
+def _emit_browser_tool_call(session_id: str, url: str = "https://jspaint.app") -> None:
+    """Emit one completed ``browser`` MCP tool call, as kiro-cli spells its identity."""
+    _update(
+        session_id,
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": _BROWSER_TOOL_CALL_ID,
+            "title": "browser",
+            "kind": "fetch",
+            "status": "pending",
+            "rawInput": {"op": "navigate", "args": {"url": url}, "__toolUsePurpose": "Open a page"},
+            "_meta": {"kiro": {"mcpServerName": "kirocrew-core", "toolName": "browser"}},
+        },
+    )
+    _update(
+        session_id,
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": _BROWSER_TOOL_CALL_ID,
+            "status": "completed",
+        },
+    )
+
+
 def _emit_elicitation(session_id: str, mode: str) -> str:
     """Raise an MCP elicitation mid tool call and echo the host's answer.
 
@@ -679,15 +717,12 @@ def _stream_slowly(
     cancel_aware=False models an agent stuck in a long tool call that cannot
     acknowledge a stop, so the host's soft-stop budget expires.
 
-    ack_after_chunks>0 models an agent that notices the cancel but takes a
-    bounded moment to wind down: it emits that many more chunks, then acks. The
-    host stays in `soft_pending` for the whole wind-down, which is what makes
-    that state observable to a UI assertion instead of a ~250ms race, while
-    still ending the turn cooperatively so nothing leaks into the next turn.
+    ack_after_chunks>0 emits that many more chunks after the cancel, then acks:
+    the host stays in `soft_pending` long enough for a UI assertion (not a
+    ~250ms race) and the turn still ends cooperatively.
 
-    The cancel observation is LATCHED because `_cancel_requested` consumes the
-    message from the inbox: a second call after the wind-down starts would
-    return False and the ack would never fire.
+    The cancel is LATCHED because `_cancel_requested` consumes the inbox
+    message: a second call would return False and the ack would never fire.
 
     *hold*, when given, is asked before chunk ``SLOW_HOLD_AFTER_CHUNKS``: the
     stream waits there until it answers True (:func:`_hold_until_released`),
@@ -717,6 +752,66 @@ def _stream_slowly(
         time.sleep(SLOW_CHUNK_DELAY_SECS if delay is None else delay)
     # A cancel arriving during the final sleep still counts.
     return bool(cancelled or (cancel_aware and _cancel_requested(session_id)))
+
+
+def _script() -> Any:
+    """The reply script, or ``None`` when ``SCRIPT_ENV`` is unset or unusable.
+
+    With the variable unset nothing below changes. The script module is
+    imported only then: it reads the file through Kiro Crew's guarded reader,
+    which this stdlib-only module cannot import at load time.
+    """
+    if not os.environ.get(SCRIPT_ENV, "").strip():
+        return None
+    try:
+        from kiro_crew.testing import scripted_replies
+    except ImportError:
+        sys.stderr.write(
+            f"fake ACP backend script: {SCRIPT_ENV} ignored: "
+            "kiro_crew is not importable by this interpreter\n"
+        )
+        return None
+    return scripted_replies.active_script()
+
+
+def _send_scripted(req_id: Any, session_id: str, reply: Any) -> None:
+    """Stream one ``scripted_replies.ScriptedReply``, then its result or error."""
+    if reply.error is not None:
+        _error(req_id, message=reply.error)
+        return
+    for tool in reply.tools:
+        tool_call_id = f"fake-script-tool-{next(_SCRIPT_TOOL_IDS)}"
+        _update(
+            session_id,
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": tool_call_id,
+                "title": tool.title,
+                "kind": tool.kind,
+                "status": "pending",
+                "rawInput": tool.input,
+            },
+        )
+        _update(
+            session_id,
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": tool_call_id,
+                "status": tool.status,
+            },
+        )
+    for start in range(0, len(reply.text), _SCRIPT_CHUNK_CHARS):
+        _update(
+            session_id,
+            {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                    "type": "text",
+                    "text": reply.text[start : start + _SCRIPT_CHUNK_CHARS],
+                },
+            },
+        )
+    _result(req_id, {"stopReason": reply.stop})
 
 
 def _handle(msg: dict[str, Any]) -> None:
@@ -812,6 +907,11 @@ def _handle(msg: dict[str, Any]) -> None:
             )
             _result(req_id, {"stopReason": "end_turn"})
             return
+        script = _script()
+        scripted = script.reply_for(session_id, text) if script is not None else None
+        if scripted is not None:
+            _send_scripted(req_id, session_id, scripted)
+            return
         if ERROR_TRIGGER in text:
             # A JSON-RPC error instead of a result: the turn fails, not stops.
             _error(req_id)
@@ -835,6 +935,8 @@ def _handle(msg: dict[str, Any]) -> None:
             _emit_tool_call(session_id, with_permission=True)
         elif TOOL_TRIGGER in text:
             _emit_tool_call(session_id, with_permission=False)
+        if BROWSER_TRIGGER in text:
+            _emit_browser_tool_call(session_id)
 
         holds = _SLOW_HOLD_RE.findall(text)
         if holds:

@@ -22,10 +22,15 @@ from aws_control_app_helpers import (  # noqa: F401 -- fixtures are used by name
     _registered,
     _request,
 )
+from redaction_structured_cases import github_classic
 
 from kiro_crew import aws_consent
 from kiro_crew.apps.builtins.aws_control.backend import accounts as accounts_mod
 from kiro_crew.apps.builtins.aws_control.backend import routes as routes_mod
+
+# An AWS key ID is an Identifier with the structured detectors on, so the
+# credential these tests expect to be redacted is a GitHub token.
+SECRET = github_classic(seed=14)
 
 
 class TestStateShapeGuards:
@@ -87,17 +92,9 @@ class TestStaleMappingGuard:
     def test_a_cached_identity_cannot_authorize_a_read(self):
         """The probe must not answer an authorization question from memory.
 
-        The test above mocks ``probe_identity`` outright, so it proves the refusal
-        and says nothing about WHERE the identity came from. The real function
-        memoises per ``(profile, region)`` for 30 seconds, which is why this one
-        drives the actual cache: it primes an answer of ACCOUNT, repoints the
-        underlying credentials at another account, and then asks for ACCOUNT.
-
-        Against a cached probe the route reads ACCOUNT's inventory out of the
-        OTHER account, and nothing anywhere reports a problem: the caller asked
-        for an account they own, the check passed, and the rows came back. That is
-        disclosure, and it is silent, which is why the assertion below is that no
-        AWS read was attempted at all.
+        ``probe_identity`` memoises per ``(profile, region)`` for 30 seconds, so this
+        drives the real cache: prime ACCOUNT, repoint the credentials elsewhere, ask
+        again. A cached answer would silently read the OTHER account's inventory.
         """
         handlers = _registered()
         other = "444455556666"
@@ -152,7 +149,7 @@ class TestRound16Hardening:
     def test_profile_and_account_names_are_redacted_on_the_way_out(self):
         # The profile registry is an agent-writable store, so a planted
         # credential in a profile NAME must not reach the dashboard verbatim.
-        planted = "prof-AKIAIOSFODNN7EXAMPLE"
+        planted = f"prof-{SECRET}"
         view = accounts_mod.ProfileView(
             name=planted,
             region="us-west-2",
@@ -163,11 +160,11 @@ class TestRound16Hardening:
             detail=f"probe failed for {planted}",
         )
         out = view.to_dict()
-        assert "AKIAIOSFODNN7EXAMPLE" not in out["name"]
-        assert "AKIAIOSFODNN7EXAMPLE" not in out["detail"]
+        assert SECRET not in out["name"]
+        assert SECRET not in out["detail"]
 
         acct = accounts_mod.AccountView(account=ACCOUNT, profiles=[view])
-        assert "AKIAIOSFODNN7EXAMPLE" not in acct.to_dict()["name"]
+        assert SECRET not in acct.to_dict()["name"]
 
     def test_corrupt_runs_map_does_not_lose_a_completed_upload(self, tmp_path, monkeypatch):
         # The archive is already in S3 by the time the ledger is written: a
@@ -371,7 +368,7 @@ class TestRound17Hardening:
             assert Path(path).read_text(encoding="utf-8") == key
 
     def test_every_string_display_field_is_redacted(self):
-        planted = "AKIAIOSFODNN7EXAMPLE"
+        planted = SECRET
         view = accounts_mod.ProfileView(
             name=f"p-{planted}",
             region=f"us-west-2-{planted}",
@@ -873,8 +870,9 @@ class TestRound24Hardening:
         # secret is placed so that a naive `err[:200]` would split it.
         from kiro_crew.deploy import engine
 
-        secret = "AKIAIOSFODNN7EXAMPLE"
-        padded = "x" * 190 + secret + " trailing context"
+        secret = SECRET
+        # A blank before it: a token glued to a letter is no token.
+        padded = "x" * 189 + " " + secret + " trailing context"
         out = engine._trimmed_stderr(padded)
 
         assert len(out) <= 200
@@ -1101,15 +1099,16 @@ class TestRound36Hardening:
 
         from kiro_crew.apps.builtins.aws_control.backend import backup
 
-        # flake-ok: pre-existing UTC wall-clock read, moved verbatim; the product reads the same clock and the due window is about a day
-        recent = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None).isoformat()
+        # A pinned instant, so the stamp sits one hour before it on every host.
+        now = _dt.datetime(2026, 1, 1, 12, 0, tzinfo=_dt.timezone.utc)
+        recent = (now - _dt.timedelta(hours=1)).replace(tzinfo=None).isoformat()
         with (
             mock.patch.object(backup, "nightly_enabled", return_value=True),
             mock.patch.object(
                 backup, "last_runs", return_value={backup.KIND_SNAPSHOT: {"at": recent}}
             ),
         ):
-            assert backup.due_for_nightly(ACCOUNT) is False
+            assert backup.due_for_nightly(ACCOUNT, now=now) is False
 
     def test_a_non_string_last_run_reads_as_due(self):
         from kiro_crew.apps.builtins.aws_control.backend import backup
@@ -1125,11 +1124,11 @@ class TestRound36Hardening:
 
     def test_a_credential_shaped_profile_name_is_redacted_in_the_reconnect_command(self):
         # _PROFILE_RE is a shell-safety gate, not a secret gate: it admits
-        # [A-Za-z0-9._@=+-] up to 128 chars, so an access key id passes it and
+        # [A-Za-z0-9._@=+-] up to 128 chars, so a GitHub token passes it and
         # would render verbatim into the guidance card and the clipboard.
         from kiro_crew.apps.builtins.aws_control.backend import accounts
 
-        key = "AKIAIOSFODNN7EXAMPLE"
+        key = SECRET
         plan = accounts.reconnect_plan(accounts.KIND_SSO, key)
         assert key not in plan["command"]
         # Still a usable command shape, not an empty string.

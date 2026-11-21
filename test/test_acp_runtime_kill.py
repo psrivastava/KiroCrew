@@ -9,6 +9,12 @@ every sweep and leak until reboot.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import ctypes
+import os
+import signal
+import sys
+import threading
 from collections import deque
 from unittest.mock import MagicMock
 
@@ -16,6 +22,8 @@ import pytest
 
 from kiro_crew import platform_compat
 from kiro_crew.acp import runtime as rt
+from kiro_crew.process_identity import ProcessHandle, process_survived
+from kiro_crew.testing.wait import async_wait_until
 
 
 def _bare_runtime(pid: int = 54321) -> rt.AcpRuntime:
@@ -54,21 +62,9 @@ def _bare_runtime(pid: int = 54321) -> rt.AcpRuntime:
 class _StubbedPlatformCompat:
     """The real ``platform_compat``, with only what a kill test must pin replaced.
 
-    These tests describe the POSIX-shaped teardown, so the module they run
-    against has to answer ``IS_WINDOWS`` False on a Windows host. Substituting a
-    hand-listed namespace for the module did that and paid for it twice: every
-    production read of an attribute nobody thought to list raised
-    ``AttributeError`` from inside the code under test, and the list went stale
-    the moment the teardown started reading one more thing (the root-identity
-    check). Delegating instead means only the pins are fiction.
-
-    Every destructive entry point is pinned to ``None`` rather than delegated, so
-    a test that forgets to stub one fails loudly on a call to ``None`` instead of
-    aiming a real terminate at a fabricated pid on the host running the suite.
-    Reads (``get_process_start_id``, ``pid_exists`` where a test sets it, the
-    signal constants) come from the real module. Assignment lands on the
-    instance, so ``monkeypatch.setattr(rt.platform_compat, ...)`` in a test wins
-    over both the pins and the delegation.
+    ``IS_WINDOWS`` is False so the POSIX teardown runs on any host; other reads delegate
+    so no attribute goes missing. Destructive entry points are ``None`` so a missing stub
+    fails loudly instead of killing a fabricated pid. ``monkeypatch.setattr`` wins.
     """
 
     #: Anything that can signal, terminate or reap a process on this host.
@@ -88,12 +84,8 @@ class _StubbedPlatformCompat:
     def kill_process_tree_pinned(self, pid: int, expected_start_time: str, sig: int) -> bool:
         """The POSIX half of the real function, spelled out rather than delegated.
 
-        The real one branches on ``platform_compat``'s OWN ``IS_WINDOWS``, which
-        this class cannot pin: on a Windows host it would take the owned-handle
-        drain and open a real process object for a pid these tests invented.
-        ``IS_WINDOWS`` False is already the premise here, and on that side the
-        real function is exactly ``kill_process_tree(pid, sig)`` -- so resolve it
-        through the instance, where the pin above (or a test's own stub) lives.
+        The real one reads its own ``IS_WINDOWS``, which this class cannot pin, and on
+        Windows would open a real process for an invented pid.
         """
         return self.kill_process_tree(pid, sig)
 
@@ -107,11 +99,8 @@ class _StubbedPlatformCompat:
 def _fast_kill_windows(monkeypatch):
     """Make the two escalation waits time out without waiting for a real clock.
 
-    `kill()` only reaches the SIGKILL escalation and the liveness probe after both
-    `wait_for`s expire. At 0.05s that depended on the scheduler resuming a coroutine
-    inside 50ms, which a loaded runner (and Windows, ~15.6ms timer granularity) does
-    not promise. Zero makes `wait_for` raise on its first check: same code path,
-    reached deterministically with no sleeping.
+    Zero makes both `wait_for`s raise on the first check, so the SIGKILL escalation is
+    reached deterministically; a small timeout depends on scheduler timing.
     """
     monkeypatch.setattr(rt, "platform_compat", _StubbedPlatformCompat())
     monkeypatch.setattr(rt.AcpRuntime, "_KILL_TERM_TIMEOUT", 0)
@@ -188,11 +177,8 @@ async def test_kill_signals_the_group_when_the_root_is_already_gone(monkeypatch)
     """The leak that survives descendant tracking: a root that died before any
     descendant was recorded.
 
-    kill_process_tree is killpg(getpgid(root)); getpgid raises once the root has
-    exited, and swallowing that leaves the launcher, agent and chat process in
-    the group unsignalled. The group id is known without the root -- it was a
-    session leader -- so the teardown must still reach it, and escalate, once a
-    live member vouches for it.
+    getpgid raises once the root exits, but the root was a session leader, so the group
+    id is known and must still be signalled once a live member vouches for it.
     """
     r = _bare_runtime()
 
@@ -421,12 +407,8 @@ async def test_kill_reports_an_unreached_tree_on_a_vouching_host_too(
 ):
     """On Linux, reaching no member is not proof the tree is gone.
 
-    The members can be there and simply not vouch -- a sandbox that scrubbed the
-    incarnation token, an unreadable `/proc/<pid>/environ`, a missing argv
-    identity -- which is the reported leak's own shape. So the group read is the
-    guard, not the platform: something still in the group means the teardown
-    reached nothing that was there and must say so, while an empty group is the
-    ordinary teardown and stays quiet.
+    Members may not vouch (scrubbed token, unreadable `/proc/<pid>/environ`). A
+    non-empty group must be reported; an empty group stays quiet.
     """
     r = _bare_runtime()
     monkeypatch.setattr(rt, "group_vouching_available", lambda: True)
@@ -649,3 +631,271 @@ async def test_kill_untracks_pid_when_process_died(monkeypatch):
 
     assert untracked_pids == [54321, 54321]
     assert r._process is None
+
+
+@pytest.mark.asyncio
+async def test_kill_untracks_root_off_the_event_loop(monkeypatch):
+    """The root's PID-registry untrack runs off the event loop.
+
+    It locks and fsyncs the PID file; on the loop a slow disk would stall the gateway
+    and block the warm-pool discard's ``wait_for``. Asserted on the recorded thread.
+    """
+    r = _bare_runtime()
+    # A recorded identity so the retire goes through _untrack_root_by_identity,
+    # the call that holds the pid-file lock.
+    r._spawn_start_token = "root-start"
+    monkeypatch.setattr(rt.platform_compat, "kill_process_tree", lambda *a, **k: None)
+    monkeypatch.setattr(rt.platform_compat, "pid_exists", lambda pid: False)
+
+    loop_thread_id = threading.get_ident()
+    ran_on: list[int] = []
+
+    def _record_thread(pid, token):
+        ran_on.append(threading.get_ident())
+        return True  # a line of ours was retired; no bare fallback needed
+
+    monkeypatch.setattr(rt, "_untrack_root_by_identity", _record_thread)
+
+    await r.kill()
+
+    assert ran_on, "the root untrack never ran"
+    assert (
+        ran_on[0] != loop_thread_id
+    ), "the root PID untrack ran on the event-loop thread; it must be offloaded"
+
+
+#: Prints its pid, then blocks on stdin until EOF: the agent below a launcher, which
+#: exits only when the gateway's end of its stdin closes.
+_EOF_BOUND_CHILD = (
+    "import os, sys\n"
+    "sys.stdout.write(str(os.getpid()) + chr(10))\n"
+    "sys.stdout.flush()\n"
+    "sys.stdin.read()\n"
+)
+#: Starts that child on the inherited stdio and exits at once: a root that dies first.
+_ROOT_THAT_DIES_FIRST = (
+    "import subprocess, sys\n" f"subprocess.Popen([sys.executable, '-c', {_EOF_BOUND_CHILD!r}])\n"
+)
+
+
+#: One worker runs the tests that start a real interpreter tree: each kill ends its
+#: own tree, so the trees cannot be one module-scoped child, and cold-starting them on
+#: several workers at once stalls a shard.
+_REAL_TREE_GROUP = "acp_runtime_kill_real_tree"
+
+#: The liveness oracle's own reads, bound at import, before any fixture or test patch
+#: runs: whatever a test stubs on the kill path, the oracle still asks the kernel.
+_kernel_start_id = platform_compat.get_process_start_id
+_kernel_pid_is_zombie = platform_compat.pid_is_zombie
+
+
+def _still_running(pid: int, start: str | None) -> bool:
+    """Whether *pid* is still the process recorded as *start*, and not a zombie."""
+    if start is None or _kernel_start_id(pid) != start:
+        return False
+    return _kernel_pid_is_zombie(pid) is not True
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX teardown; Windows drains by handle")
+@pytest.mark.xdist_group(name=_REAL_TREE_GROUP)
+@pytest.mark.asyncio
+async def test_kill_releases_stdin_so_the_tree_a_dead_root_left_reads_eof(monkeypatch):
+    """A tree no signal reaches still ends when the kill releases the root's stdin.
+
+    The macOS shape of a leader killed first: the root has exited, its child holds
+    stdout and stderr open and blocks on stdin, and neither teardown path can reach
+    the leaderless group (the root identity is unreadable and no member vouches).
+    asyncio's transport then never finishes on its own, so only the kill closing
+    the gateway's end of stdin lets that child read EOF and exit.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        _ROOT_THAT_DIES_FIRST,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    assert proc.stdout is not None
+    child = int(await asyncio.wait_for(proc.stdout.readline(), timeout=60))
+    child_start = _kernel_start_id(child)
+    try:
+        await async_wait_until(
+            lambda: proc.returncode is not None, describe=lambda: f"root rc={proc.returncode}"
+        )
+        assert _still_running(child, child_start), "the child must outlive its root"
+        r = _bare_runtime(pid=proc.pid)
+        r._process = proc
+        monkeypatch.setattr(rt, "group_vouching_available", lambda: False)
+        monkeypatch.setattr(rt.platform_compat, "IS_POSIX", True)
+        monkeypatch.setattr(rt.platform_compat, "get_process_start_id", lambda pid: None)
+        monkeypatch.setattr(rt, "_signal_orphaned_runtime_group", lambda pgid, sig, inst, **k: {})
+        monkeypatch.setattr(rt.platform_compat, "pid_exists", lambda pid: False)
+        monkeypatch.setattr(rt, "_untrack_pid", lambda pid: None)
+        monkeypatch.setattr(rt, "_untrack_session_pid", lambda pid: None)
+
+        await r.kill()
+
+        await async_wait_until(
+            lambda: not _still_running(child, child_start),
+            describe=lambda: f"child {child} still running after kill()",
+        )
+    finally:
+        if _still_running(child, child_start):
+            # The child still holds the group the root led, so its number is still ours.
+            os.killpg(proc.pid, signal.SIGKILL)
+
+
+#: On SIGTERM, closes its stdio -- the pipes the root's transport waits on -- and
+#: holds its exit until a byte (or EOF) arrives on the gate fd in argv[1]: the agent
+#: below the sandbox launcher, whose exit closes those pipes before the init it was
+#: reparented to has reaped it.
+_AGENT_SLOW_TO_STOP = (
+    "import os, signal, sys\n"
+    "gate = int(sys.argv[1])\n"
+    "def _stop(*_):\n"
+    "    for fd in (0, 1, 2):\n"
+    "        os.close(fd)\n"
+    "    os.read(gate, 1)\n"
+    "    os._exit(0)\n"
+    "signal.signal(signal.SIGTERM, _stop)\n"
+    "print('ready', flush=True)\n"
+    "while True:\n"
+    "    signal.pause()\n"
+)
+#: The sandbox launcher's shape: forks that agent into its own process group and
+#: waits for it under the default SIGTERM disposition, so a group SIGTERM ends the
+#: launcher at once while the agent is still stopping.
+_LAUNCHER_ROOT = (
+    "import os, sys\n"
+    "pid = os.fork()\n"
+    "if pid == 0:\n"
+    f"    os.execv(sys.executable, [sys.executable, '-c', {_AGENT_SLOW_TO_STOP!r}, sys.argv[1]])\n"
+    "print(pid, flush=True)\n"
+    "os.waitpid(pid, 0)\n"
+)
+
+#: ``prctl`` option that makes a process the reaper of the orphans in its subtree.
+_PR_SET_CHILD_SUBREAPER = 36
+
+
+def _set_child_subreaper(on: bool) -> None:
+    """Make this process the reaper of its subtree's orphans (Linux), or stop being it.
+
+    The test that sets it reaps the one orphan its own tree leaves, so the group it
+    waits on empties without help from whatever init the host runs.
+    """
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(_PR_SET_CHILD_SUBREAPER, int(on), 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), "prctl(PR_SET_CHILD_SUBREAPER)")
+
+
+def _reap_group(pgid: int) -> None:
+    """Reap each child of this process left in process group *pgid*, until none is left."""
+    with contextlib.suppress(ChildProcessError):
+        while True:
+            os.waitpid(-pgid, 0)
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="the sandbox launcher that forks the agent is Linux's"
+)
+@pytest.mark.xdist_group(name=_REAL_TREE_GROUP)
+@pytest.mark.asyncio
+async def test_kill_waits_for_the_group_a_root_that_dies_at_once_leaves(monkeypatch):
+    """A root that dies on the SIGTERM at once does not end the kill for its group.
+
+    The sandbox launcher is that root: the group's SIGTERM ends it immediately, and
+    the agent it forked into the same group closes the root's pipes as it exits, so
+    the root's ``wait()`` returns while that agent is still in the group -- exiting,
+    or a zombie the init it was reparented to has not reaped yet. A kill that returns
+    there hands every check after it -- the descendant prune, a sub-agent's survivor
+    check -- a process the SIGTERM already ended, which they read as one that
+    survived the teardown and force-kill. The kill waits the group out for the rest
+    of the grace instead. The agent's exit is held on a gate the group probe opens,
+    so the wait is observed, not timed, and this test is the subreaper that reaps
+    the orphaned agent, so the group empties whatever init the host runs.
+    """
+    proc: asyncio.subprocess.Process | None = None
+    agent: int | None = None
+    agent_start: str | None = None
+    reaped: list[int] = []
+    subreaper = False
+    gate_w = -1
+    try:
+        _set_child_subreaper(True)
+        subreaper = True
+        gate_r, gate_w = os.pipe()
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-c",
+                _LAUNCHER_ROOT,
+                str(gate_r),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                start_new_session=True,
+                pass_fds=(gate_r,),
+            )
+        finally:
+            os.close(gate_r)
+        assert proc.stdout is not None
+        lines = [await asyncio.wait_for(proc.stdout.readline(), timeout=60) for _ in range(2)]
+        agent = int(next(line for line in lines if line.strip().isdigit()))
+        agent_start = _kernel_start_id(agent)
+        asked: list[bool] = []
+
+        def _pgroup_exists(pgid: int) -> bool:
+            if asked:
+                # The root is gone, so the agent is this subreaper's: reap it once it exits.
+                with contextlib.suppress(ChildProcessError):
+                    if os.waitpid(agent, os.WNOHANG)[0] == agent:
+                        reaped.append(agent)
+            alive = platform_compat.pgroup_exists(pgid)
+            if alive and not asked:
+                os.write(gate_w, b"x")  # the kill is waiting on the group: let the agent stop
+            asked.append(alive)
+            return alive
+
+        stub = rt.platform_compat
+        monkeypatch.setattr(stub, "kill_process_tree", platform_compat.kill_process_tree)
+        monkeypatch.setattr(stub, "pid_exists", platform_compat.pid_exists)
+        monkeypatch.setattr(stub, "pgroup_exists", _pgroup_exists, raising=False)
+        monkeypatch.setattr(rt.AcpRuntime, "_KILL_TERM_TIMEOUT", 60.0)
+        monkeypatch.setattr(rt, "_untrack_pid", lambda pid: None)
+        monkeypatch.setattr(rt, "_untrack_session_pid", lambda pid: None)
+        r = _bare_runtime(pid=proc.pid)
+        r._process = proc
+        r._start_time = _kernel_start_id(proc.pid)
+        r._child_pids = {agent: (agent_start, b"python")}
+        # The handle a sub-agent reset takes of this runtime before it resets.
+        handle = ProcessHandle(
+            pid=proc.pid, start_id=r._start_time, pgid=proc.pid, child_pids=dict(r._child_pids)
+        )
+
+        await r.kill()
+
+        assert proc.returncode == -signal.SIGTERM
+        assert not process_survived(handle), "a reset's survivor check would force-kill it"
+        assert not _still_running(agent, agent_start), "kill() returned with the agent stopping"
+        assert asked and asked[-1] is False, asked
+        assert reaped == [agent], "the group emptied without this subreaper reaping the agent"
+        assert r._process_tree_confirmed_dead is True
+    finally:
+        try:
+            if gate_w >= 0:
+                os.close(gate_w)  # EOF releases an agent the kill never waited for
+            if proc is not None:
+                if proc.returncode is None or (
+                    agent is not None and _still_running(agent, agent_start)
+                ):
+                    # A member is still in the group, so its number is still the root's.
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(proc.pid, signal.SIGKILL)
+                await asyncio.wait_for(proc.wait(), timeout=60)
+                # The root is reaped, so what is left of its group is this subreaper's.
+                await asyncio.wait_for(asyncio.to_thread(_reap_group, proc.pid), timeout=60)
+        finally:
+            if subreaper:
+                _set_child_subreaper(False)

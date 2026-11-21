@@ -19,7 +19,7 @@ describe('inferLane exhaustiveness and exclusivity', () => {
         const slot: LaneSlotFields = {}
         FIELDS.forEach((f, i) => {
           if (!(mask & (1 << i))) return
-          slot[f as Exclude<keyof LaneSlotFields, 'queue_depth'>] = true
+          slot[f as Exclude<keyof LaneSlotFields, 'queue_depth' | 'queue_held_depth'>] = true
         })
         const lane = inferLane(slot, { subagentAwaiting })
         expect(keys, `mask ${mask}`).toContain(lane)
@@ -56,6 +56,26 @@ describe('inferLane precedence', () => {
 
   it('treats an options card as waiting on the user', () => {
     expect(inferLane({ has_options: true })).toBe('waiting')
+  })
+
+  it('files a conductor whose crew still moves under working, despite its options line', () => {
+    expect(inferLane({ has_options: true }, { crewBusy: true })).toBe('working')
+    expect(inferLane({}, { crewBusy: true })).toBe('working')
+  })
+
+  it('files a conductor whose ledger work is still moving under idle, despite its options line', () => {
+    expect(inferLane({ has_options: true }, { crewOpenWork: true })).toBe('idle')
+    // Its armed patrol does not make that crew read as working either.
+    expect(inferLane({ has_options: true }, { crewOpenWork: true, goalLoopActive: true })).toBe('idle')
+  })
+
+  it('keeps a conductor whose own turn runs under working, even with quiet ledger work', () => {
+    expect(inferLane({ running: true }, { crewStalled: true })).toBe('working')
+    expect(inferLane({}, { crewStalled: true })).toBe('waiting')
+  })
+
+  it('files a conductor whose ledger names the person under waiting, even with its crew moving', () => {
+    expect(inferLane({}, { crewPerson: true, crewBusy: true })).toBe('waiting')
   })
 
   it('treats an interrupted turn as waiting, not idle', () => {
@@ -124,6 +144,12 @@ describe('inferLane working signals', () => {
 
   it('does not treat a zero queue depth as work', () => {
     expect(inferLane({ queue_depth: 0 })).toBe('idle')
+  })
+
+  it('does not treat restored cards as work: nothing sends them on their own', () => {
+    expect(inferLane({ queue_depth: 2, queue_held_depth: 2 })).toBe('idle')
+    expect(inferLane({ interrupted: true, queue_depth: 1, queue_held_depth: 1 })).toBe('waiting')
+    expect(inferLane({ queue_depth: 2, queue_held_depth: 1 })).toBe('working')
   })
 })
 

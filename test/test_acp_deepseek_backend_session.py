@@ -19,6 +19,7 @@ from kiro_crew.acp import launch as launch_mod
 from kiro_crew.acp.client import AcpClient, AcpToolGateUnroutable
 from kiro_crew.acp.harness import deepseek as deepseek_mod
 from kiro_crew.acp_backends import ACP_BACKEND_CLAUDE, ACP_BACKEND_DEEPSEEK
+from kiro_crew.agent_sdk.backends_sessions import can_restore_session
 
 # ── The restore verb ─────────────────────────────────────────────────────────
 
@@ -121,8 +122,13 @@ def test_both_varying_reads_are_keyed_on_the_one_set() -> None:
     hazard is a second decision site appearing, which no behavioural test sees.
     """
     body = inspect.getsource(AcpClient._initialize_session)
-    assert body.count("ACP_BACKENDS_RESUME_WITHOUT_LOAD") == 2
-    assert 'session_capabilities.get("resume")' in body
+    # The verb is keyed on the set here; the capability through the one reader both
+    # drivers share, which keys on the same set.
+    assert body.count("ACP_BACKENDS_RESUME_WITHOUT_LOAD") == 1
+    assert "can_restore_session(self.backend, capabilities)" in body
+    reader = inspect.getsource(can_restore_session)
+    assert "ACP_BACKENDS_RESUME_WITHOUT_LOAD" in reader
+    assert 'session_capabilities.get("resume")' in reader
     assert "METHOD_SESSION_RESUME" in body
     assert "restore_method" in body
 
@@ -212,17 +218,13 @@ def test_the_install_pins_the_exact_dsh_build_the_routing_was_measured_on() -> N
 def test_the_resolution_ladder_prefers_the_explicit_override(monkeypatch, tmp_path) -> None:
     """Override, then mise, then PATH -- the plain-binary ladder.
 
-    What is pinned is the ORDER, so executability is STUBBED rather than staged on
-    disk. A file written and chmod-ed here answers ``is_executable_file`` on POSIX
-    and not on Windows, where an executable needs a recognised extension -- so a
-    disk-staged override fell through to the mise rung there, and this test was
-    asserting the platform's notion of an executable instead of the precedence it
-    exists to pin.
+    Executability is stubbed, not staged on disk: Windows needs a recognised
+    extension for ``is_executable_file``, and only the order is under test.
     """
     from kiro_crew.acp import client as client_module
 
     binary = tmp_path / "dsh"
-    binary.write_text("#!/bin/sh\n")
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
     monkeypatch.setenv("DSH_BIN", str(binary))
     monkeypatch.setattr(
         client_module.platform_compat,
@@ -278,11 +280,8 @@ def test_the_arm_runs_the_credential_mask_preflight_before_its_read_back(
 ) -> None:
     """An ENFORCED harness takes a preflight call site, and takes it FIRST.
 
-    ORDER is the part worth pinning: the read-back boots a child of this harness, and
-    a child that ran before the mask was resolved would read the operator's
-    credentials with the gate's own blessing. And the gate is composed through the
-    harness's own per-launch patch flag, naming the sealed copy, never by editing a
-    profile Crew does not own.
+    The read-back boots a child, which must not run before the mask is resolved. The
+    gate goes in through the per-launch patch flag, never by editing the profile.
     """
     rig = _DeepseekLaunchRig(monkeypatch, tmp_path)
     plan = rig.run()

@@ -262,15 +262,22 @@ class TestStripImageRefs:
     def test_a_long_message_of_path_fragments_scans_in_linear_time(self):
         # Space is both a delimiter and a legal path character, so every "/" here
         # opens a path body that would walk to the suffix: the bounded body is
-        # what keeps this linear.
-        text = (" /a" * 20000) + ".png~"
+        # what keeps this linear. The cost is inside the regex engine, which no
+        # work counter can see, so the shared ramp holds this thread's CPU to its
+        # default budget, one fragment at a time and then at growing pumps, each
+        # costing at most a linear multiple of the one before.
+        from conftest import assert_rejected_without_backtracking
 
-        started = time.perf_counter()
-        out = strip_image_refs(text)
-        elapsed = time.perf_counter() - started
+        def left_alone(text: str) -> None:
+            assert strip_image_refs(text) == text
 
-        assert out == text
-        assert elapsed < 5.0, f"image-reference scan took {elapsed:.3f}s"
+        # The long pumps carry a quarter of the fragments (the one-unit ramp keeps
+        # every unit): a linear scan of 20 000 fragments costs about a third of the
+        # budget on an idle host, too close to it on a slow one, and the 10x step
+        # between long pumps that the growth check reads is unchanged.
+        assert_rejected_without_backtracking(
+            left_alone, lambda n: (" /a" * (n if n < 200 else n // 4)) + ".png~"
+        )
 
     def test_a_path_component_after_an_image_suffix_is_stripped_whole(self, tmp_path):
         p = _dest(_png(tmp_path))
@@ -334,6 +341,11 @@ class TestBarePathPassIsNarrowerThanTheInliner:
                     # Inline code and a fenced block are documentation.
                     f"run `open {_ABS_A}` to view it",
                     f"how to:\n```\nopen {_ABS_A}\n```\nthat is all",
+                    # Indented code and escaped markup are literal text too, and
+                    # the builder attaches none of them.
+                    f"how to:\n\n    open {_ABS_A}\n\nthat is all",
+                    f"how to:\n\topen {_ABS_A}",
+                    f"write \\![shot]({_ABS_A}) to embed it",
                     # Protocol-relative: a path shape to both grammars ("/" opens the
                     # POSIX one, "//" also spells a UNC share) but REMOTE to
                     # iter_local_refs, so pass one declines it and pass two must too --
@@ -393,6 +405,14 @@ class TestBarePathPassIsNarrowerThanTheInliner:
             f"look at this\n{_ABS_A}",  # the Slack/Telegram append shape
             _ABS_A,  # the whole row
             f"look at ({_ABS_A}) there",  # opening delimiter
+            # An indented FIRST line is prose once replayed: the role label put in
+            # front of it removes the indent, so the builder would attach it.
+            f"    open {_ABS_A}\nthanks",
+            f"\t{_ABS_A}",
+            # A fence never closed is prose on both sides: the builder must not
+            # let a dangling opener swallow a channel's appended attachment,
+            # so the scrubber strips what the builder would attach.
+            f"see this:\n```python\nprint(1)\n{_ABS_A}",
         ],
     )
     def test_a_standalone_path_is_still_stripped(self, text):
@@ -636,7 +656,9 @@ class TestBarePathPassKeepsProse:
         # One lead read per line that held a candidate the lead reached, not one
         # per candidate: 6 001 candidates on the first line share a single read.
         assert lead.fullmatch_calls == 2
-        assert cpu < 2.0, f"scrub spent {cpu:.1f}s of CPU"
+        assert (
+            cpu < 2.0
+        ), f"scrub spent {cpu:.1f}s of CPU"  # flake-ok: existing complexity guard's thread-CPU budget at its original constant (D7); the fullmatch count above is the work proof
 
     def test_no_file_is_consulted(self):
         # Lexical by contract: a probe here would run on the event loop, and the
@@ -681,6 +703,7 @@ class TestBarePathPassKeepsProse:
             IngestResult,
             _make_temp,
             append_attachment_context,
+            image_location_note,
         )
 
         spaced_dir = tmp_path / "John Smith"
@@ -692,8 +715,9 @@ class TestBarePathPassKeepsProse:
         # Spaced, or this pins nothing: an unspaced path strips by another rule.
         assert " " in dest
         assert os.path.dirname(dest) == str(spaced_dir)
-        assert row == f"look at this\n{dest}"
-        assert strip_image_refs(row) == f"look at this\n{STRIPPED_IMAGE_MARKER}"
+        note = image_location_note(dest)
+        assert row == f"look at this\n{dest}\n\n{note}"
+        assert strip_image_refs(row) == f"look at this\n{STRIPPED_IMAGE_MARKER}\n\n{note}"
 
 
 class TestTheTitlePromptKeepsItsOwnImageHandling:
@@ -702,19 +726,17 @@ class TestTheTitlePromptKeepsItsOwnImageHandling:
     ``run_bg_oneliner`` scrubs the composed prompt and sends the turn text-only
     (``test_run_bg_oneliner``), so no path that survives in a one-line prompt
     becomes an image block. ``chat_title._title_text`` strips markdown images
-    and attachment markers its own way, because it keeps an escaped or
-    code-quoted ``![x](...)`` readable where the scrubber's bare-path pass
-    would replace the escaped one's destination.
+    and attachment markers its own way, and keeps an escaped or code-quoted
+    ``![x](...)`` readable.
     """
 
     _ROW = f"look at this\n{_TEMP}"
 
     def test_the_title_builder_keeps_a_bare_path_as_text(self):
         # NOT scrubbed here: `_title_text` keeps an escaped or code-quoted
-        # `![x](...)` readable in a title prompt, and `strip_image_refs`
-        # replaces the escaped one's destination (pinned below), so the title
-        # path strips markdown images and attachment markers its own way. A
-        # channel's bare path is neither, and stays in the title prompt as text.
+        # `![x](...)` readable in a title prompt and strips markdown images and
+        # attachment markers its own way. A channel's bare path is neither, and
+        # stays in the title prompt as text.
         from kiro_crew.dashboard.chat_title import _build_title_prompt
 
         prompt = _build_title_prompt([{"role": "user", "content": self._ROW}])
@@ -722,16 +744,15 @@ class TestTheTitlePromptKeepsItsOwnImageHandling:
         assert prompt and _TEMP in prompt
         assert STRIPPED_IMAGE_MARKER not in prompt
 
-    def test_the_scrubber_replaces_the_escaped_destination_the_title_keeps(self):
-        # Why the title path cannot share the scrubber: the bare-path pass
-        # reaches inside an escaped marker, while a code-quoted one is masked
-        # from both passes and survives.
+    def test_the_scrubber_keeps_the_escaped_and_quoted_markers_the_title_keeps(self):
+        # Both are literal text, masked from both passes, so the
+        # scrubber and the title prompt agree on them.
         escaped = f"\\![image]({_ABS_A})"
         quoted = f"`![image]({_ABS_B})`"
 
-        out = strip_image_refs(f"{escaped} and {quoted}")
+        text = f"{escaped} and {quoted}"
 
-        assert out == f"\\![image]({STRIPPED_IMAGE_MARKER}) and {quoted}"
+        assert strip_image_refs(text) == text
 
 
 class TestReplayedHistoryCarriesNoImage:
@@ -777,6 +798,19 @@ class TestReplayedHistoryCarriesNoImage:
         assert "Assistant: I see a red panel with a stack trace." in replay
         assert "User: and now the second one" in replay
         assert replay.startswith("User: here is the failing screen ")
+
+    @pytest.mark.parametrize("indent", ["    ", "\t"], ids=["spaces", "tab"])
+    def test_an_indented_first_line_marker_is_not_re_inlined(self, tmp_path, indent):
+        # The role label replay puts in front of a row's first line removes its
+        # indent, so a marker kept there as indented code would attach again.
+        p = _png(tmp_path)
+        rows = [{"role": "user", "content": f"{indent}![shot]({_dest(p)})\nthanks"}]
+        replay = build_session_replay(_Log(rows), "k")
+        blocks = build_prompt_blocks(replay, allow_image=True)
+
+        assert [b["type"] for b in blocks] == ["text"]
+        assert _dest(p) not in blocks[0]["text"]
+        assert STRIPPED_IMAGE_MARKER in blocks[0]["text"]
 
     def test_recall_rows_strip_too(self, tmp_path):
         # The other row builder. It feeds the thread-history fallback, so a

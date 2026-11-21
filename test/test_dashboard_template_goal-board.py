@@ -48,19 +48,27 @@ def test_every_animation_names_a_keyframes_this_page_defines() -> None:
     assert used == defined
 
 
-def test_a_needs_you_button_fills_the_chat_box_and_never_sends() -> None:
-    """The host bridge office and project-report use: the page posts ``act`` and the
-    host only fills the composer. Any other message type would be a new channel."""
+def test_a_needs_you_option_asks_to_send_and_reply_fills_the_chat_box() -> None:
+    """An offered option is a finished answer, so it posts ``send``: the host sends it
+    only when the person turned one-click sends on, and otherwise fills the composer
+    exactly as ``act`` does. Reply posts a starter ("About ...: ") the person finishes,
+    so it stays ``act``. No other channel exists."""
     script = _script()
     assert sorted(re.findall(r"type:\s*'([\w:-]+)'", script)) == [
         "kirocrew-dashboard:act",
         "kirocrew-dashboard:open",
+        "kirocrew-dashboard:send",
     ]
-    assert script.count("postMessage(") == 2
+    assert script.count("postMessage(") == 3
     assert "postMessage(" in _function("act")
-    assert "act(say)" in _function("button")
-    for banned in ("send", "submit"):
-        assert not re.search(rf"type:\s*'[^']*{banned}", script)
+    assert "postMessage(" in _function("send")
+    actions = _function("actions")
+    # Fails if an option goes back to filling the chat box with the switch on.
+    assert "ref + clip(opts[i], 200), send)" in actions
+    # Reply passes no `post`, so `button` falls back to `act`.
+    assert "button(i18n('reply'), 'reply', ref)" in actions
+    assert "var to = post || act;" in _function("button")
+    assert not re.search(r"type:\s*'[^']*submit", script)
 
 
 def test_a_row_without_an_asks_entry_still_gets_its_reply_button() -> None:
@@ -131,10 +139,12 @@ def test_live_keys_off_the_workers_status_not_a_masked_field() -> None:
     reaches a page, so a ``live`` test on it would never be true."""
     from kiro_crew.dashboard.handlers.member_dashboard import _MASKED_VALUE_KEYS
 
-    body = _function("live")
+    body = _function("view")
     for masked in _MASKED_VALUE_KEYS:
         assert masked not in _script(), masked
+    assert "it.worker === 'running'" in body
     assert "it.status === 'progress'" in body
+    assert "view(it) === 'working'" in _function("live")
 
 
 def test_no_animation_runs_forever_except_the_live_markers() -> None:
@@ -164,7 +174,14 @@ def test_every_needs_you_button_says_it_drafts_rather_than_sends() -> None:
 def test_items_that_need_the_reader_get_their_own_segment() -> None:
     """The bar's "open" must not swallow a task that waits on the reader."""
     assert "['needs_you', 'needs you', 'var(--warn, #ffd230)']" in _script()
-    assert "needsYou(list[i]) ? 'needs_you'" in _function("drawStates")
+    assert "var s = view(list[i]);" in _function("drawStates")
+
+
+def test_only_needs_you_is_warm_a_stall_is_muted() -> None:
+    """Stuck and quiet are the conductor's to pick up, so neither takes a warm colour."""
+    script = _script()
+    assert "['stuck', 'stuck', 'var(--muted-strong, #778)']" in script
+    assert "['quiet', 'quiet', 'var(--muted-strong, #778)']" in script
 
 
 def test_a_worker_status_reads_in_the_readers_language() -> None:
@@ -190,3 +207,39 @@ def test_the_whole_board_numbers_count_forgotten_items() -> None:
     assert "counts[state] / total" in states
     assert "counts[closing[c]] += gone[closing[c]];" in states
     assert "String(list.length + forgotten().items)" in _script()
+
+
+def test_a_hosted_discussion_reads_as_discussing_but_never_hides_a_question() -> None:
+    """An open item whose last report carried ``discussion`` is a discussing row; one
+    that waits on the reader stays needs-you, and one whose chat is gone is not shown
+    as a live discussion."""
+    body = _function("view")
+    asked = body.index("return 'needs_you'")
+    talking = body.index("return 'discussing'")
+    assert asked < talking < body.index("it.worker === 'running'")
+    assert "it.worker !== 'closed' && it.orphaned !== true && it.stale !== true" in body
+    assert "['discussing', 'discussing', 'var(--info, #6aa9ff)']" in _script()
+    assert "text(it.state) === 'open'" in _function("discussionOf")
+    # Every open item lands in one of the summary's counts, a discussion in "in progress".
+    assert "if (v === 'working' || v === 'discussing') run += 1;" in _function("drawLoop")
+
+
+def test_the_discussion_panel_is_a_keyboard_toggle_and_its_thread_opens_through_the_host() -> None:
+    body = _function("drawTalk")
+    # A native button, so Enter and Space work; its state is announced.
+    assert "button('', 'tg', null)" in body
+    assert "toggle.setAttribute('aria-expanded'" in body
+    assert "toggle.setAttribute('aria-controls', panel.id)" in body
+    assert "panel.hidden = !open" in body
+    # The thread link takes the page's one open path, under the same LINKABLE rule.
+    assert "LINKABLE.test(thread)" in body and "openLink(thread)" in body
+
+
+def test_every_language_table_names_the_discussion_rows_words() -> None:
+    """The row's words are in each UI language; any other key falls back to English."""
+    script = _script()
+    keys = re.findall(r"\b(state_discussing|talk_\w+|phase_\w+):", script)
+    per_key = {key: keys.count(key) for key in keys}
+    tables = re.findall(r"^        (?:'[\w-]+'|en): \{", script, re.MULTILINE)
+    assert len(tables) == 12
+    assert set(per_key.values()) == {len(tables)}, per_key

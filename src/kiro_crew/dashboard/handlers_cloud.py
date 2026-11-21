@@ -8,7 +8,8 @@ Like the instances control plane, every route is **owner-only, never reachable
 via Slack**, and emits a SEL audit event. Provisioning is a deliberate
 **human/installer action** (the owner clicking Launch is the consent), which is
 exactly the caller ``cloud.aws.assert_human_action`` permits — the gateway
-process carries no ``KIROCREW_SESSION_KEY``, so the destructive verbs
+process carries none of the agent markers ``cloud.aws._in_agent_session``
+reads, so the destructive verbs
 (stop/start/destroy) are allowed here but blocked from any agent subprocess.
 
 POSIX-only: the deploy engine shells to ``bash``/``aws``; Windows returns 400.
@@ -36,20 +37,30 @@ from kiro_crew.cloud import connect as connect_mod
 from kiro_crew.cloud import ec2, iam
 from kiro_crew.cloud import launch_job as lj
 from kiro_crew.cloud import login as login_mod
+from kiro_crew.cloud import sizes
 from kiro_crew.cloud import source as source_mod
 from kiro_crew.cloud import ssm
-from kiro_crew.cloud.aws import AWSError, CloudActionDenied
+from kiro_crew.cloud.aws import AWSError, CloudActionDenied, service_error_code
 from kiro_crew.cloud.launch_engine import RealLaunchEngine
 from kiro_crew.cloud.login_target import KiroLoginTarget, LoginTargetError, target_from_whoami
+from kiro_crew.dashboard.cloud_launch_controls import (
+    _cancels,
+    _register_cancel,
+    _register_skip,
+    _release_cancel,
+    _release_skip,
+)
 from kiro_crew.dashboard.handlers._shared import _owner_denial_response
 from kiro_crew.dashboard.handlers.sessions import fetch_local_identity
 from kiro_crew.dashboard.handlers.source_providers import (
     is_owner_dashboard_request,
 )
+from kiro_crew.dashboard.handlers_cloud_paused import mark_cloud_stopped
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.platform.defaults import RecipientMoved
 from kiro_crew.platform.interfaces import BUILTIN_PROVISIONER_ID
-from kiro_crew.sandbox import SandboxCeilingUnsealable
+from kiro_crew.platform.provisioner_listing import offered_provisioners
+from kiro_crew.sandbox import SandboxCeilingUnsealable, SandboxUnavailableError
 from kiro_crew.sel import sel
 from kiro_crew.validation import ValidationError
 
@@ -158,23 +169,8 @@ async def _astore(state: "DashboardState") -> lj.LaunchJobStore:
 
 
 def _provisioners() -> list:
-    """The deployment's provisioners, from the CPP ``remote_provisioners`` seam.
-
-    ``safe_context_call`` fallback is the built-in descriptor alone: a degraded
-    seam read keeps today's AWS tab working rather than emptying it, which is
-    the fail-safe direction for a listing (nothing here mints or bills). Rows
-    with a blank id or kind are dropped, never shadowed. Synchronous; called via
-    ``_in_executor`` from a handler because context resolution can touch disk.
-    """
-    from kiro_crew.platform.context import current_context, safe_context_call
-    from kiro_crew.platform.defaults import BUILTIN_REMOTE_PROVISIONER
-
-    rows = safe_context_call(
-        lambda: list(current_context().remote_provisioners.provisioners()),
-        fallback_factory=lambda: [BUILTIN_REMOTE_PROVISIONER],
-        log_message="remote_provisioners.provisioners degraded; offering the built-in lane only",
-    )
-    return [r for r in rows if getattr(r, "id", "") and getattr(r, "kind", "")]
+    """The deployment's provisioners; see :func:`offered_provisioners`."""
+    return offered_provisioners()
 
 
 def _provisioner_dict(p) -> dict:
@@ -320,42 +316,6 @@ def _launch_lock(state: "DashboardState") -> LoopBoundLock:
     return lock
 
 
-def _cancels(state: "DashboardState") -> dict:
-    cancels = getattr(state, "cloud_launch_cancels", None)
-    if cancels is None:
-        cancels = {}
-        state.cloud_launch_cancels = cancels
-    return cancels
-
-
-#: Serialises the register/release pair on ``_cancels``. Registration happens on
-#: the event loop and release on a worker thread, so a compare-then-delete
-#: without it could still read one worker's event and delete the next one's.
-_CANCELS_GUARD = threading.Lock()
-
-
-def _register_cancel(state: "DashboardState", job_id: str, cancel: threading.Event) -> None:
-    with _CANCELS_GUARD:
-        _cancels(state)[job_id] = cancel
-
-
-def _release_cancel(state: "DashboardState", job_id: str, cancel: threading.Event) -> None:
-    """Drop the registered event for *job_id* only if it is still *cancel*.
-
-    A worker releases its event AFTER persisting its terminal result -- and the
-    restart route admits a new retry for the same job as soon as the file reads
-    terminal, registering a new event under the same id. An unconditional pop in
-    the finishing worker's ``finally`` therefore raced that registration and could
-    delete the NEW worker's event: a cancel then found nothing to set, wrote
-    CANCELLED, and the new worker overwrote it with its result -- the cancel was
-    silently ignored. Releasing only our own event closes that.
-    """
-    with _CANCELS_GUARD:
-        cancels = _cancels(state)
-        if cancels.get(job_id) is cancel:
-            del cancels[job_id]
-
-
 def _start_worker(
     state: "DashboardState", job: lj.LaunchJob, engine: Optional[lj.LaunchEngine] = None
 ) -> None:
@@ -368,15 +328,18 @@ def _start_worker(
     if engine is None:
         engine = _engine(state, job.provider_id)
     cancel = threading.Event()
+    skip = lj.SigninSkip()
     _register_cancel(state, job.id, cancel)
+    _register_skip(state, job.id, skip)
     # Claim the job for this process, so a later reap_orphans() does not mistake
     # a launch we are actively driving for one abandoned by a restart.
     store.adopt(job.id)
 
     def _run() -> None:
         try:
-            lj.run_launch(job, store, engine, cancel=cancel)
+            lj.run_launch(job, store, engine, cancel=cancel, skip_signin=skip)
         finally:
+            _release_skip(state, job.id, skip)
             _release_cancel(state, job.id, cancel)
 
     if getattr(state, "cloud_launch_sync", False):
@@ -390,6 +353,61 @@ async def _in_executor(func, *args):
     return await asyncio.get_event_loop().run_in_executor(None, func, *args)
 
 
+def _sandbox_unavailable_response(
+    op: str, exc: SandboxUnavailableError, what: str, *, request_id: str = ""
+) -> web.Response:
+    """The typed 503 for an ``aws`` call the sandbox refused to start.
+
+    Every cloud call runs the CLI through ``cloud.aws.run_aws``, which wraps it
+    with ``wrap_argv``. On a host with no sandbox backend and
+    ``allow_unsandboxed_exec`` unset that raises ``SandboxUnavailableError``
+    before any AWS request is made. The refusal stands, but uncaught it reaches
+    the browser as aiohttp's bare "500 Internal Server Error" page, and the setup
+    tab would blame credentials nobody read.
+    Same shape as deploy-web's profile discovery answer for the same
+    condition (``deploy/handlers.py``): a ``code`` the dashboard keys on, plus
+    the probe ``detail`` and ``remedy`` the exception carries.
+
+    The sentence follows ``exc.kind``: only ``no_backend`` means this host has no
+    sandbox. ``transient`` clears on a retry, and ``foreign_sandbox`` means an
+    outer sandbox confines the gateway while the host's own sandbox is fine.
+    """
+    logger.warning(
+        "cloud %s: aws call refused by the sandbox (kind=%s, detail=%s); returning 503",
+        op,
+        exc.kind,
+        exc.detail,
+    )
+    _audit(op, "failure", request_id=request_id, error=f"sandbox_unavailable: {exc.detail}")
+    not_sent = "nothing was sent to AWS and your credentials were not checked."
+    if exc.kind == "transient":
+        reason = (
+            "the sandbox for the aws command hit a temporary limit, so "
+            f"{not_sent} Try again in a moment."
+        )
+    elif exc.kind == "foreign_sandbox":
+        reason = (
+            "another sandbox already confines this gateway, so it cannot start its "
+            f"own sandbox for the aws command and {not_sent} Start the gateway "
+            "outside that sandbox."
+        )
+    else:
+        reason = (
+            f"this computer has no sandbox for the aws command, so {not_sent} "
+            "Run `kirocrew doctor` in a terminal for the fix."
+        )
+    return web.json_response(
+        {
+            "error": f"{what} could not run: {reason}",
+            "code": "sandbox_unavailable",
+            "kind": exc.kind,
+            "detail": exc.detail,
+            "remedy": exc.remedy,
+        },
+        status=503,
+    )
+
+
 # ── read endpoints ───────────────────────────────────────────────────────
 
 
@@ -400,7 +418,10 @@ async def api_cloud_preflight(request: web.Request) -> web.Response:
         return denied
     profile = request.query.get("profile", "")
     region = request.query.get("region", "")
-    reach = await _in_executor(iam.reachability_check, profile, region)
+    try:
+        reach = await _in_executor(iam.reachability_check, profile, region)
+    except SandboxUnavailableError as exc:
+        return _sandbox_unavailable_response("preflight", exc, "The AWS check")
     plugin = await _in_executor(ssm.session_manager_plugin_installed)
     # Installed but refused by the provenance check is not "not installed": the
     # install command would reinstall the same refused file. The row then shows the
@@ -676,6 +697,8 @@ async def api_cloud_launch_task(request: web.Request) -> web.Response:
     except AWSError as e:
         _audit("launch_task", "failure", request_id=job.id, error=str(e))
         return web.json_response({"error": str(e), "code": "aws_call_failed"}, status=502)
+    except SandboxUnavailableError as exc:
+        return _sandbox_unavailable_response("launch_task", exc, "The AWS call", request_id=job.id)
     _audit("launch_task", "success", request_id=job.id)
     return web.json_response(
         {
@@ -693,8 +716,10 @@ async def api_cloud_launch_task(request: web.Request) -> web.Response:
 async def api_cloud_launch_create(request: web.Request) -> web.Response:
     """POST /api/cloud/launch — start a launch job.
 
-    Body: ``{provider_id?, profile, region, size_key, subnet_id?, login_target?,
-    confirm_recipient?}``. ``subnet_id`` pins a built-in EC2 launch to that subnet.
+    Body: ``{provider_id?, profile, region, size_key, subnet_id?, instance_type?,
+    login_target?, confirm_recipient?}``. ``subnet_id`` pins a built-in EC2 launch to
+    that subnet; ``instance_type`` launches a type the Region offers instead of the
+    ``size_key`` tier (see ``handlers_cloud_instance_types``).
     ``confirm_recipient`` is the credential recipient the operator confirmed, required by any
     lane whose launch delivers a credential to something its own configuration names (the
     Fargate lane refuses an empty or stale one and names both values); the built-in EC2 lane
@@ -728,6 +753,12 @@ async def api_cloud_launch_create(request: web.Request) -> web.Response:
     # handler has no way to know what a lane's recipient looks like, and a check that
     # guessed would be a second rule to keep in step with the engine's.
     confirm_recipient = str(body.get("confirm_recipient") or "")
+    # Launch without the Kiro sign-in: a crew on another harness needs none.
+    skip_signin = body.get("skip_signin", False)
+    if not isinstance(skip_signin, bool):
+        return web.json_response(
+            {"error": "skip_signin must be true or false", "code": "invalid_body"}, status=400
+        )
     # The Kiro identity the crew signs in as — validated HERE, at the owner-only
     # HTTP boundary, before anything is persisted or reaches a remote shell.
     # An absent block is the Builder ID default (a pre-seam client body launches
@@ -755,6 +786,11 @@ async def api_cloud_launch_create(request: web.Request) -> web.Response:
     except ValidationError as e:
         _audit("launch_create", "denied", error=f"invalid subnet: {e}")
         return web.json_response({"error": str(e), "code": "invalid_subnet"}, status=400)
+    from kiro_crew.dashboard.handlers_cloud_instance_types import check_requested_instance_type
+
+    instance_type, refused = await check_requested_instance_type(body, provider_id)
+    if refused is not None:
+        return refused
     provisioner = next((p for p in await _in_executor(_provisioners) if p.id == provider_id), None)
     if provisioner is None:
         _audit("launch_create", "denied", error=f"unknown provisioner {provider_id!r}")
@@ -797,6 +833,37 @@ async def api_cloud_launch_create(request: web.Request) -> web.Response:
             },
             status=400,
         )
+    tier = sizes.TIERS_BY_KEY.get(size_key)
+    if subnet_id and (instance_type or tier is not None):
+        # The same check ec2.deploy runs, here so a subnet the launch would refuse is
+        # reported under its field before anything is set up. Outside the launch lock:
+        # these are AWS calls, and holding it would stall cancel and the sign-in retry.
+        # An unknown size skips it; store.create below refuses that request. A custom
+        # type replaces the tier's, so the subnet's zone must offer that one.
+        subnet_type = instance_type or (tier.instance_type if tier else "")
+
+        def _check_subnet() -> None:
+            region = ec2.validate_region(str(body.get("region", "")) or lj._default_region())
+            profile = ec2.validate_profile(str(body.get("profile", "")))
+            ec2.resolve_explicit_subnet(subnet_id, profile, region, subnet_type)
+
+        try:
+            await _in_executor(_check_subnet)
+        except ValidationError as e:
+            _audit("launch_create", "denied", error=str(e))
+            return web.json_response(
+                {"error": str(e), "code": "invalid_cloud_parameter"}, status=400
+            )
+        except AWSError as e:
+            # Only the subnet's own refusals go under its field: the check's own, or AWS
+            # naming the id. A credential, permission or network failure is the account's.
+            if e.stderr and not service_error_code(e.stderr).startswith("InvalidSubnetID"):
+                _audit("launch_create", "failure", error=str(e))
+                return web.json_response({"error": str(e), "code": "aws_call_failed"}, status=502)
+            _audit("launch_create", "denied", error=f"invalid subnet: {e}")
+            return web.json_response({"error": str(e), "code": "invalid_subnet"}, status=400)
+        except SandboxUnavailableError as exc:
+            return _sandbox_unavailable_response("launch_create", exc, "The subnet check")
     # One launch at a time. Without this a double-click or a retried request
     # creates two jobs with two tags and two CloudFormation stacks — two billed
     # instances, and the client cannot undo that after the fact. The check, the
@@ -804,7 +871,24 @@ async def api_cloud_launch_create(request: web.Request) -> web.Response:
     # itself awaits: two POSTs arriving together would otherwise both pass it.
     async with _launch_lock(state):
         store = await _astore(state)
-        existing = await _in_executor(store.list)
+        # One read of each job file answers both checks: two scans would let a
+        # worker's save() land between them, so a running job could be missed by both.
+        existing, unreadable = await _in_executor(store.snapshot)
+        if unreadable:
+            # A record the list skips may be a launch still running: refuse, as
+            # a launch already running is refused, rather than risk a second one.
+            _audit("launch_create", "denied", request_id=unreadable[0], error="unreadable job")
+            return web.json_response(
+                {
+                    "error": (
+                        "a crew setup record cannot be read, so a setup may still be "
+                        "running; remove the launch job file "
+                        f"{unreadable[0]}.json before starting another"
+                    ),
+                    "code": "launch_record_unreadable",
+                },
+                status=409,
+            )
         active = next((j for j in existing if not j.terminal), None)
         if active is not None:
             _audit("launch_create", "denied", request_id=active.id, error="already running")
@@ -857,6 +941,8 @@ async def api_cloud_launch_create(request: web.Request) -> web.Response:
                     step_labels=dict(provisioner.step_labels or ()),
                     login_target=login_target,
                     subnet_id=subnet_id,
+                    skip_signin=skip_signin,
+                    instance_type=instance_type,
                 )
             )
         except KeyError as e:  # unknown size
@@ -914,22 +1000,24 @@ async def api_cloud_launch_cancel(request: web.Request) -> web.Response:
     return web.json_response(updated.to_dict())
 
 
-def _preserved_code_may_be_approved(job: lj.LaunchJob) -> bool:
-    """Is this the one shape where the box can be signed in behind our back?
+def _unsigned_crew_may_be_reprobed(job: lj.LaunchJob) -> bool:
+    """Is this a crew whose recorded "not signed in" may be out of date?
 
-    A sign-in that ran out of time deliberately KEEPS its device code and leaves
-    the remote login polling, so the user can still approve it from the browser
-    tab that is already open. Nothing re-probes the instance after that, so an
-    approval that lands then signs the crew in while the job still reads
-    ``signin_detected=False`` — badged "Needs sign-in" forever, with Connect held.
+    ``signin_detected`` is written once, when the launch (or a retry) ends. The
+    box can be signed in after that by paths this job never sees: a preserved
+    device code approved from the open browser tab, a sign-in on the crew's own
+    dashboard, ``kirocrew kas login`` or ``kiro-cli login`` in a shell on it.
+    Nothing re-probes the instance afterwards, so such a crew read
+    ``signin_detected=False`` -- badged "Needs sign-in" forever while it served
+    chats. The dashboard asks once per unsigned crew row (the route below), so
+    the badge shows only what the box says now.
 
     True only for: terminal (no worker owns it, so nothing else is writing it),
-    registered with an instance to probe, not already signed in, and still
-    holding the surviving prompt that makes the approval possible. Deliberately
-    narrow — this must never become a blanket poll of every job, and never touch
-    a job a worker is driving.
+    registered with an instance to probe, and not already signed in. Never a job
+    a worker is driving, and never a signed-in one: this is one probe per unsigned
+    crew the owner is looking at, not a poll of every job.
     """
-    if not job.terminal or job.signin_detected or not job.instance_id or not job.signin:
+    if not job.terminal or job.signin_detected or not job.instance_id:
         return False
     if lj.target_is_unreadable(job):
         # `from_dict` substituted the DEFAULT identity for one it could not parse,
@@ -954,10 +1042,11 @@ def _probe_signin_on_box(state: "DashboardState", job: lj.LaunchJob) -> Optional
     :func:`_record_probed_signin` owns the write -- on the loop, under the lock.
     """
     try:
-        return bool(
-            login_mod.is_logged_in(
-                job.instance_id, job.profile, job.region, target=job.login_target
-            )
+        # `signin_state`, not `is_logged_in`: the latter answers False for a box it
+        # could not reach, and the row would then tell the owner a crew it never
+        # asked is signed out.
+        return login_mod.signin_state(
+            job.instance_id, job.profile, job.region, target=job.login_target
         )
     except Exception:  # noqa: BLE001 - a probe failure is not a launch failure
         logger.info("could not re-probe the Kiro sign-in for %s", job.id, exc_info=True)
@@ -981,7 +1070,7 @@ async def _record_probed_signin(state: "DashboardState", job: lj.LaunchJob) -> b
         fresh = await _in_executor(store.get, job.id)
         if fresh is None:
             return False
-        if not _preserved_code_may_be_approved(fresh):
+        if not _unsigned_crew_may_be_reprobed(fresh):
             logger.info("dropping a stale sign-in probe result for %s: the job moved on", job.id)
             return False
         lj.mark_signed_in(fresh)
@@ -997,12 +1086,15 @@ async def api_cloud_launch_signin(request: web.Request) -> web.Response:
     The job auto-polls for approval; this returns the URL + code to display (and
     409 when no sign-in is pending), so the UI has a dedicated fetch for it.
 
-    A terminal job that still holds a PRESERVED code is re-probed first: nothing
-    else re-checks the box after the job goes terminal, so a code approved out of
-    band left the crew signed in while the job said it was not. The probe runs
-    only on that narrow shape (see :func:`_preserved_code_may_be_approved`) and
-    answers ``signin_already_complete``, with the corrected job, instead of the
-    bare "no sign-in pending" that hid it.
+    A terminal, registered, unsigned job is re-probed first, with or without a
+    preserved code: nothing else re-checks the box after the job goes terminal,
+    so a crew signed in later (an approved code, a sign-in on the crew itself)
+    stayed "not signed in" here. The probe runs only on that shape (see
+    :func:`_unsigned_crew_may_be_reprobed`). Three answers: signed in ->
+    ``signin_already_complete`` with the corrected job; the box said it is NOT
+    signed in -> ``no_signin_pending``; the box could not be asked ->
+    ``signin_probe_failed`` (502), which the dashboard shows as unknown, never as
+    "Needs sign-in".
     """
     denied = _guard(request, "launch_signin")
     if denied is not None:
@@ -1013,7 +1105,7 @@ async def api_cloud_launch_signin(request: web.Request) -> web.Response:
     if job is None:
         return web.json_response({"error": "not found", "code": "launch_job_not_found"}, status=404)
     if job.status != lj.AWAITING_SIGNIN or not job.signin:
-        if _preserved_code_may_be_approved(job):
+        if _unsigned_crew_may_be_reprobed(job):
             # Query off the loop, write on it under the lock. Both halves must
             # succeed to report the crew signed in: a probe that says yes but whose
             # write is dropped means another writer moved the job on, and the
@@ -1216,7 +1308,22 @@ async def api_cloud_launch_signin_restart(request: web.Request) -> web.Response:
                 },
                 status=400,
             )
-        existing = await _in_executor(store.list)
+        existing, unreadable = await _in_executor(store.snapshot)
+        if unreadable:
+            # A job file the list skips may be a launch or sign-in still running on
+            # this instance; refuse, as launch create does, rather than race it.
+            _audit("launch_signin_restart", "denied", request_id=job_id, error="unreadable job")
+            return web.json_response(
+                {
+                    "error": (
+                        "a crew setup record cannot be read, so a setup or sign-in may "
+                        "still be running; remove the launch job file "
+                        f"{unreadable[0]}.json before trying again"
+                    ),
+                    "code": "launch_record_unreadable",
+                },
+                status=409,
+            )
         # Only a job that can reach THIS instance can race this sign-in: one already
         # on it, or a launch whose instance is unknown until `provision` returns. A
         # sign-in on another crew, or a launch already on its own instance, runs on.
@@ -1324,7 +1431,7 @@ def _start_teardown_watch(
     ).start()
 
 
-def _lane_of(store: "lj.LaunchJobStore", tag: str) -> str:
+def _lane_of(jobs: "list[lj.LaunchJob]", tag: str) -> str:
     """Which provisioner created the crew carrying *tag*.
 
     From the launch job, which is server-owned state: the tag in the URL is the
@@ -1336,7 +1443,7 @@ def _lane_of(store: "lj.LaunchJobStore", tag: str) -> str:
     has always had rather than being refused.
     """
     return next(
-        (j.provider_id for j in store.list() if j.tag == tag and j.provider_id),
+        (j.provider_id for j in jobs if j.tag == tag and j.provider_id),
         BUILTIN_PROVISIONER_ID,
     )
 
@@ -1355,15 +1462,34 @@ async def _mutate_instance(request: web.Request, op: str) -> web.Response:
     store = _store(state)  # constructing it touches no disk
     sync_teardown = bool(getattr(state, "cloud_launch_sync", False))
 
-    # Which lane created this crew decides what these verbs can even mean. Read off
-    # the loop because `list()` reads the job files.
+    # A job file `list()` skips may be the record of THIS crew, and the lane and the
+    # destroy fallback's instance id both come from it. Reading it as absent would
+    # run the built-in EC2 path against a crew another lane created, so refuse, as
+    # launch create does, until the file is removed. The lane and the instance-id
+    # fallback below read the same snapshot, so no save() lands between the checks.
+    jobs, unreadable = await _in_executor(store.snapshot)
+    if unreadable:
+        _audit(op, "denied", request_id=tag, error="unreadable job")
+        return web.json_response(
+            {
+                "error": (
+                    "a crew setup record cannot be read, so which lane runs this crew "
+                    "is unknown; remove the launch job file "
+                    f"{unreadable[0]}.json before trying again"
+                ),
+                "code": "launch_record_unreadable",
+            },
+            status=409,
+        )
+
+    # Which lane created this crew decides what these verbs can even mean.
     #
     # Without this the three verbs all ran the built-in EC2 lane's CloudFormation
     # path, which looks for a stack named after the tag that only THAT lane creates.
     # A crew from any other lane has no such stack, so the operator was told their
     # credentials could not describe a stack that was never meant to exist -- a
     # report that reads as a broken profile rather than a verb that does not apply.
-    lane = await _in_executor(lambda: _lane_of(store, tag))
+    lane = _lane_of(jobs, tag)
     if lane != BUILTIN_PROVISIONER_ID and op in ("stop", "start"):
         # These two are the EC2 lane's reversible pair: stop parks an instance and
         # keeps its disk, start brings the same disk back. A lane whose engine offers
@@ -1403,9 +1529,7 @@ async def _mutate_instance(request: web.Request, op: str) -> web.Response:
             # The registry row still has to go, exactly as the built-in path's watcher
             # does it, and the id comes from the job rather than the caller for the
             # reason the comment below gives.
-            registered = next(
-                (j.instance_id for j in store.list() if j.tag == tag and j.instance_id), ""
-            )
+            registered = next((j.instance_id for j in jobs if j.tag == tag and j.instance_id), "")
             if ok and registered:
                 connect_mod.unregister_instance(registered)
             return {"ok": ok, "cleanup": "done" if ok else "skipped", "provisioner_id": lane}
@@ -1435,7 +1559,7 @@ async def _mutate_instance(request: web.Request, op: str) -> web.Response:
             # as a no-op, resolves no id, and skips the unregister AGAIN, so the row can
             # never be cleared from this panel. The launch job that created this tag
             # persists its instance id: still server-owned state, never caller input.
-            iid = next((j.instance_id for j in store.list() if j.tag == tag and j.instance_id), "")
+            iid = next((j.instance_id for j in jobs if j.tag == tag and j.instance_id), "")
         # destroy: issue the delete and return; do not block the request on
         # DELETE_COMPLETE (minutes). A later status / the reaper reflects it.
         out = ec2.destroy(tag, profile, region, wait=False)
@@ -1465,7 +1589,7 @@ async def _mutate_instance(request: web.Request, op: str) -> web.Response:
         # ``KeyError`` for a provider id with no launch engine. The row exists and
         # the request is well formed, so this is a 400, not an unaudited 500 that
         # would also leave the running crew undeletable from the panel. Same arm
-        # ``api_launch_task`` carries for the same resolution.
+        # ``api_cloud_launch_task`` carries for the same resolution.
         _audit(op, "denied", request_id=tag, error=f"no engine for lane {lane!r}")
         return web.json_response(
             {"error": f"lane {lane!r} has no teardown engine", "code": "unknown_provisioner"},
@@ -1480,6 +1604,15 @@ async def _mutate_instance(request: web.Request, op: str) -> web.Response:
     except AWSError as e:
         _audit(op, "failure", request_id=tag, error=str(e))
         return web.json_response({"error": str(e), "code": "aws_call_failed"}, status=502)
+    except SandboxUnavailableError as exc:
+        return _sandbox_unavailable_response(op, exc, "The AWS call", request_id=tag)
+    if op in ("stop", "start"):
+        unsaved = await mark_cloud_stopped(
+            state, str(result.get("instance_id") or ""), tag, op == "stop"
+        )
+        if unsaved is not None:
+            _audit(op, "failure", request_id=tag, error="cloud state not saved")
+            return unsaved
     _audit(op, "success", request_id=tag)
     return web.json_response(result)
 

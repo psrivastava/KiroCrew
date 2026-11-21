@@ -1,12 +1,7 @@
 """Persistent retry accounting for history consolidation.
 
-A consolidation pass spends a billed LLM turn before it can write the durable
-``last_consolidated`` marker, so a failure in between leaves the span
-unconsolidated. Without durable accounting every entry point then re-spends that
-turn indefinitely — the 60s idle sweep on every tick, session-expiry sweeps on
-every expiry, and every gateway restart (the in-memory throttle is memory-only).
-These tests pin the attempt counter, the exponential backoff, the abandon cap,
-and that no entry point bypasses them.
+A failure between the billed LLM turn and the ``last_consolidated`` write would be
+re-spent by every sweep and restart, so no entry point may bypass the accounting.
 
 The failure accounting (attempts, backoff, the cap, restarts, hostile metadata) is in
 ``test_history_consolidation_retry_accounting.py``, and the cases tying the cap to its span
@@ -68,11 +63,8 @@ async def test_consolidation_captures_execution_off_loop(tmp_path, monkeypatch, 
 class TestTheLineIsValidatedWithTheRows:
     """The consolidator's privacy check reads the line, then snapshots rows.
 
-    A writer can tighten the line in between -- a same-key hand-over landing a
-    restricted tab's rows under a line that was persistent a moment ago. The
-    snapshot therefore re-reads the line under the SAME lock as the rows and
-    refuses them together, at both the pre-turn snapshot and the write-boundary
-    one, so no rows a restricted line governs reach the model or memory.
+    A same-key hand-over can tighten the line in between, so both snapshots re-read it
+    under the SAME lock as the rows and refuse them together.
     """
 
     @staticmethod
@@ -129,8 +121,7 @@ class TestTheLineIsValidatedWithTheRows:
         c = _make_consolidator(log)
 
         async def response(_prompt, **_kwargs):
-            with history_mod.allow_on_loop_persist():
-                log.update_metadata(KEY, {"memory_mode": "incognito"})
+            await asyncio.to_thread(log.update_metadata, KEY, {"memory_mode": "incognito"})
             return {"history_entry": "derived from rows now under a restricted line"}
 
         with patch.object(c, "_call_llm", AsyncMock(side_effect=response)):
@@ -669,12 +660,9 @@ async def test_consolidate_refuses_a_channel_thread_whose_map_entry_was_pruned(
 ):
     """The transcript header is the record a memory reader consults.
 
-    ``privacy_mode.apply_mode`` stamps ``memory_mode`` into the header, the record
-    ``_consolidate`` refuses on, so a channel thread's mode survives the pruning
-    of its session-map entry. Driven the way production runs it: the real
-    modifier path over a real ``SessionMap``, then a consolidator that holds NO
-    session map at all (a header-only reader), with the process-local trackers
-    emptied (the restart), through the session-end hook's entry point.
+    ``privacy_mode.apply_mode`` stamps ``memory_mode`` into the header, so the mode
+    survives pruning of the session-map entry. The consolidator holds NO session map
+    and its trackers are emptied, as after a restart.
     """
     from types import SimpleNamespace
 
@@ -732,14 +720,10 @@ async def test_a_legacy_privacy_flag_is_kept_by_prune_and_stamped_by_the_startup
 ):
     """A thread flagged before the header carried the mode: the map entry is all it has.
 
-    Pre-upgrade installs hold private threads whose flag was written straight to
-    the session map, with no header stamp, and ``apply_mode`` returns early for a
-    mode already marked, so nothing re-stamps them. Two facts pinned in one
-    lifecycle: the startup ``prune()`` keeps such an entry (clearing only its
-    dead ``sid``) and never reads a transcript for it; and the startup path's
-    off-loop step then copies the mode into the existing transcript's header
-    while the row STAYS (it is what the channel gate hydrates from), after which
-    the consolidator -- a header reader, holding no map -- refuses the thread.
+    ``apply_mode`` returns early for a mode already marked, so nothing re-stamps such a
+    thread. Startup ``prune()`` keeps the entry (clearing its dead ``sid``), the off-loop
+    step copies the mode into the header while the row stays for the channel gate, and
+    the header-only consolidator then refuses the thread.
     """
     import threading
 
@@ -813,7 +797,7 @@ async def test_pending_extraction_rechecks_its_actual_transcript(
 ):
     from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig
     from kiro_crew.context import ContextBuilder
-    from kiro_crew.history_consolidation import _CONSOLIDATION_REFUSED
+    from kiro_crew.history_consolidation import _CONSOLIDATION_STALE
     from kiro_crew.memory_stores import memory_store_dir_for, provision_member_memory
     from kiro_crew.vector_memory import VectorMemoryStore, open_member_database
 
@@ -883,7 +867,7 @@ async def test_pending_extraction_rechecks_its_actual_transcript(
                 c._memory.append_history.assert_called_once()
             assert log.consolidation_counts(KEY)[1] == 1
         else:
-            assert outcome is _CONSOLIDATION_REFUSED
+            assert outcome is _CONSOLIDATION_STALE
             assert json.loads(row["value_json"]) == "old@example.com"
             c._memory.append_history.assert_not_called()
             assert int(log.get_metadata(KEY).get("last_consolidated", 0)) == 0
@@ -912,22 +896,23 @@ class TestEveryEntryPointRespectsTheAccounting:
         """The expiry path consults no time throttle of its own at all."""
         log = _seed_log(tmp_path)
         c = _make_consolidator(log)
-        with history_mod.allow_on_loop_persist():
-            log.update_metadata(
-                KEY,
-                {
-                    "consolidation_attempts": 1,
-                    "consolidation_retry_at": time.time() + 3600,
-                },
-            )
+        await asyncio.to_thread(
+            log.update_metadata,
+            KEY,
+            {
+                "consolidation_attempts": 1,
+                "consolidation_retry_at": time.time() + 3600,
+            },
+        )
 
         c.consolidate_session(KEY)
         assert not c._tasks, "session expiry re-fired a backed-off consolidation"
 
         # Past the deadline the same call proceeds, so backoff delays rather than
         # disables the path.
-        with history_mod.allow_on_loop_persist():
-            log.update_metadata(KEY, {"consolidation_retry_at": time.time() - 1})
+        await asyncio.to_thread(
+            log.update_metadata, KEY, {"consolidation_retry_at": time.time() - 1}
+        )
         with patch.object(c, "_consolidate", new_callable=AsyncMock):
             c.consolidate_session(KEY)
             assert c._tasks
@@ -939,14 +924,14 @@ class TestEveryEntryPointRespectsTheAccounting:
 
         log = _seed_log(tmp_path)
         c = _make_consolidator(log)
-        with history_mod.allow_on_loop_persist():
-            log.update_metadata(
-                KEY,
-                {
-                    "consolidation_attempts": 2,
-                    "consolidation_retry_at": time.time() + 3600,
-                },
-            )
+        await asyncio.to_thread(
+            log.update_metadata,
+            KEY,
+            {
+                "consolidation_attempts": 2,
+                "consolidation_retry_at": time.time() + 3600,
+            },
+        )
 
         state = MagicMock()
         state.consolidator = c
@@ -959,8 +944,9 @@ class TestEveryEntryPointRespectsTheAccounting:
         assert resp.status == 429
         assert not c._tasks, "manual trigger bypassed the backoff"
 
-        with history_mod.allow_on_loop_persist():
-            log.update_metadata(KEY, {"consolidation_retry_at": time.time() - 1})
+        await asyncio.to_thread(
+            log.update_metadata, KEY, {"consolidation_retry_at": time.time() - 1}
+        )
         with patch.object(c, "_consolidate", new_callable=AsyncMock):
             resp = await api_memory_consolidate(request)  # type: ignore[arg-type]
             assert resp.status == 200
@@ -1010,14 +996,14 @@ class TestTheManualTriggerClaimsAtomically:
 
         log = _seed_log(tmp_path)
         c = _make_consolidator(log)
-        with history_mod.allow_on_loop_persist():
-            log.update_metadata(
-                KEY,
-                {
-                    "consolidation_attempts": 2,
-                    "consolidation_retry_at": time.time() + 3600,
-                },
-            )
+        await asyncio.to_thread(
+            log.update_metadata,
+            KEY,
+            {
+                "consolidation_attempts": 2,
+                "consolidation_retry_at": time.time() + 3600,
+            },
+        )
 
         state = MagicMock()
         state.consolidator = c
@@ -1032,8 +1018,9 @@ class TestTheManualTriggerClaimsAtomically:
 
         # Once the backoff expires the same key is dispatchable again, which it
         # would not be if the refusal above had left the claim in place.
-        with history_mod.allow_on_loop_persist():
-            log.update_metadata(KEY, {"consolidation_retry_at": time.time() - 1})
+        await asyncio.to_thread(
+            log.update_metadata, KEY, {"consolidation_retry_at": time.time() - 1}
+        )
         with patch.object(c, "_consolidate", new_callable=AsyncMock):
             resp = await api_memory_consolidate(request)  # type: ignore[arg-type]
             assert resp.status == 200
@@ -1050,21 +1037,20 @@ class TestConsolidateIsTheEligibilityChokePoint:
     """
 
     def _arm_backoff(self, log: ConversationLog, attempts: int = 1) -> None:
-        with history_mod.allow_on_loop_persist():
-            log.update_metadata(
-                KEY,
-                {
-                    "consolidation_attempts": attempts,
-                    "consolidation_retry_at": time.time() + 3600,
-                },
-            )
+        log.update_metadata(
+            KEY,
+            {
+                "consolidation_attempts": attempts,
+                "consolidation_retry_at": time.time() + 3600,
+            },
+        )
 
     @pytest.mark.asyncio
     async def test_a_direct_call_inside_the_backoff_bills_nothing(self, tmp_path):
         """No caller pre-check at all — the inner gate alone must refuse."""
         log = _seed_log(tmp_path)
         c = _make_consolidator(log)
-        self._arm_backoff(log)
+        await asyncio.to_thread(self._arm_backoff, log)
 
         with patch.object(c, "_call_llm", new_callable=AsyncMock) as spy:
             await c._consolidate(KEY, include_history=True)
@@ -1095,7 +1081,7 @@ class TestConsolidateIsTheEligibilityChokePoint:
         schedules a task (this path runs on every user turn)."""
         log = _seed_log(tmp_path, count=history_mod._CONSOLIDATION_THRESHOLD)
         c = _make_consolidator(log)
-        self._arm_backoff(log)
+        await asyncio.to_thread(self._arm_backoff, log)
 
         with patch.object(c, "_call_llm", new_callable=AsyncMock) as spy:
             c.maybe_consolidate(KEY)
@@ -1115,7 +1101,7 @@ class TestConsolidateIsTheEligibilityChokePoint:
         True; the second (the inner gate) tells the truth."""
         log = _seed_log(tmp_path, count=history_mod._CONSOLIDATION_THRESHOLD)
         c = _make_consolidator(log)
-        self._arm_backoff(log)
+        await asyncio.to_thread(self._arm_backoff, log)
 
         with (
             patch.object(c, "_call_llm", new_callable=AsyncMock) as spy,
@@ -1140,7 +1126,7 @@ class TestConsolidateIsTheEligibilityChokePoint:
         gate's refusal path actually runs."""
         log = _seed_log(tmp_path, count=history_mod._CONSOLIDATION_THRESHOLD)
         c = _make_consolidator(log)
-        self._arm_backoff(log)
+        await asyncio.to_thread(self._arm_backoff, log)
 
         with (
             patch.object(c, "_call_llm", new_callable=AsyncMock),
@@ -1156,8 +1142,9 @@ class TestConsolidateIsTheEligibilityChokePoint:
 
         # Once the backoff expires the same key is dispatchable again, which
         # it would not be if the refusal above had left the claim in place.
-        with history_mod.allow_on_loop_persist():
-            log.update_metadata(KEY, {"consolidation_retry_at": time.time() - 1})
+        await asyncio.to_thread(
+            log.update_metadata, KEY, {"consolidation_retry_at": time.time() - 1}
+        )
         with patch.object(c, "_call_llm", AsyncMock(return_value={"history_entry": "x"})) as spy:
             c.consolidate_session(KEY)
             assert c._tasks, "a released key was still refused after the backoff"
@@ -1189,7 +1176,7 @@ class TestConsolidateIsTheEligibilityChokePoint:
         actually runs."""
         log = _seed_log(tmp_path, count=history_mod._CONSOLIDATION_THRESHOLD)
         c = _make_consolidator(log)
-        self._arm_backoff(log)
+        await asyncio.to_thread(self._arm_backoff, log)
 
         with (
             patch.object(c, "_call_llm", new_callable=AsyncMock) as spy,
@@ -1206,8 +1193,9 @@ class TestConsolidateIsTheEligibilityChokePoint:
 
         # Once the backoff expires the SAME window is retried — the refusal
         # delayed the extraction rather than dropping it.
-        with history_mod.allow_on_loop_persist():
-            log.update_metadata(KEY, {"consolidation_retry_at": time.time() - 1})
+        await asyncio.to_thread(
+            log.update_metadata, KEY, {"consolidation_retry_at": time.time() - 1}
+        )
         with patch.object(c, "_call_llm", AsyncMock(return_value={"noop": True})) as spy:
             c.maybe_consolidate(KEY)
             assert c._tasks, "the un-advanced offset did not re-arm the threshold"
@@ -1223,7 +1211,7 @@ class TestConsolidateIsTheEligibilityChokePoint:
         the backoff skip instead of a false success."""
         log = _seed_log(tmp_path)
         c = _make_consolidator(log)
-        self._arm_backoff(log)
+        await asyncio.to_thread(self._arm_backoff, log)
 
         with patch.object(c, "_call_llm", new_callable=AsyncMock) as spy:
             assert await c.consolidate_now(KEY) is False

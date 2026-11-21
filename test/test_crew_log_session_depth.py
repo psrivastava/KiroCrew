@@ -59,7 +59,7 @@ def _opened_data(session_id: str = SESSION) -> dict:
     return opened[0]["data"]
 
 
-# --- what the writer stores ------------------------------------------------
+# what the writer stores
 
 
 @pytest.mark.parametrize(
@@ -96,7 +96,7 @@ def test_a_bool_depth_is_refused_at_write():
     assert "depth" not in _opened_data()
 
 
-# --- the stored entry still validates --------------------------------------
+# the stored entry still validates
 
 
 def test_the_entry_with_a_depth_still_validates():
@@ -114,7 +114,7 @@ def test_the_entry_without_a_depth_still_validates():
 
 
 def test_an_old_opened_entry_replays_without_a_depth_observation():
-    # The exact shape of a session/opened written before this change: no depth key.
+    # The exact shape of a legacy session/opened entry: no depth key.
     # It must validate AND contribute no depth counter add -- not a zero.
     old = {
         "agent": "kirocrew",

@@ -16,7 +16,7 @@ import types
 
 import pytest
 
-# Two tests spawn a real child interpreter to pin the CLI contract; pin the
+# Several tests spawn a real child interpreter to pin the CLI contract; pin the
 # module to a dedicated xdist worker so concurrent cold-starts under -n auto
 # don't starve each other. Requires --dist loadgroup.
 pytestmark = pytest.mark.xdist_group(name="subprocess_spawn")
@@ -610,9 +610,10 @@ def test_comments_and_blank_lines_are_ignored(tmp_path) -> None:
 
 def _run(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, _SCRIPT_PATH, *args],
+        [sys.executable, "-X", "utf8", _SCRIPT_PATH, *args],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         timeout=60,
         check=False,
     )

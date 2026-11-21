@@ -1,0 +1,1803 @@
+"""The ``browser`` MCP tool's operations, on top of ``HarnessSupervisor.call``.
+
+One function, :func:`run_op`, serves every op the tool advertises (:data:`OPS`).
+It runs in the GATEWAY (the MCP tool is a separate stdio process that posts here
+through ``/api/browser/op``), and it reaches the browser only two ways:
+
+* ``ctx.helper(helper, **kwargs)`` -- one allowlisted Harness helper over the
+  daemon's IPC (``goto``, ``click``, ``type_text``, ``press_key``, ``scroll``,
+  ``mouse_move``, ``drag``, ``screenshot``, ``page_info``, ``wait_for_load``,
+  ``new_tab``, ``switch_tab``, ``list_tabs``, ``js``, and the ``reflex`` op's
+  ``page_clock``);
+* the ``js`` helper, ONLY with :data:`WALKER_SOURCE` -- the page-side half of
+  this module (``snapshot_walker.js``) -- so every read or write in the page is
+  a method on that one script. No arbitrary expression is ever evaluated.
+
+Every op answers ``{"ok": True, ...}`` or ``{"ok": False, "code", "error"}``.
+A refusal is a VALUE, never an exception: a stale ref, a password field, a tab
+the agent does not own, a wait that timed out. A transport failure (the daemon
+is gone, a helper raised) propagates to the route, which maps it to its own
+code, so the two can never be confused and a refusal is never retried elsewhere.
+
+Takeover: before anything else an op asks ``ctx.in_control()``; while the person
+holds the browser the op returns ``user_in_control`` rather than touching their
+page. The route above it (``dashboard/handlers/browser_ops.py``) is what HOLDS an
+op until the hand-back and runs it then, so this check is the backstop under the
+route's fence, not the agent's wait. Each op that runs reports itself to the
+live card through ``ctx.step(label)``.
+
+Statelessness: nothing here holds per-caller data. The ref map lives in the
+walker's isolated world (``window.__kcRefs`` there, out of a page script's reach),
+the tab ledger in the relay, the input lock in the stream lane. This module is a
+pure function of ``(op, args, ctx)``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import importlib
+import json
+import logging
+import os
+import re
+import secrets
+import time
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import Any
+
+from kiro_crew.browser_harness.budgets import CHANGE_AFTER_S, CHANGE_BEFORE_S
+from kiro_crew.browser_harness.frames import FRAME_READ_CAP, split_frame_ref
+from kiro_crew.browser_snapshots import SNAPSHOT_DIR_NAME
+from kiro_crew.browser_snapshots import prune as prune_snapshots
+from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+
+logger = logging.getLogger(__name__)
+
+# The ops the tool advertises, in the order the schema lists them. An enum on the
+# wire, so the model cannot invent a verb. ``evaluate`` is deliberately absent:
+# arbitrary in-page JS is not needed to drive a page and widens the surface an
+# untrusted page could influence.
+OPS: tuple[str, ...] = (
+    "navigate",
+    "back",
+    "snapshot",
+    "read",
+    "click",
+    "drag",
+    "scroll",
+    "type",
+    "paste",
+    "press_key",
+    "hover",
+    "select_option",
+    "wait_for",
+    "console",
+    "screenshot",
+    "tabs",
+    "dialog",
+    "reflex",
+    # Served by the gateway route itself (``dashboard/handlers/browser_ask.py``):
+    # it needs the live card, which this module never sees. ``run_op`` refuses it.
+    "ask",
+)
+
+# Ops that legitimately take longer than one CDP round trip (a page load, an
+# explicit wait); the route gives them the long budget and everything else the
+# short one.
+SLOW_OPS: frozenset[str] = frozenset({"navigate", "back", "wait_for", "reflex"})
+
+WALKER_PATH = Path(__file__).with_name("snapshot_walker.js")
+
+# ``eN`` names an element of the page (same-origin frames included); ``f<tag>eN`` one
+# inside a cross-origin frame the gateway reads itself (``browser_harness.frames``).
+_REF_RE = re.compile(r"^(?:f[1-9][0-9]{0,3})?e[1-9][0-9]*$")
+_MOUSE_BUTTONS = frozenset({"left", "middle", "right", "back", "forward"})
+# CDP takes modifiers as a bitmask: Alt=1, Ctrl=2, Meta/Cmd=4, Shift=8.
+_MODIFIER_BITS = {"alt": 1, "control": 2, "ctrl": 2, "meta": 4, "command": 4, "cmd": 4, "shift": 8}
+_NAMED_KEYS = frozenset(
+    {
+        "Enter",
+        "Tab",
+        "Backspace",
+        "Escape",
+        "Delete",
+        " ",
+        "Space",
+        "ArrowLeft",
+        "ArrowUp",
+        "ArrowRight",
+        "ArrowDown",
+        "Home",
+        "End",
+        "PageUp",
+        "PageDown",
+    }
+)
+
+NAV_SETTLE_S = 10.0
+NAV_POLL_S = 0.05
+# A ref's point is re-measured, without scrolling, after scroll-into-view
+# until two reads in a row agree. Cost: every action by ref waits at least one
+# settle (0.1s) and at most TRIES of them (0.6s), each a page round trip; a
+# drag pays it for both ends.
+RESOLVE_SETTLE_S = 0.1
+RESOLVE_SETTLE_TRIES = 6
+RESOLVE_SETTLE_PX = 1.0
+#: ``screenshot`` ``max_dim`` bounds (pixels on the longest side), and the size a
+#: zoomed region is fitted to when ``max_dim`` is not given.
+SHOT_MIN_DIM = 64
+SHOT_MAX_DIM = 4096
+SHOT_ZOOM_DIM = 1568
+#: A zoomed region is magnified at most this many times, an element not at all.
+SHOT_ZOOM_MAGNIFY = 4.0
+WAIT_DEFAULT_S = 5.0
+WAIT_MAX_S = 30.0
+WAIT_POLL_S = 0.1
+CONSOLE_CAP = 500
+#: Longest dialog message passed on: the page writes it, and a long one is noise.
+DIALOG_MESSAGE_CAP = 1000
+_DIALOG_ACTIONS = {"accept": "accepted", "dismiss": "dismissed"}
+#: Ops whose result carries a ``changes`` report while ``browser.report_changes`` is on.
+REPORT_OPS: frozenset[str] = frozenset({"click", "type", "select_option"})
+#: How long the page gets to react to an action before the report reads it, and the
+#: longest one read may take: a wedged page costs the report, never the action. Each
+#: side of the action is bounded as a whole too (``budgets.CHANGE_BEFORE_S`` and
+#: ``CHANGE_AFTER_S``), and the route adds both to the op's budget.
+CHANGE_SETTLE_S = 0.3
+CHANGE_READ_S = 3.0
+_CHANGES_LEFT_OUT = "`changes` left out: the page could not be read around the action"
+SCROLL_DEFAULT_PX = 300
+TEXT_CAP = 20_000
+#: Most steps one ``type {steps}`` call runs: the whole list stays one op inside
+#: the short op budget (``budgets.OP_TIMEOUT_S``).
+STEPS_CAP = 50
+_URL_MAX = 4096
+
+_SleepFn = Callable[[float], Awaitable[None]]
+
+
+def _load_walker() -> str:
+    """The walker as one JavaScript expression, without its comment lines or indents.
+
+    Every page call resends it as ONE line to the Harness daemon, which reads at most
+    64 KiB per line (``test_browser_walker_ipc_line.py`` pins the margin).
+    """
+    lines = (line.strip() for line in WALKER_PATH.read_text(encoding="utf-8").splitlines())
+    return "\n".join(line for line in lines if line and not line.startswith("//"))
+
+
+# Read once per process: the file ships in the package and never changes at runtime.
+WALKER_SOURCE: str = _load_walker()
+
+
+async def _no_sleep(_seconds: float) -> None:  # pragma: no cover - replaced by the route
+    return None
+
+
+#: Ops that accept ``target`` -- the element described in words -- in place of a
+#: ``ref``. Only the optional ``browser.step`` decision hook (``browser_harness.decide``)
+#: can resolve one; without it such a call is refused with ``needs_ref``.
+TARGET_OPS: frozenset[str] = frozenset({"click", "hover", "type", "select_option"})
+
+
+def names_target_only(op: str, args: dict[str, Any]) -> bool:
+    """Whether *args* name the element only by ``target``: no ``ref`` and no ``x``/``y``."""
+    target = args.get("target")
+    return (
+        op in TARGET_OPS
+        and isinstance(target, str)
+        and bool(target.strip())
+        and args.get("ref") is None
+        and args.get("x") is None
+        and args.get("y") is None
+    )
+
+
+def needs_ref() -> dict[str, Any]:
+    return refusal(
+        "needs_ref",
+        "`target` could not be matched to one element; call snapshot and pass `ref`",
+    )
+
+
+@dataclass
+class OpContext:
+    """What one op needs from the gateway, all injected so tests fake it.
+
+    ``helper`` is ``HarnessSupervisor.call``; ``step`` and ``in_control`` are the
+    live hub's, bound to the caller's session; ``agent_targets`` is
+    ``CdpRelay.agent_targets``; ``screenshot_dir`` is where ``screenshot``
+    writes; ``sleep`` and ``now`` are the one clock, so a test drives a wait
+    without a real delay.
+    """
+
+    helper: Callable[..., Awaitable[Any]]
+    step: Callable[[str], Any] = lambda _label: None
+    in_control: Callable[[], Any] = lambda: False
+    agent_targets: Callable[[], list[str]] = list
+    #: The navigate gate, applied to the URL a navigation COMMITTED on (after every
+    #: redirect), not only to the one the agent asked for. The route wires the same
+    #: predicate the shim applies before the op (``browser_harness.url_gate``).
+    url_allowed: Callable[[str], bool] = lambda _url: True
+    screenshot_dir: Path = field(default_factory=lambda: Path(os.getcwd()))
+    sleep: _SleepFn = _no_sleep
+    now: Callable[[], float] = time.monotonic
+    #: The optional ``browser.step`` hooks (``browser_harness.decide.BrowserDecisions``)
+    #: for this caller's session, or ``None``: then every op runs exactly as written.
+    decisions: Any = None
+    #: Where a loop op (``reflex``) reports its counters, for the live card's loop
+    #: line (``LiveHub.loop``). No-ops by default; no single op calls them.
+    loop: Callable[[Mapping[str, Any]], Any] = lambda _info: None
+    #: The turn replay's seam for an action a loop op runs inside itself:
+    #: ``mark()`` before it, ``record(op, args, result, mark)`` after it
+    #: (``LiveHub.inner_mark`` / ``LiveHub.record_op``). No-ops by default.
+    mark: Callable[[], Any] = lambda: None
+    record: Callable[..., Any] = lambda *_args: None
+    #: The cross-origin frames of the caller's tab (``browser_harness.frames.FrameOps``),
+    #: read at call time, or ``None`` when no stream holds the tab: then a frame ref
+    #: is stale and the outline marks those frames as not read.
+    frames: Callable[[], Any] = lambda: None
+    #: ``browser.report_changes``: ``click``, ``type`` and ``select_option`` add a
+    #: ``changes`` report of what the page did. Off by default, so every result is
+    #: byte-for-byte what it was.
+    report_changes: bool = False
+    #: Where ``screenshot`` writes the image while it is still being judged: a leaf
+    #: no sandboxed agent can read (the hidden IPC leaf). The image moves into
+    #: ``screenshot_dir`` only once the check after the capture passes. ``None``
+    #: writes straight into ``screenshot_dir`` (tests).
+    staging_dir: Path | None = None
+
+
+def screenshot_dir(home: Path) -> Path:
+    """Where ``screenshot`` writes its PNGs: a fixed leaf of the data home.
+
+    The leaf is :data:`kiro_crew.browser_snapshots.SNAPSHOT_DIR_NAME`, the one
+    name the ``file_send`` admission (``messaging/outbound_files.py``) and the
+    sandbox leaf lists spell too. Fixed so the agent gets an absolute path it
+    can show in chat. Created owner-only on first use by :func:`_screenshot_path`.
+    """
+    return home / SNAPSHOT_DIR_NAME
+
+
+def browsing_available(home: Path) -> bool:
+    """Whether the Harness is installed for this data home. Fail-CLOSED.
+
+    The prompt's Browser section and the tool's own call-time check both read
+    this. The install plane is the core lane's; an import or read error means
+    "not set up", never a working browser the prompt describes wrongly.
+    """
+    try:
+        # By name: the install plane is a sibling lane's module, resolved at call time.
+        install = importlib.import_module("kiro_crew.browser_harness.install")
+        return bool(getattr(install.install_state(home), "installed", False))
+    except Exception:
+        logger.debug("browser harness install state unreadable", exc_info=True)
+        return False
+
+
+def refusal(code: str, error: str) -> dict[str, Any]:
+    return {"ok": False, "code": code, "error": error}
+
+
+def _is_ref(value: Any) -> bool:
+    return isinstance(value, str) and bool(_REF_RE.match(value))
+
+
+def _number(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value != value or value in (float("inf"), float("-inf")):
+        return None
+    return float(value)
+
+
+def _modifier_mask(modifiers: Any) -> int:
+    if isinstance(modifiers, int) and not isinstance(modifiers, bool):
+        return modifiers & 15
+    if not isinstance(modifiers, list):
+        return 0
+    mask = 0
+    for m in modifiers:
+        mask |= _MODIFIER_BITS.get(str(m or "").lower(), 0)
+    return mask
+
+
+def format_outline(nodes: list[dict[str, Any]]) -> str:
+    """Render walker nodes as the indented outline the model reads."""
+    lines: list[str] = []
+    for n in nodes:
+        if not isinstance(n, dict):
+            continue
+        indent = "  " * _depth(n.get("depth"))
+        role = n.get("role") or "generic"
+        name = "" if n.get("name") is None else str(n.get("name"))
+        line = f'{indent}- {role} "{name}"'
+        if n.get("ref"):
+            line += f" [ref={n['ref']}]"
+        if n.get("frame"):
+            line += f" [frame {n['frame']}]"
+        st = n.get("state") or {}
+        if isinstance(st, dict):
+            if st.get("unread"):
+                line += " [cross-origin, not read]"
+            if st.get("password"):
+                line += " [password]"
+            if st.get("unusable") == "covered" or st.get("covered"):
+                line += " [covered]"
+            elif st.get("unusable"):
+                line += " [not usable yet]"
+            if st.get("checked"):
+                line += " [checked]"
+            if st.get("disabled"):
+                line += " [disabled]"
+            if st.get("expanded") is True:
+                line += " [expanded]"
+            elif st.get("expanded") is False:
+                line += " [collapsed]"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+class _PageRefused(Exception):
+    """A URL refusal carried across an op's nested page reads."""
+
+    def __init__(self, result: dict[str, Any]) -> None:
+        self.result = result
+        super().__init__(result["error"])
+
+
+def _frame_document_url(url: str) -> bool:
+    """A child frame the parent wrote itself (``about:blank``, ``srcdoc``): no origin to reach."""
+    return url in ("about:blank", "about:srcdoc")
+
+
+def _frame_url_allowed(ctx: OpContext, url: str) -> bool:
+    return bool(url) and (_frame_document_url(url) or ctx.url_allowed(url))
+
+
+async def _refuse_current_url(ctx: OpContext) -> dict[str, Any] | None:
+    """Judge the active tab before reading it, including a link's landing."""
+    tab = await ctx.helper("current_tab")
+    reported = tab.get("url") if isinstance(tab, dict) else None
+    # The gateway's empty recovery/new tab has no page content to expose, and a
+    # popup that has not committed its first document yet reports url "": sending
+    # it to about:blank would cancel the navigation its opener started. Only those
+    # exact strings pass; a malformed answer (no dict, no url, a non-string) is
+    # still judged, and refused.
+    if reported in ("about:blank", ""):
+        return None
+    return await _refuse_committed_url(ctx, str(reported or ""))
+
+
+#: The walker counts the screenshot guards read: fields the person filled through a
+#: quick ask that still hold a value, password or secret-looking boxes, and filled
+#: fields the walker's secret rule names (a takeover OTP in a text field).
+GUARD_COUNTS = ("askedValues", "passwordBoxes", "secretValues")
+
+
+async def _guard_count(ctx: OpContext, method: str) -> int | None:
+    """*method*'s count over the top document and its frames, or ``None`` when any
+    part of it could not be taken.
+
+    The top document is counted in an isolated world (the ``js_isolated`` helper),
+    not the page's own world: there a page script could replace
+    ``document.querySelectorAll`` and make the count read zero. Cross-origin frames
+    are counted in their own isolated worlds (``FrameOps.count``), which already
+    counts an unreadable frame as one. With no frame inspector (no live stream
+    holds the tab, so ``ctx.frames()`` is ``None``), a cross-origin frame cannot be
+    counted at all, so any frame the top document cannot read makes the count
+    ``None``. What the isolated world cannot stop is a page that edits its own DOM
+    (drops ``data-kc-asked``, changes an input's type).
+    """
+    value = await _isolated_count(ctx, method)
+    if value is None:
+        return None
+    frames = ctx.frames()
+    # A frame no one looks inside makes the count unknown, so the guard refuses.
+    if await _frames_unchecked(ctx) != 0 or await _closed_secrets(ctx) != 0:
+        return None
+    if frames is None:
+        return value
+    try:
+        value += await frames.count(method)
+    except Exception:  # noqa: BLE001 - no count: the caller fails closed
+        return None
+    return value
+
+
+async def _frames_unchecked(ctx: OpContext) -> int | None:
+    """How many frames, objects and embeds no one looks inside, or ``None`` when
+    that cannot be told.
+
+    Every one whose document the top page's walk cannot read counts
+    (``unreadableFrames``), live stream or not: the live stream's frame inspector
+    (``FrameOps``) does not yet prove it checked every such frame, so it is not
+    trusted to. Every ``object`` and ``embed`` counts too, since no field count
+    walks their documents. The walk cannot reach a frame in a closed shadow root,
+    so the browser's own count of frame owners (``frame_owner_count``) is compared
+    with the ones the walk reached (``framesSeen``): any it missed count as well.
+    """
+    unreadable = await _isolated_count(ctx, "unreadableFrames")
+    seen = await _isolated_count(ctx, "framesSeen")
+    try:
+        owners = await ctx.helper("frame_owner_count")
+    except Exception:  # noqa: BLE001 - no tree: the caller fails closed
+        return None
+    if unreadable is None or seen is None:
+        return None
+    if not isinstance(owners, int) or isinstance(owners, bool) or owners < 0:
+        return None
+    if seen > owners:
+        # The walk reached more frames than the browser holds: the page changed
+        # between the two reads (frames added for one, gone for the other), so
+        # neither can be trusted to account for the other.
+        return None
+    return unreadable + (owners - seen)
+
+
+async def _closed_secrets(ctx: OpContext) -> int | None:
+    """How many secret-looking fields sit in closed shadow roots, or ``None``.
+
+    No walk from page or isolated world can enter a closed root, so the field
+    counts cannot see these; the browser's own DOM does (``closed_secret_count``).
+    """
+    try:
+        value = await ctx.helper("closed_secret_count")
+    except Exception:  # noqa: BLE001 - no count: the caller fails closed
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        return None
+    return value
+
+
+async def _isolated_count(ctx: OpContext, method: str) -> int | None:
+    """A walker count taken in the top frame's isolated world, or ``None``."""
+    try:
+        value = await ctx.helper("js_isolated", expression=f"{WALKER_SOURCE}.{method}()")
+    except Exception:  # noqa: BLE001 - no count: the caller fails closed
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        return None
+    return value
+
+
+#: The walker methods that run in the page's own world: the console hook wraps the
+#: page's ``console``, and the navigation stamp is read back from the same world.
+#: Every other method (the outline, the refs, every read of a field, every guard)
+#: runs in the walker's isolated world, where a page script that replaces
+#: ``getAttribute`` or a property getter cannot change what the walker sees.
+PAGE_WORLD_METHODS = frozenset({"stamp", "state", "consoleMessages"})
+
+
+async def _page(ctx: OpContext, method: str, *args: Any) -> Any:
+    """Call one method of the walker in the page: the ONLY use of the ``js`` and
+    ``js_isolated`` helpers (:data:`PAGE_WORLD_METHODS` run in the first, the rest,
+    guard counts included, in the walker's isolated world).
+
+    A ``f<tag>eN`` ref runs the method in that cross-origin frame instead, through
+    the gateway's session (``resolve`` then answers page pixels). The guards'
+    reads -- what holds focus, how many asked or password fields there are --
+    take the cross-origin frames into account, failing closed when one cannot
+    be read.
+    """
+    if method not in ("stamp", "state"):
+        refused = await _refuse_current_url(ctx)
+        if refused is not None:
+            raise _PageRefused(refused)
+    framed = split_frame_ref(args[0]) if args else None
+    if framed is not None:
+        frames = ctx.frames()
+        if frames is not None:
+            url = await frames.url_for_ref(framed[0])
+            if not url:
+                # An unknown or gone frame: nothing of it is read, and the tab stays.
+                return {"ok": False, "code": "ref_stale"}
+            refused = None if _frame_document_url(url) else await _refuse_committed_url(ctx, url)
+            if refused is not None:
+                raise _PageRefused(refused)
+        value = (
+            await frames.call(framed[0], method, framed[1], *args[1:])
+            if frames is not None
+            else None
+        )
+        if frames is not None:
+            # A frame that navigated during the call is judged again before its answer is kept.
+            url = await frames.url_for_ref(framed[0])
+            if not url:
+                return {"ok": False, "code": "ref_stale"}
+            refused = None if _frame_document_url(url) else await _refuse_committed_url(ctx, url)
+            if refused is not None:
+                raise _PageRefused(refused)
+        return value if value is not None else {"ok": False, "code": "ref_stale"}
+    if method in GUARD_COUNTS:
+        # A count that could not be taken reads as one field: the guard refuses.
+        counted = await _guard_count(ctx, method)
+        return 1 if counted is None else counted
+    rendered = ", ".join(json.dumps(a) for a in args)
+    helper = "js" if method in PAGE_WORLD_METHODS else "js_isolated"
+    value = await ctx.helper(helper, expression=f"{WALKER_SOURCE}.{method}({rendered})")
+    if method == "activeField" and isinstance(value, dict) and value.get("frame"):
+        frames = ctx.frames()
+        inner = await frames.focused() if frames is not None else None
+        # Focus is inside a cross-origin frame: judge the field there, or nothing.
+        value = inner if inner is not None else {**value, "unreadable": True}
+    return value
+
+
+async def _in_control(ctx: OpContext) -> bool:
+    held = ctx.in_control()
+    if hasattr(held, "__await__"):
+        held = await held
+    return bool(held)
+
+
+async def _step(ctx: OpContext, label: str) -> None:
+    try:
+        result = ctx.step(label[:120])
+        if hasattr(result, "__await__"):
+            await result
+    except Exception:  # noqa: BLE001 - the card is a mirror; it never fails an op
+        logger.debug("live hub step failed", exc_info=True)
+
+
+async def _resolve(ctx: OpContext, ref: Any) -> dict[str, Any]:
+    if not _is_ref(ref):
+        return refusal("bad_ref", f"not a valid ref: {ref!r}; call snapshot first")
+    # The walker scrolls the ref into view and measures it in one call, before
+    # the page's own scroll handlers run. A page that moves its layout on
+    # scroll (a header that collapses) shifts the target after that measure,
+    # so re-measure WITHOUT scrolling after a short settle until two reads in a
+    # row agree.
+    # shortcut: a page still moving after the last try gets the latest
+    # measure; refuse instead if real pages show that clicking it misses.
+    found = await _page(ctx, "resolve", ref)
+    if not isinstance(found, dict) or not found.get("ok"):
+        return refusal("ref_stale", f"ref {ref} is not on the current page; re-snapshot")
+    last_ok = True
+    for _ in range(RESOLVE_SETTLE_TRIES):
+        await ctx.sleep(RESOLVE_SETTLE_S)
+        again = await _page(ctx, "resolve", ref, False)
+        prev_ok, last_ok = last_ok, isinstance(again, dict) and bool(again.get("ok"))
+        if not last_ok:
+            continue  # a frame mid-animation can measure empty; read again
+        settled = (
+            prev_ok
+            and abs(float(again["x"]) - float(found["x"])) <= RESOLVE_SETTLE_PX
+            and abs(float(again["y"]) - float(found["y"])) <= RESOLVE_SETTLE_PX
+        )
+        found = again
+        if settled:
+            break
+    if not last_ok:
+        # The ref measured empty to the end: the page dropped or hid it.
+        return refusal("ref_stale", f"ref {ref} is not on the current page; re-snapshot")
+    box = {k: float(found[k]) for k in ("w", "h") if isinstance(found.get(k), (int, float))}
+    return {
+        "ok": True,
+        "x": float(found["x"]),
+        "y": float(found["y"]),
+        "tag": found.get("tag"),
+        **box,
+    }
+
+
+async def _point(ctx: OpContext, args: dict[str, Any], ref_key: str, x_key: str, y_key: str) -> Any:
+    """A ref OR a coordinate pair -> ``(x, y)``, or a refusal dict."""
+    ref = args.get(ref_key)
+    if ref is not None:
+        resolved = await _resolve(ctx, ref)
+        if not resolved["ok"]:
+            return resolved
+        return resolved["x"], resolved["y"]
+    x, y = _number(args.get(x_key)), _number(args.get(y_key))
+    if x is None or y is None or x < 0 or y < 0:
+        return refusal(
+            "bad_target",
+            f"give either `{ref_key}` from a snapshot or non-negative `{x_key}`,`{y_key}` pixels",
+        )
+    return x, y
+
+
+async def _wait_for_commit(
+    ctx: OpContext, token: str, target: str | None, start_href: str = ""
+) -> dict[str, Any]:
+    """Wait for a navigation started by ``goto``/``back`` to actually commit.
+
+    Three settle signals: the stamp being gone proves a NEW document committed
+    (``readyState`` alone reads ``complete`` on the OLD document at once); the
+    href matching the target covers a same-document ``goto`` (``#section``)
+    where the stamp survives; and the href moving off *start_href* while the
+    stamp survives covers a same-document history step (``back`` after a
+    fragment or ``pushState``) and a target Chromium canonicalized. The old
+    document's href changes only by a same-document navigation, so a move off
+    it is a commit. Bounded by both the clock and an iteration count so an
+    injected constant clock still terminates.
+    """
+    deadline = ctx.now() + NAV_SETTLE_S
+    last = ""
+    for _ in range(max(1, int(NAV_SETTLE_S / NAV_POLL_S))):
+        if ctx.now() > deadline:
+            break
+        await ctx.sleep(NAV_POLL_S)
+        try:
+            state = await _page(ctx, "state")
+        except Exception:  # noqa: BLE001 - the context is torn down mid-navigation
+            continue
+        if not isinstance(state, dict):
+            continue
+        ready = str(state.get("readyState", ""))
+        new_doc = state.get("stale") != token
+        href = str(state.get("href", ""))
+        last = f"{ready}{' (still old doc)' if not new_doc else ''} {href}"
+        same_doc_moved = bool(start_href) and bool(href) and href != start_href
+        if (new_doc or (target is not None and href == target) or same_doc_moved) and ready in (
+            "interactive",
+            "complete",
+        ):
+            return {"ok": True, "url": href, "title": str(state.get("title", ""))}
+    return refusal(
+        "nav_timeout", f"navigation did not commit within {NAV_SETTLE_S:g}s (last: {last})"
+    )
+
+
+async def _href_now(ctx: OpContext) -> str:
+    """The current document's href, or ``""`` when the page cannot say."""
+    try:
+        state = await _page(ctx, "state")
+    except Exception:  # noqa: BLE001 - an unreadable page just loses this signal
+        return ""
+    return str(state.get("href", "")) if isinstance(state, dict) else ""
+
+
+def _stamp_token(ctx: OpContext) -> str:
+    return f"kcnav_{secrets.token_hex(6)}_{int(ctx.now() * 1000)}"
+
+
+# -- ops ---------------------------------------------------------------------
+
+
+async def _navigate(ctx: OpContext, args: dict[str, Any]) -> dict[str, Any]:
+    url = args.get("url")
+    if not isinstance(url, str) or not url.strip() or len(url) > _URL_MAX:
+        return refusal("bad_url", "navigate needs a `url` string")
+    url = url.strip()
+    if not url.lower().startswith(("http://", "https://")):
+        return refusal("bad_url", f"refused non-web URL: {url[:80]}")
+    await _step(ctx, f"Open {url}")
+    token = _stamp_token(ctx)
+    try:
+        await _page(ctx, "stamp", token)
+    except Exception:  # noqa: BLE001 - an unstampable old page still navigates
+        logger.debug("navigate: could not stamp the old document", exc_info=True)
+    start_href = await _href_now(ctx)
+    started = await ctx.helper("goto", url=url)
+    if isinstance(started, dict) and started.get("errorText"):
+        return refusal("nav_error", str(started["errorText"]))
+    committed = await _wait_for_commit(ctx, token, url, start_href)
+    if not committed["ok"]:
+        return committed
+    refused = await _refuse_committed_url(ctx, committed["url"])
+    if refused is not None:
+        return refused
+    await _arm_console(ctx)
+    return {"ok": True, "url": committed["url"], "title": committed.get("title", "")}
+
+
+async def _refuse_committed_url(ctx: OpContext, url: str) -> dict[str, Any] | None:
+    """The gate, one hop past the request: judge where the navigation LANDED.
+
+    The shim judged the URL the agent asked for; a public page that redirects to a
+    loopback, private or link-local address would otherwise be read back through the
+    browser. The tab is moved to ``about:blank`` so the landed page is not left in
+    front of the live view or the next op, and the refusal names the host.
+    """
+    if ctx.url_allowed(url):
+        return None
+    try:
+        await ctx.helper("goto", url="about:blank")
+    except Exception:  # noqa: BLE001 - the refusal stands even if the blank page fails
+        logger.debug("navigate: could not leave the refused page", exc_info=True)
+    return refusal(
+        "redirect_refused",
+        f"the page redirected to {url[:120]}, which is not a public http(s) URL or a "
+        "loopback origin the user listed (or, for an app's own session, not one of the "
+        "pages the app may browse); the tab was moved to about:blank",
+    )
+
+
+async def _arm_console(ctx: OpContext) -> None:
+    """Install the page's console hook as early as the new document allows.
+
+    Best effort: the ``console`` op installs it too, so a failure here only
+    loses the messages logged before the agent's next page-side call.
+    """
+    try:
+        await _page(ctx, "consoleMessages", 0)
+    except Exception:  # noqa: BLE001 - see docstring
+        logger.debug("navigate: console hook not installed", exc_info=True)
+
+
+async def _back(ctx: OpContext, _args: dict[str, Any]) -> dict[str, Any]:
+    await _step(ctx, "Go back")
+    token = _stamp_token(ctx)
+    await _page(ctx, "stamp", token)
+    start_href = await _href_now(ctx)
+    went = await _page(ctx, "back")
+    if not isinstance(went, dict) or not went.get("ok"):
+        return refusal("no_history", "no previous page in history")
+    committed = await _wait_for_commit(ctx, token, None, start_href)
+    if not committed["ok"]:
+        return committed
+    refused = await _refuse_committed_url(ctx, committed["url"])
+    if refused is not None:
+        return refused
+    return {"ok": True, "url": committed["url"], "title": committed.get("title", "")}
+
+
+#: The walker's node cap, shared by the page and every frame read after it.
+NODE_CAP = 1500
+
+
+_DEPTH_MAX = 64
+
+
+def _depth(value: Any) -> int:
+    """A walker node's depth, from page script: a small whole number or 0."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+        return 0
+    return max(0, min(_DEPTH_MAX, int(value)))
+
+
+async def _with_frames(ctx: OpContext, nodes: list[Any]) -> list[Any]:
+    """Fill each cross-origin frame's ``slot`` node with that frame's own outline.
+
+    The node budget is shared: each frame gets what the page and the frames before
+    it left. A frame that cannot be read stays one ``iframe`` line marked so.
+    """
+    slots = [n for n in nodes if isinstance(n, dict) and isinstance(n.get("slot"), int)]
+    frames = ctx.frames() if slots else None
+    if not slots:
+        return nodes
+    ids = await frames.slot_frames(len(slots)) if frames is not None else []
+    budget = NODE_CAP - len(nodes)
+    out: list[Any] = []
+    for n in nodes:
+        if not (isinstance(n, dict) and isinstance(n.get("slot"), int)):
+            out.append(n)
+            continue
+        slot = int(n["slot"])
+        frame_id = ids[slot] if slot < len(ids) and slot < FRAME_READ_CAP else ""
+        read = None
+        if frames is not None and frame_id and _frame_url_allowed(ctx, await frames.url(frame_id)):
+            read = await frames.outline(frame_id, budget)
+            # A frame that navigated during the read is judged again; a refused
+            # landing drops what was read.
+            if read is not None and not _frame_url_allowed(ctx, await frames.url(frame_id)):
+                read = None
+        head = {k: v for k, v in n.items() if k != "slot"}
+        if read is None:
+            head["state"] = {"unread": True}
+            out.append(head)
+            continue
+        tag, url, inner = read
+        # Origin and path only: a frame's query or fragment can carry a token.
+        head["frame"] = f"f{tag} {url.split('?', 1)[0].split('#', 1)[0][:120]}"
+        out.append(head)
+        depth = _depth(n.get("depth")) + 1
+        for m in inner:
+            out.append({**m, "depth": min(_DEPTH_MAX, depth + _depth(m.get("depth")))})
+        budget -= len(inner)
+    return out
+
+
+async def _snapshot(ctx: OpContext, _args: dict[str, Any]) -> dict[str, Any]:
+    await _step(ctx, "Read the page")
+    await _arm_console(ctx)
+    data = await _page(ctx, "snapshot")
+    if not isinstance(data, dict) or not isinstance(data.get("nodes"), list):
+        return refusal("snapshot_error", "snapshot walker returned no data")
+    nodes = await _with_frames(ctx, data["nodes"])
+    out: dict[str, Any] = {
+        "ok": True,
+        "url": data.get("url", ""),
+        "title": data.get("title", ""),
+        "snapshot": format_outline(nodes)[:TEXT_CAP],
+    }
+    unread = sum(1 for n in nodes if isinstance(n, dict) and (n.get("state") or {}).get("unread"))
+    if unread:
+        out["note"] = (
+            f"{unread} cross-origin iframe(s) could not be read, so their fields have no "
+            "refs. To sign in there, use `ask` kind credentials with no targets: the user "
+            "types into Kiro's sheet and the browser fills the site where it can, else "
+            "they sign in on the page themselves. Never ask for a password in chat."
+        )
+    if data.get("error"):
+        out["partial"] = str(data["error"])
+    return out
+
+
+#: The longest ``content`` one ``read`` returns. Below :data:`TEXT_CAP` so the
+#: header the tool shim puts in front of it still fits the shim's 20,000 cap.
+READ_CONTENT_CAP = TEXT_CAP - 2_000
+#: How far back a truncated page is scanned for whitespace; longer than any
+#: credential the redactor matches.
+READ_CUT_SCAN = 512
+
+
+async def _read(ctx: OpContext, args: dict[str, Any]) -> dict[str, Any]:
+    if args.get("format", "text") != "text":
+        return refusal("bad_format", "only text is supported")
+    offset = args.get("offset", 0)
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        return refusal("bad_offset", "offset must be a whole number of characters, 0 or more")
+    ref = args.get("ref")
+    if ref is not None and not _is_ref(ref):
+        return refusal("bad_ref", f"not a valid ref: {ref!r}; call snapshot first")
+    if split_frame_ref(ref) is not None:
+        return refusal(
+            "bad_ref",
+            f"read cannot be scoped to {ref}, an element of a cross-origin frame; "
+            "read the page without a ref",
+        )
+    await _step(ctx, "Read the page text")
+    data = await _page(ctx, "read", ref)
+    if isinstance(data, dict) and data.get("code") == "ref_stale":
+        return refusal("ref_stale", f"ref {ref} is not on the current page; re-snapshot")
+    if not isinstance(data, dict) or not isinstance(data.get("content"), str):
+        return refusal("read_error", "the page returned no content")
+    # Redacted and fence-neutralized whole, before paging: a token split across
+    # two pages would match in neither, and neutralizing after paging grows a
+    # page past the shim's cap, which then drops text no `next_offset` covers.
+    # Imported here: the MCP server loads this module before it answers the tool
+    # list, and test_mcp_listing_import_budget caps what that list may load.
+    from kiro_crew.context_assembly.markers import _neutralize_fence_markers
+
+    content = data["content"]
+    if data.get("truncated"):
+        # The walker may cut a credential mid-word. Withhold that word before
+        # redaction, but scan back at most READ_CUT_SCAN characters: a page with
+        # no whitespace near its end loses only that tail, not all its text.
+        floor = max(0, len(content) - READ_CUT_SCAN)
+        end = len(content)
+        while end > floor and not content[end - 1].isspace():
+            end -= 1
+        content = content[:end]
+    content, _ = redact_exfiltration_urls(content)
+    content, _ = redact_credentials(content)
+    content = _neutralize_fence_markers(content)
+    total = len(content)
+    if offset > total:
+        return refusal("bad_offset", f"offset {offset} is past the end ({total} characters)")
+    page = content[offset : offset + READ_CONTENT_CAP]
+    out: dict[str, Any] = {
+        "ok": True,
+        "url": str(data.get("url", "")),
+        "title": str(data.get("title", "")),
+        "content": page,
+        "offset": offset,
+        "total": total,
+        "digest": hashlib.sha256(content.encode("utf-8", "surrogatepass")).hexdigest()[:12],
+    }
+    if offset + len(page) < total:
+        out["next_offset"] = offset + len(page)
+    if data.get("truncated"):
+        out["truncated"] = True
+    counts = [data.get("skippedFrames"), data.get("deepRoots")]
+    skipped, deep = (c if isinstance(c, int) and not isinstance(c, bool) else 0 for c in counts)
+    notes = []
+    if skipped > 0:
+        notes.append(
+            f"{skipped} cross-origin frame(s) or embedded document(s) were not read; "
+            "their text is not included"
+        )
+    if deep > 0:
+        notes.append(
+            f"{deep} shadow root(s) or frame(s) nested past the read depth were not read; "
+            "read a ref inside them"
+        )
+    if notes:
+        out["note"] = "; ".join(notes)
+    return out
+
+
+async def _click(ctx: OpContext, args: dict[str, Any]) -> dict[str, Any]:
+    point = await _point(ctx, args, "ref", "x", "y")
+    if isinstance(point, dict):
+        return point
+    x, y = point
+    button = args.get("button", "left")
+    if button not in _MOUSE_BUTTONS:
+        return refusal("bad_button", f"button must be one of {sorted(_MOUSE_BUTTONS)}")
+    clicks = args.get("clicks", 2 if args.get("doubleClick") else 1)
+    if clicks not in (1, 2) or isinstance(clicks, bool):
+        return refusal("bad_clicks", "clicks must be 1 or 2")
+    await _step(ctx, f"Click {args.get('ref') or f'({x:.0f}, {y:.0f})'}")
+    await ctx.helper("click", x=x, y=y, button=button, clicks=clicks)
+    return {"ok": True, "x": x, "y": y, "button": button, "clicks": clicks, "ref": args.get("ref")}
+
+
+async def _hover(ctx: OpContext, args: dict[str, Any]) -> dict[str, Any]:
+    point = await _point(ctx, args, "ref", "x", "y")
+    if isinstance(point, dict):
+        return point
+    x, y = point
+    await _step(ctx, f"Hover {args.get('ref') or f'({x:.0f}, {y:.0f})'}")
+    await ctx.helper("mouse_move", x=x, y=y)
+    return {"ok": True, "x": x, "y": y, "ref": args.get("ref")}
+
+
+async def _drag(ctx: OpContext, args: dict[str, Any]) -> dict[str, Any]:
+    start = await _point(ctx, args, "ref", "x", "y")
+    if isinstance(start, dict):
+        return start
+    end = await _point(ctx, args, "to_ref", "to_x", "to_y")
+    if isinstance(end, dict):
+        return end
+    await _step(ctx, "Drag")
+    await ctx.helper("drag", x=start[0], y=start[1], to_x=end[0], to_y=end[1])
+    return {"ok": True, "from": list(start), "to": list(end)}
+
+
+async def _scroll(ctx: OpContext, args: dict[str, Any]) -> dict[str, Any]:
+    dx = _number(args.get("dx")) or 0.0
+    dy = _number(args.get("dy"))
+    if dy is None:
+        dy = float(SCROLL_DEFAULT_PX)
+    if args.get("ref") is not None or args.get("x") is not None or args.get("y") is not None:
+        point = await _point(ctx, args, "ref", "x", "y")
+        if isinstance(point, dict):
+            return point
+        x, y = point
+    else:
+        info = await ctx.helper("page_info")
+        if not isinstance(info, dict) or "w" not in info:
+            return refusal("page_error", "could not read the viewport size")
+        x, y = float(info["w"]) / 2, float(info["h"]) / 2
+    await _step(ctx, "Scroll")
+    await ctx.helper("scroll", x=x, y=y, dy=dy, dx=dx)
+    return {"ok": True, "x": x, "y": y, "dx": dx, "dy": dy}
+
+
+async def _focus_ref(ctx: OpContext, ref: Any) -> dict[str, Any] | None:
+    """Focus *ref* before typing; the refusal, or ``None`` once it holds focus."""
+    if not _is_ref(ref):
+        return refusal("bad_ref", f"not a valid ref: {ref!r}; call snapshot first")
+    focused = await _page(ctx, "focus", ref)
+    if not isinstance(focused, dict) or not focused.get("ok"):
+        code = focused.get("code") if isinstance(focused, dict) else None
+        if code == "password_field":
+            return _password_refusal(ref)
+        if code == "asked_field":
+            return _asked_refusal(ref)
+        return refusal("ref_stale", f"ref {ref} is not on the current page; re-snapshot")
+    if not focused.get("focused"):
+        why = " (disabled)" if focused.get("disabled") else ""
+        why += " (readonly)" if focused.get("readOnly") else ""
+        if focused.get("activeTag"):
+            why += f"; focus stayed on <{focused['activeTag']}>"
+        return refusal(
+            "not_focusable",
+            f"ref {ref} did not take focus{why} -- refusing to type into another field",
+        )
+    return None
+
+
+def _known_key(key: Any) -> bool:
+    """*key* is one ``press_key`` presses: ``Space``, a named key, or one character."""
+    return isinstance(key, str) and (key == "Space" or key in _NAMED_KEYS or len(key) == 1)
+
+
+async def _type(ctx: OpContext, args: dict[str, Any]) -> dict[str, Any]:
+    if args.get("steps") is not None:
+        # ``browser_harness.type_steps``, resolved at call time: it imports this module.
+        module = importlib.import_module("kiro_crew.browser_harness.type_steps")
+        return await module.run(ctx, args)  # type: ignore[no-any-return]
+    text = args.get("text")
+    if not isinstance(text, str):
+        return refusal("bad_text", "type needs a `text` string")
+    if len(text) > TEXT_CAP:
+        return refusal("bad_text", f"text longer than {TEXT_CAP} characters")
+    ref = args.get("ref")
+    field = await _focus_field(ctx, ref)
+    if not field["ok"]:
+        return field
+    await _step(ctx, f"Type into {ref or field['tag'] or 'the field'}")
+    await ctx.helper("type_text", text=text)
+    submitted = bool(args.get("submit"))
+    if submitted:
+        await ctx.helper("press_key", key="Enter", modifiers=0)
+    return {"ok": True, "ref": ref, "chars": len(text), "submitted": submitted}
+
+
+async def _focus_field(ctx: OpContext, ref: Any) -> dict[str, Any]:
+    """Focus *ref* when given, then judge whatever holds focus: where input lands.
+
+    Answers ``{"ok": True, "tag"}`` or the refusal ``type`` and ``paste`` share.
+    """
+    if ref is not None:
+        refused = await _focus_ref(ctx, ref)
+        if refused is not None:
+            return refused
+    # Whatever holds focus now is where the text lands: never a password box.
+    active = await _page(ctx, "activeField")
+    if not isinstance(active, dict) or not active.get("focused"):
+        return refusal("no_focus", "no field has focus; pass a `ref` from a snapshot")
+    if active.get("unreadable"):
+        return _frame_focus_refusal()
+    if active.get("password"):
+        return _password_refusal(ref)
+    if active.get("asked"):
+        return _asked_refusal(ref)
+    return {"ok": True, "tag": active.get("tag") or ""}
+
+
+async def _paste(ctx: OpContext, args: dict[str, Any]) -> dict[str, Any]:
+    text, html = args.get("text"), args.get("html")
+    if not isinstance(text, str):
+        return refusal("bad_text", "paste needs a `text` string (the plain version)")
+    if html is not None and not isinstance(html, str):
+        return refusal("bad_html", "`html` must be a string")
+    if len(text) > TEXT_CAP:
+        return refusal("bad_text", f"text longer than {TEXT_CAP} characters")
+    if len(html or "") > TEXT_CAP:
+        return refusal("bad_html", f"html longer than {TEXT_CAP} characters")
+    ref = args.get("ref")
+    field = await _focus_field(ctx, ref)
+    if not field["ok"]:
+        return field
+    # The walker hands both to the page as a paste event; the clipboard is never written.
+    pasted = await _page(ctx, "paste", ref, html or "", text)
+    if not isinstance(pasted, dict) or not pasted.get("ok"):
+        if isinstance(pasted, dict) and pasted.get("code") == "focus_in_frame":
+            return refusal(
+                "focus_in_frame",
+                "focus is inside a cross-origin frame; pass the field's `ref` from the "
+                "frame (f<n>e<n>) so the paste lands there",
+            )
+        return refusal("ref_stale", f"{ref or 'the focused field'} left the page; re-snapshot")
+    await _step(ctx, f"Paste into {ref or field['tag'] or 'the field'}")
+    handled = bool(pasted.get("handled"))
+    if not handled:
+        # A script's paste event inserts nothing by itself, so a field whose page did
+        # not take it gets the plain text the way ``type`` puts it there. The page's
+        # handler may have moved focus, so the ref is focused again (or, with none,
+        # whatever holds focus is judged) before the text lands.
+        field = await _focus_field(ctx, ref)
+        if not field["ok"]:
+            return field
+        await ctx.helper("type_text", text=text)
+    return {"ok": True, "ref": ref, "chars": len(text), "handled": handled}
+
+
+def _password_refusal(ref: Any) -> dict[str, Any]:
+    return refusal(
+        "password_field",
+        f"{ref or 'the focused field'} is a password field. The agent never types a "
+        "password: use the `ask` op (kind credentials) so the user fills it in on the "
+        "live card, or ask them to take over and sign in themselves, then continue.",
+    )
+
+
+def _frame_focus_refusal() -> dict[str, Any]:
+    return refusal(
+        "focus_in_frame",
+        "focus is inside a cross-origin frame that could not be read, so what it holds "
+        "is unknown; snapshot and pass a `ref` from the frame (f<n>e<n>), or use `ask`",
+    )
+
+
+def _asked_refusal(ref: Any) -> dict[str, Any]:
+    return refusal(
+        "asked_field",
+        f"{ref or 'the focused field'} holds what the user entered through a quick ask; "
+        "the agent does not type into, select or copy it. Move on (Tab) or snapshot.",
+    )
+
+
+#: Modifier bits under which a single-character key inserts no text (Ctrl, Meta).
+_NON_TEXT_MODIFIERS = _MODIFIER_BITS["control"] | _MODIFIER_BITS["meta"]
+
+
+async def _press_key(ctx: OpContext, args: dict[str, Any]) -> dict[str, Any]:
+    key = args.get("key")
+    if not isinstance(key, str) or not key:
+        return refusal("bad_key", "press_key needs a `key`")
+    if not _known_key(key):
+        return refusal("bad_key", f"unknown key: {key!r} (named keys or a single character)")
+    if key == "Space":
+        key = " "
+    modifiers = _modifier_mask(args.get("modifiers"))
+    if len(key) == 1 or modifiers:
+        # A printable key is a character typed into whatever holds focus: the same
+        # refusal ``type`` applies, so a password cannot be spelled one key at a time.
+        # Ctrl/Meta chords insert nothing into a password box and stay allowed there.
+        # On the person's quick-ask field every modified key is refused (Shift+Home,
+        # Shift+Delete cut it as surely as Ctrl+X); plain named keys (Tab, Escape,
+        # arrows) are never checked, so the agent can always leave a field.
+        active = await _page(ctx, "activeField")
+        focused = isinstance(active, dict) and active.get("focused")
+        if focused and active.get("unreadable"):
+            # Unknown field: neither a character nor a modified key, like an asked one.
+            return _frame_focus_refusal()
+        if focused and active.get("asked"):
+            # Neither a character nor any modified key (select, copy, cut) on the
+            # person's field: a copy would carry its value into one the agent reads.
+            return _asked_refusal(None)
+        if modifiers and await _closed_secrets(ctx) != 0:
+            # A secret field in a closed shadow root: focus inside it reads as its
+            # host (or as nothing, when the host is the body), so no select, copy or
+            # cut chord while one is on the page, whatever the focus reads as.
+            return refusal(
+                "secret_field",
+                "the page holds a secret field this tool cannot see into; select, copy "
+                "and cut keys are refused. Press Tab to move on",
+            )
+        if focused and active.get("secret") and modifiers:
+            # A filled OTP or token field the person typed during a takeover: no
+            # select, copy or cut chord, so its value cannot be pasted elsewhere.
+            return refusal(
+                "secret_field",
+                "the focused field holds a secret (a code or token); select, copy and "
+                "cut keys are refused there. Press Tab to leave it",
+            )
+        if (
+            focused
+            and active.get("password")
+            and len(key) == 1
+            and not modifiers & _NON_TEXT_MODIFIERS
+        ):
+            return _password_refusal(None)
+    await _step(ctx, f"Press {key.strip() or 'Space'}")
+    await ctx.helper("press_key", key=key, modifiers=modifiers)
+    return {"ok": True, "key": key, "modifiers": modifiers}
+
+
+async def _select_option(ctx: OpContext, args: dict[str, Any]) -> dict[str, Any]:
+    ref = args.get("ref")
+    if not _is_ref(ref):
+        return refusal("bad_ref", f"not a valid ref: {ref!r}; call snapshot first")
+    raw = args.get("values")
+    if raw is None:
+        raw = args.get("value")
+    if isinstance(raw, list):
+        values = [str(v) for v in raw]
+    elif raw is None:
+        values = []
+    else:
+        values = [str(raw)]
+    if not values:
+        return refusal("bad_values", "select_option needs `values` (a list) or `value`")
+    await _step(ctx, f"Select in {ref}")
+    result = await _page(ctx, "selectOption", ref, values)
+    if not isinstance(result, dict) or not result.get("ok"):
+        code = result.get("code") if isinstance(result, dict) else None
+        if code == "not_select":
+            return refusal("not_select", f"ref {ref} is not a <select> element")
+        return refusal("ref_stale", f"ref {ref} is not on the current page; re-snapshot")
+    return {"ok": True, "ref": ref, "selected": result.get("selected", [])}
+
+
+async def _wait_for(ctx: OpContext, args: dict[str, Any]) -> dict[str, Any]:
+    seconds = _number(args.get("time"))
+    if seconds is not None and seconds > 0:
+        waited = min(seconds, WAIT_MAX_S)
+        await _step(ctx, f"Wait {waited:g}s")
+        await ctx.sleep(waited)
+        return {"ok": True, "waited": waited}
+    timeout = _number(args.get("timeout"))
+    # ``timeout`` is in SECONDS, like ``time``; a millisecond-looking value is read as such.
+    if timeout is None:
+        timeout = WAIT_DEFAULT_S
+    elif timeout > WAIT_MAX_S * 10:
+        timeout = timeout / 1000.0
+    timeout = max(0.0, min(timeout, WAIT_MAX_S))
+    if args.get("load"):
+        await _step(ctx, "Wait for the page to load")
+        loaded = await ctx.helper("wait_for_load", timeout=timeout)
+        return (
+            {"ok": True, "loaded": bool(loaded)}
+            if loaded
+            else refusal("wait_timeout", f"page did not finish loading within {timeout:g}s")
+        )
+    text = args.get("text") if isinstance(args.get("text"), str) and args.get("text") else None
+    gone = (
+        args.get("textGone")
+        if isinstance(args.get("textGone"), str) and args.get("textGone")
+        else None
+    )
+    if text is None and gone is None:
+        return refusal("bad_wait", "wait_for needs one of: text, textGone, time, load")
+    target = text if text is not None else str(gone)
+    want_present = text is not None
+    await _step(ctx, f"Wait for {'text' if want_present else 'text to go'}")
+    start = ctx.now()
+    for _ in range(max(1, int(WAIT_MAX_S / WAIT_POLL_S)) + 1):
+        present = bool(await _page(ctx, "textPresent", target))
+        if want_present and present:
+            return {"ok": True, "matched": "present", "text": target}
+        if not want_present and not present:
+            return {"ok": True, "matched": "absent", "text": target}
+        if ctx.now() - start >= timeout:
+            break
+        await ctx.sleep(WAIT_POLL_S)
+    state = "present" if want_present else "absent"
+    return refusal(
+        "wait_timeout", f"timed out after {timeout:g}s waiting for text {state}: {target}"
+    )
+
+
+async def _console(ctx: OpContext, args: dict[str, Any]) -> dict[str, Any]:
+    limit = args.get("limit", CONSOLE_CAP)
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        limit = CONSOLE_CAP
+    limit = max(1, min(limit, CONSOLE_CAP))
+    await _step(ctx, "Read the console")
+    messages = await _page(ctx, "consoleMessages", limit)
+    return {"ok": True, "messages": messages if isinstance(messages, list) else []}
+
+
+def _screenshot_path(ctx: OpContext) -> Path:
+    directory = ctx.screenshot_dir
+    directory.mkdir(parents=True, exist_ok=True)
+    try:
+        # 0o700 is owner-only, the tightest mode a directory the owner reads can have.
+        # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
+        os.chmod(directory, 0o700)
+    except OSError:  # pragma: no cover - Windows ACLs
+        pass
+    stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+    return directory / f"shot-{stamp}-{secrets.token_hex(3)}.png"
+
+
+def _shot_options(args: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """The valid optional ``screenshot`` arguments (``full``, ``max_dim``, ``ref``, ``region``)
+    and a note for each one that is left out.
+
+    No option makes a screenshot fail: an option that is not valid is left out, and
+    when more than one of ``full``, ``ref`` and ``region`` is given, all of them are
+    left out. The screenshot is then taken as without them, the visible page by
+    default, and the notes go back to the agent as the result's ``warning``.
+    """
+    out: dict[str, Any] = {}
+    notes: list[str] = []
+    full = args.get("full")
+    if full is not None:
+        if isinstance(full, bool):
+            out["full"] = full
+        else:
+            notes.append("`full` ignored: it must be true or false")
+    max_dim = args.get("max_dim")
+    if max_dim is not None:
+        size = _number(max_dim)
+        if size is not None and SHOT_MIN_DIM <= size <= SHOT_MAX_DIM:
+            out["max_dim"] = int(size)
+        else:
+            notes.append(f"`max_dim` ignored: it must be {SHOT_MIN_DIM} to {SHOT_MAX_DIM} pixels")
+    ref = args.get("ref")
+    if ref is not None:
+        if _is_ref(ref):
+            out["ref"] = ref
+        else:
+            notes.append("`ref` ignored: it is not a ref from a snapshot")
+    region = args.get("region")
+    if region is not None:
+        box = _region_box(region)
+        if box is not None:
+            out["region"] = box
+        else:
+            notes.append(
+                "`region` ignored: it needs [x, y, width, height] with x, y >= 0 and "
+                "width, height > 0, in the same page pixels as click x,y"
+            )
+    chosen = [k for k in ("full", "ref", "region") if k in out and out[k] is not False]
+    if len(chosen) > 1:
+        for key in chosen:
+            del out[key]
+        names = ", ".join(f"`{k}`" for k in chosen)
+        notes.append(f"{names} ignored: give only one of `full`, `ref` and `region`")
+    return out, notes
+
+
+def _region_box(region: Any) -> list[float] | None:
+    """``[x, y, width, height]`` as four numbers, or ``None`` if not a box.
+
+    A list, not an object: the ``browser`` tool passes only scalars and lists of
+    them (``_args_are_scalar``), so an object-valued ``region`` never gets here.
+    """
+    if not isinstance(region, list) or len(region) != 4:
+        return None
+    x, y, width, height = (_number(value) for value in region)
+    if x is None or y is None or width is None or height is None:
+        return None
+    if x < 0 or y < 0 or width <= 0 or height <= 0:
+        return None
+    return [x, y, width, height]
+
+
+async def _shot_clip(ctx: OpContext, options: dict[str, Any]) -> tuple[list[float] | None, str]:
+    """The viewport box ``[x, y, width, height]`` to photograph, or ``None`` for the
+    page itself, and a note when ``ref`` could not be used and the page is taken."""
+    if "region" in options:
+        return options["region"], ""
+    if "ref" not in options:
+        return None, ""
+    ref = options["ref"]
+    resolved = await _resolve(ctx, ref)
+    if not resolved["ok"]:
+        return None, f"`ref` {ref} ignored: it is not on the current page; re-snapshot"
+    width, height = resolved.get("w"), resolved.get("h")
+    if not width or not height:
+        return None, f"`ref` {ref} ignored: the element has no size; re-snapshot"
+    return [resolved["x"] - width / 2, resolved["y"] - height / 2, width, height], ""
+
+
+async def _screenshot(ctx: OpContext, args: dict[str, Any]) -> dict[str, Any]:
+    options, notes = _shot_options(args)
+    # A field the person filled through `ask` would be in the pixels (a code, an
+    # email; a password once a "show" toggle is clicked). The snapshot withholds it.
+    refused = await _refuse_current_url(ctx)
+    if refused is not None:
+        return refused
+    blocked = await _screenshot_blocked(ctx)
+    if blocked is not None:
+        return blocked
+    await _step(ctx, "Take a screenshot")
+    clip, note = await _shot_clip(ctx, options)
+    if note:
+        notes.append(note)
+    path = _screenshot_path(ctx)
+    # The gateway is the directory's only writer, so it bounds it on each write.
+    await asyncio.to_thread(prune_snapshots, path.parent, time.time())
+    staged = await asyncio.to_thread(_staged_path, ctx, path)
+    if clip is None:
+        # Only what was asked for is passed: no argument leaves today's call as it was.
+        extra = {k: options[k] for k in ("full", "max_dim") if k in options}
+        await ctx.helper("screenshot", path=str(staged), **extra)
+    else:
+        x, y, width, height = clip
+        magnify = SHOT_ZOOM_MAGNIFY if "region" in options else 1.0
+        fit = options.get("max_dim", SHOT_ZOOM_DIM if "region" in options else SHOT_MAX_DIM)
+        await ctx.helper(
+            "screenshot_clip",
+            path=str(staged),
+            x=x,
+            y=y,
+            width=width,
+            height=height,
+            max_dim=fit,
+            magnify=magnify,
+        )
+    if not await asyncio.to_thread(staged.exists):
+        return refusal("screenshot_error", "the browser wrote no image")
+    # Judged again AFTER the capture, as the decision hooks do: a filled field, a
+    # cross-origin frame no one can look inside, or a refused page that arrived
+    # while the image was taken discards it before the agent can read it.
+    blocked = await _screenshot_blocked(ctx, after=True)
+    if blocked is not None:
+        if not await asyncio.to_thread(_unlink, staged):
+            blocked["error"] += f" The image could not be deleted: {staged}"
+        return blocked
+    if staged != path:
+        await asyncio.to_thread(os.replace, staged, path)
+    result: dict[str, Any] = {"ok": True, "path": str(path)}
+    if notes:
+        result["warning"] = "; ".join(notes)
+    return result
+
+
+async def _screenshot_blocked(ctx: OpContext, *, after: bool = False) -> dict[str, Any] | None:
+    """The refusal ``screenshot`` answers now, or ``None`` when the image may be kept."""
+    if after:
+        refused = await _refuse_current_url(ctx)
+        if refused is not None:
+            return refused
+    lead = (
+        "the page changed while the screenshot was taken; the image was discarded. "
+        if after
+        else ""
+    )
+    unreadable = await _frames_unchecked(ctx)
+    if unreadable is None:
+        return refusal(
+            "secret_check_failed",
+            lead + "could not check the page's frames; use snapshot instead",
+        )
+    if unreadable:
+        return refusal(
+            "unreadable_frame_on_page",
+            lead + "the page embeds a frame, object or embed from another site that "
+            "cannot be checked for secret fields, so no screenshot is taken; use "
+            "snapshot instead",
+        )
+    closed = await _closed_secrets(ctx)
+    if closed is None:
+        return refusal(
+            "secret_check_failed",
+            lead + "could not check the page for secret fields; use snapshot instead",
+        )
+    if closed:
+        return refusal(
+            "secret_field_on_page",
+            lead + "the page holds a password or one-time-code field that cannot be "
+            "checked for a value, so no screenshot is taken; use snapshot instead",
+        )
+    asked = await _guard_count(ctx, "askedValues")
+    if asked is None:
+        return refusal(
+            "secret_check_failed",
+            lead + "could not check the page for fields the user filled through `ask`; "
+            "use snapshot instead",
+        )
+    if asked:
+        return refusal(
+            "asked_value_on_page",
+            lead + "a field the user filled through `ask` still holds its value; use "
+            "snapshot instead, or take the screenshot after the page moves on",
+        )
+    # A code typed into a text field named otp/token/cvv during a takeover carries
+    # no quick-ask marker, and its digits would be in the pixels.
+    filled = await _guard_count(ctx, "secretValues")
+    if filled is None:
+        return refusal(
+            "secret_check_failed",
+            lead + "could not check the page for filled secret fields; use snapshot instead",
+        )
+    if filled:
+        return refusal(
+            "secret_value_on_page",
+            lead + "a one-time-code, token or other secret field still holds a value; "
+            "use snapshot instead, or take the screenshot after the field is cleared",
+        )
+    return None
+
+
+#: How long a staged image may sit before it is taken for a leftover.
+STAGED_MAX_AGE_S = 300.0
+
+
+def _staged_path(ctx: OpContext, final: Path) -> Path:
+    """Where the image is written until the check after the capture passes."""
+    if ctx.staging_dir is None:
+        return final
+    ctx.staging_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
+        os.chmod(ctx.staging_dir, 0o700)
+    except OSError:  # pragma: no cover - Windows ACLs
+        pass
+    # A gateway that died between the capture and the move left its image here;
+    # one older than any capture still in flight is dropped (another session's
+    # screenshot may be staged right now, so a fresh one is left alone).
+    cutoff = time.time() - STAGED_MAX_AGE_S
+    for stale in ctx.staging_dir.glob("shot-*.png"):
+        try:
+            if stale.stat().st_mtime < cutoff:
+                stale.unlink()
+        except OSError:
+            continue
+    return ctx.staging_dir / final.name
+
+
+def _unlink(path: Path) -> bool:
+    """Delete *path*; ``False`` when it is still there."""
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+async def _tabs(ctx: OpContext, args: dict[str, Any]) -> dict[str, Any]:
+    action = args.get("action", "list")
+    owned = set(ctx.agent_targets())
+    if action == "list":
+        tabs = await ctx.helper("list_tabs")
+        mine = [
+            {
+                "target_id": t.get("target_id") or t.get("targetId"),
+                "url": t.get("url"),
+                "title": t.get("title"),
+            }
+            for t in (tabs if isinstance(tabs, list) else [])
+            if isinstance(t, dict)
+            and (t.get("target_id") or t.get("targetId")) in owned
+            and (t.get("url") == "about:blank" or ctx.url_allowed(str(t.get("url") or "")))
+        ]
+        return {"ok": True, "tabs": mine}
+    if action == "switch":
+        target = args.get("target_id")
+        if not isinstance(target, str) or target not in owned:
+            return refusal("not_agent_tab", "only a tab the agent opened can be switched to")
+        await _step(ctx, "Switch tab")
+        await ctx.helper("switch_tab", target=target)
+        return {"ok": True, "target_id": target}
+    if action == "new":
+        url = args.get("url", "about:blank")
+        if not isinstance(url, str) or not url or len(url) > _URL_MAX:
+            return refusal("bad_url", "tabs new needs a `url` string")
+        if url != "about:blank" and not url.lower().startswith(("http://", "https://")):
+            return refusal("bad_url", f"refused non-web URL: {url[:80]}")
+        await _step(ctx, f"Open a new tab {url}")
+        target = await ctx.helper("new_tab", url=url)
+        return {"ok": True, "target_id": target}
+    return refusal("bad_action", "tabs action must be one of: list, switch, new")
+
+
+def _dialog_view(raw: Any) -> dict[str, Any] | None:
+    """What the agent is told of an open dialog: its kind, text and default answer.
+
+    The page writes all three, so the text is capped, and the page's address is
+    left out (it can carry a token).
+    """
+    if not isinstance(raw, dict):
+        return None
+    view: dict[str, Any] = {
+        "type": str(raw.get("type") or "alert"),
+        "message": str(raw.get("message") or "")[:DIALOG_MESSAGE_CAP],
+    }
+    default = raw.get("defaultPrompt")
+    if isinstance(default, str) and default:
+        view["default"] = default[:DIALOG_MESSAGE_CAP]
+    return view
+
+
+async def _dialog(ctx: OpContext, args: dict[str, Any]) -> dict[str, Any]:
+    """Report the page's open JavaScript dialog, and answer it when asked.
+
+    A dialog (alert, confirm, prompt, leave-page) holds the page's script until it
+    is answered, so every other op fails while one is open. With no ``action`` the
+    dialog is only reported. A bad ``action`` or ``text`` is left out and named in
+    the ``warning``; it never makes the op fail.
+    """
+    notes: list[str] = []
+    action = args.get("action")
+    if action is not None and (not isinstance(action, str) or action not in _DIALOG_ACTIONS):
+        notes.append("`action` ignored: it must be accept or dismiss; the dialog is only reported")
+        action = None
+    text = args.get("text")
+    if text is not None and (not isinstance(text, str) or len(text) > TEXT_CAP):
+        notes.append(f"`text` ignored: it must be a string of at most {TEXT_CAP} characters")
+        text = None
+    if text is not None and action != "accept":
+        notes.append("`text` ignored: it is only used with action accept")
+        text = None
+    await _step(ctx, f"{action.capitalize()} a dialog" if action else "Check for a dialog")
+    kwargs: dict[str, Any] = {}
+    if action:
+        kwargs["action"] = action
+    if text is not None:
+        kwargs["text"] = text
+    reply = await ctx.helper("dialog", **kwargs)
+    shown = _dialog_view(reply.get("dialog") if isinstance(reply, dict) else None)
+    result: dict[str, Any] = {"ok": True, "dialog": shown}
+    if shown is not None and action and reply.get("answered") == action:
+        result["answered"] = _DIALOG_ACTIONS[action]
+        if text is not None and shown["type"] != "prompt":
+            notes.append("`text` ignored: the dialog is not a prompt")
+    if notes:
+        result["warning"] = "; ".join(notes)
+    return result
+
+
+def _dialog_open(shown: dict[str, Any]) -> dict[str, Any]:
+    """The refusal for an op the page could not answer because a dialog holds it."""
+    kind = shown["type"]
+    answer = " (and `text` for the prompt's answer)" if kind == "prompt" else ""
+    return refusal(
+        "dialog_open",
+        f"the page has an open {kind} dialog with the text {json.dumps(shown['message'])}, "
+        f"which blocks it until it is answered. Call `dialog` with action accept or dismiss"
+        f"{answer}; an op sent just before it may or may not have taken effect.",
+    )
+
+
+async def _open_dialog(ctx: OpContext) -> dict[str, Any] | None:
+    """The dialog the page holds open now, or ``None`` (also when it cannot be read).
+
+    A refused address found by the read is the op's answer, so it is raised.
+    """
+    return _dialog_view(await _page_dialog(ctx))
+
+
+async def _page_dialog(ctx: OpContext) -> dict[str, Any] | None:
+    """The open dialog as the page wrote it, uncut, or ``None`` (also when unreadable).
+
+    The change report reads this, so its redaction sees the whole message.
+    """
+    try:
+        info = await ctx.helper("page_info")
+    except _PageRefused:
+        raise
+    except Exception:  # noqa: BLE001 - unreadable: the op's own error is the one to report
+        return None
+    raw = info.get("dialog") if isinstance(info, dict) else None
+    return raw if isinstance(raw, dict) else None
+
+
+async def _glance(ctx: OpContext) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """``(census, dialog)``: the page as the change report reads it, or the dialog holding it.
+
+    A JavaScript dialog stops the page's script, so it is looked for first and the
+    page is not read while one is open. The dialog is passed on uncut, so the
+    report redacts its whole message before any cut. Anything else that stops the
+    read leaves both ``None``: the report is dropped, never the action.
+    """
+    from kiro_crew.browser_harness import change_report
+    from kiro_crew.browser_harness.governance import BrowsingDenied
+
+    shown = await _page_dialog(ctx)
+    if shown is not None:
+        return None, shown
+    try:
+        raw = await asyncio.wait_for(_page(ctx, "glance"), CHANGE_READ_S)
+    except (_PageRefused, BrowsingDenied, asyncio.CancelledError):
+        raise
+    except Exception:  # noqa: BLE001 - the report is a convenience; the action stands
+        logger.debug("browser change report: page not read", exc_info=True)
+        return None, None
+    return change_report.census(raw), None
+
+
+async def _census_before(ctx: OpContext) -> dict[str, Any] | None:
+    """The page before the action, or ``None`` when it is not read inside its bound."""
+    try:
+        return (await asyncio.wait_for(_glance(ctx), CHANGE_BEFORE_S))[0]
+    except asyncio.TimeoutError:
+        logger.debug("browser change report: page not read before the action")
+        return None
+
+
+async def _report_changes(
+    ctx: OpContext, result: dict[str, Any], before: dict[str, Any] | None
+) -> None:
+    """:func:`_attach_changes` inside its bound; past it the action's result stands."""
+    try:
+        await asyncio.wait_for(_attach_changes(ctx, result, before), CHANGE_AFTER_S)
+    except asyncio.TimeoutError:
+        _left_out(result)
+
+
+def _left_out(result: dict[str, Any]) -> None:
+    """Say the report was left out, after any warning the op itself gave."""
+    prior = result.get("warning")
+    result["warning"] = f"{prior}; {_CHANGES_LEFT_OUT}" if prior else _CHANGES_LEFT_OUT
+
+
+async def _attach_changes(
+    ctx: OpContext, result: dict[str, Any], before: dict[str, Any] | None
+) -> None:
+    """Add ``changes`` to a successful action's *result*, or a ``warning`` saying why not."""
+    from kiro_crew.browser_harness import change_report
+
+    await ctx.sleep(CHANGE_SETTLE_S)
+    after, dialog = await _glance(ctx)
+    if after is None and dialog is None:
+        # A navigation can swallow the first read; the new page is read once more.
+        await ctx.sleep(CHANGE_SETTLE_S)
+        after, dialog = await _glance(ctx)
+    if dialog is not None:
+        result["changes"] = change_report.dialog_report(dialog)
+    elif before is None or after is None:
+        _left_out(result)
+    else:
+        result["changes"] = change_report.diff(before, after)
+
+
+async def _reflex(ctx: OpContext, args: dict[str, Any]) -> dict[str, Any]:
+    """The fast loop (``browser_harness.reflex``), resolved at call time: it imports
+    this module, and it is only ever needed when the agent asks for it."""
+    module = importlib.import_module("kiro_crew.browser_harness.reflex")
+    return await module.run(ctx, args)  # type: ignore[no-any-return]
+
+
+async def _ask_elsewhere(_ctx: OpContext, _args: dict[str, Any]) -> dict[str, Any]:
+    """``ask`` needs the live card; the op route serves it and never calls here."""
+    return refusal("not_available", "ask is served by the gateway's op route")
+
+
+_HANDLERS: dict[str, Callable[[OpContext, dict[str, Any]], Awaitable[dict[str, Any]]]] = {
+    "navigate": _navigate,
+    "back": _back,
+    "snapshot": _snapshot,
+    "read": _read,
+    "click": _click,
+    "drag": _drag,
+    "scroll": _scroll,
+    "type": _type,
+    "paste": _paste,
+    "press_key": _press_key,
+    "hover": _hover,
+    "select_option": _select_option,
+    "wait_for": _wait_for,
+    "console": _console,
+    "screenshot": _screenshot,
+    "tabs": _tabs,
+    "dialog": _dialog,
+    "reflex": _reflex,
+    "ask": _ask_elsewhere,
+}
+
+
+async def run_op(op: str, args: dict[str, Any], ctx: OpContext) -> dict[str, Any]:
+    """Run one op. Unknown op -> ``bad_op``; person in control -> ``user_in_control``."""
+    handler = _HANDLERS.get(op)
+    if handler is None:
+        return refusal("bad_op", f"op must be one of: {', '.join(OPS)}")
+    if await _in_control(ctx):
+        return refusal(
+            "user_in_control",
+            "the user has taken over the browser; wait for them to hand it back",
+        )
+    raw_ctx = ctx
+
+    async def checked_helper(name: str, **kwargs: Any) -> Any:
+        if name in {
+            "click",
+            "mouse_move",
+            "drag",
+            "scroll",
+            "type_text",
+            "press_key",
+            "screenshot",
+            "screenshot_clip",
+            "page_info",
+            "wait_for_load",
+        }:
+            refused = await _refuse_current_url(raw_ctx)
+            if refused is not None:
+                raise _PageRefused(refused)
+        return await raw_ctx.helper(name, **kwargs)
+
+    ctx = replace(ctx, helper=checked_helper)
+    reporting = ctx.report_changes and op in REPORT_OPS
+    before: dict[str, Any] | None = None
+
+    async def act(c: OpContext, a: dict[str, Any]) -> dict[str, Any]:
+        # The page is read just before the action, so a hook that answers instead
+        # of running it costs no read.
+        nonlocal before
+        if reporting:
+            before = await _census_before(c)
+        return await handler(c, a)
+
+    try:
+        # Navigation/new tabs must still be able to leave a refused page.
+        if op not in ("navigate", "tabs", "ask"):
+            refused = await _refuse_current_url(ctx)
+            if refused is not None:
+                return refused
+        if ctx.decisions is not None:
+            result = await ctx.decisions.run(op, args, ctx, act)
+        elif names_target_only(op, args):
+            return needs_ref()
+        else:
+            result = await act(ctx, args)
+        # A link, key or tab switch can move the page without a navigate op.
+        # Check again before the route follows it or publishes a successful result.
+        if result.get("ok"):
+            refused = await _refuse_current_url(ctx)
+            if refused is not None:
+                return refused
+            if reporting:
+                await _report_changes(ctx, result, before)
+        return result  # type: ignore[no-any-return]
+    except _PageRefused as exc:
+        return exc.result
+    except Exception as exc:
+        # Imported here: the MCP servers' tool listing imports this module, and the
+        # supervisor module loads the HTTP client stack.
+        from kiro_crew.browser_harness.supervisor import HelperError
+
+        if not isinstance(exc, HelperError) or op == "dialog":
+            raise
+        # A dialog holds the page's script, so an op the page cannot answer times out:
+        # say what holds it. With none open the helper's own error is kept.
+        shown = await _open_dialog(raw_ctx)
+        if shown is None:
+            raise
+        return _dialog_open(shown)

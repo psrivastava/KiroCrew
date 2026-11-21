@@ -32,6 +32,7 @@ from onboarding_import_helpers import (  # noqa: F401 -- the autouse fixture reg
     _write_jsonl,
     _write_openclaw_session,
 )
+from redaction_structured_cases import github_classic
 from source_corpus import parsed_candidates, src_root
 
 from kiro_crew import onboarding_apply, onboarding_plan, onboarding_scan, onboarding_sources
@@ -340,8 +341,8 @@ class TestApplyMergeSafety:
         barrier = threading.Barrier(2)
 
         def write(source_id: str) -> None:
-            # flake-ok: pre-existing barrier wait with no timeout, moved verbatim
-            barrier.wait()
+            # The timeout is a lost-run bound: a broken barrier fails the test by name.
+            barrier.wait(timeout=30)
             statuses.append(
                 api._write_schedule(
                     api._Item(source_id, "schedules", source_id, payload),
@@ -356,8 +357,8 @@ class TestApplyMergeSafety:
         for thread in threads:
             thread.start()
         for thread in threads:
-            # flake-ok: pre-existing thread join with no timeout, moved verbatim
-            thread.join()
+            thread.join(timeout=30)
+            assert not thread.is_alive(), "a schedule import thread never finished"
 
         assert sorted(statuses) == ["existing", "imported"]
         assert len(service.list_jobs(include_disabled=True)) == 1
@@ -408,7 +409,8 @@ class TestConservativeParsingRegressions:
         anchor = tmp_path / "memory"
         anchor.mkdir()
         memory_file = anchor / "secret.md"
-        memory_file.write_text("access key AKIAIOSFODNN7EXAMPLE lives here", encoding="utf-8")
+        token = github_classic(seed=165)
+        memory_file.write_text(f"access token {token} lives here", encoding="utf-8")
 
         scan = onboarding_scan._Scan("predecessor", tmp_path, tmp_path)
         onboarding_plan._add_memory_files(scan, [(memory_file, anchor)])

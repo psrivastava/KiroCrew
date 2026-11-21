@@ -24,14 +24,16 @@ const themeState = {
   mode: 'dark' as const,
   onboarded: true,
   importOnboarded: true,
-  privacyAcked: true,
   crewmatesOnboarded: true,
   crewmatesFlowSeen: true,
   themeBootReady: true,
+  themeBootRead: true,
   themes: [],
+  // Read by the Customize chapter `/onboarding` opens once the import step closes.
+  allThemes: [],
   markOnboarded: vi.fn(),
   markImportOnboarded: vi.fn(),
-  markPrivacyAcked: vi.fn(),
+
   markCrewmatesOnboarded: vi.fn(),
   setColorTheme: vi.fn(),
   setMode: vi.fn(),
@@ -68,10 +70,11 @@ const CHAIN_WAIT = { timeout: 5000 }
 beforeEach(() => {
   themeState.onboarded = true
   themeState.importOnboarded = true
-  themeState.privacyAcked = true
   themeState.markImportOnboarded.mockClear()
   vi.spyOn(api, 'onboardingImportScan').mockResolvedValue(NOTHING_TO_IMPORT)
   vi.spyOn(api, 'onboardingImportState').mockResolvedValue({ ok: true })
+  // First run opens only for the owner (`useViewerIsNotOwner`).
+  vi.spyOn(api, 'viewerOwnerOk').mockResolvedValue(true)
 })
 
 afterEach(() => {
@@ -124,19 +127,25 @@ describe('Import chapter on an empty scan', () => {
       window.dispatchEvent(new CustomEvent('mc-start-import', { detail: { continueOnboarding: true } }))
     })
 
-    // Chain: the scan query -> the auto-complete effect -> the completion mutation -> `onSuccess`.
-    await waitFor(() => expect(themeState.markImportOnboarded).toHaveBeenCalledOnce(), CHAIN_WAIT)
+    // Chain: the scan query -> the auto-complete effect -> the completion mutation -> `onSuccess`,
+    // which marks the chapter done before the close re-renders: the unmount is part of the wait.
+    await waitFor(() => {
+      expect(themeState.markImportOnboarded).toHaveBeenCalledOnce()
+      expect(screen.queryByRole('heading', EMPTY_RESULT)).not.toBeInTheDocument()
+    }, CHAIN_WAIT)
     expect(api.onboardingImportState).toHaveBeenCalledWith({ completed: true })
-    expect(screen.queryByRole('heading', EMPTY_RESULT)).not.toBeInTheDocument()
   })
 
   it('lets first run finish its own import chapter by itself', async () => {
     themeState.importOnboarded = false
     renderWithProviders(<App />, { route: '/chat' })
 
-    // Chain: the scan query -> the auto-complete effect -> the completion mutation -> `onSuccess`.
-    await waitFor(() => expect(themeState.markImportOnboarded).toHaveBeenCalledOnce(), CHAIN_WAIT)
+    // Chain: the scan query -> the auto-complete effect -> the completion mutation -> `onSuccess`,
+    // which marks the chapter done before the close re-renders: the unmount is part of the wait.
+    await waitFor(() => {
+      expect(themeState.markImportOnboarded).toHaveBeenCalledOnce()
+      expect(screen.queryByRole('heading', EMPTY_RESULT)).not.toBeInTheDocument()
+    }, CHAIN_WAIT)
     expect(api.onboardingImportState).toHaveBeenCalledWith({ completed: true })
-    expect(screen.queryByRole('heading', EMPTY_RESULT)).not.toBeInTheDocument()
   })
 })

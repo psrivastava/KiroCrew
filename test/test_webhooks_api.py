@@ -23,6 +23,7 @@ from webhooks_api_helpers import _bearer, _payload, _req
 
 from kiro_crew import webhooks
 from kiro_crew.dashboard.handlers import hooks as H
+from kiro_crew.testing.synthetic_credentials import github_classic
 
 
 class TestEveryStoreTouchingHandlerIsGuarded:
@@ -76,12 +77,12 @@ class TestEveryStoreTouchingHandlerIsGuarded:
             r"(token_store\(\)|run_store\(\)|_get_hook_store|_mutate_hook_store|"
             r"_webhooks_snapshot|_delete_hook_context)"
         )
-        # One deliberate exemption: the externally reachable route answers store
+        # One deliberate exemption: the externally reachable routes answer store
         # failure with a NEUTRAL `webhooks_unavailable` 503 instead of the
         # dashboard's diagnostic `store_unavailable`, because an outside caller
-        # should not learn that the operator's store needs repair. Its store
+        # should not learn that the operator's store needs repair. Their store
         # touches are individually guarded, so nothing escapes as a 500.
-        exempt = {"api_hooks_agent"}
+        exempt = {"api_hooks_agent", "api_hooks_agent_status"}
 
         handlers = list(pattern.finditer(source))
         unguarded = []
@@ -473,7 +474,7 @@ class TestRunHistoryRedaction:
 
     @pytest.mark.asyncio
     async def test_every_caller_supplied_run_field_is_redacted(self, wired):
-        secret = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+        secret = github_classic(seed=93)
         runs = webhooks.run_store()
         runs.record(
             outcome=webhooks.OUTCOME_COMPLETED,

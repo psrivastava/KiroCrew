@@ -1,50 +1,92 @@
 /** The dock over the lanes. Its field is the search row's controls: the lane
  *  cycle button and the sort and filter menu (status chips with the Recent
- *  window, sort, folder order, dormant collapse, tags, models, folders), with
- *  the label tables its rows and chips name. Its shelf, under the search
- *  capsule, holds the active filter chips (tags, models, status, hides) and the
+ *  window, sort, folder order, dormant collapse, tags, models, "Started by",
+ *  folders), with the label tables its rows and chips name. Its shelf, under the
+ *  search capsule, holds the active filter chips (tags, models, "Started by",
+ *  status, hides) and the
  *  list-level notices (seed, crew names, read failures, close refusal, folder
  *  writes and order, create, rename, title, peer sessions). */
-import { Fragment } from 'react'
+import { Fragment, useLayoutEffect, useRef } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
-import { X, ArrowUpDown, EyeOff, ChevronRight, Clock, Check, List, ListTree, RotateCcw, Rows3, Server, Pause, Play, WifiOff } from 'lucide-react'
+import { X, ArrowUpDown, TextSearch, EyeOff, ZapOff, ChevronRight, Clock, Check, List, ListTree, Pin, RotateCcw, Rows3, Server, Pause, Play, WifiOff } from 'lucide-react'
 import ErrorNotice from '../../components/ErrorNotice'
 import FolderGlyph from '../../components/FolderGlyph'
 import { useQuery } from '@tanstack/react-query'
 import { useLocation } from 'react-router-dom'
-import { DropdownMenu, DropdownMenuTrigger, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuRadioGroup, DropdownMenuRadioItem, DropdownMenuSub, DropdownMenuSubTrigger, DropdownMenuSubContent } from '../../components/ui/dropdown-menu'
+import { DropdownMenu, DropdownMenuTrigger, DropdownMenuGroup, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuRadioGroup, DropdownMenuRadioItem, DropdownMenuSub, DropdownMenuSubTrigger, DropdownMenuSubContent } from '../../components/ui/dropdown-menu'
 import { setCloseRefused } from '../../store/chatSlice'
 import { api } from '../../api/client'
+import { isPermissionRefusal } from '../../api/apiError'
 import { isInstancesDisabledError } from '../../utils/instancesDisabled'
 import { errMessage } from '../../utils/thunkError'
 import { Btn, IconButton } from '../../components/ui'
 import SimpleSelect from '../../components/SimpleSelect'
 import { isEmbeddedPane } from '../../lib/embedded'
-import { SearchFilterBar, FilterMenuButton, FilterChip, FILTER_CHIP_ROW_CLS, FilterMenuLabel, FilterMenuContent } from '../../components/SearchFilterBar'
+import { crewModeEnabled } from '../../lib/crewMode'
+import { SearchFilterBar, FilterMenuButton, FilterChip, FILTER_CHIP_ROW_CLS, FilterMenuLabel, FilterMenuContent, type FilterChipPause } from '../../components/SearchFilterBar'
 import { FOLDER_SORT_MODES, folderHasCreatedStamp, type FolderSortMode } from '../../utils/folderTree'
 import { type RecentUnit, RECENT_WINDOW_PRESETS, formatRecentWindow } from '../recentWindow'
 import { STALE_COLLAPSE_PRESETS_MS } from '../staleCollapse'
 import { SORT_LABEL_KEY, type SortKey } from '../chat/sessionOrder'
 import { i18nT } from '../../i18n/t'
+import { openGlobalChatSearch } from '../../components/globalChatSearch/globalChatSearchStore'
 import { sessionDisplayTitle } from '../../utils/sessionDisplayTitle'
 import { fmtList } from '../../i18n/format'
 import type { SessionFilterKey } from './types'
 import { SESSION_FILTERS } from './filters'
 import { modelFilterLabel } from './models'
+import { CreatorFilterChip, CreatorFilterSection } from './creatorFilterMenu'
 import { DisclosureChevron } from './chrome'
+import { keepRowInMenuView } from '../../lib/menuRowReveal'
+import { RadioChipGroup, radioChip } from '../../components/RadioChipGroup'
+import { renderResumeAllRow } from './resumeAll'
 import type { SidebarScope } from './scope'
+import RemoveMergedCrChips from './RemoveMergedCrChips'
+
+/**
+ * The menu's Folders section, its separator included. Opened for it (`reveal`, the board
+ * notice's Show), it takes focus on its heading and stays in view while the menu settles:
+ * it sits last, so a menu taller than the room below the funnel would otherwise open with
+ * it out of sight, and a keyboard reader's first arrow would start from the top. Radix
+ * leaves a focus already inside the menu where it is.
+ */
+function FoldersSection({ reveal, children }: { reveal: boolean; children: React.ReactNode }) {
+  const ref = useRef<HTMLDivElement>(null)
+  useLayoutEffect(() => {
+    const el = ref.current
+    const menu = reveal ? el?.closest<HTMLElement>('[role="menu"]') : null
+    if (!menu || !el) return
+    el.querySelector<HTMLElement>('[role="menuitem"]')?.focus({ preventScroll: true })
+    return keepRowInMenuView(menu, () => el)
+  }, [reveal])
+  return (
+    <DropdownMenuGroup ref={ref} data-testid="folder-filter-section">
+      <DropdownMenuSeparator />
+      {children}
+    </DropdownMenuGroup>
+  )
+}
 
 /**
  * A pill for one duration choice, shared by the Recent window presets and — on a
  * phone, where those options render inline rather than in a flyout — the
  * dormant-collapse thresholds. One component so the two lists cannot drift, and
  * so the duplicated class/style pair does not read as copy-paste.
+ *
+ * `role="radio"`, not the toggle-button `aria-pressed`: each list is one choice
+ * out of a mutually exclusive set, so a screen reader must hear "which one is in
+ * effect", not "this toggle is on". The caller wraps the chips in the shared
+ * `RadioChipGroup` so the set is one named group, matching the desktop
+ * submenu's `menuitemradio` grammar. The group owns the roving tab stop (the
+ * checked chip, or the first when a custom Recent window matches no preset) and
+ * the arrow keys; `selectOnArrow` keeps #22330's "arrow moves AND selects", since
+ * a duration pick here is cheap and undone by the next arrow.
  */
 function DurationChip({ label, selected, onSelect }: { label: string; selected: boolean; onSelect: () => void }) {
   return (
     <button
       type="button"
-      aria-pressed={selected}
+      {...radioChip(selected)}
       className="px-2 py-0.5 rounded-full text-[11px] cursor-pointer border transition-colors"
       style={selected
         ? { background: 'color-mix(in srgb, var(--ok) 12%, transparent)', color: 'var(--ok)', borderColor: 'color-mix(in srgb, var(--ok) 35%, transparent)' }
@@ -146,19 +188,29 @@ function RemoteCrewNamesError() {
 export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode; shelf: React.ReactNode } {
   const { activeFilters, activeModelKeys, activeModelRows, activeTagIds, activeTagNames, autoTitleError,
     availableLanes, boardLaneActive, changeRecentUnit, clearHiddenFilters, clearModelFilter, clearTagFilter,
-    closeRefused, columnsError, columnsFailed, commitRecentAmount, conductorView, connected, cycleLane, dismissSortError, dispatch,
-    filterCounts, filterHiddenFolders, filterSortOpen, filtersPaused, flatLaneActive, folderActionError, groupByKind, toggleGroupByKind,
+    closeRefused, columnsError, columnsFailed, creatorFilter, commitRecentAmount, conductorView, connected, cycleLane, dismissSortError,
+    dismissUnfiledAboveFoldersError, dispatch,
+    filterCounts, filterHiddenFolders, filterSortOpen, filtersPaused, pausedFilters, flatLaneActive, folderActionError, groupByKind, toggleGroupByKind,
     folderFilterRows, folderOfflineNotice, folderReorderHint, folderReorderHintRef, folderRowsDrawn, folderSortMode,
     folderSortMut, folderSortRead, folders, foldersError, foldersFailed, foldersShelved,
     hasRemoteExecutedRow, hiddenFilters, hiddenFolderCount, instanceSessions, isMobile, lane,
-    laneSwitchLabel, listNarrowed, manualOrderError, modelFilterInverted, modelFilterRows, newChatError, nextLane, pinnedOrderError,
+    laneSwitchLabel, listNarrowed, manualOrderError, modelFilterInverted, modelFilterRows, newChatError, nextLane, pinnedOrderError, prStatusRefreshError,
     recentAmountDraft, recentUnitDraft, recentWindowMs, refetchColumns, refetchFolders, remoteSessionsError,
-    renameError, seedError, seedStateLanesMutation, selectRecentPreset, setAllFiltersPaused,
+    renameError, seedError, seedStateLanesMutation, selectRecentPreset, setAllFiltersPaused, toggleFilterPaused,
     setAutoTitleError, setFilterSortOpen, setFolderActionError, setFolderOfflineNotice, setManualOrderError, setModelFilterExcluded, setNewChatError,
-    setPinnedOrderError, setRecentAmountDraft, setRenameError, setSeedError, setSlotFilter, setSortKey, setStaleCollapseMs,
+    setPinnedOrderError, setPrStatusRefreshError, setRecentAmountDraft, setRenameError, setSeedError, setSlotFilter, setSortKey, setStaleCollapseMs,
     setToggleSaveFailed, showAllFolders, slotFilter, sortError, sortKey, staleCollapseMs, tagFilterRows, toggleFilter,
-    toggleFolderFilter, toggleFoldersShelved, toggleHideFilter, toggleModelFilter, toggleSaveFailed,
-    toggleTagFilter } = shell
+    toggleFolderFilter, toggleFoldersShelved, toggleFoldersUnreadFirst, foldersUnreadFirst, toggleHideFilter, toggleModelFilter, toggleSaveFailed,
+    toggleTagFilter, toggleUnfiledAboveFolders, unfiledAboveFolders, unfiledAboveFoldersError } = shell
+  const chipPause = (key: Parameters<typeof toggleFilterPaused>[0], filterLabel: string): FilterChipPause => ({
+    paused: pausedFilters.has(key),
+    onToggle: () => toggleFilterPaused(key),
+    pauseLabel: i18nT('pages.chatSidebar.pause_named_filter', { filter: filterLabel }),
+    resumeLabel: i18nT('pages.chatSidebar.resume_named_filter', { filter: filterLabel }),
+    pausedText: i18nT('pages.chatSidebar.filter_paused_suffix'),
+    pauseHint: i18nT('pages.chatSidebar.filter_chip_pause_hint'),
+    resumeHint: i18nT('pages.chatSidebar.filter_chip_resume_hint'),
+  })
   const field = (
         // Search with inline sort/filter control — the shared list-panel
         // search row (components/SearchFilterBar), also mounted by the Crew
@@ -218,7 +270,7 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
               </AnimatePresence>
             </button>
             )}
-            <DropdownMenu open={filterSortOpen} onOpenChange={setFilterSortOpen}>
+            <DropdownMenu open={filterSortOpen !== false} onOpenChange={setFilterSortOpen}>
               <DropdownMenuTrigger asChild>
                 {/* The funnel holds the way back, so while a hide withholds rows its
                     title says both that something is withheld and how much.
@@ -244,6 +296,18 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
                 />
               </DropdownMenuTrigger>
               <FilterMenuContent align="end">
+                {/* Built only while the menu is open: Radix mounts the content
+                    on open, and this closure runs then. Built inline it ran on
+                    every render of the sidebar, menu closed, and its labels (the
+                    window presets' number formatting among them) were part of the
+                    longest task of opening the chat page. */}
+                <RenderWhenOpen render={() => (<>
+                {/* Search all chats: every matching message across chats (⌘⇧F). */}
+                <DropdownMenuItem onSelect={openGlobalChatSearch} data-testid="search-all-chats">
+                  <TextSearch size={14} className="shrink-0" aria-hidden="true" />
+                  <span className="flex-1 truncate">{i18nT('components.globalChatSearch.title')}</span>
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
                 <FilterMenuLabel>{i18nT('pages.chatSidebar.filter')}</FilterMenuLabel>
                 {SESSION_FILTERS.map(filterDef => {
                   const active = activeFilters.has(filterDef.key)
@@ -253,7 +317,8 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
                   // (a row the server stamps `crew_mode_root`), and stays while the
                   // filter is on. With no such chat, on a gateway without Crew Mode
                   // included, the menu reads as it does today.
-                  if (filterDef.key === 'crew' && !active && slotCount === 0) return null
+                  // In a build without conductor mode (LTS) the row is never offered.
+                  if (filterDef.key === 'crew' && (!crewModeEnabled() || (!active && slotCount === 0))) return null
                   const isRecent = filterDef.key === 'recent'
                   if (isRecent) {
                     // The window picker is a NESTED FLYOUT on a wide viewport and
@@ -276,7 +341,7 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
                         onMouseDown={e => e.stopPropagation()}
                         onKeyDown={e => e.stopPropagation()}
                       >
-                        <div className="flex flex-wrap gap-1 px-1 mb-2">
+                        <RadioChipGroup selectOnArrow ariaLabel={i18nT(FILTER_LABEL_KEY.recent)} className="flex flex-wrap gap-1 px-1 mb-2">
                           {RECENT_WINDOW_PRESETS.map(preset => (
                             <DurationChip
                               key={preset.ms}
@@ -285,7 +350,7 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
                               onSelect={() => selectRecentPreset(preset.ms)}
                             />
                           ))}
-                        </div>
+                        </RadioChipGroup>
                         <div className="px-1 text-[12px] text-muted">
                           <div className="mb-1">{i18nT('pages.chatSidebar.custom')}</div>
                           <div className="flex items-center gap-1.5">
@@ -328,8 +393,9 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
                           {i18nT(FILTER_LABEL_KEY[filterDef.key])}
                           <span className="text-muted"> · {formatRecentWindow(recentWindowMs)}</span>
                           {slotCount > 0 ? ` (${slotCount})` : ''}
+                          {active && pausedFilters.has('recent') && <span className="text-muted"> · {i18nT('pages.chatSidebar.filter_paused_suffix')}</span>}
                         </span>
-                        {active && <Check size={14} className="text-accent shrink-0" />}
+                        {active && (pausedFilters.has('recent') ? <Pause size={14} className="text-muted shrink-0" aria-hidden="true" /> : <Check size={14} className="text-accent shrink-0" />)}
                       </>
                     )
                     if (isMobile) {
@@ -394,8 +460,8 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
                       className={canHide ? 'flex-1 min-w-0' : undefined}
                     >
                       {filterDef.icon(active)}
-                      <span className="flex-1 truncate">{filterLabel}{slotCount > 0 ? ` (${slotCount})` : ''}</span>
-                      {active && <Check size={14} className="text-accent shrink-0" />}
+                      <span className="flex-1 truncate">{filterLabel}{slotCount > 0 ? ` (${slotCount})` : ''}{active && pausedFilters.has(filterDef.key) && <span className="text-muted"> · {i18nT('pages.chatSidebar.filter_paused_suffix')}</span>}</span>
+                      {active && (pausedFilters.has(filterDef.key) ? <Pause size={14} className="text-muted shrink-0" aria-hidden="true" /> : <Check size={14} className="text-accent shrink-0" />)}
                     </DropdownMenuItem>
                   )
                   if (!canHide) return showRow
@@ -420,44 +486,63 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
                   const hideLabel = hidden
                     ? i18nT('pages.chatSidebar.filter_unhide_named', { filter: filterLabel })
                     : i18nT('pages.chatSidebar.filter_hide_named', { filter: filterLabel })
+                  // "In progress" gets a named "Not in progress" row instead of the
+                  // hover-only EyeOff button, so hiding running sessions is discoverable
+                  // without hovering. Unread and Pinned keep the EyeOff. The row stays
+                  // in the menu while show-only is on, so the menu keeps its shape:
+                  // toggleHideFilter clears show-only and toggleFilter drops the hide,
+                  // so one click moves between the two.
+                  const notRow = filterDef.key === 'running'
                   return (
-                    <div
-                      key={filterDef.key}
-                      role="group"
-                      className="group/filter flex items-center rounded-md transition-colors hover:bg-bg-hover focus-within:bg-bg-hover"
-                    >
-                      {showRow}
-                      {!active && (
-                        <DropdownMenuItem
-                          aria-label={hideLabel}
-                          title={hideLabel}
-                          onSelect={e => { e.preventDefault(); toggleHideFilter(filterDef.key) }}
-                          className="group/hide shrink-0"
-                          data-testid={`filter-hide-${filterDef.key}`}
-                          data-filter-hidden={hidden ? 'true' : undefined}
-                        >
-                          <span
-                            className={hidden
-                              ? 'inline-flex size-3.5 items-center justify-center rounded bg-accent-subtle text-accent ring-4 ring-accent-subtle'
-                              : 'inline-flex size-3.5 items-center justify-center text-muted group-focus/hide:text-text'}
+                    <Fragment key={filterDef.key}>
+                      <div
+                        role="group"
+                        className="group/filter flex items-center rounded-md transition-colors hover:bg-bg-hover focus-within:bg-bg-hover"
+                      >
+                        {showRow}
+                        {!active && !notRow && (
+                          <DropdownMenuItem
+                            aria-label={hideLabel}
+                            title={hideLabel}
+                            onSelect={e => { e.preventDefault(); toggleHideFilter(filterDef.key) }}
+                            className="group/hide shrink-0"
+                            data-testid={`filter-hide-${filterDef.key}`}
+                            data-filter-hidden={hidden ? 'true' : undefined}
                           >
-                            <EyeOff
-                              size={12}
-                              className={hidden ? undefined : 'opacity-0 group-hover/filter:opacity-100 group-focus-within/filter:opacity-100 [@media(hover:none)]:opacity-100'}
-                            />
-                          </span>
+                            <span
+                              className={hidden
+                                ? 'inline-flex size-3.5 items-center justify-center rounded bg-accent-subtle text-accent ring-4 ring-accent-subtle'
+                                : 'inline-flex size-3.5 items-center justify-center text-muted group-focus/hide:text-text'}
+                            >
+                              <EyeOff
+                                size={12}
+                                className={hidden ? undefined : 'opacity-0 group-hover/filter:opacity-100 group-focus-within/filter:opacity-100 [@media(hover:none)]:opacity-100'}
+                              />
+                            </span>
+                          </DropdownMenuItem>
+                        )}
+                      </div>
+                      {notRow && (
+                        <DropdownMenuItem
+                          title={i18nT('pages.chatSidebar.filter_not_running_description')}
+                          onSelect={e => { e.preventDefault(); toggleHideFilter(filterDef.key) }}
+                          data-testid={`filter-not-${filterDef.key}`}
+                          data-filter-hidden={hidden ? 'true' : undefined}
+                          role="menuitemcheckbox"
+                          aria-checked={hidden}
+                        >
+                          <ZapOff size={12} className={hidden ? 'text-[var(--warn)]' : 'text-muted'} />
+                          <span className="flex-1 truncate">{i18nT('pages.chatSidebar.filter_not_running')}</span>
+                          {hidden && <Check size={14} className="text-accent shrink-0" />}
                         </DropdownMenuItem>
                       )}
-                    </div>
+                    </Fragment>
                   )
                 })}
-                {/* Lift every active status filter at once, for a look at the
-                    whole list without losing the filter setup, then put them
-                    back. A menu row, not a third control in the chip row:
-                    AUTOSDE max-two-buttons-per-row grandfathers that row but
-                    forbids growing it, and the chip click keeps its one meaning
-                    (clear this filter). Hidden with no active filter, when
-                    there is nothing to pause. */}
+                {/* Lift every active status filter at once; a chip pauses just
+                    itself. A menu row, not another chip-row control, per AUTOSDE
+                    max-two-buttons-per-row. Reads "Resume all" only once every
+                    filter is paused. Hidden with no active filter. */}
                 {activeFilters.size > 0 && (
                   <DropdownMenuItem
                     data-testid="filter-pause-all"
@@ -472,7 +557,7 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
                     listed in its side panel. One line, so the absence is explained;
                     shown with the Crew Mode row, so a list with no such chat says
                     nothing about one. */}
-                {((filterCounts['crew'] ?? 0) > 0 || activeFilters.has('crew')) && (
+                {crewModeEnabled() && ((filterCounts['crew'] ?? 0) > 0 || activeFilters.has('crew')) && (
                   <p className="px-2 pt-1 pb-1.5 text-[11px] text-muted max-w-[16rem]" data-testid="filter-crew-hint">{i18nT('pages.chatSidebar.filter_crew_hint')}</p>
                 )}
                 {/* A view option, not a filter: it hides nothing and splits each list
@@ -566,6 +651,25 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
                     </DropdownMenuRadioItem>
                   ))}
                 </DropdownMenuRadioGroup>
+                {/* A view over the mode, kept in this browser: folders with an
+                    unread chat are drawn first. Only where folder rows are drawn,
+                    since the flat and conductor lanes show no folder to move. */}
+                {folderRowsDrawn && (
+                  <DropdownMenuItem
+                    role="menuitemcheckbox"
+                    aria-checked={foldersUnreadFirst}
+                    data-testid="folder-order-unread-first"
+                    onSelect={e => { e.preventDefault(); toggleFoldersUnreadFirst() }}
+                  >
+                    <span className="flex-1">{i18nT('pages.chatSidebar.folder_order_unread_first')}</span>
+                    {foldersUnreadFirst && <Check size={14} className="text-accent shrink-0" aria-hidden="true" />}
+                  </DropdownMenuItem>
+                )}
+                {foldersUnreadFirst && folderRowsDrawn && (
+                  <div className="px-2 pt-0.5 pb-1.5 text-[11px] text-muted italic whitespace-normal max-w-[300px]" data-testid="folder-order-unread-first-note">
+                    {i18nT('pages.chatSidebar.folder_order_unread_first_note')}
+                  </div>
+                )}
                 {/* Outside Custom a folder drag can re-parent but not reorder
                     (the rows' droppable side is off). Said here, where the mode
                     is chosen, the same caption grammar as the stale control's
@@ -598,6 +702,36 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
                   <div className="px-2 pt-0.5 pb-1.5 text-[11px] text-muted italic whitespace-normal max-w-[300px]" data-testid="folder-order-unstamped-note">
                     {i18nT('pages.chatSidebar.folder_order_unstamped_note')}
                   </div>
+                )}
+                {/* Where the sessions filed in no folder sit relative to the folder
+                    list (dashboard.unfiled_sessions_above_folders). Under Folder order
+                    because it is one more fact about how the folder list reads.
+                    The separator above the row sets this layout toggle apart from
+                    the order choices. It renders only with the row. A lane that
+                    hides the row then shows no doubled separator.
+                    Offered in the lanes that draw a folder row (`folderRowsDrawn`,
+                    a lane-mode gate). A tree with no folders yet, or a board whose
+                    filter conceals every folder, still offers it. The setting takes
+                    effect the moment a folder appears. The flat and conductor lanes
+                    draw no folders, so there it would do nothing.
+                    A checkbox row: it reports `aria-checked` and keeps the menu open
+                    on a pick, as the tag and model rows do. The checked state and the
+                    toggle both read the SHOWN value. A second click during an
+                    in-flight save then sends the opposite of the first, not the same
+                    value twice. */}
+                {folderRowsDrawn && (
+                  <>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem
+                      onSelect={e => { e.preventDefault(); toggleUnfiledAboveFolders() }}
+                      data-testid="folder-order-unfiled-above"
+                      role="menuitemcheckbox"
+                      aria-checked={unfiledAboveFolders}
+                    >
+                      <span className="flex-1">{i18nT('pages.chatSidebar.unfiled_sessions_above_folders')}</span>
+                      {unfiledAboveFolders && <Check size={14} className="text-accent shrink-0" aria-hidden="true" />}
+                    </DropdownMenuItem>
+                  </>
                 )}
                 <DropdownMenuSeparator />
                 {/* Stale-session collapse threshold. Lives beside Sort rather than
@@ -653,11 +787,12 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
                         <DropdownMenuLabel
                           className="text-[11px] uppercase tracking-[.04em] flex items-center gap-2"
                           data-testid="stale-collapse-menu"
+                          id="stale-collapse-presets-label"
                         >
                           {staleRowBody}
                         </DropdownMenuLabel>
                         {staleCaption}
-                        <div className="flex flex-wrap gap-1 px-2 pb-1.5">
+                        <RadioChipGroup selectOnArrow ariaLabelledBy="stale-collapse-presets-label" className="flex flex-wrap gap-1 px-2 pb-1.5">
                           {STALE_COLLAPSE_PRESETS_MS.map(ms => (
                             <DurationChip
                               key={ms}
@@ -666,7 +801,7 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
                               onSelect={() => setStaleCollapseMs(ms)}
                             />
                           ))}
-                        </div>
+                        </RadioChipGroup>
                       </>
                     )
                   }
@@ -679,15 +814,27 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
                   </DropdownMenuSubTrigger>
                   <DropdownMenuSubContent className="min-w-[150px] max-w-[240px]">
                     {staleCaption}
-                    {STALE_COLLAPSE_PRESETS_MS.map(ms => (
-                      <DropdownMenuItem
-                        key={ms}
-                        onSelect={() => setStaleCollapseMs(ms)}
-                      >
-                        <span className="flex-1">{staleLabel(ms)}</span>
-                        {staleCollapseMs === ms && <Check size={14} className="text-accent shrink-0" />}
-                      </DropdownMenuItem>
-                    ))}
+                    {/* A switcher over mutually exclusive thresholds, so each row
+                        is a `menuitemradio` reporting `aria-checked` — a screen
+                        reader says WHICH threshold is in effect, which a plain
+                        item's check icon (kept, sighted-only) cannot convey. The
+                        write stays on each row's `onSelect`, not the group's
+                        `onValueChange`, so a re-pick of the already-active
+                        threshold still fires; the group's `value` is the ms
+                        preset serialized to a string (Radix radio values are
+                        strings). */}
+                    <DropdownMenuRadioGroup value={String(staleCollapseMs)}>
+                      {STALE_COLLAPSE_PRESETS_MS.map(ms => (
+                        <DropdownMenuRadioItem
+                          key={ms}
+                          value={String(ms)}
+                          onSelect={() => setStaleCollapseMs(ms)}
+                        >
+                          <span className="flex-1">{staleLabel(ms)}</span>
+                          {staleCollapseMs === ms && <Check size={14} className="text-accent shrink-0" aria-hidden="true" />}
+                        </DropdownMenuRadioItem>
+                      ))}
+                    </DropdownMenuRadioGroup>
                   </DropdownMenuSubContent>
                 </DropdownMenuSub>
                   )
@@ -827,6 +974,9 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
                     })}
                   </>
                 )}
+                {/* "Started by", on a Shared Crew only: a session property like the
+                    model, so not gated on the lane either. */}
+                <CreatorFilterSection view={creatorFilter} />
                 {/* Folders sit LAST on purpose: the list grows with the user's
                     folder count, so anything below it would get pushed out of
                     easy reach. Being last, it can simply overflow into the
@@ -840,8 +990,7 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
                     no reveal row either, and without this section the hide would have no
                     way back short of leaving board view. */}
                 {folderFilterRows.length > 0 && (
-                  <>
-                    <DropdownMenuSeparator />
+                    <FoldersSection reveal={filterSortOpen === 'folders'}>
                     {/* The heading doubles as the shelve control: activating it
                         rolls the folder list up or down. It stays a menu item so
                         keyboard users reach it with the same arrow keys as every
@@ -869,37 +1018,79 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
                         <span className="flex-1">{i18nT('pages.chatSidebar.show_all_folders')}</span>
                       </DropdownMenuItem>
                     )}
-                    {folderFilterRows.map(({ folder: f, depth, count, hidden, hiddenByAncestor }) => (
-                      <DropdownMenuItem
-                        key={f.id}
-                        style={{ paddingLeft: `${8 + depth * 14}px` }}
-                        title={hiddenByAncestor
-                          ? i18nT('pages.chatSidebar.hidden_because_parent_hidden', { name: f.name })
-                          : hidden ? i18nT('pages.chatSidebar.show_folder') : i18nT('pages.chatSidebar.hide_folder')}
-                        // Keep the menu open so several folders can be toggled.
-                        onSelect={e => { e.preventDefault(); toggleFolderFilter(f.id) }}
-                        data-testid={`folder-filter-${f.id}`}
-                        role="menuitemcheckbox"
-                        aria-checked={!hidden && !hiddenByAncestor}
-                      >
-                        <span
-                          aria-hidden="true"
-                          className="w-3.5 h-3.5 shrink-0 rounded-[3px] border flex items-center justify-center"
-                          style={hidden || hiddenByAncestor
-                            ? { borderColor: 'var(--border)', background: 'transparent' }
-                            : { borderColor: 'var(--accent)', background: 'var(--accent)' }}
+                    {folderFilterRows.map(({ folder: f, depth, count, hidden, hiddenByAncestor, pinned, pinnedDescendant }) => {
+                      // A folder under or above a pin reads checked and inert:
+                      // the pin steps over this checkbox, so a tick here would
+                      // change nothing on screen, and the row says why instead
+                      // of offering it. The reason is drawn as a line under the
+                      // row, not only as its title: a disabled item takes no
+                      // pointer events, so a hover tooltip never shows on
+                      // exactly the row that needs explaining.
+                      const inert = pinned || pinnedDescendant !== null
+                      const inertReason = pinned
+                        ? i18nT('pages.chatSidebar.pinned_folder_always_shown', { name: f.name })
+                        : pinnedDescendant !== null
+                          ? i18nT('pages.chatSidebar.holds_pinned_folder', { name: f.name, pinned: pinnedDescendant.name })
+                          : null
+                      return (
+                        <DropdownMenuItem
+                          key={f.id}
+                          style={{ paddingLeft: `${8 + depth * 14}px` }}
+                          // The reason wraps onto its own line under the row; the
+                          // first line keeps the one-row alignment of its neighbours.
+                          className={inert ? 'flex-wrap' : undefined}
+                          title={inertReason
+                            ?? (hiddenByAncestor
+                              ? i18nT('pages.chatSidebar.hidden_because_parent_hidden', { name: f.name })
+                              : hidden ? i18nT('pages.chatSidebar.show_folder') : i18nT('pages.chatSidebar.hide_folder'))}
+                          // Keep the menu open so several folders can be toggled.
+                          onSelect={e => { e.preventDefault(); if (!inert) toggleFolderFilter(f.id) }}
+                          disabled={inert}
+                          data-testid={`folder-filter-${f.id}`}
+                          role="menuitemcheckbox"
+                          aria-checked={inert || (!hidden && !hiddenByAncestor)}
                         >
-                          {!hidden && !hiddenByAncestor && <Check size={10} className="text-accent-fg" strokeWidth={3} />}
-                        </span>
-                        <FolderGlyph color={f.color} icon={f.icon} size={12} className="shrink-0 text-muted" />
-                        <span className={`flex-1 truncate${hiddenByAncestor ? ' opacity-50' : ''}`}>{f.name}</span>
-                        {count > 0 && <span className="text-muted text-[11px] shrink-0">{count}</span>}
-                      </DropdownMenuItem>
-                    ))}
+                          <span
+                            aria-hidden="true"
+                            className="w-3.5 h-3.5 shrink-0 rounded-[3px] border flex items-center justify-center"
+                            style={!inert && (hidden || hiddenByAncestor)
+                              ? { borderColor: 'var(--border)', background: 'transparent' }
+                              : { borderColor: 'var(--accent)', background: 'var(--accent)' }}
+                          >
+                            {/* The pin, not a tick, for an inert row: a checked box that
+                             *  cannot be unchecked would read as an ordinary checked row,
+                             *  which in dark mode is exactly what it looks like, and the
+                             *  pin is the mark the folder header already wears for this
+                             *  state. A lock read as "private" instead. */}
+                            {inert
+                              ? <Pin size={11} className="text-accent-fg" strokeWidth={2.5} data-testid={`folder-filter-lock-${f.id}`} />
+                              : (!hidden && !hiddenByAncestor) && <Check size={10} className="text-accent-fg" strokeWidth={3} />}
+                          </span>
+                          <FolderGlyph color={f.color} icon={f.icon} size={12} className="shrink-0 text-muted" />
+                          <span className={`flex-1 truncate${hiddenByAncestor && !inert ? ' opacity-50' : ''}`}>{f.name}</span>
+                          {count > 0 && <span className="text-muted text-[11px] shrink-0">{count}</span>}
+                          {/* Indented past the checkbox and the glyph (14 + 8 + 12 + 8)
+                              so the reason lines up under the folder name. */}
+                          {inertReason && (
+                            <span className="basis-full pl-[42px] text-[11px] text-muted" data-testid={`folder-filter-reason-${f.id}`}>
+                              <span className="block w-0 min-w-[16rem] whitespace-normal">{inertReason}</span>
+                            </span>
+                          )}
+                        </DropdownMenuItem>
+                      )
+                    })}
                       </>
                     )}
-                  </>
+                    </FoldersSection>
                 )}
+                {/* Opt-in cross-session action: clear the chips for changes that
+                    have merged, in one step, re-reading each change's provider
+                    status rather than trusting the chip's own cached state.
+                    Renders nothing (the component self-hides, its own separator
+                    included) when no session carries an unlinkable change chip,
+                    so the menu is unchanged for a list with none. */}
+                <RemoveMergedCrChips />
+                </>)} />
               </FilterMenuContent>
             </DropdownMenu>
           </>
@@ -908,6 +1099,11 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
   )
   const shelf = (
         <>
+      {/* Resume every interrupted idle session. FIRST in the shelf: after a
+          gateway restart this is the one list-level action the person came to
+          the sidebar for, and the chips below describe a view, not a repair.
+          Absent when nothing is interrupted (see renderResumeAllRow). */}
+      {renderResumeAllRow(shell)}
       {/* One aggregate chip in its OWN row, never per-tag chips in the row below.
           AUTOSDE max-two-buttons-per-row grandfathers that row's existing filter
           chips but forbids growing it, and per-tag chips grow it without bound.
@@ -958,6 +1154,8 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
           </div>
         )
       })()}
+      {/* The "Started by" chip, in its own row for the same AUTOSDE reason. */}
+      <CreatorFilterChip view={creatorFilter} />
       {/* The Crew Mode chip in its own row, above the status chips, for the same
           AUTOSDE reason as the tag, model and hides chips: the status-chip row
           below holds the base branch's four filter chips and must not grow
@@ -972,7 +1170,7 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
               label={`${filterLabel}${slotCount > 0 ? ` (${slotCount})` : ''}`}
               color="var(--accent)"
               gradient
-              paused={filtersPaused}
+              pause={chipPause('crew', filterLabel)}
               clearLabel={i18nT('pages.chatSidebar.clear_named_filter', { filter: filterLabel })}
               onClear={() => toggleFilter('crew')}
             />
@@ -995,7 +1193,7 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
                 testId={`filter-chip-${filterDef.key}`}
                 label={`${filterLabel}${filterDef.key === 'recent' ? ` · ${formatRecentWindow(recentWindowMs)}` : ''}${slotCount > 0 ? ` (${slotCount})` : ''}`}
                 color={filterDef.color}
-                paused={filtersPaused}
+                pause={chipPause(filterDef.key, filterLabel)}
                 clearLabel={clearLabel}
                 onClear={() => toggleFilter(filterDef.key)}
               />
@@ -1071,8 +1269,11 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
       {/* Read failures for the two lists this pane is built from. Same placement
        *  rationale as the seed banner: a failed folders query means no folder
        *  tree, a failed columns query means no board, so neither branch can host
-       *  its own notice. Both are pure reads — askAgent on, Retry via refetch. */}
-      {foldersFailed && (
+       *  its own notice. Both are pure reads — askAgent on, Retry via refetch.
+       *  A permission refusal (`owner_only`, or the relay's teammate refusal) is
+       *  not a failed read: this caller is not given the list, a Retry cannot
+       *  change that, and the chats still list unfiled, so no notice (#32031). */}
+      {foldersFailed && !isPermissionRefusal(foldersError) && (
         <div className="mx-2 mt-2 flex flex-col gap-1 shrink-0">
           <ErrorNotice
             title={i18nT('pages.chatSidebar.folders_load_failed')}
@@ -1087,7 +1288,7 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
           </div>
         </div>
       )}
-      {columnsFailed && (
+      {columnsFailed && !isPermissionRefusal(columnsError) && (
         <div className="mx-2 mt-2 flex flex-col gap-1 shrink-0">
           <ErrorNotice
             title={i18nT('pages.chatSidebar.columns_load_failed')}
@@ -1164,6 +1365,19 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
         onDismiss={dismissSortError}
         className="mx-2 mt-2 shrink-0"
         testId="session-sort-error"
+      />
+      {/* An unfiled-sessions toggle the gateway refused. The lane already shows
+          the stored layout again. The title tells the person that nothing
+          changed. The server's text sits under the title as the detail. */}
+      <ErrorNotice
+        title={i18nT('pages.settings.displayPanel.keep_running_when_window_closed_save_failed')}
+        message={unfiledAboveFoldersError}
+        messagePlacement="below"
+        askAgent={connected}
+        actionPlacement="below"
+        onDismiss={dismissUnfiledAboveFoldersError}
+        className="mx-2 mt-2 shrink-0"
+        testId="unfiled-above-folders-error"
       />
       {/* The folder order (dashboard.folder_sort) could not be read AND there is
        *  no body to fall back on: the tree is drawn in the stored order meanwhile
@@ -1255,15 +1469,28 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
         className="mx-2 mt-2 shrink-0"
         testId="new-chat-error"
       />
-      {/* A refused rename: the editor is already closed and the title has been
-       *  reverted to the server value by the recovery refetch, so there is no
-       *  unsaved draft left to lose and the hand-off is safe. Dismissable: the
-       *  failure is a moment, not a state. */}
       <ErrorNotice
-        title={i18nT('pages.chatPage.could_not_rename_session')}
-        message={renameError}
+        title={i18nT('pages.chatSidebar.refresh_pr_status_failed')}
+        message={prStatusRefreshError}
+        messagePlacement="below"
         askAgent
-        onDismiss={() => setRenameError('')}
+        actionPlacement="below"
+        onDismiss={() => setPrStatusRefreshError('')}
+        className="mx-2 mt-2 shrink-0"
+        testId="pr-status-refresh-error"
+      />
+      {/* A refused rename: the editor is already closed, so there is no unsaved
+       *  draft left to lose and the hand-off is safe. The lead names the refused
+       *  title and nothing else: when the recovery re-read fails too, the row
+       *  keeps that title, so "the previous title stays" would be false here.
+       *  Dismissable: the failure is a moment, not a state. */}
+      <ErrorNotice
+        title={renameError ? i18nT('pages.chatPage.could_not_rename_session', { title: renameError.refused }) : undefined}
+        message={renameError?.reason}
+        askAgent
+        // Below, not beside: the lead carries a title of any length.
+        actionPlacement="below"
+        onDismiss={() => setRenameError(null)}
         className="mx-2 mt-2 shrink-0"
         testId="rename-error"
       />
@@ -1321,4 +1548,10 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
         </>
   )
   return { field, shelf }
+}
+
+/** Runs `render` when React renders this element, which for a child of a closed
+ *  Radix menu content is only once the menu opens. */
+function RenderWhenOpen({ render }: { render: () => React.ReactNode }) {
+  return <>{render()}</>
 }

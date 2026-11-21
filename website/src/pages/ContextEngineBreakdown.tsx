@@ -3,7 +3,7 @@ import { ChevronDown, ChevronRight } from 'lucide-react'
 
 import InfoTip from '../components/InfoTip'
 
-import { fmtBytes, fmtCompact, fmtList, fmtNumber, fmtPercent, fmtUnit } from '../i18n/format'
+import { fmtBytes, fmtCompact, fmtList, fmtNumber, fmtPercent, fmtUnit, joinSentences } from '../i18n/format'
 import { i18nT } from '../i18n/t'
 
 /**
@@ -579,11 +579,11 @@ function RowView({
             <span className="flex flex-col items-end @[26rem]/ctxrows:flex-row @[26rem]/ctxrows:items-baseline" data-engine-value>
               <span className="whitespace-nowrap">
                 {row.estimated ? '~' : ''}
-                {fmtN(row.tokens)} {i18nT('pages.contextBreakdown.unit_tokens')}
+                {i18nT('pages.contextBreakdown.n_tokens', { count: Math.round(row.tokens), n: fmtN(row.tokens) })}
               </span>
               {row.chars !== null ? (
                 <span className="font-sans text-[11px] opacity-70 whitespace-nowrap @[26rem]/ctxrows:ml-1.5" data-engine-chars>
-                  {fmtN(row.chars)} {i18nT('pages.contextBreakdown.unit_chars')}
+                  {i18nT('pages.contextBreakdown.n_chars', { count: Math.round(row.chars), n: fmtN(row.chars) })}
                 </span>
               ) : null}
             </span>
@@ -592,7 +592,7 @@ function RowView({
           ) : measured || row.plain ? (
             fmtN(row.chars)
           ) : (
-            `${fmtN(row.chars)} ${i18nT('pages.contextBreakdown.unit_chars')}`
+            i18nT('pages.contextBreakdown.n_chars', { count: Math.round(row.chars), n: fmtN(row.chars) })
           )}
         </span>
         {measured || row.tokens !== undefined ? (
@@ -697,7 +697,7 @@ export function TurnBreakdown({
   const hovered = segments.find(s => s.id === hover)
   const media = measured ? mediaText(engine?.media) : null
   const caption = measured
-    ? [i18nT('pages.contextBreakdown.caption_measured'), ttft ? i18nT('pages.contextBreakdown.engine_ttft', { total: fmtSeconds(ttft.total_ms) }) : ''].filter(Boolean).join(' ')
+    ? joinSentences([i18nT('pages.contextBreakdown.caption_measured'), ttft ? i18nT('pages.contextBreakdown.engine_ttft', { total: fmtSeconds(ttft.total_ms) }) : ''])
     : inTokens
       ? i18nT('pages.contextBreakdown.caption_estimate', { ratio: fmtNumber(charsPerToken ?? 4) })
       : i18nT('pages.contextBreakdown.caption_chars')
@@ -737,7 +737,7 @@ export function TurnBreakdown({
                 <span className="text-text-strong truncate">{hovered.label}</span>
                 <span className="font-mono text-muted shrink-0">
                   {hovered.tokens !== undefined
-                    ? `${hovered.estimated ? '~' : ''}${fmtN(hovered.tokens)} ${i18nT('pages.contextBreakdown.unit_tokens')}`
+                    ? `${hovered.estimated ? '~' : ''}${i18nT('pages.contextBreakdown.n_tokens', { count: Math.round(hovered.tokens), n: fmtN(hovered.tokens) })}`
                     : fmtN(size(hovered))}{' '}
                   · {fmtShare(hovered.share)}
                 </span>

@@ -133,17 +133,18 @@ explicit restart action. Never erase that evidence or retry the refusal.
 
 ```text
 monitor_start({
-  "message": "Watch https://github.com/kirodotdev/KiroCrew/pull/123. On each injected cycle, inspect current review comments and checks. Act only on a real change. Kiro Crew AI repairs MUST follow kirocrew-prepare-pr Review repair routing with model-pinned subagents and parent verification; commit and push only if authorized. If ready, terminal, blocked, stopped by the user or out of budget, report the outcome and any open findings, then call autonudge_stop with a reason.",
+  "message": "Watch https://github.com/kirodotdev/KiroCrew/pull/123. On each injected cycle, inspect current review comments and checks. Act only on a real change. Kiro Crew AI repairs MUST follow kirocrew-prepare-pr Review repair routing with model-pinned subagents and parent verification; commit and push only if authorized. Decide when it is done from live state (gh pr view), not from memory. If ready, terminal, blocked or stopped by the user, first send ONE final report (the outcome, any open findings, links), then in a later step call monitor_stop with a reason.",
   "interval_secs": 300,
-  "max_cycles": 48,
-  "max_runtime_secs": 14400,
   "judge": false
 })
 ```
 
 Replace the example URL with the real target. Gated, an unchanged pull request
-costs no turn; a change to its reading, comments included, wakes it once. All
-three limits must be positive and finite; never use `0` for unlimited work.
+costs no turn; a change to its reading, comments included, wakes it once. Leave
+`max_cycles` and `max_runtime_secs` unset: a gated loop has no cycle cap, and
+its runtime defaults to the `monitoring.max_runtime_secs` ceiling (7 days as
+shipped), a runaway backstop. A `gate=false` loop wakes every interval, so it
+keeps a finite cap (24 by default); never pass `0` for unlimited work.
 Every delivered cycle is a full model turn. Name the readiness conditions below
 by reference rather than copying their text into the message: a copy inside the
 instruction drifts from the list it duplicates while still reading as
@@ -169,8 +170,8 @@ security. Fix, commit and push only within the user's authorization.
   `monitor_start` with `watch="work-ledger"`: a quiet cycle costs no turn, and a
   worker's blocked, question or done report wakes it within seconds.
 - `gate=true` is the default. Quiet subjects avoid turns, with eventual delivery
-  after enough quiet intervals. A merge or close ends a gated loop with a notice,
-  no turn. Use `gate=false` for a required final turn or for acting on silence,
+  after enough quiet intervals. A merge or close ends a gated loop after one
+  final turn that names the result. Use `gate=false` for acting on silence,
   such as chasing a missing reviewer or tracking a moving base. `max_cycles`
   counts DELIVERED turns, including quiet-floor deliveries and fallbacks, not
   just useful changes.

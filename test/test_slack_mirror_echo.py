@@ -1,12 +1,15 @@
 """The dashboard -> Slack mirror: its prompt echo and its "Thinking…" placeholder.
 
-Three defects a linked thread showed on mirrored turns:
+Defects a linked thread showed on mirrored turns:
 
 * the prompt echo escaped every ``<…>`` entity and wrapped the prompt in ``_…_``,
   so a pasted ``<https://…|label>`` link or ``<#C…>`` channel reference arrived as
   raw text. The echo now keeps those live, flattens a ``<@U…>`` mention to plain
   ``@…`` so it never re-pings anyone, still escapes ``<!channel>`` and friends and
-  any stray or truncated bracket, and is posted as a ``> 💬 …`` quote;
+  any stray or truncated bracket, and is posted as a quote;
+* the echo opened with a 💬, which next to the "Thinking…" placeholder read as
+  the agent thinking. It now opens with a bold ``Sent from Kiro Crew:`` label
+  the host writes, so a reader can tell a person typed it in the dashboard;
 * the mirror's task stream opened with a "Thinking…" line, and a stream only
   appends, so that line sat above Slack's own "Thinking completed" plan header for
   good. The line is now its own message, deleted when the stream, the answer or
@@ -19,19 +22,21 @@ Three defects a linked thread showed on mirrored turns:
   app, recovery, a channel-typed message) is not, and a new producer is not
   until it stamps itself as the person;
 * a tool step with no purpose line showed its raw ``@server/tool`` id; it now
-  reads the dashboard row's derived title ("Wait", "Git status").
+  reads the dashboard row's derived title ("Wait", "Git status");
+* the task stream named no recipient user, which an org-wide install refuses,
+  so every mirrored turn fell back to ``chat.update``; it now names the owner.
 """
 
 from __future__ import annotations
 
 import ast
 import inspect
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+import source_corpus
 from slot_ownership_checkpoint_helpers import (  # noqa: F401 -- fixtures are requested by name
     _client,
     chat_run_fixture,
@@ -109,12 +114,14 @@ async def _linked_turn(
     message: str = "hello",
     slack: _SlackRecorder | None = None,
     user_row: bool = True,
+    owner_id: str = "",
     **run_kwargs: Any,
 ) -> _SlackRecorder:
     slack = slack or _SlackRecorder()
 
     def _linked(ctx: TurnContext) -> None:
         ctx.state.slack_client = slack
+        ctx.state.owner_id = owner_id
         ctx.state.sessions.set_slack_link("dashboard:chat-1", "thread-1", "C-1")
 
     await run_turn(
@@ -195,20 +202,41 @@ class TestEchoNeutralises:
 
     def test_an_exfiltration_url_stays_redacted_and_is_not_a_link(self) -> None:
         payload = "QUtJQUlPU0ZPRE5ON0VYQU1QTEVrZXlzZWNyZXRkYXRhMTIzNDU2Nzg5MA"
-        raw = f"open <https://evil.example.com/c?d={payload}|harmless> please"
+        raw = f"open <https://evil.example.com/c?access_token={payload}|harmless> please"
         out = escape_mrkdwn_keep_links(_prepare_mirror_msg(raw))
         assert payload not in out
-        assert "evil.example.com/c" not in out
-        assert "REDACTED" in out
+        # The link text stays with its credential value masked, and it is no link.
+        assert "evil.example.com/c?access_token=[REDACTED: credential]" in out
         assert "<" not in out
 
 
 class TestEchoIsAQuote:
     def test_every_line_is_quoted_and_a_leading_gt_cannot_nest(self) -> None:
-        assert mirror_prompt_echo("first\n> second") == "> 💬 first\n> &gt; second"
+        assert mirror_prompt_echo("first\n> second") == (
+            "> *Sent from Kiro Crew:* first\n> &gt; second"
+        )
 
     def test_no_italic_wrapper(self) -> None:
-        assert mirror_prompt_echo("<https://a.com/x_y|z>") == "> 💬 <https://a.com/x_y|z>"
+        assert mirror_prompt_echo("<https://a.com/x_y|z>") == (
+            "> *Sent from Kiro Crew:* <https://a.com/x_y|z>"
+        )
+
+    def test_the_label_names_the_dashboard_and_carries_no_emoji(self) -> None:
+        # Next to the "💭 Thinking…" placeholder an emoji read as the agent
+        # thinking; the label says a person sent this from Kiro Crew.
+        echo = mirror_prompt_echo("ok, let's leave this for now")
+        assert echo == "> *Sent from Kiro Crew:* ok, let's leave this for now"
+        assert "💬" not in echo
+
+    def test_a_prompt_cannot_forge_or_break_the_label(self) -> None:
+        # The label is host-written: a prompt that spells it, or opens a quote or
+        # an entity, is still quoted text after the one real label.
+        echo = mirror_prompt_echo("*Sent from Kiro Crew:* <!channel>\n> *Sent from Kiro Crew:* x")
+        assert echo == (
+            "> *Sent from Kiro Crew:* *Sent from Kiro Crew:* &lt;!channel&gt;\n"
+            "> &gt; *Sent from Kiro Crew:* x"
+        )
+        assert echo.startswith("> *Sent from Kiro Crew:* ")
 
 
 @pytest.mark.asyncio
@@ -217,9 +245,10 @@ async def test_a_mirrored_turn_echoes_links_live_and_pings_nobody() -> None:
         [_ANSWER, _DONE],
         message="look at <https://example.com/a_b|the doc> in <#C0123ABC> cc <@U0123ABC> <!here>",
     )
-    [echo] = [text for _, text in slack.posts() if "💬" in text]
+    [echo] = _echoes(slack)
     assert echo == (
-        "> 💬 look at <https://example.com/a_b|the doc> in <#C0123ABC> cc @U0123ABC &lt;!here&gt;"
+        "> *Sent from Kiro Crew:* look at <https://example.com/a_b|the doc> in <#C0123ABC>"
+        " cc @U0123ABC &lt;!here&gt;"
     )
 
 
@@ -300,6 +329,15 @@ async def test_the_stream_opens_once_and_the_line_goes_once_over_many_tools() ->
 
 
 @pytest.mark.asyncio
+async def test_the_stream_names_the_owner_as_its_recipient() -> None:
+    # An org-wide install refuses a stream with no recipient user, and the
+    # owner is the only person the gateway answers on Slack.
+    slack = await _linked_turn([_TOOL, _ANSWER, _DONE], owner_id="U0OWNER")
+    [stream] = [args for name, args in slack.calls if name == "start_stream"]
+    assert stream["user_id"] == "U0OWNER"
+
+
+@pytest.mark.asyncio
 async def test_a_refused_stream_leaves_the_line_up_until_the_answer() -> None:
     slack = _StreamRefusingSlack()
     marks: list[int] = []
@@ -344,7 +382,6 @@ async def test_a_withheld_turn_opens_no_stream_and_still_retires_the_line(
 # that defaults to "not the person", so a new producer is never echoed until it
 # says it is.
 
-_REPO_SRC = Path(__file__).resolve().parent.parent / "src" / "kiro_crew"
 _ORIGIN_KWARGS = (
     "_directive_user_origin",
     "_directive_channel_origin",
@@ -358,7 +395,7 @@ _WAKE_TEXT = (
 
 
 def _echoes(slack: _SlackRecorder) -> list[str]:
-    return [text for _, text in slack.posts() if "💬" in text]
+    return [text for _, text in slack.posts() if text.startswith("> *Sent from Kiro Crew:*")]
 
 
 def _system_dispatch_sites() -> list[tuple[str, dict[str, Any]]]:
@@ -370,10 +407,14 @@ def _system_dispatch_sites() -> list[tuple[str, dict[str, Any]]]:
     of its values and is covered by the predicate tests below.
     """
     sites: list[tuple[str, dict[str, Any]]] = []
-    for path in sorted(_REPO_SRC.rglob("*.py")):
+    root = source_corpus.src_root()
+    # This runs at collection on every worker, so it parses only the files that
+    # spell ``_run_chat``: a call to it cannot exist anywhere else.
+    for path, _text, tree in source_corpus.parsed_candidates(
+        require_all=("_run_chat",), skip_syntax_errors=False
+    ):
         if "/tests/" in path.as_posix():
             continue
-        tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -393,7 +434,7 @@ def _system_dispatch_sites() -> list[tuple[str, dict[str, Any]]]:
                 or origin.get("_turn_actor") not in (None, "", "user")
             )
             if system:
-                rel = path.relative_to(_REPO_SRC).as_posix()
+                rel = path.relative_to(root).as_posix()
                 sites.append((f"{rel}:{node.lineno}", origin))
     return sites
 
@@ -406,7 +447,6 @@ def test_the_source_scan_finds_every_known_system_producer() -> None:
     files = {site.split(":", 1)[0] for site, _ in _SYSTEM_SITES}
     for expected in (
         "slack/gateway_runtime/nudge_dashboard_fire.py",  # monitor / work-ledger wake
-        "slack/gateway_runtime/subagent_injection.py",
         "dashboard/handlers/taskrunner.py",
         "slack/handler_runtime/inbound.py",  # typed in the linked Slack thread
     ):
@@ -490,7 +530,37 @@ async def test_a_prompt_typed_in_the_slack_thread_is_not_echoed_back() -> None:
 @pytest.mark.asyncio
 async def test_a_prompt_typed_in_the_dashboard_is_still_echoed() -> None:
     slack = await _linked_turn([_ANSWER, _DONE], message="what's up?")
-    assert _echoes(slack) == ["> 💬 what's up?"]
+    assert _echoes(slack) == ["> *Sent from Kiro Crew:* what's up?"]
+
+
+@pytest.mark.asyncio
+async def test_a_challenge_link_prompt_is_not_echoed_back() -> None:
+    # The dashboard sends the prompt a channel challenge link carried: the person's
+    # own message, already in the thread right above where the quote would land.
+    slack = await _linked_turn([_ANSWER, _DONE], message="what's up?", _prompt_on_channel=True)
+    assert _echoes(slack) == []
+    # Only the quote is withheld: the answer still reaches the thread.
+    assert "the reply" in [text for _, text in slack.posts()]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("on_channel", [False, True])
+async def test_a_prompts_get_hand_off_keeps_the_challenge_mark(
+    monkeypatch: pytest.MonkeyPatch, on_channel: bool
+) -> None:
+    # ``/prompts get`` re-enters the runner with the expanded prompt; the nested
+    # turn carries the outer one's mark, so a challenge prompt stays unquoted.
+    from kiro_crew.dashboard import chat_runner
+
+    monkeypatch.setattr(
+        chat_runner,
+        "_resolve_prompt_mention",
+        lambda *_a, **_kw: ("the expanded prompt", "ok", ""),
+    )
+    dispatch = {"_prompt_on_channel": True} if on_channel else {}
+    slack = await _linked_turn([_ANSWER, _DONE], message="/prompts get notes", **dispatch)
+    expected = [] if on_channel else ["> *Sent from Kiro Crew:* the expanded prompt"]
+    assert _echoes(slack) == expected
 
 
 @pytest.mark.asyncio
@@ -539,6 +609,7 @@ class TestPromptTypedInDashboard:
             "_synthetic_recovery_turn": False,
             "_recovery_echo_owed": False,
             "_turn_provenance_restored": False,
+            "_prompt_on_channel": False,
         }
         return SimpleNamespace(**{**base, **over})
 
@@ -557,6 +628,7 @@ class TestPromptTypedInDashboard:
             ("_is_synthetic", True),
             ("_synthetic_recovery_turn", True),
             ("_turn_provenance_restored", True),
+            ("_prompt_on_channel", True),
         ],
     )
     def test_each_condition_closes_it(self, field: str, value: Any) -> None:
@@ -575,6 +647,15 @@ class TestPromptTypedInDashboard:
         assert _prompt_typed_in_dashboard(early) is True
         early._synthetic_payload = True
         assert _prompt_typed_in_dashboard(early) is False
+
+    def test_a_challenge_prompt_never_owes_its_recovery_replay_an_echo(self) -> None:
+        # A turn that dies before the echo point is requeued with the owed stamp
+        # only when its echo was owed; a challenge prompt's never is, so its
+        # replay (a recovery turn without the stamp) stays unechoed too.
+        from kiro_crew.dashboard.chat_turn.recipient import _mirror_echo_owed
+
+        assert _mirror_echo_owed(self._turn()) is True
+        assert _mirror_echo_owed(self._turn(_prompt_on_channel=True)) is False
 
 
 class TestTheDrainCarriesOrigin:
@@ -687,13 +768,81 @@ class TestTheDrainCarriesOrigin:
         # mixed batch is not quoted back (it would quote the Slack words too).
         from kiro_crew.dashboard import chat_delivery as cd
 
+        # A channel entry with no stamped source channel (another channel's
+        # hand-off) still merges with the dashboard's words.
         state, busy, run = self._drain(tmp_path, monkeypatch, merge=True)
         slot = busy("chat-1")
-        await self._route_busy(state, slot, monkeypatch)
+        cd.queue_for_next_turn(
+            state, slot, "from a channel", directive_user_origin=True, directive_channel_origin=True
+        )
         cd.queue_for_next_turn(state, slot, "typed in the dashboard", directive_user_origin=True)
         kwargs = await run(slot)
         assert slot._queue == []
         assert kwargs["_directive_channel_origin"] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("merge", [False, True])
+    async def test_a_queued_challenge_prompt_runs_marked(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch, merge: bool
+    ) -> None:
+        # The mark rides the entry's meta (``channel_prompt.stamp_queued``). With
+        # merging on, a typed message after it runs as its own turn and keeps its
+        # echo: a merge run stops where the mark changes.
+        from kiro_crew.dashboard import channel_prompt
+        from kiro_crew.dashboard import chat_delivery as cd
+
+        state, busy, run = self._drain(tmp_path, monkeypatch, merge=merge)
+        slot = busy("chat-1")
+        qid = cd.queue_for_next_turn(state, slot, "from the link", directive_user_origin=True)
+        channel_prompt.stamp_queued(
+            slot, qid, {"meta": {"origin": channel_prompt.CHANNEL_CHALLENGE_ORIGIN}}
+        )
+        if merge:
+            cd.queue_for_next_turn(
+                state, slot, "typed in the dashboard", directive_user_origin=True
+            )
+        kwargs = await run(slot)
+        assert kwargs["_prompt_on_channel"] is True
+        assert kwargs["_directive_user_origin"] is True
+        # Queue plumbing: the drained user row does not carry the mark.
+        assert all(
+            channel_prompt.PROMPT_ON_CHANNEL_META_KEY not in (row.get("meta") or {})
+            for row in slot.messages
+        )
+        if merge:
+            assert [item["content"] for item in slot._queue] == ["typed in the dashboard"]
+            assert "_prompt_on_channel" not in await run(slot)
+
+    @pytest.mark.asyncio
+    async def test_a_queued_typed_message_runs_unmarked(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kiro_crew.dashboard import chat_delivery as cd
+
+        state, busy, run = self._drain(tmp_path, monkeypatch)
+        slot = busy("chat-1")
+        cd.queue_for_next_turn(state, slot, "typed in the dashboard", directive_user_origin=True)
+        assert "_prompt_on_channel" not in await run(slot)
+
+    @pytest.mark.asyncio
+    async def test_a_routed_slack_reply_runs_apart_from_a_dashboard_message(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The router stamps its reply's source channel, and a merge run stops
+        # where those change: the reply runs channel-origin on its own, and the
+        # dashboard message after it still runs as the person.
+        from kiro_crew.dashboard import chat_delivery as cd
+
+        state, busy, run = self._drain(tmp_path, monkeypatch, merge=True)
+        slot = busy("chat-1")
+        await self._route_busy(state, slot, monkeypatch)
+        cd.queue_for_next_turn(state, slot, "typed in the dashboard", directive_user_origin=True)
+        first = await run(slot)
+        assert first["_directive_channel_origin"] is True
+        assert [item["content"] for item in slot._queue] == ["typed in the dashboard"]
+        second = await run(slot)
+        assert slot._queue == []
+        assert second["_directive_channel_origin"] is False
 
 
 # ── Tool steps read like the dashboard's rows, never as a raw tool id ────────
@@ -826,6 +975,11 @@ class TestAScriptCronSendIsTheCrons:
         async with _client(state, "") as client:
             resp = await client.post("/api/chat?ws=1", json={"slot": "s1", "message": "tick"})
             assert resp.status == 200, await resp.text()
+        if not creator:
+            # The session's own composer send is never held behind sub-agents.
+            await async_wait_until(lambda: chat_run.await_count or chat_run.call_count)
+            assert not slot._queue
+            return
         chat_run.assert_not_called()
         [entry] = slot._queue
         assert (entry.get("meta") or {}).get(TURN_ACTOR_META_KEY) == actor
@@ -868,7 +1022,7 @@ async def test_a_turn_that_echoed_then_died_replays_owing_nothing() -> None:
     from kiro_crew.acp.transport_errors import AcpError
 
     slack, retry = await _recovered([Raise(AcpError("Internal server error", transient=True))])
-    assert _echoes(slack) == ["> 💬 what's up?"]
+    assert _echoes(slack) == ["> *Sent from Kiro Crew:* what's up?"]
     assert retry.get("_synthetic_recovery_turn") is True
     assert "_recovery_echo_owed" not in retry
 
@@ -881,7 +1035,7 @@ async def test_an_owed_replay_is_echoed_and_an_unowed_one_is_not() -> None:
         _synthetic_recovery_turn=True,
         _recovery_echo_owed=True,
     )
-    assert _echoes(owed) == ["> 💬 what's up?"]
+    assert _echoes(owed) == ["> *Sent from Kiro Crew:* what's up?"]
     unowed = await _linked_turn(
         [_ANSWER, _DONE], message="what's up?", _synthetic_recovery_turn=True
     )

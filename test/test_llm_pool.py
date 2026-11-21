@@ -332,12 +332,41 @@ class TestProviderDetection:
         with patch("pathlib.Path.home", return_value=tmp_path):
             assert _get_provider_type() == "acp"
 
-    def test_reads_claude_code_from_config(self, tmp_path):
+    def test_a_hand_edited_claude_code_reads_as_acp(self, tmp_path):
+        """The schema admits only ``acp``, so the loader turns any other value into
+        ``acp``; the pool reads the raw file and must agree with it."""
         config = tmp_path / ".kirocrew" / "config.json"
         config.parent.mkdir(parents=True)
         config.write_text('{"agent": {"provider": "claude_code"}}')
         with patch("pathlib.Path.home", return_value=tmp_path):
-            assert _get_provider_type() == "claude_code"
+            assert _get_provider_type() == "acp"
+
+    @pytest.mark.asyncio
+    async def test_a_hand_edited_claude_code_still_builds_the_acp_worker(self, tmp_path):
+        config = tmp_path / ".kirocrew" / "config.json"
+        config.parent.mkdir(parents=True)
+        config.write_text('{"agent": {"provider": "claude_code"}}')
+        built: list[str] = []
+
+        def _fake(kind: str):
+            def _make(**_kwargs):
+                built.append(kind)
+                return FakeWorker()
+
+            return _make
+
+        with (
+            patch("pathlib.Path.home", return_value=tmp_path),
+            patch("kiro_crew.knowledge.llm_pool.AcpWorker", side_effect=_fake("acp")),
+            patch("kiro_crew.knowledge.llm_pool.CCWorker", side_effect=_fake("claude_code")),
+            patch("kiro_crew.knowledge.llm_pool._get_acp_backend", return_value=ACP_BACKEND_KIRO),
+        ):
+            pool = LLMPool(pool_size=1)
+            await pool.start()
+            await pool.shutdown()
+
+        assert pool.provider_type == "acp"
+        assert built == ["acp"]
 
     def test_reads_acp_from_config(self, tmp_path):
         config = tmp_path / ".kirocrew" / "config.json"
@@ -446,11 +475,8 @@ class TestReadConfig:
 
     def test_parsers_accept_config_dict(self):
         """provider parser reads the passed dict, no disk access."""
-        data = {
-            "agent": {"provider": "claude_code"},
-            "knowledge": {},
-        }
-        assert _get_provider_type(data) == "claude_code"
+        assert _get_provider_type({"agent": {"provider": "acp"}, "knowledge": {}}) == "acp"
+        assert _get_provider_type({"agent": {"provider": "claude_code"}}) == "acp"
 
     @pytest.mark.parametrize(
         "bad",
@@ -510,11 +536,10 @@ class TestReadConfig:
             (None, ACP_BACKEND_KIRO),
             ("no-such-harness", ACP_BACKEND_KIRO),
             (42, ACP_BACKEND_KIRO),
-            # claude's routing (SEEDED_SETTINGS) is declared but not enforced by
-            # this core -- an inherited ~/.claude pre-approval can skip
-            # session/request_permission entirely, so honors_zero_tool_ban answers
-            # False and it degrades to kiro.
-            (ACP_BACKEND_CLAUDE, ACP_BACKEND_KIRO),
+            # claude's zero-tool session mounts no tool at all (empty
+            # options.tools, strictMcpConfig, an empty wire array), so an
+            # inherited ~/.claude pre-approval has nothing to run -- passes through.
+            (ACP_BACKEND_CLAUDE, ACP_BACKEND_CLAUDE),
             # Selectable through the gate but outside this pool's zero-tool
             # allowlist -- codex is served by AcpRuntime, which carries no
             # zero-tool refusal -- so it degrades to kiro the same as an

@@ -11,6 +11,7 @@
 import { lazy, type ComponentType } from 'react'
 import { reportSeamCollision } from './seamCollision'
 import { isValidAppId } from './appIdentity'
+import { FILE_EXPLORER_PATH_PARAM } from './file-explorer/deepLink'
 
 export type LazyComponent = React.LazyExoticComponent<ComponentType<Record<string, never>>>
 
@@ -30,6 +31,13 @@ export interface BuiltinAppEntry {
    * holding state no other reader can find.
    */
   readonly appId: string
+  /**
+   * The query parameter this page reads an absolute path from, for a page that
+   * opens a path handed to it in its URL (`<route>?<param>=<path>`). A surface
+   * showing a file offers "Open in <app>" for such a page through
+   * `apps/pathOpener.ts`. Absent for a page that opens no path.
+   */
+  readonly opensPathParam?: string
 }
 
 /**
@@ -48,14 +56,13 @@ export interface BuiltinAppEntry {
  */
 export const BUILTIN_COMPONENT_REGISTRY: Record<string, BuiltinAppEntry> = {
   '/worlds': { component: lazy(() => import('../pages/WorldsPage')), appId: 'agent-worlds' },
-  '/channels': { component: lazy(() => import('../pages/ChannelPage')), appId: 'channels' },
   '/auto-improvement': { component: lazy(() => import('./auto-improvement/AutoImprovementPage')), appId: 'auto-improvement' },
   '/auto-research': { component: lazy(() => import('./auto-research/ResearchLabPage')), appId: 'auto-research' },
   '/aws-control': { component: lazy(() => import('./aws-control/AwsControlPage')), appId: 'aws-control' },
-  '/file-explorer': { component: lazy(() => import('./file-explorer/FileExplorerPage')), appId: 'file-explorer' },
+  '/file-explorer': { component: lazy(() => import('./file-explorer/FileExplorerPage')), appId: 'file-explorer', opensPathParam: FILE_EXPLORER_PATH_PARAM },
   '/code-review-sage': { component: lazy(() => import('./code-review-sage/CodeReviewSagePage')), appId: 'code-review-sage' },
   '/workflows': { component: lazy(() => import('./workflows/WorkflowsPage')), appId: 'workflows' },
-  '/dev-fleet': { component: lazy(() => import('../pages/DevFleetPage')), appId: 'dev-fleet' },
+  '/dev-fleet': { component: lazy(() => import('./dev-fleet/DevFleetPage')), appId: 'dev-fleet' },
   '/issue-radar': { component: lazy(() => import('./issue-radar/IssueRadarPage')), appId: 'issue-radar' },
   '/meetings': { component: lazy(() => import('./meetings/MeetingsPage')), appId: 'meetings' },
   '/papyrus': { component: lazy(() => import('./papyrus/PapyrusPage')), appId: 'papyrus' },
@@ -63,7 +70,6 @@ export const BUILTIN_COMPONENT_REGISTRY: Record<string, BuiltinAppEntry> = {
   '/ops-mission-control': { component: lazy(() => import('./ops-mission-control/OpsMissionControlPage')), appId: 'ops-mission-control' },
   '/design-critique': { component: lazy(() => import('./design-critique/DesignCritiquePage')), appId: 'design-critique' },
   '/crew-companion': { component: lazy(() => import('./crew-companion/CrewCompanionPage')), appId: 'crew-companion' },
-  '/projects': { component: lazy(() => import('../pages/ProjectsPage')), appId: 'projects' },
   '/md-notebook': { component: lazy(() => import('./md-notebook/MdNotebookPage')), appId: 'md-notebook' },
   '/mochi': { component: lazy(() => import('./mochi/MochiPage')), appId: 'mochi' },
   '/spec-builder': { component: lazy(() => import('./spec-builder/SpecBuilderPage')), appId: 'spec-builder' },

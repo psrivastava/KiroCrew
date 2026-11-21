@@ -302,10 +302,9 @@ class TestSanitizedPath:
         # writable by anything that can write the project — including the agent. A
         # planted `gh` there would run the moment the user types `gh`, before Enter.
         #
-        # The trusted-chain test is stubbed out so this isolates its own subject.
-        # Asserting against real system directories made it depend on host
-        # ownership, and it broke on CI runners where `/usr/local/bin` is not
-        # root-owned — a true fact about the runner, not about this filter.
+        # The trusted-chain check is stubbed so this tests only the location
+        # filter: real system directories would make it depend on who owns
+        # `/usr/local/bin` on the host, which differs across CI runners.
         monkeypatch.setattr(tc, "_is_trusted_dir", lambda _d: True)
         usr_bin, usr_local_bin = host_abs("usr", "bin"), host_abs("usr", "local", "bin")
         monkeypatch.setenv("PATH", os.pathsep.join([
@@ -326,9 +325,9 @@ class TestSanitizedPath:
         assert tc._is_project_local("/usr/lib/build-helpers") is False
 
     def test_matches_either_separator_on_any_host(self):
-        # Regression: splitting on `os.sep` alone made this silently stop matching
-        # POSIX-shaped paths on Windows — a security filter that quietly returns
-        # False while its own tests still pass on the authoring host.
+        # A filter that splits on `os.sep` alone stops matching POSIX-shaped
+        # paths on Windows: a security filter that quietly returns False while
+        # its tests still pass on the authoring host.
         assert tc._is_project_local(r"C:\Users\u\proj\.venv\Scripts") is True
         assert tc._is_project_local(r"C:\proj\node_modules\.bin") is True
         assert tc._is_project_local("/home/u/proj/.venv/bin") is True
@@ -1189,9 +1188,14 @@ class TestRunProbe:
         # test_sandbox_gradle_daemon.py::test_sets_the_flag_when_gradle_opts_is_absent.
         # `KIROCREW_SANDBOX_TOOL` is the tool-tree marker the chokepoint stamps on every
         # tree it spawns, for the runtime reconciler to read back.
+        # `_KIROCREW_USERNS_FAILURE` is the Linux launcher's permanent userns verdict,
+        # written only when this process recorded one (a sandboxed host, or one whose
+        # kernel refuses unshare). `_set_inherited_userns_failure` overwrites or drops
+        # any parent value, so it never carries an inherited one.
         sandbox_injected = {"KIROCREW_HOST_PID", "KIROCREW_SANDBOX_ACTIVE",
                             "KIROCREW_SANDBOX_LEVEL", "KIROCREW_SANDBOX_TOOL",
-                            "KIROCREW_SPAWNED", "GIT_SSH_COMMAND", "GRADLE_OPTS"}
+                            "KIROCREW_SPAWNED", "GIT_SSH_COMMAND", "GRADLE_OPTS",
+                            "_KIROCREW_USERNS_FAILURE"}
         shell_added = {"PWD", "SHLVL", "_"}
         # macOS injects __CF_USER_TEXT_ENCODING into every spawned process
         # unconditionally (CoreFoundation per-user encoding preference). This is

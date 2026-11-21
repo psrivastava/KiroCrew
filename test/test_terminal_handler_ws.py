@@ -26,6 +26,7 @@ from terminal_handler_helpers import (  # noqa: F401 -- the autouse fixture regi
 )
 
 from kiro_crew.dashboard.handlers import terminal
+from kiro_crew.testing.wait import await_until
 
 # ── api_terminal_ws ──
 
@@ -140,7 +141,7 @@ class TestApiTerminalWs:
             mock_sel.return_value.log_api_access = MagicMock()
             resp = await terminal.api_terminal_ws(req)
         assert isinstance(resp, web.Response)
-        assert resp.status == 429
+        assert resp.status == 409
 
     @pytest.mark.asyncio
     async def test_at_the_cap_the_slot_changes_hands_before_any_await(self):
@@ -171,7 +172,7 @@ class TestApiTerminalWs:
             patch.object(
                 terminal, "_get_config", return_value={"enabled": True, "max_sessions": 2}
             ),
-            patch.object(terminal.web, "WebSocketResponse", return_value=ws),
+            patch.object(terminal.ws_heartbeat, "LagTolerantWebSocketResponse", return_value=ws),
             patch.object(terminal, "_end_evicted_shell", side_effect=end_evicted),
         ):
             mock_sel.return_value.log_api_access = MagicMock()
@@ -197,7 +198,9 @@ class TestApiTerminalWs:
             patch.object(
                 terminal, "_get_config", return_value={"enabled": True, "max_sessions": 2}
             ),
-            patch.object(terminal.web, "WebSocketResponse", return_value=AsyncMock()),
+            patch.object(
+                terminal.ws_heartbeat, "LagTolerantWebSocketResponse", return_value=AsyncMock()
+            ),
             patch.object(terminal, "_close_terminal_ws_bounded", AsyncMock()),
             patch.object(terminal, "_run_path_probe", AsyncMock(side_effect=cwd_probe)),
             patch.object(terminal, "_end_evicted_shell", AsyncMock()),
@@ -239,7 +242,7 @@ class TestApiTerminalWs:
             patches[1],
             patches[4],
             patches[5] as end_evicted,
-            patch.object(terminal.web, "WebSocketResponse", return_value=ws),
+            patch.object(terminal.ws_heartbeat, "LagTolerantWebSocketResponse", return_value=ws),
             patch.object(terminal, "_close_terminal_ws_bounded", side_effect=close),
         ):
             await terminal.api_terminal_ws(req)
@@ -278,6 +281,19 @@ class TestApiTerminalWs:
         assert end_evicted.await_args.args[1][:2] == ("old", old)
         assert end_evicted.await_args.args[2] == 2
         assert registry == {"old": fresh, "busy": busy}
+
+    @pytest.mark.asyncio
+    async def test_a_refused_open_ends_the_displaced_shell_once_the_panel_is_off(self):
+        # The panel was switched off while the probe waited, and the switch-off
+        # could not see the shell this open had displaced: it ends, not goes back.
+        old, busy, registry, req, patches = self._at_the_cap(OSError("no such directory"))
+        off = patch.object(terminal, "_read_terminal_config", return_value={"enabled": False})
+        with patches[0], patches[1], patches[2], patches[3], patches[4], off:
+            with patches[5] as end_evicted:
+                await terminal.api_terminal_ws(req)
+        end_evicted.assert_awaited_once()
+        assert end_evicted.await_args.args[1][:2] == ("old", old)
+        assert registry == {"busy": busy}
 
     @pytest.mark.asyncio
     async def test_an_open_that_goes_ahead_ends_the_displaced_shell_before_spawning(self):
@@ -393,7 +409,7 @@ class TestApiTerminalWs:
             return True
 
         with (
-            patch.object(terminal.web, "WebSocketResponse", return_value=ws),
+            patch.object(terminal.ws_heartbeat, "LagTolerantWebSocketResponse", return_value=ws),
             patch.object(terminal, "_replace_terminal_ws", side_effect=exit_wins_then_publish),
             patch.object(terminal, "_close_terminal_ws_bounded", AsyncMock()) as close,
             patch.object(terminal, "_sel") as mock_sel,
@@ -446,7 +462,7 @@ class TestApiTerminalWs:
             patch.object(terminal.fcntl, "ioctl", lambda *a: None),
             patch.object(terminal.asyncio, "create_subprocess_exec", spawn),
             patch.object(terminal, "_get_config", return_value=cfg),
-            patch.object(terminal.web, "WebSocketResponse", return_value=ws),
+            patch.object(terminal.ws_heartbeat, "LagTolerantWebSocketResponse", return_value=ws),
             patch.object(terminal, "_sel") as mock_sel,
         ):
             mock_sel.return_value.log_api_access = MagicMock()
@@ -486,7 +502,7 @@ class TestApiTerminalWs:
             patch.object(terminal, "termios", fake_termios),
             patch.object(terminal.asyncio, "create_subprocess_exec", spawn),
             patch.object(terminal, "_get_config", return_value={"enabled": True}),
-            patch.object(terminal.web, "WebSocketResponse", return_value=ws),
+            patch.object(terminal.ws_heartbeat, "LagTolerantWebSocketResponse", return_value=ws),
             patch.object(terminal, "_sel") as mock_sel,
         ):
             mock_sel.return_value.log_api_access = MagicMock()
@@ -537,7 +553,7 @@ class TestApiTerminalWs:
             patch.object(terminal.fcntl, "ioctl", lambda *a: None),
             patch.object(terminal.asyncio, "create_subprocess_exec", spawn),
             patch.object(terminal, "_get_config", return_value={"enabled": True}),
-            patch.object(terminal.web, "WebSocketResponse", return_value=ws),
+            patch.object(terminal.ws_heartbeat, "LagTolerantWebSocketResponse", return_value=ws),
             patch.object(terminal, "_sel") as mock_sel,
         ):
             mock_sel.return_value.log_api_access = MagicMock()
@@ -577,7 +593,7 @@ class TestApiTerminalWs:
             patch.object(terminal, "spawn_shim_argv", return_value=()),
             patch.object(terminal.asyncio, "create_subprocess_exec", spawn),
             patch.object(terminal, "_get_config", return_value={"enabled": True}),
-            patch.object(terminal.web, "WebSocketResponse", return_value=ws),
+            patch.object(terminal.ws_heartbeat, "LagTolerantWebSocketResponse", return_value=ws),
             patch.object(terminal, "_sel") as mock_sel,
             caplog.at_level(logging.WARNING, logger="kiro_crew.dashboard.handlers.terminal"),
         ):
@@ -618,7 +634,7 @@ class TestApiTerminalWs:
             patch.object(terminal.fcntl, "ioctl", lambda *a: None),
             patch.object(terminal.asyncio, "create_subprocess_exec", spawn),
             patch.object(terminal, "_get_config", return_value={"enabled": True}),
-            patch.object(terminal.web, "WebSocketResponse", return_value=ws),
+            patch.object(terminal.ws_heartbeat, "LagTolerantWebSocketResponse", return_value=ws),
             patch.object(terminal, "_sel") as mock_sel,
         ):
             mock_sel.return_value.log_api_access = MagicMock()
@@ -642,9 +658,75 @@ class TestApiTerminalWs:
         ]
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("shell", ["/bin/bash", "/bin/zsh", "powershell.exe"])
+    async def test_new_session_sends_replayed_before_output(self, monkeypatch, tmp_path, shell):
+        registry = {}
+        req = _make_request(registry=registry, session_id="replayed-open")
+        ws = MagicMock()
+        ws.closed = False
+        ws.prepare = AsyncMock()
+        frames = []
+        output_sent = asyncio.Event()
+
+        async def send_bytes(data):
+            frames.append(data)
+            output_sent.set()
+
+        async def send_str(data):
+            frames.append(json.loads(data))
+
+        async def incoming():
+            await await_until(output_sent, what="the first terminal output")
+            return
+            yield  # pragma: no cover -- async iterator with no input frames
+
+        ws.send_bytes = AsyncMock(side_effect=send_bytes)
+        ws.send_str = AsyncMock(side_effect=send_str)
+        ws.__aiter__.side_effect = incoming
+        proc = _make_session().proc
+        wp = MagicMock()
+        wp.pid = proc.pid
+        wp.read.side_effect = [b"live", b""]
+        fake_os = MagicMock(wraps=os)
+        fake_os.read.side_effect = [b"live", b""]
+        monkeypatch.setattr(terminal, "os", fake_os)
+        monkeypatch.setattr(terminal.platform_compat, "IS_WINDOWS", shell == "powershell.exe")
+        monkeypatch.setattr(terminal.platform_compat, "IS_POSIX", shell != "powershell.exe")
+        monkeypatch.setattr(terminal, "_pty", MagicMock())
+        terminal._pty.openpty.return_value = (101, 102)
+        monkeypatch.setattr(terminal, "fcntl", MagicMock())
+        monkeypatch.setattr(terminal, "termios", MagicMock(TIOCSWINSZ=1))
+        monkeypatch.setattr(terminal, "_close_terminal_fd", AsyncMock())
+        monkeypatch.setattr(terminal, "_handle_pty_reader_end", AsyncMock())
+        monkeypatch.setattr(terminal, "_resolve_cwd", lambda *_args: str(tmp_path))
+        monkeypatch.setattr(
+            terminal, "_resolve_shell_with_fence_shells", lambda _cfg: (shell, None, {})
+        )
+        monkeypatch.setattr(terminal, "_pty_child_env", lambda env: env)
+        monkeypatch.setattr(terminal, "_get_config", lambda _req: {"enabled": True})
+        monkeypatch.setattr(terminal, "_sel", MagicMock())
+        monkeypatch.setattr(terminal.ws_heartbeat, "LagTolerantWebSocketResponse", lambda **kw: ws)
+        monkeypatch.setattr(
+            terminal.asyncio, "create_subprocess_exec", AsyncMock(return_value=proc)
+        )
+        with patch("kiro_crew.conpty.WindowsPty", return_value=wp):
+            try:
+                assert await terminal.api_terminal_ws(req) is ws
+            finally:
+                sess = registry.get("replayed-open")
+                if sess is not None and sess.reader_task is not None:
+                    await await_until(sess.reader_task, what="the terminal reader finishing")
+
+        assert frames.count({"type": "replayed"}) == 1
+        assert frames.index({"type": "replayed"}) < frames.index(b"live")
+        if shell == "/bin/bash":
+            assert frames == [{"type": "replayed"}, b"live"]
+            assert sess.shell_ready is False
+
+    @pytest.mark.asyncio
     async def test_windows_conpty_spawn_failure_sends_error(self, monkeypatch):
-        """On Windows a new WS session spawns a ConPTY shell (kiro_crew.conpty);
-        the old 'not supported on Windows' refusal is gone. If the
+        """On Windows a new WS session spawns a ConPTY shell (kiro_crew.conpty).
+        If the
         spawn fails, the handler pops the placeholder, sends an error frame, and
         closes. WindowsPty is mocked to raise so ``return ws`` is exercised
         without a real pseudo-console (and without needing pywinpty on POSIX CI).
@@ -662,7 +744,7 @@ class TestApiTerminalWs:
             patch.object(terminal.platform_compat, "IS_WINDOWS", True),
             patch("kiro_crew.conpty.WindowsPty", side_effect=RuntimeError("boom")),
             patch.object(terminal, "_get_config", return_value={"enabled": True}),
-            patch.object(terminal.web, "WebSocketResponse", return_value=ws),
+            patch.object(terminal.ws_heartbeat, "LagTolerantWebSocketResponse", return_value=ws),
             patch.object(terminal, "_sel") as mock_sel,
         ):
             mock_sel.return_value.log_api_access = MagicMock()
@@ -693,7 +775,7 @@ class TestApiTerminalWs:
             patch.object(terminal.platform_compat, "IS_WINDOWS", True),
             patch("kiro_crew.conpty.WindowsPty", side_effect=RuntimeError("boom")),
             patch.object(terminal, "_get_config", return_value={"enabled": True}),
-            patch.object(terminal.web, "WebSocketResponse", return_value=ws),
+            patch.object(terminal.ws_heartbeat, "LagTolerantWebSocketResponse", return_value=ws),
             patch.object(terminal, "_sel") as mock_sel,
         ):
             mock_sel.return_value.log_api_access = MagicMock()
@@ -1014,18 +1096,36 @@ class TestEvictionAtTheCap:
 
 
 class TestReapOrphanedTerminals:
+    @staticmethod
+    async def _run_one_sweep(monkeypatch, app) -> None:
+        """Run the reaper until its first real sweep has finished, then cancel it.
+
+        The reaper's sleep interval is zeroed on the module that owns it, so the
+        loop reaches its sweep without waiting a real minute. The test waits on the
+        sweep's own signal, not on a count of loop turns.
+        """
+        monkeypatch.setattr(terminal, "_ORPHAN_SWEEP_INTERVAL_S", 0)
+        real_sweep = terminal._sweep_terminals
+        swept = asyncio.Event()
+
+        async def _sweep_once(app, now) -> None:
+            await real_sweep(app, now)
+            swept.set()
+
+        monkeypatch.setattr(terminal, "_sweep_terminals", _sweep_once)
+        reaper = asyncio.ensure_future(terminal.reap_orphaned_terminals(app))
+        await await_until(swept, what="the reaper finished its first sweep")
+        reaper.cancel()
+        await await_until(reaper, what="the reaper stopped after cancel")
+
     @pytest.mark.asyncio
-    async def test_handles_missing_state(self):
+    async def test_handles_missing_state(self, monkeypatch):
         app = {"state": None}
-        # flake-ok: pre-existing patch of asyncio.sleep that ends the reaper loop with CancelledError on its second tick, moved verbatim; tracked for a de-flake pass
-        with patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError]):
-            await terminal.reap_orphaned_terminals(app)
+        await self._run_one_sweep(monkeypatch, app)
         # Should not raise
 
     @pytest.mark.asyncio
-    async def test_handles_no_terminal_sessions_attr(self):
+    async def test_handles_no_terminal_sessions_attr(self, monkeypatch):
         state = MagicMock(spec=[])  # no attributes
         app = {"state": state}
-        # flake-ok: pre-existing patch of asyncio.sleep that ends the reaper loop with CancelledError on its second tick, moved verbatim; tracked for a de-flake pass
-        with patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError]):
-            await terminal.reap_orphaned_terminals(app)
+        await self._run_one_sweep(monkeypatch, app)

@@ -11,11 +11,10 @@ import pytest
 
 from kiro_crew.slack import events as events_mod
 from kiro_crew.slack.events import _publish_home_tab
+from kiro_crew.testing.synthetic_credentials import github_classic
 from kiro_crew.testing.wait import finished
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -76,9 +75,7 @@ def _make_orch(
     return orch
 
 
-# ---------------------------------------------------------------------------
 # Tests
-# ---------------------------------------------------------------------------
 
 
 class TestPublishHomeTabHappyPath:
@@ -391,9 +388,7 @@ class TestPublishHomeTabVectorStore:
         assert "always do X" in text
 
 
-# ---------------------------------------------------------------------------
 # Sessions section
-# ---------------------------------------------------------------------------
 
 
 def _write_session_jsonl(path, *, title="", agent="", messages=None):
@@ -424,9 +419,7 @@ class TestPublishHomeTabSessions:
         within a ``with patch(...)`` block.
         """
         monkeypatch.setattr("kiro_crew.slack.events.is_owner", lambda _: True)
-        monkeypatch.setattr(
-            "kiro_crew.slack.events.is_allowed_user", lambda _: True
-        )
+        monkeypatch.setattr("kiro_crew.slack.events.is_allowed_user", lambda _: True)
 
     @pytest.mark.asyncio
     @patch("kiro_crew.slack.events.is_yolo_mode", return_value=False)
@@ -555,9 +548,7 @@ class TestPublishHomeTabSessions:
         new_callable=AsyncMock,
         return_value="*SSO:* ✅",
     )
-    async def test_uses_section_blocks_not_task_card(
-        self, _mw, _fmt, _yolo, tmp_path, monkeypatch
-    ):
+    async def test_uses_section_blocks_not_task_card(self, _mw, _fmt, _yolo, tmp_path, monkeypatch):
         """Slack ``views.publish`` rejects ``task_card`` blocks with
         ``unsupported type: task_card``. The Home Tab MUST render sessions
         as plain ``section`` blocks. Regression test for the rendering
@@ -621,16 +612,11 @@ class TestPublishHomeTabSessions:
         new_callable=AsyncMock,
         return_value="*SSO:* ✅",
     )
-    async def test_collector_failure_emits_error_sel_audit(
-        self, _mw, _fmt, _yolo, monkeypatch
-    ):
+    async def test_collector_failure_emits_error_sel_audit(self, _mw, _fmt, _yolo, monkeypatch):
         """SEL audit records the data-access attempt on the Home Tab path.
 
-        SEL audit must record the data-access attempt even when the collector
-        raises, so a failure mode can't silently bypass the audit trail. The
-        success-path audit fires INSIDE the try block AFTER the collector,
-        so an exception skips it — the except branch is the only place the
-        audit fires in that case.
+        The success audit fires after the collector inside the try, so when it raises
+        the except branch is the only place the audit fires.
         """
         orch = _make_orch()
         with (
@@ -677,7 +663,7 @@ class TestPublishHomeTabSessions:
         ordering across all three surfaces.
         """
         orch = _make_orch()
-        leaked_key = "AKIAIOSFODNN7EXAMPLE"
+        leaked_key = github_classic(seed=93)
         with (
             patch(
                 "kiro_crew.slack.sessions_view._collect_recent_sessions",
@@ -711,11 +697,8 @@ class TestPublishHomeTabSessions:
     ):
         """Defense-in-depth authorization gate on the Home Tab path.
 
-        Defense-in-depth: even though the dispatcher already gates app_home_opened
-        events via is_allowed_user, the Sessions section must also enforce
-        deny-by-default. An unauthorized user_id (e.g. via a future refactor that
-        bypasses the dispatcher gate) must NOT see session contents and MUST emit
-        a denied SEL audit. Mirrors the slash command's defense-in-depth gate.
+        The dispatcher already gates app_home_opened, but the Sessions section also
+        denies by default: no session contents and a denied SEL audit.
         """
         sess_dir = tmp_path / "sessions"
         sess_dir.mkdir()
@@ -803,9 +786,7 @@ class TestHomeTabCollectorConcurrency:
             self._tracking_collector(observed),
         )
 
-        await asyncio.gather(*(
-            _publish_home_tab(_make_orch(), f"U{i}") for i in range(6)
-        ))
+        await asyncio.gather(*(_publish_home_tab(_make_orch(), f"U{i}") for i in range(6)))
 
         assert observed, "the collector never ran"
         assert max(observed) == 1, f"collectors overlapped: {observed}"
@@ -831,9 +812,7 @@ class TestHomeTabCollectorConcurrency:
         )
         orchs = [_make_orch() for _ in range(4)]
 
-        await asyncio.gather(*(
-            _publish_home_tab(o, f"U{i}") for i, o in enumerate(orchs)
-        ))
+        await asyncio.gather(*(_publish_home_tab(o, f"U{i}") for i, o in enumerate(orchs)))
 
         assert len(observed) == 4
         for o in orchs:
@@ -869,7 +848,9 @@ class TestHomeTabCollectorConcurrency:
             "_collect_recent_sessions_off_loop",
             self._tracking_collector(observed),
         )
-        await finished(_publish_home_tab(_make_orch(), "U2"), "the second home-tab publish", timeout=5)
+        await finished(
+            _publish_home_tab(_make_orch(), "U2"), "the second home-tab publish", timeout=5
+        )
 
         assert observed == [1]
 
@@ -982,11 +963,7 @@ class TestPublishHomeTabCronTimezone:
             captured["tz_name"] = tz_name
             return "0 9 * * *"
 
-        cfg = SimpleNamespace(timezone="America/New_York")
-        with (
-            patch("kiro_crew.slack.events.format_schedule", side_effect=_capture),
-            patch("kiro_crew.slack.events.KiroCrewConfig.load", return_value=cfg),
-        ):
+        with patch("kiro_crew.slack.events.format_schedule", side_effect=_capture):
             await _publish_home_tab(orch, "U123")
 
         assert captured.get("tz_name") == "Asia/Seoul"
@@ -998,22 +975,38 @@ class TestPublishHomeTabCronTimezone:
         new_callable=AsyncMock,
         return_value="*SSO:* ✅",
     )
-    async def test_falls_back_to_configured_zone_when_job_has_none(self, _mw, _yolo):
-        """A job with no timezone falls back to the existing App Home zone."""
+    async def test_a_job_with_no_zone_renders_in_the_zone_the_scheduler_fires_it_in(
+        self, _mw, _yolo
+    ):
+        """A job with no timezone reaches format_schedule with no zone, so it is
+        resolved the scheduler's way (configured zone, else the host's), never as
+        the viewer's Slack zone, which would show a different instant."""
         orch = _make_orch(
             cron_svc=FakeCronService([FakeCronJobTZ(timezone="")]),
         )
+        orch.slack.get_user_profile = AsyncMock(return_value={"timezone": "Asia/Seoul"})
         captured: dict = {}
 
         def _capture(_schedule, tz_name=""):
             captured["tz_name"] = tz_name
             return "0 9 * * *"
 
-        cfg = SimpleNamespace(timezone="America/New_York")
-        with (
-            patch("kiro_crew.slack.events.format_schedule", side_effect=_capture),
-            patch("kiro_crew.slack.events.KiroCrewConfig.load", return_value=cfg),
-        ):
+        with patch("kiro_crew.slack.events.format_schedule", side_effect=_capture):
             await _publish_home_tab(orch, "U123")
 
-        assert captured.get("tz_name") == "America/New_York"
+        assert captured.get("tz_name") == ""
+        orch.slack.get_user_profile.assert_not_called()
+
+
+class TestHomeTabCommandName:
+    @pytest.mark.asyncio
+    @patch("kiro_crew.slack.events.is_yolo_mode", return_value=False)
+    async def test_commands_name_the_live_slack_command(self, _yolo):
+        """The Home tab has no payload to read a typed name from, so it names
+        ``orch.slack_command``: the live ``slack.command`` the applier refreshes."""
+        orch = _make_orch()
+        orch.slack_command = "kirocrew-alice"
+        await _publish_home_tab(orch, "U123")
+        text = str(orch.slack.views_publish.call_args[1]["view"]["blocks"])
+        assert "/kirocrew-alice " in text
+        assert "/kirocrew " not in text

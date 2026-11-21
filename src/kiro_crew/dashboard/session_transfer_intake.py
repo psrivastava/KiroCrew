@@ -162,6 +162,10 @@ _memory_reserved = 0
 #: all three working without asking any caller to relabel what it already sends.
 _GZIP_MAGIC = b"\x1f\x8b"
 
+#: A zip's local file header signature (PKWARE APPNOTE 4.3.7). Kiro IDE exports
+#: a session as a zip; it is refused by name, not as bad JSON.
+_ZIP_MAGIC = b"PK\x03\x04"
+
 
 def _reject(reason: str, code: str) -> web.Response:
     """Return a 400 validation failure carrying a machine-readable ``code``.
@@ -263,35 +267,29 @@ class _MemoryWaitTimedOut(Exception):
     """The host did not free enough memory within the wait budget."""
 
 
-def _cgroup_memory_bounds() -> tuple[int | None, int | None]:
+def _cgroup_memory_bounds(*, measured_only: bool = False) -> tuple[int | None, int | None]:
     """The tightest memory limit on this process's own cgroup ancestry and the
-    headroom left under it, in bytes; ``None`` for either when no limit applies
-    or it cannot be read. **Blocking IO (small /proc and /sys reads).**
+    headroom left under it, in bytes; ``(None, None)`` off Linux or with no finite
+    limit. **Blocking IO (small /proc and /sys reads).**
 
     A gateway in a memory-limited unit or container (the dev-fleet pod unit sets
     ``MemoryMax``) is killed at that limit however much the host has free, so
-    the host-wide readings alone would admit what the gateway cannot hold. The
-    walk and the headroom reading are the ones subagent sizing uses, so both
-    budgets see the same ceiling.
+    the host-wide readings alone would admit what the gateway cannot hold. Both
+    figures come from the one walk subagent sizing uses
+    (``subagent._container_cgroup_reading``), so import admission, spawn admission
+    and the dashboard's ``/api/system`` see the same ceiling.
+
+    The callers differ only when a limit is found but no level's usage can be
+    read: import admission (the default) takes the headroom as ``0`` and waits;
+    the dashboard passes ``measured_only=True`` and gets ``None``, so its free
+    figure is bounded by the limit alone, as the resource posture reads it.
     """
     if not platform_compat.IS_LINUX:
         return None, None
     from kiro_crew import subagent
 
-    limit: int | None = None
-    for leaf, mount, v2 in subagent._cgroup_memory_roots():
-        name = "memory.max" if v2 else "memory.limit_in_bytes"
-        directory = leaf
-        while True:
-            value = subagent._read_int_file(str(directory / name))
-            if value is not None and 0 <= value < subagent._CGROUP_UNLIMITED:
-                limit = value if limit is None else min(limit, value)
-            if directory == mount:
-                break
-            directory = directory.parent
-    headroom_gb = subagent._container_cgroup_available_gb()
-    headroom = int(headroom_gb * 1024**3) if headroom_gb >= 0 else None
-    return limit, headroom
+    limit, headroom_gb = subagent._container_cgroup_reading(measured_only=measured_only)
+    return limit, int(headroom_gb * 1024**3) if headroom_gb >= 0 else None
 
 
 def _gateway_memory() -> tuple[int | None, int | None]:
@@ -512,6 +510,12 @@ def _load_json_file(path: Path) -> Any:
     """
     with open(path, encoding="utf-8", errors="surrogatepass") as f:
         return json.loads(f.read())
+
+
+def _is_zip_file(path: Path) -> bool:
+    """Whether the file at *path* starts with :data:`_ZIP_MAGIC`. **Blocking IO.**"""
+    with open(path, "rb") as f:
+        return f.read(len(_ZIP_MAGIC)) == _ZIP_MAGIC
 
 
 def _new_import_temp(suffix: str) -> Path:
@@ -752,6 +756,15 @@ async def _read_bundle_body(
             # Nothing durable was created beyond the temp cleaned up below.
             return None, _reject("could not read the request body", "transfer_body_unreadable")
 
+        # Before the expansion permit and the memory reservation: no parse of
+        # a zip can succeed.
+        if not is_gzip and await asyncio.to_thread(_is_zip_file, raw_path):
+            return None, _reject(
+                "this file is a zip archive, such as a Kiro IDE export, not a session "
+                "exported from Kiro Crew",
+                "transfer_unsupported_format",
+            )
+
         # Taken only once the body is on disk: an upload holds one chunk of
         # memory however long it takes, so a slow sender must not hold a permit
         # that every other import is waiting on.
@@ -759,8 +772,8 @@ async def _read_bundle_body(
             await keep.enter_async_context(_expansion_admission())
         except _ExpansionBusy:
             # Retryable and the sender is at no fault, so it gets a status that
-            # says so. 429 rather than 400 for the same reason the slot cap does:
-            # the body was fine, the host is busy.
+            # says so. 429 rather than 400: the body was fine and the host is
+            # busy, so a retry can win.
             return None, web.json_response(
                 {
                     "error": "too many imports are arriving; please retry",

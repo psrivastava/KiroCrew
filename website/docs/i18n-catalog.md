@@ -20,6 +20,37 @@ legally do) is in [`docs/ci/i18n-gates.md`](../../docs/ci/i18n-gates.md).
   here (`.map(t => …)` over tabs, turns, tasks, themes), so a bare `t` gets
   shadowed and the call lands on a domain object instead.
 
+### Stored text is a value, never a key
+
+Text the dashboard did not write (a tool-step title built from the agent's
+command, a question-card option, a reminder, a command-bar query, a name) goes
+into a `{{placeholder}}` as an `i18nT()` or `useTranslation()` value, or
+renders on its own with no translator call at all. It is never the key: i18next
+would look it up, fill its `{{...}}` placeholders and resolve its `$t(...)`
+references.
+
+`i18nT()` and the `t` from `useTranslation()` keep text values away from
+i18next: `initI18n()` wraps `i18next.t`, which both end in. It translates the
+catalog string around an opaque placeholder and puts the value back afterwards,
+so the value shows exactly as stored and i18next never parses it. Numbers,
+booleans and i18next's own options (`count`, `lng`, `context`, ...) pass through
+unchanged. Because options pass through, `defaultValue` is still parsed by
+i18next: never put stored text in it. `i18n/literalValues.test.ts` pins the
+behaviour.
+
+`<Trans>` gives no such guarantee for `values`: it parses its translated string
+as markup and fills `{{...}}` in every text node again, so a stored value can
+become an element or have its placeholders filled. Stored text in a `<Trans>`
+is a component's own child, never a value:
+`components={{ mono: <code>{command}</code> }}` with `<mono/>` in the catalog
+string.
+
+One sentence family takes a value without a placeholder: the sign-in sentences
+name `api.client.reauth_command` verbatim, and on a container gateway
+`api/signInCommand.ts` replaces that command, as a whole, with the one the
+gateway sends. A translation keeps its own `reauth_command` inside each of those
+sentences; `ApiClient.coverage.test.tsx` pins it in every catalog.
+
 `LanguageProvider` forces a re-RENDER of the tree on a language change, using
 `cloneElement` (which defeats React's referential-equality bailout) rather than a
 changing `key`. It deliberately does **not** remount, because a remount discards
@@ -216,7 +247,7 @@ other languages keep, so a shared key forces a translator to guess:
 - `schedulePage.type` was both a table column header (the noun "Type") and the
   imperative verb in "Type `delete` to confirm". es/pt/ru picked the noun and
   broke the instruction; zh-CN/hi/bn picked the verb, so the column header read
-  "please enter". It is two keys now, the verb one named `type_verb_to_confirm`.
+  "please enter". It is two keys now, the verb one named `type_token_to_confirm`.
 
 If a value's part of speech is not obvious from the key, **put it in the key**.
 
@@ -236,7 +267,8 @@ ASCII `"{{name}}"` is not enough.
 allowlist you can forget to extend:
 
 - every key whose **name** matches `/confirm/i` and whose English value
-  interpolates a placeholder must be on `QUOTED_OPERAND_CONFIRM_KEYS`, **or**
+  interpolates a placeholder is swept in automatically and must quote its
+  operand in every catalog, **or**
 - listed in `CONFIRM_OPERAND_KEY_EXEMPTIONS` with a reason (today: the #4657
   kind-word forms, where "template" / "crew" already sit next to the name), **or**
 - interpolate **only** placeholder names in `EXEMPT_CONFIRM_PLACEHOLDER_NAMES`
@@ -245,8 +277,12 @@ allowlist you can forget to extend:
   restate it here.
 
 A new confirm key with `{{name}}` and no kind word fails CI until it is quoted
-in all 12 catalogs and added to the pin. The glyph pin then requires **every**
-non-exempt placeholder in a pinned key to be wrapped, not merely one of them.
+in every catalog; it needs no edit to the test. `QUOTED_OPERAND_CONFIRM_KEYS`
+holds only the confirm prompts the sweep cannot see because their names do not
+match `/confirm/i` (`…_title`, `delete_x`, `make_x_live`), and a key the sweep
+already reads fails if it is also listed there. The glyph check requires
+**every** non-exempt placeholder in a checked key to be wrapped, not merely one
+of them.
 After changing English, regenerate `en-XA.json` with `npm run i18n:pseudo`.
 
 **A literal token the user must type must never be a catalog value.** Keep it a
@@ -323,6 +359,14 @@ id, even when install-state enrichment lends it `origin: builtin`; `origin` bloc
 installed third-party record, whose detail payload carries no `_registry`. Both are
 required. Same ordering as `sourceLabel()` and `isVerified()` in
 `src/components/appstore/types.ts`.
+
+A bell note the gateway writes follows the same additive rule: the note keeps its
+English, and names its copy with `NotificationPayload.i18n`, which `noteText`
+(`components/notifications/notifMeta.tsx`) resolves through two `as const` maps to
+keys under `components.notifications.systemNote`. Give a new producer an entry in
+both maps, keys in `en.manual.json` whose English matches the note's, and the eleven
+translations. The spec is `docs/system-specs/modules/app-notifications.md`
+§ Localized copy.
 
 ## Formatting follows the app language, not the browser
 
@@ -470,6 +514,16 @@ Latin family in front silently returns zh-CN, ja, ko, hi and bn to whatever the
 platform picks for a missing glyph. A test pins the `:root` tokens, every
 declaration site (including the theme blocks, which redeclare both), the
 `html:lang(zh-CN/ja/ko)` overrides, and the ordering.
+
+**No letter-spacing under a Hindi or Bengali UI.** Devanagari and Bengali hang
+each word from one headline stroke and join letters into conjuncts, so
+letter-spacing pulls a word apart (or crowds it, when negative). One rule in `src/styles/content-fit.css`
+puts letter-spacing back to `normal` under `html:lang(hi)` and `html:lang(bn)`, on
+every `tracking-*` utility and on each class that sets letter-spacing in a
+stylesheet. A new stylesheet class that tracks text joins that rule's list;
+`src/i18n/scriptLetterSpacing.test.ts` fails until it does. The rule matches by
+class, not `*`, because xterm's DOM renderer aligns its cell grid through
+inherited letter-spacing.
 
 ## Translating the corpus
 

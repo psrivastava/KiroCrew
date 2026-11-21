@@ -73,13 +73,29 @@ class TestLogDirResolution:
         # Compared with as_posix so the assertion does not depend on the host
         # separator: str() of a path is backslash-separated on Windows.
         dirs = [d.as_posix() for d in cli_desktop.desktop_log_dirs({"APPDATA": "/roam"})]
-        assert "/roam/KiroCrew/logs" in dirs
+        assert "/roam/kirocrew-desktop/logs" in dirs
 
     def test_linux_honours_xdg_config_home(self, monkeypatch):
         monkeypatch.setattr(platform_compat, "IS_MACOS", False)
         monkeypatch.setattr(platform_compat, "IS_WINDOWS", False)
         dirs = [d.as_posix() for d in cli_desktop.desktop_log_dirs({"XDG_CONFIG_HOME": "/cfg"})]
-        assert "/cfg/KiroCrew/logs" in dirs
+        assert "/cfg/kirocrew-desktop/logs" in dirs
+
+    @pytest.mark.parametrize(
+        ("is_windows", "env_var"), [(True, "APPDATA"), (False, "XDG_CONFIG_HOME")]
+    )
+    def test_an_artifact_the_app_wrote_is_found(
+        self, monkeypatch, tmp_path, is_windows, env_var
+    ):
+        """On Windows and Linux the app writes under <userData>/logs, and Electron
+        names userData after the npm package, so a product-name probe never finds it."""
+        monkeypatch.setattr(platform_compat, "IS_MACOS", False)
+        monkeypatch.setattr(platform_compat, "IS_WINDOWS", is_windows)
+        logs = tmp_path / "kirocrew-desktop" / "logs"
+        logs.mkdir(parents=True)
+        art = logs / cli_desktop.ARTIFACT_NAME
+        art.write_text("{}", encoding="utf-8")
+        assert cli_desktop.find_metrics_artifact(env={env_var: str(tmp_path)}) == art
 
     def test_unresolvable_home_degrades_instead_of_raising(self, monkeypatch):
         """No HOME and no passwd entry must not raise out of a helper.
@@ -296,13 +312,60 @@ class TestNonNumericValues:
         assert cli_desktop._num(float("nan")) == 0.0
         assert cli_desktop._fmt_pct(float("nan")) == "-"
 
+    def test_an_integer_past_float_range_is_junk_not_a_crash(self, monkeypatch, capsys, tmp_path):
+        """JSON integers are unbounded; one float cannot hold reads as junk, like a string."""
+        monkeypatch.setenv(perf_sampler.DEBUG_ENV_VAR, "1")
+        huge = 10**400
+        doc = _doc(intervalMs=huge)
+        doc["samples"][0]["totalCpuPercent"] = huge
+        doc["samples"][1]["totalWorkingSetKb"] = huge
+        art = tmp_path / "desktop-metrics.json"
+        art.write_text(json.dumps(doc), encoding="utf-8")
+        try:
+            outcome: object = cli_desktop.desktop_cmd(_args(art))
+        except OverflowError:
+            outcome = "escaped as OverflowError"
+        assert outcome == 0
+        out = capsys.readouterr().out
+        assert "latest total: cpu=1.0% rss=-" in out
+        assert " at " not in out.splitlines()[1]
+
+    def test_json_nested_past_the_parser_limit_is_reported_not_raised(
+        self, monkeypatch, capsys, tmp_path
+    ):
+        monkeypatch.setenv(perf_sampler.DEBUG_ENV_VAR, "1")
+        art = tmp_path / "desktop-metrics.json"
+        art.write_text("[" * 100_000 + "]" * 100_000, encoding="utf-8")
+        try:
+            outcome: object = cli_desktop.desktop_cmd(_args(art))
+        except RecursionError:
+            outcome = "escaped as RecursionError"
+        assert outcome == 5
+        assert "not valid JSON" in capsys.readouterr().err
+
+    def test_json_mode_nested_past_the_encoder_limit_is_reported_not_raised(
+        self, monkeypatch, capsys, tmp_path
+    ):
+        """The parser takes deeper nesting than ``--json`` can print back."""
+        monkeypatch.setenv(perf_sampler.DEBUG_ENV_VAR, "1")
+        art = tmp_path / "desktop-metrics.json"
+        art.write_text('{"version": 1, "x": ' + "[" * 3000 + "]" * 3000 + "}", encoding="utf-8")
+        try:
+            outcome: object = cli_desktop.desktop_cmd(_args(art, json=True))
+        except RecursionError:
+            outcome = "escaped as RecursionError"
+        assert outcome == 5
+        assert "not valid JSON" in capsys.readouterr().err
+
 
 class TestNightlyProductDirectory:
-    """Nightly installs under its own productName and so its own log directory.
+    """Nightly installs under its own names and so its own log directory.
 
-    packaging/build-desktop.sh passes `-c.productName=KiroCrew Nightly` for nightly
-    stamps, so probing only "KiroCrew" reported "not found" against a nightly app
-    that was recording correctly -- and nightly users are the likeliest profilers.
+    packaging/build-desktop.sh passes `-c.productName=KiroCrew Nightly` (the macOS
+    log directory) and `-c.extraMetadata.name=kirocrew-desktop-nightly` (the
+    Windows and Linux one) for nightly stamps, so probing only the release name
+    reported "not found" against a nightly app that was recording correctly -- and
+    nightly users are the likeliest profilers.
     """
 
     def test_both_product_directories_are_probed_on_macos(self, monkeypatch):
@@ -311,20 +374,23 @@ class TestNightlyProductDirectory:
         dirs = [d.as_posix() for d in cli_desktop.desktop_log_dirs({})]
         assert any(d.endswith("Library/Logs/KiroCrew") for d in dirs)
         assert any(d.endswith("Library/Logs/KiroCrew Nightly") for d in dirs)
+        assert any(d.endswith("Library/Logs/KiroCrew LTS") for d in dirs)  # brand-ok
 
-    def test_both_product_directories_are_probed_on_linux(self, monkeypatch):
+    def test_both_package_directories_are_probed_on_linux(self, monkeypatch):
         monkeypatch.setattr(platform_compat, "IS_MACOS", False)
         monkeypatch.setattr(platform_compat, "IS_WINDOWS", False)
         dirs = [d.as_posix() for d in cli_desktop.desktop_log_dirs({"XDG_CONFIG_HOME": "/cfg"})]
-        assert "/cfg/KiroCrew/logs" in dirs
-        assert "/cfg/KiroCrew Nightly/logs" in dirs
+        assert "/cfg/kirocrew-desktop/logs" in dirs
+        assert "/cfg/kirocrew-desktop-nightly/logs" in dirs
+        assert "/cfg/kirocrew-desktop-lts/logs" in dirs
 
-    def test_both_product_directories_are_probed_on_windows(self, monkeypatch):
+    def test_both_package_directories_are_probed_on_windows(self, monkeypatch):
         monkeypatch.setattr(platform_compat, "IS_MACOS", False)
         monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
         dirs = [d.as_posix() for d in cli_desktop.desktop_log_dirs({"APPDATA": "/roam"})]
-        assert "/roam/KiroCrew/logs" in dirs
-        assert "/roam/KiroCrew Nightly/logs" in dirs
+        assert "/roam/kirocrew-desktop/logs" in dirs
+        assert "/roam/kirocrew-desktop-nightly/logs" in dirs
+        assert "/roam/kirocrew-desktop-lts/logs" in dirs
 
     def test_the_newest_artifact_wins_when_both_exist(self, monkeypatch, tmp_path):
         """With both installed, the run just reproduced is the one written last."""
@@ -362,6 +428,18 @@ class TestNightlyProductDirectory:
         text = sh.read_text(encoding="utf-8")
         for name in cli_desktop.PRODUCT_NAMES:
             assert name in text, f"{name} not found in build-desktop.sh"
+
+    def test_package_names_stay_in_sync_with_the_electron_package(self):
+        """The Windows and Linux log directory follows the npm package name."""
+        root = Path(__file__).resolve().parents[1]
+        package_json = root / "website" / "electron" / "package.json"
+        release, *overrides = cli_desktop.PACKAGE_NAMES
+        assert json.loads(package_json.read_text(encoding="utf-8"))["name"] == release
+        sh = (root / "packaging" / "build-desktop.sh").read_text(encoding="utf-8")
+        for name in overrides:  # nightly, then LTS
+            assert f"-c.extraMetadata.name={name}" in sh
+        for product in cli_desktop.PRODUCT_NAMES[1:]:
+            assert f"-c.productName={product}" in sh
 
 
 class TestSensitivePathGate:
@@ -442,6 +520,23 @@ class TestParserWiring:
         cli_desktop.register_desktop_parser(sub)
         args = parser.parse_args(["desktop", "metrics", "--json", "--top", "3"])
         assert args.json is True and args.top == 3
+
+    @pytest.mark.parametrize("raw", ["0", "-1"])
+    def test_top_below_one_is_refused(self, raw, capsys):
+        """``--top -1`` would slice off the last process and print "top -1"."""
+        parser = argparse.ArgumentParser()
+        sub = parser.add_subparsers(dest="command")
+        cli_desktop.register_desktop_parser(sub)
+        with pytest.raises(SystemExit) as exc:
+            parser.parse_args(["desktop", "metrics", "--top", raw])
+        assert exc.value.code == 2
+        assert "must be 1 or more" in capsys.readouterr().err
+
+    def test_top_of_one_is_kept(self):
+        parser = argparse.ArgumentParser()
+        sub = parser.add_subparsers(dest="command")
+        cli_desktop.register_desktop_parser(sub)
+        assert parser.parse_args(["desktop", "metrics", "--top", "1"]).top == 1
 
     def test_metrics_subcommand_is_required(self):
         parser = argparse.ArgumentParser()

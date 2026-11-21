@@ -23,6 +23,7 @@ from ephemeral_sessions_helpers import (
     _make_app,
     _make_state,
 )
+from redaction_structured_cases import github_classic
 
 from kiro_crew.dashboard.state import _ChatSlot
 from kiro_crew.history import ConversationLog
@@ -103,7 +104,8 @@ class TestSlotCreation:
         assert "dashboard:reuse" in state._restricted_keys
 
         async with TestClient(TestServer(_make_app(state))) as client:
-            resp = await client.delete("/api/chat/slots/reuse")
+            inc = state._slots["reuse"]._dashboard_card_identity
+            resp = await client.delete(f"/api/chat/slots/reuse?incarnation={inc}")
             assert resp.status == 200
 
         assert "dashboard:reuse" not in state._restricted_keys
@@ -354,17 +356,29 @@ class TestResumeFromHistory:
 
 
 class TestConsolidation:
-    def test_consolidation_not_triggered_for_restricted(self, tmp_path):
+    def test_consolidation_not_triggered_for_restricted(self, tmp_path, monkeypatch):
         """maybe_consolidate must not be called for restricted sessions."""
         from kiro_crew.dashboard.chat import _maybe_consolidate
+        from kiro_crew.sel import SecurityEventLog
 
         state = _make_state(tmp_path)
         state.consolidator = MagicMock()
         slot = state.get_or_create_slot("e1", memory_mode="incognito")
+        sel_dir = tmp_path / "sel"
+        monkeypatch.setattr(SecurityEventLog, "_instance", None)
+        monkeypatch.setattr(SecurityEventLog, "_initialized", False)
+        real_log = MagicMock(wraps=SecurityEventLog(base_dir=sel_dir, sync=True))
 
-        with patch("kiro_crew.dashboard.chat_utils.sel") as mock_sel:
+        with patch("kiro_crew.dashboard.chat_utils.sel", return_value=real_log) as mock_sel:
             _maybe_consolidate(state, slot)
 
+        rows = [
+            _json.loads(line)
+            for line in (sel_dir / "security_events.jsonl").read_text("utf-8").splitlines()
+        ]
+        assert [(r["operation"], r["outcome"], r["resources"]) for r in rows] == [
+            ("consolidate", "denied", "restricted_session_block")
+        ]
         state.consolidator.maybe_consolidate.assert_not_called()
         mock_sel().log_api_access.assert_called_once_with(
             caller="dashboard:e1",
@@ -697,6 +711,8 @@ class TestMcpCoreSessionKeyPassthrough:
         import io
         import urllib.error
 
+        token = github_classic(seed=161)
+
         with (
             patch("kiro_crew.mcp_core.loopback_urlopen") as mock_urlopen,
             patch("kiro_crew.mcp_core._resolve_session_key", return_value=""),
@@ -706,13 +722,13 @@ class TestMcpCoreSessionKeyPassthrough:
                 code=502,
                 msg="Bad Gateway",
                 hdrs=None,
-                fp=io.BytesIO(b'{"error": "upstream rejected key AKIAIOSFODNN7EXAMPLE"}'),
+                fp=io.BytesIO(f'{{"error": "upstream rejected key {token}"}}'.encode()),
             )
             from kiro_crew.mcp_core import _post
 
             result = _post("/api/lessons", {"rule": "x"})
 
-        assert "AKIAIOSFODNN7EXAMPLE" not in result["error"]
+        assert token not in result["error"]
         assert "REDACTED" in result["error"]
 
     def test_learn_add_tool_maps_unknown_session_to_friendly_message(self):

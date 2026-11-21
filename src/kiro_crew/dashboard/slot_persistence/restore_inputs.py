@@ -3,10 +3,11 @@
 Most of this is disk work or a pure screen that touches no slot state, which is
 what lets the async restore drivers run it on a worker thread: the agent-to-model
 map, the restore config, the open-tab snapshot and its key screen, the committed
-agent choice, the delete-during-read witness, the app-owned channel-row screen and
-the recent-session key map. The MCP-app claim recovery pairs its spool read with
-the in-memory apply that follows a build. The drivers, the prefetch helpers and the
-slot builders stay in ``chat_persistence_parts``.
+agent choice, the delete-during-read witness, the app-owned channel-row screen, the
+crew-log fold a restored ``created_by`` is checked against and the recent-session key
+map. The MCP-app claim recovery pairs its spool read with the in-memory apply that
+follows a build. The drivers, the prefetch helpers and the slot builders stay in
+``chat_persistence_parts``.
 
 New restore-time reads and screens belong here.
 """
@@ -175,6 +176,35 @@ def read_open_slot_keys(config_dir: "Path") -> "tuple[list[object], bool]":
     return previous, current_known
 
 
+def read_open_slot_focus(config_dir: "Path") -> "tuple[str, list[str]]":
+    """The focused key and the visible keys ``open_slots.json`` recorded, or empty.
+
+    Only orders the restore, so any damage (absent file, bad JSON, wrong types, a
+    file written by an older build with neither field) answers empty and the order
+    falls back to transcript recency. Entries are UNVALIDATED -- see
+    :func:`_sanitize_open_slot_key`.
+    """
+    try:
+        data = json.loads((config_dir / OPEN_SLOTS_FILE).read_text(encoding="utf-8"))
+    except Exception:
+        return "", []
+    if not isinstance(data, dict):
+        return "", []
+    focus = data.get("focus")
+    visible = data.get("visible")
+    return (
+        focus if isinstance(focus, str) else "",
+        [k for k in visible if isinstance(k, str)] if isinstance(visible, list) else [],
+    )
+
+
+def _read_open_slot_focus() -> "tuple[str, list[str]]":
+    """:func:`read_open_slot_focus` for the live config directory."""
+    from kiro_crew.dashboard import chat_persistence as cp  # circular import: facade imports owners
+
+    return read_open_slot_focus(cp.config_dir())
+
+
 def _build_kiro_model_map() -> dict[str, str]:
     """Map kiro-agent name/stem -> configured model, for legacy sessions.
 
@@ -302,7 +332,38 @@ def _restored_agent_name(session_key: str, meta: dict) -> str:
     if selected and isinstance(agent, str) and agent and agent != selected:
         if _member_record_runs_another_template(session_key, agent):
             return agent
+        # The record is canonical and the line is editable by the session's own
+        # file tools, so the record still wins; say so instead of choosing silently.
+        logger.warning(
+            "Session %s: saved agent %r disagrees with its recorded selection %r; "
+            "restoring the recorded selection",
+            session_key,
+            agent,
+            selected,
+        )
     return selected or (agent if isinstance(agent, str) else "")
+
+
+def _seed_session_tree(meta: dict) -> None:
+    """Fold the crew log before a restore checks *meta*'s ``created_by``. Blocking.
+
+    The restore reads that claim against the crew log's creation records with no
+    I/O, and a tree not folded yet confirms nothing, so a worker restored at boot
+    would come back with no creator. Idempotent and cheap after the first fold;
+    never raises, so a fold that fails leaves the claim unconfirmed.
+    """
+    if not meta.get("created_by"):
+        return
+    try:
+        from kiro_crew.crew_log import emit as crew_log_emit
+
+        if not crew_log_emit.enabled():
+            return
+        from kiro_crew.crew_log.session_tree_projection import projection
+
+        projection().ensure_seeded()
+    except Exception:
+        logger.debug("session tree could not be folded for a restore", exc_info=True)
 
 
 def _member_record_runs_another_template(session_key: str, agent: str) -> bool:

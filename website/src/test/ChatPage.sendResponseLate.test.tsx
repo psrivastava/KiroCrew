@@ -24,10 +24,11 @@ import { MemoryRouter } from 'react-router-dom'
 import { configureStore } from '@reduxjs/toolkit'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { ThemeProvider } from '../hooks/useTheme'
-import chatReducer, { confirmOptimisticSend, endLocalTurn, selectTurnInterrupted, sseChatMessage, startLocalTurn } from '../store/chatSlice'
+import chatReducer, { confirmOptimisticSend, endLocalTurn, refreshSlot, selectTurnInterrupted, sseChatMessage, startLocalTurn } from '../store/chatSlice'
 import dashboardReducer from '../store/dashboardSlice'
 import notificationsReducer from '../store/notificationsSlice'
 import { i18nT } from '../i18n/t'
+import { addStashEntry, loadPromptStash, makeStashEntry, withPromptStashLock } from '../utils/promptStash'
 
 vi.mock('react-virtuoso', () => ({
   Virtuoso: ({ data, itemContent }: { data?: unknown[]; itemContent: (index: number, item: unknown) => ReactNode }) => (
@@ -83,6 +84,7 @@ Object.defineProperty(window, 'matchMedia', {
 })
 
 import ChatPage from '../pages/ChatPage'
+import { api } from '../api/client'
 
 const SENT_TEXT = 'did this arrive?'
 
@@ -321,5 +323,129 @@ describe('the footer running indicator while the trailing send is unconfirmed', 
     await waitFor(() => expect(thinking()).toBeInTheDocument())
     expect(screen.queryByTestId('send-pending')).toBeNull()
     expect(messages().some(m => m.role === 'notice' || m.role === 'error')).toBe(false)
+  })
+})
+
+/* The composer is empty once the send is under way, so the pending bubble is
+ * the prompt's only on-screen copy. A slot refresh that rebuilds the transcript
+ * from a server that never received the POST drops that bubble; ↑ must still
+ * return the prompt. */
+describe('↑ recall after the unconfirmed bubble leaves the transcript', { timeout: 20_000 }, () => {
+  it('the first ↑ returns the lost prompt, the second the earlier one', async () => {
+    const { store, input, messages, sendId } = await sendPastTheDeadline()
+    expect(store.getState().chat.sendAttempts?.['slot-a']).toEqual([{ text: SENT_TEXT, sendId }])
+    // The real refresh thunk, answered by a server that never got the POST:
+    // an earlier prompt and its reply, no row for this send.
+    vi.mocked(api.chatSlotDetail).mockResolvedValueOnce({
+      messages: [
+        { role: 'user', content: 'earlier prompt', cls: 'msg msg-u', ts: '2026-09-27T00:00:00Z', meta: { mid: 'm-earlier' } },
+        { role: 'assistant', content: 'hi', cls: '' },
+      ],
+      running: false, has_more: false, total: 2,
+    } as unknown as Awaited<ReturnType<typeof api.chatSlotDetail>>)
+    await act(async () => { await store.dispatch(refreshSlot('slot-a')) })
+    expect(messages().map(m => m.content)).toEqual(['earlier prompt', 'hi'])
+    await act(async () => { fireEvent.keyDown(input, { key: 'ArrowUp' }) })
+    expect(input.value).toBe(SENT_TEXT)
+    await act(async () => { fireEvent.keyDown(input, { key: 'ArrowUp' }) })
+    expect(input.value).toBe('earlier prompt')
+  })
+
+  it('offers a prompt once while its bubble is still on screen', async () => {
+    const { input, messages } = await sendPastTheDeadline()
+    expect(messages().filter(m => m.role === 'user' && m.content === SENT_TEXT)).toHaveLength(1)
+    await act(async () => { fireEvent.keyDown(input, { key: 'ArrowUp' }) })
+    expect(input.value).toBe(SENT_TEXT)
+    // Nothing older: ↑ stays on the one entry instead of offering a twin.
+    await act(async () => { fireEvent.keyDown(input, { key: 'ArrowUp' }) })
+    expect(input.value).toBe(SENT_TEXT)
+  })
+
+  it('records nothing for a busy-slot Queue send, which minted no bubble', async () => {
+    const { store } = await sendPastTheDeadline({ busy: true })
+    expect(store.getState().chat.sendAttempts?.['slot-a']).toBeUndefined()
+  })
+})
+
+// The composer must re-render from the draft store itself: nothing else
+// re-renders it after a send since #23423 (dd2799cf6).
+describe('↑ recall right after a send', { timeout: 20_000 }, () => {
+  it('↑ right after a delivered send puts the prompt back in the box', async () => {
+    const { input } = await sendPastTheDeadline({ confirmed: true })
+    expect(input.value).toBe('')
+    await act(async () => { fireEvent.keyDown(input, { key: 'ArrowUp' }) })
+    expect(input.value).toBe(SENT_TEXT)
+  })
+})
+
+/* A draft restored from the prompt stash keeps its stash entry until the
+ * server confirms the send. `send()` counts a `response-late` plain send as
+ * delivered (the bubble stays pending rather than restoring), but that is a
+ * guess, and the stash entry is the draft's only durable copy: if the late
+ * POST never landed, a reload would otherwise lose the prompt. */
+describe('a restored stash draft sent from the main chat', { timeout: 20_000 }, () => {
+  const STASHED = 'restored draft'
+  const flushStash = () => act(async () => { await withPromptStashLock(() => undefined) })
+
+  /** With `running`, the slot is mid-turn and Enter takes the default steer
+   *  path (`busyTurnControls.ts` `steer`), not a plain send. */
+  async function restoreAndSend({ confirmed = false, running = false } = {}) {
+    expect(addStashEntry('slot-a', makeStashEntry(STASHED, []))).toBe(true)
+    fixtureRunning = running
+    const store = makeStore({ running })
+    sendChat.mockImplementation(async () => {
+      if (confirmed) return { ok: true, json: () => Promise.resolve({ ok: true, mid: 'm-ok' }) }
+      throw new DOMException('aborted', 'AbortError')
+    })
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const view = await act(async () => render(
+      <QueryClientProvider client={qc}>
+        <Provider store={store}>
+          <ThemeProvider>
+            <MemoryRouter><ChatPage /></MemoryRouter>
+          </ThemeProvider>
+        </Provider>
+      </QueryClientProvider>,
+    ))
+    const input = await waitFor(() => screen.getByLabelText('Message input') as HTMLTextAreaElement)
+    fireEvent.keyDown(input, { key: 's', ctrlKey: true })
+    await waitFor(() => expect(input.value).toBe(STASHED))
+    await act(async () => {
+      fireEvent.keyDown(input, { key: 'Enter' })
+      await Promise.resolve()
+    })
+    await waitFor(() => expect(sendChat).toHaveBeenCalled())
+    await act(async () => { for (let i = 0; i < 8; i++) await Promise.resolve() })
+    await flushStash()
+    return view
+  }
+
+  it('keeps the entry when the send hits the deadline unconfirmed, across a reload', async () => {
+    const view = await restoreAndSend()
+    view.unmount()
+    await flushStash()
+    expect(loadPromptStash('slot-a').map(e => e.text)).toEqual([STASHED])
+  })
+
+  it('removes the entry once the server confirms the send', async () => {
+    await restoreAndSend({ confirmed: true })
+    await waitFor(() => expect(loadPromptStash('slot-a')).toEqual([]))
+  })
+
+  // Mid-turn, Enter steers. The steer's receipt is the verdict: a confirmed
+  // steer consumes the entry, so it is not restored and sent a second time.
+  it('removes the entry once the server confirms a mid-turn steer', async () => {
+    await restoreAndSend({ confirmed: true, running: true })
+    // The steer flag is the 6th positional argument.
+    expect(sendChat.mock.calls[0][5]).toBeTruthy()
+    await waitFor(() => expect(loadPromptStash('slot-a')).toEqual([]))
+  })
+
+  it('keeps the entry when a mid-turn steer hits the deadline unconfirmed', async () => {
+    const view = await restoreAndSend({ running: true })
+    expect(sendChat.mock.calls[0][5]).toBeTruthy()
+    view.unmount()
+    await flushStash()
+    expect(loadPromptStash('slot-a').map(e => e.text)).toEqual([STASHED])
   })
 })

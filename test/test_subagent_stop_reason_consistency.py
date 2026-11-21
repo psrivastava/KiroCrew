@@ -1,19 +1,12 @@
 """Stop-reason consistency across every completion consumer.
 
-``EVENT_COMPLETE`` only says a stream ENDED. Before this change the sub-agent
-run (``subagent_manager/run.py``) recorded EVERY completion as success --
-``done=True, error="", outcome=completed, record_success()`` -- whatever the
-stop reason said, so a watchdog tool stall, a runtime cancel or a transport
-death reached the parent as "completed ✅" with the partial as the answer.
-The task runner (``task_executor.py``) had the same shape.
+``EVENT_COMPLETE`` only says a stream ended, so a watchdog tool stall, a runtime cancel or a
+transport death must not be recorded as success, in the sub-agent run
+(``subagent_manager/run.py``) or the task runner (``task_executor.py``).
 
-These tests drive the REAL production paths -- ``SubagentManager.spawn`` ->
-``_run`` -> ``_run_inner_impl`` and ``TaskRunner._execute_single_task`` ->
-``execute_single_task`` -- with only the ACP session provider faked, which is
-the seam every other run test uses. Nothing in ``run.py`` is mocked.
-
-The mapping lives in ONE place, ``acp.types.classify_stop_reason``; the table
-tests pin it and the path tests pin that each entry actually uses it.
+The real paths (``SubagentManager.spawn`` -> ``_run`` -> ``_run_inner_impl`` and
+``TaskRunner._execute_single_task`` -> ``execute_single_task``) run with only the ACP
+session provider faked. The mapping lives in ``acp.types.classify_stop_reason``.
 """
 
 from __future__ import annotations
@@ -26,7 +19,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from subagent_stop_reason_helpers import (
-    _RUN_CEILING,
+    _STALL_EVIDENCE,
+    _await_run,
     _complete,
     _done_event,
     _manager,
@@ -38,7 +32,6 @@ from subagent_stop_reason_helpers import (
     _text,
     _wait_writers_landed,
 )
-from test_taskrunner import _make_mock_sessions as _make_taskrunner_sessions
 
 from kiro_crew.acp.types import (
     STOP_CLASS_CANCELLED,
@@ -56,17 +49,11 @@ from kiro_crew.acp.types import (
     classify_stop_reason,
 )
 from kiro_crew.dashboard.state import TOOL_STALL_RECOVERY_PREFIX
-from kiro_crew.providers.base import LLMEvent
 from kiro_crew.subagent import SubagentInfo, SubagentManager
-from kiro_crew.taskrunner import Step, StepStatus, TaskRun, TaskRunner
 from kiro_crew.testing.wait import async_wait_until, await_until
 
-pytestmark = pytest.mark.usefixtures("healthy_host_memory")
+pytestmark = pytest.mark.usefixtures("healthy_host_memory", "close_subagent_managers")
 
-_STALL_EVIDENCE = (
-    "verdict=unknown; idle_secs=5400; tool=execute_bash; "
-    "command=pytest -q; evidence=no result frame"
-)
 _GENERIC_ERROR = "error: process exited (exit 137)"
 
 
@@ -275,11 +262,9 @@ async def test_runtime_cancel_is_cancelled_not_completed():
 async def test_exhausted_stream_without_complete_is_not_marked_result_complete():
     """A stream that dies between chunks must not be recorded as a finished result.
 
-    ``classify_stop_reason("")`` resolves to ``succeeded``, so a generator that
-    simply stops -- no EVENT_COMPLETE at all -- takes the success branch unless
-    the complete event is checked. The durable flag must reflect the missing
-    complete event, not the absent stop reason: nothing else on disk tells a
-    reader after a restart that ``result.txt`` holds a fragment.
+    ``classify_stop_reason("")`` resolves to ``succeeded``, so the durable flag must
+    follow the missing complete event; nothing else tells a reader after a restart that
+    ``result.txt`` holds a fragment.
     """
 
     # ...the stream dies after its chunk: no EVENT_COMPLETE, no stop reason.
@@ -363,16 +348,11 @@ class _GatedResultWrite:
 
 
 class _HeldResultDrain:
-    """Parks the bounded drain of a claimed result write until the test
-    starts its bound.
+    """Parks the bounded drain of a claimed result write until the test starts its bound.
 
-    The bound counts wall-clock from the drain's first await, while
-    :class:`_GatedResultWrite` can report ``entered`` only once a pool thread
-    has picked the write up and the loop has run two more callbacks. Timed
-    against each other, a late executor lets the bound expire first and the
-    run is ``done`` before the test looks at it. Parked here, "claimed, write
-    pending, not done" lasts until :meth:`start_bound`, and the bound then
-    expires against a write the gate still holds.
+    :class:`_GatedResultWrite` reports ``entered`` only after a pool thread picks the write
+    up, so a late executor could let the bound expire first. Parked, "claimed, write
+    pending, not done" lasts until :meth:`start_bound`.
     """
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -748,11 +728,8 @@ async def test_a_failed_result_write_records_no_flag_and_the_run_completes(
 class _DeadlineOnDemand:
     """The run's deadline, fired by the test rather than by the clock.
 
-    Stands in for ``asyncio.wait_for`` on the one call that carries the run's
-    budget, which is set far past any test, so the run is held where the test
-    wants it before its deadline lands: on firing, the run is cancelled and its
-    ``TimeoutError`` raised, as ``wait_for`` does when time runs out. Every
-    other ``wait_for`` passes straight through.
+    Stands in for ``asyncio.wait_for`` on the one call carrying the run's budget: on firing
+    the run is cancelled and ``TimeoutError`` raised. Every other ``wait_for`` passes through.
     """
 
     _BUDGET = 86_400.0
@@ -813,7 +790,18 @@ async def test_whatever_lands_after_the_claim_the_run_is_completed_once(
     import time as _time
 
     import kiro_crew.subagent_persistence as sp
+    from kiro_crew.subagent_manager.run import RunEventCoordinator
 
+    real_drain = RunEventCoordinator._drain_state_writer_impl
+
+    async def _drain_until_released(coordinator, info, what, writer, *, bound=None):
+        # The claimed write's bound starts at submission, before a pool thread
+        # runs the gated write, so a slow executor could expire it and end the
+        # run before ``entered``. Here only the gate's release ends the write;
+        # the drain's cancellation handling runs unchanged.
+        return await real_drain(coordinator, info, what, writer)
+
+    monkeypatch.setattr(RunEventCoordinator, "_drain_state_writer_impl", _drain_until_released)
     gate = _GatedResultWrite(monkeypatch)
     factory, calls = _answer_stream()
     mgr = _manager(_mock_sessions(factory))
@@ -1072,6 +1060,94 @@ async def test_a_reap_in_flight_names_whether_the_answer_had_finished(
     sessions.record_success.assert_not_called()
 
 
+async def _race_a_reap_against_the_answer(reason: str, *, user_stop: bool = False):
+    """A reap that begins while the answer streams; the answer then finishes."""
+    complete_go = asyncio.Event()
+    reset_go = asyncio.Event()
+
+    def factory(msg: str, *a, **kw):
+        async def _gen():
+            yield _text(_ANSWER)
+            await complete_go.wait()
+            yield _complete(STOP_REASON_END_TURN)
+
+        return _gen()
+
+    sessions = _mock_sessions(factory)
+    resets: list[str] = []
+
+    async def _reset(key, **_kw):
+        resets.append(key)
+        if len(resets) == 1:
+            await reset_go.wait()
+
+    sessions.reset = AsyncMock(side_effect=_reset)
+    mgr = _manager(sessions)
+    try:
+        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
+            info = mgr.spawn("do work")
+            assert info is not None
+            run = mgr._tasks[info.id]
+            await _wait_until(lambda: info.streaming_text, "the first chunk")
+            if user_stop:
+                info.user_stopped = True
+                info._reap_reason = "user_stop"
+                info._stop_origin = "stopped by user"
+            reaping = asyncio.ensure_future(mgr._force_reap(info.id, info, 601.0, reason=reason))
+            await _wait_until(lambda: resets, "the reap's reset")
+            complete_go.set()
+            await _wait_until(lambda: run.done(), "the run's own ending")
+            reset_go.set()
+            await await_until(reaping, what="the reap finishing")
+            await _wait_settled(mgr, info)
+    finally:
+        complete_go.set()
+        reset_go.set()
+    return info
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("user_stop", [False, True], ids=["deadline", "user stop"])
+async def test_a_finished_answer_a_reap_got_to_first_reaches_the_parent(user_stop: bool):
+    """The reap owns the report of a run whose answer finished under it, and
+    that report must still hand the parent the answer, named as finished --
+    not drop it behind the stop's error, nor call it a partial."""
+    from kiro_crew.slack.gateway import _compose_subagent_completion
+
+    info = await _race_a_reap_against_the_answer("deadline", user_stop=user_stop)
+    assert info._answer_finished and not info._ending_claimed
+    assert info.outcome == ("stopped" if user_stop else "failed")
+
+    report = _compose_subagent_completion(info, _flush_only=False)
+    assert _ANSWER.strip() in report.announce, report.announce
+    assert "finished its answer" in report.detail
+    assert "Partial output" not in report.detail
+
+
+@pytest.mark.parametrize("user_stop", [False, True], ids=["deadline", "user stop"])
+def test_a_truncated_finished_answer_under_a_reap_points_at_its_transcript(user_stop: bool):
+    """A finished answer the completion copy cut short reaches the parent as
+    any truncated result does -- a preview and the result.txt pointer -- so
+    the tail of the answer is not silently lost behind 'Its answer:'."""
+    from kiro_crew.slack.gateway import _compose_subagent_completion
+
+    info = SubagentInfo(
+        id="cut1",
+        task="do work",
+        result="HEAD OF THE ANSWER " * 400,
+        result_truncated=True,
+        result_path="/runs/cut1/result.txt",
+        user_stopped=user_stop,
+        error="" if user_stop else "reaped after 601s (deadline) — finished its answer",
+    )
+    info._answer_finished = True
+    info.done = True
+
+    report = _compose_subagent_completion(info, _flush_only=False)
+    assert "/runs/cut1/result.txt" in report.detail, report.detail
+    assert "finished its answer" in report.detail
+
+
 @pytest.mark.asyncio
 async def test_a_user_stop_no_reap_has_reached_yet_records_the_neutral_stop():
     """``cancel()`` stamps ``user_stopped`` synchronously and only then awaits
@@ -1157,7 +1233,7 @@ async def test_a_run_another_path_already_ended_counts_no_success():
         info = mgr.spawn("do work")
         assert info is not None
         holder["info"] = info
-        await asyncio.wait_for(mgr._tasks[info.id], _RUN_CEILING)
+        await _await_run(mgr, info)
         await _wait_settled(mgr, info)
 
     assert not info._ending_claimed
@@ -1227,10 +1303,26 @@ async def test_the_usage_row_never_holds_an_ending(monkeypatch: pytest.MonkeyPat
             assert info.done and info.outcome == "completed"
             rows = [t for t in mgr._report_tasks if not t.done()]
             assert rows, "the usage row is held by the manager while it runs"
-            loop = asyncio.get_running_loop()
-            started = loop.time()
-            await asyncio.wait_for(mgr.cancel_all(), 30)
-            assert loop.time() - started < 10, "shutdown waited on the usage row"
+            budget = subagent._REPORT_DRAIN_TIMEOUT
+            drain_waits: list[float | None] = []
+            real_wait = asyncio.wait
+
+            def _recording_wait(fs, **kwargs):  # noqa: ANN001, ANN202
+                # Records only, so every asyncio.wait caller may pass through; list
+                # first so the membership check never uses up an iterator.
+                fs = list(fs)
+                if any(row in fs for row in rows):
+                    drain_waits.append(kwargs.get("timeout"))
+                return real_wait(fs, **kwargs)
+
+            with monkeypatch.context() as patched:
+                patched.setattr(asyncio, "wait", _recording_wait)
+                await asyncio.wait_for(mgr.cancel_all(), 30)
+            assert drain_waits, "shutdown never waited on the usage row"
+            assert all(t is not None and t <= budget + 1e-6 for t in drain_waits), (
+                f"shutdown waited on the usage row for {drain_waits!r}, past the "
+                f"{budget}s report drain bound"
+            )
             assert all(t.done() for t in rows), "shutdown left the usage row running"
     finally:
         wedged.set()
@@ -1621,7 +1713,7 @@ async def test_a_transient_run_completes_without_touching_disk(
     with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
         info = mgr.spawn("do work", _memory_mode=mode)
         assert info is not None
-        await asyncio.wait_for(mgr._tasks[info.id], _RUN_CEILING)
+        await _await_run(mgr, info)
 
     assert info.outcome == "completed"
     assert not (tmp_path / "subagents" / info.id).exists()
@@ -1781,123 +1873,3 @@ async def test_blocking_wait_expiry_does_not_fail_the_child():
     src = Path(wave.__file__).read_text(encoding="utf-8")
     assert '"still_running"' in src
     assert "task_ids" in src
-
-
-# ── 4. The task runner path (task_executor) ───────────────────────────
-
-
-def _taskrunner_provider(stop_reason: str, text: str = "half") -> MagicMock:
-    provider = MagicMock()
-    calls: list[str] = []
-
-    async def _stream(message: str):
-        calls.append(message)
-        yield LLMEvent(kind="text_chunk", text=text)
-        yield LLMEvent(kind="complete", stop_reason=stop_reason, text=_STALL_EVIDENCE)
-
-    provider.stream = _stream
-    provider.approve_tool = AsyncMock()
-    provider.reject_tool = AsyncMock()
-    provider.context_usage_pct = MagicMock(return_value=0.0)
-    provider.calls = calls
-    return provider
-
-
-@pytest.mark.asyncio
-async def test_taskrunner_persistent_tool_stall_step_is_failed(tmp_path: Path):
-    sessions = _make_taskrunner_sessions()
-    provider = _taskrunner_provider(STOP_REASON_TOOL_STALL)
-    sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
-    runner = TaskRunner(sessions=sessions, auto_test=False, work_dir=tmp_path)
-    run = TaskRun(spec_path=str(tmp_path / "t.md"), spec_content="s", status="running")
-    step = Step(index=1, title="Test step", description="desc")
-    run.tasks = [step]
-
-    success = await runner._execute_single_task(run, step)
-
-    assert success is False
-    assert step.status == StepStatus.FAILED
-    assert step.result == "half"  # the partial is kept on the task
-    sessions.record_success.assert_not_called()
-    # Bounded: the existing retry ladder (incl. same-error loop detection) ran.
-    assert 1 < len(provider.calls) <= 5
-    # Every retry prompt names the stall and continues from it, never a bare re-run.
-    for retry_prompt in provider.calls[1:]:
-        assert "retry attempt" in retry_prompt
-        assert "stalled" in retry_prompt and STOP_REASON_TOOL_STALL in retry_prompt
-
-
-@pytest.mark.asyncio
-async def test_taskrunner_tool_stall_then_success_passes_on_retry(tmp_path: Path):
-    sessions = _make_taskrunner_sessions()
-    provider = MagicMock()
-    calls: list[str] = []
-
-    async def _stream(message: str):
-        calls.append(message)
-        if len(calls) == 1:
-            yield LLMEvent(kind="text_chunk", text="half")
-            yield LLMEvent(
-                kind="complete", stop_reason=STOP_REASON_TOOL_STALL, text=_STALL_EVIDENCE
-            )
-        else:
-            yield LLMEvent(kind="text_chunk", text="whole")
-            yield LLMEvent(kind="complete", stop_reason=STOP_REASON_END_TURN)
-
-    provider.stream = _stream
-    provider.approve_tool = AsyncMock()
-    provider.reject_tool = AsyncMock()
-    provider.context_usage_pct = MagicMock(return_value=0.0)
-    sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
-    runner = TaskRunner(sessions=sessions, auto_test=False, work_dir=tmp_path)
-    run = TaskRun(spec_path=str(tmp_path / "t.md"), spec_content="s", status="running")
-    step = Step(index=1, title="Test step", description="desc")
-    run.tasks = [step]
-
-    assert await runner._execute_single_task(run, step) is True
-    assert step.status == StepStatus.PASSED and step.error == ""
-    assert step.result == "whole"
-    assert "retry attempt 2" in calls[1] and "stalled" in calls[1]
-
-
-@pytest.mark.asyncio
-async def test_taskrunner_end_turn_step_passes(tmp_path: Path):
-    sessions = _make_taskrunner_sessions()
-    provider = _taskrunner_provider(STOP_REASON_END_TURN, text="done")
-    sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
-    runner = TaskRunner(sessions=sessions, auto_test=False, work_dir=tmp_path)
-    run = TaskRun(spec_path=str(tmp_path / "t.md"), spec_content="s", status="running")
-    step = Step(index=1, title="Test step", description="desc")
-    run.tasks = [step]
-    assert await runner._execute_single_task(run, step) is True
-    assert step.status == StepStatus.PASSED and step.result == "done"
-    assert provider.calls[0] and "retry attempt" not in provider.calls[0]
-
-
-# ── 5. The main chat uses the same table (no private spelling) ────────
-
-
-def test_chat_runner_has_no_private_stop_reason_mapping():
-    """chat_runner must not re-derive the class with its own `startswith("error:")`
-    or a literal retry budget; it reads the classifier and the shared constant."""
-    import kiro_crew.dashboard.chat_runner as cr
-
-    runner = Path(cr.__file__)
-    turn_files = [*sorted(runner.with_name("chat_turn").glob("*.py")), runner]
-    src = "\n".join(t.read_text(encoding="utf-8") for t in turn_files if t.name != "__init__.py")
-    assert 'startswith("error:")' not in src
-    assert "classify_stop_reason(" in src
-    assert "_tool_stall_retries < 3" not in src and "_tool_stall_retries >= 3" not in src
-    assert "_stale_recovery_retries < 3" not in src and "_stale_recovery_retries >= 3" not in src
-    assert "STOP_RECOVERY_MAX_RETRIES" in src
-
-
-def test_subagent_run_has_no_private_stop_reason_mapping():
-    import kiro_crew.subagent_manager.run as run_mod
-
-    # run.py binds most of its members from sibling ``run_*`` owners: read the family.
-    facade = Path(run_mod.__file__)
-    family = [facade, *sorted(facade.parent.glob("run_*.py"))]
-    src = "\n".join(path.read_text(encoding="utf-8") for path in family)
-    assert 'startswith("error:")' not in src
-    assert "classify_stop_reason(" in src

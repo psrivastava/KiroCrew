@@ -6,7 +6,11 @@ import ErrorNotice from './ErrorNotice'
 import { Btn } from './ui'
 import { i18nT } from '../i18n/t'
 import { earlierConversationRenderer, foldEarlierConversation } from './EarlierConversation'
+import { crewmateBrowserLiveRenderer } from './chat/crewmateBrowserLive'
 import type { ChatPaneProps } from './ChatPaneProps'
+import { useAppDispatch } from '../store'
+import { speakReply } from '../pages/chat/speakReply'
+import { usePersistedBool } from '../hooks/usePersistedBool'
 
 /**
  * `ChatPane`'s transcript content. `useChatPaneRenderers` builds the row set the
@@ -19,10 +23,12 @@ import type { ChatPaneProps } from './ChatPaneProps'
 
 type Messages = Parameters<typeof foldEarlierConversation>[0]
 
-export function useChatPaneRenderers({ slotKey, busyMode, onFileOpen, crewmate, crewmateTranscript, onSessionOpen, sessions, activeSession, messages, foldBefore, resume: { continuable, interrupted, continuing, onContinue } }: {
+export function useChatPaneRenderers({ slotKey, busyMode, onFileOpen, onFolderOpen, onOpenCrewTab, crewmate, crewmateTranscript, onSessionOpen, sessions, activeSession, messages, foldBefore, revealActions = false, linkPreviews = false, resume: { continuable, interrupted, continuing, onContinue } }: {
   slotKey: string
   busyMode: ComposerBusyMode
   onFileOpen?: ChatPaneProps['onFileOpen']
+  onFolderOpen?: ChatPaneProps['onFolderOpen']
+  onOpenCrewTab?: (slot: string) => void
   crewmate?: CrewmateIdentity
   crewmateTranscript: TranscriptRendererOptions['crewmateTranscript']
   onSessionOpen?: (key: string) => void
@@ -32,13 +38,18 @@ export function useChatPaneRenderers({ slotKey, busyMode, onFileOpen, crewmate, 
   foldBefore?: string
   /** The Resume press for this slot (`useChatPaneContinue`), for the newest error row. */
   resume: { continuable: boolean; interrupted: boolean; continuing: boolean; onContinue: () => void }
+  /** The browser blocked this slot's playback: a crewmate reply shows its
+   *  action row without hover, so the notice's More → Read aloud is reachable. */
+  revealActions?: boolean
+  /** Settings -> Chat -> Link Previews (the gateway's `link_previews`). */
+  linkPreviews?: boolean
 }) {
   // Split-view panes draw the SAME transcript rows as the single-chat surface,
   // through the SDK's row registry: the live ToolCallLine (purpose / input /
   // output / live status), the workflow and sub-agent launch cards, thinking
-  // traces, sent files, auto-nudge turns, recovery injects, workflow
-  // completions. The SDK's built-in registry is store-free by design and so
-  // draws weaker rows — or nothing at all — for most of these; the
+  // traces, sent files, auto-nudge turns, workflow completions. The SDK's
+  // built-in registry is store-free by design and so draws weaker rows — or
+  // nothing at all — for most of these; the
   // store-connected set is supplied here as host entries instead, which is the
   // registry's intended extension path and keeps app-sdk/ChatMessageList
   // Redux-free for the embed SDK.
@@ -51,7 +62,12 @@ export function useChatPaneRenderers({ slotKey, busyMode, onFileOpen, crewmate, 
   }, [])
   // The fresh-start fold opens per fresh start: a newer one closes it again.
   const [openFold, setOpenFold] = useState<string | undefined>(undefined)
+  const dispatch = useAppDispatch()
+  const onSpeak = useCallback((content: string) => speakReply(dispatch, slotKey, content), [dispatch, slotKey])
   const foldOpen = !!foldBefore && openFold === foldBefore
+  // Settings -> Chat -> Copy on Select, the same device-only key the Sessions
+  // chat reads (transcriptRendering), so a reply here copies a selection too.
+  const [copyOnSelect] = usePersistedBool('mc-chat-copy-on-select', false)
   const listMessages = useMemo(
     () => foldEarlierConversation(messages, foldBefore, foldOpen),
     [messages, foldBefore, foldOpen],
@@ -59,6 +75,7 @@ export function useChatPaneRenderers({ slotKey, busyMode, onFileOpen, crewmate, 
   const baseRenderers = useMemo(
     () => createTranscriptRenderers({
       slot: slotKey,
+      revealSlot: slotKey,
       toolDisclosure,
       onToolDisclosureChange: setToolDisclosureFor,
       // A steer-only surface has no steer/queue concept to explain, so a
@@ -67,6 +84,8 @@ export function useChatPaneRenderers({ slotKey, busyMode, onFileOpen, crewmate, 
       // Attachment cards / @mention chips open through the host's file viewer
       // (#9487); without it they render without an opener.
       onFileOpen,
+      onFolderOpen,
+      onOpenCrewTab,
       crewmate,
       crewmateTranscript,
       // Session links resolve through the SAME renderer path the single-chat
@@ -81,15 +100,23 @@ export function useChatPaneRenderers({ slotKey, busyMode, onFileOpen, crewmate, 
       interrupted,
       continuing,
       onContinue,
+      // A crewmate's reply offers Read aloud like a Sessions reply. Only the
+      // crewmate thread is read aloud off the active chat (`storeFocusedSlot`),
+      // so a split pane keeps its menu as it is.
+      onSpeak: crewmate ? onSpeak : undefined,
+      revealActions: !!crewmate && revealActions,
+      copyOnSelect,
+      linkPreviews,
     }),
-    [slotKey, toolDisclosure, setToolDisclosureFor, busyMode, onFileOpen, crewmate, crewmateTranscript, onSessionOpen, sessions, activeSession, continuable, interrupted, continuing, onContinue],
+    [slotKey, toolDisclosure, setToolDisclosureFor, busyMode, onFileOpen, onFolderOpen, onOpenCrewTab, crewmate, crewmateTranscript, onSessionOpen, sessions, activeSession, continuable, interrupted, continuing, onContinue, onSpeak, revealActions, copyOnSelect, linkPreviews],
   )
-  const renderers = useMemo(
-    () => (foldBefore
-      ? [earlierConversationRenderer(foldOpen, () => setOpenFold(foldOpen ? undefined : foldBefore)), ...baseRenderers]
-      : baseRenderers),
-    [baseRenderers, foldBefore, foldOpen],
-  )
+  const renderers = useMemo(() => {
+    // A crewmate's chat keeps each turn's browser call as a card row (crewmateBrowserLive).
+    const rows = crewmate ? [crewmateBrowserLiveRenderer(slotKey), ...baseRenderers] : baseRenderers
+    return foldBefore
+      ? [earlierConversationRenderer(foldOpen, () => setOpenFold(foldOpen ? undefined : foldBefore)), ...rows]
+      : rows
+  }, [baseRenderers, foldBefore, foldOpen, crewmate, slotKey])
 
   return { listMessages, renderers }
 }

@@ -5,8 +5,9 @@ Pins ``_requeue_unstarted`` when the store refuses its write or only its read-ba
 sweep that settles what a dead incarnation left (resume, park, fail, cancel, paging past its
 scan size, the lost-owner limit) and the rows it leaves alone; the factory over the
 manager's store and cap; the store as the only admission path; terminal writes kept through
-an outage, replayed, committed before the slot is released and settled by reconcile after a
-crash; and an accepted answer read from its persisted wake event rather than from memory.
+an outage or a caller cancel, replayed, committed before the slot is released and settled by
+reconcile after a crash; and an accepted answer read from its persisted wake event rather than
+from memory.
 Lanes, ``accept``, ``admit``, the claim/start boundary, the stop-reason recovery and the
 dependency and input waits are pinned in ``test_taskq_runner_adapter.py``; the shared
 fixtures and store helpers live in ``taskq_runner_adapter_helpers.py``.
@@ -17,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -34,7 +36,7 @@ from kiro_crew.taskq import model as m
 from kiro_crew.taskq.adapters import runner as r
 from kiro_crew.taskq.reconcile import reconcile_on_boot
 from kiro_crew.taskq.store import TaskStore, TaskStoreUnavailable
-from kiro_crew.testing.wait import await_until
+from kiro_crew.testing.wait import async_wait_until, await_until
 
 
 def _delete_mode_store(tmp_path: Path, clock: Clock) -> TaskStore:
@@ -529,8 +531,9 @@ async def test_adopt_leaves_a_row_this_incarnation_just_accepted_alone(
 
     assert report.cancelled == [] and store.state_of(waiting.id) == m.QUEUED
     assert h.done()
-    # flake-ok: pre-existing unbounded await of the admit task parked above, moved verbatim; tracked for a de-flake pass
-    live = await parked  # the slot freed and the live admission claimed it
+    live = await await_until(
+        parked, timeout=30, what="parked admission gets the freed slot"
+    )  # the slot freed and the live admission claimed it
     assert live.generation == 1 and live.done()
 
 
@@ -607,8 +610,7 @@ async def test_adopt_leaves_a_retry_wait_row_carrying_an_answer_alone(
     assert adm_a.answer_input(rec.id, "hunter2") is True
     wait.cancel()  # -- crash before the re-admission
     with pytest.raises(asyncio.CancelledError):
-        # flake-ok: pre-existing await of the input-wait task cancelled just above, moved verbatim; tracked for a de-flake pass
-        await wait
+        await await_until(wait, timeout=30, what="cancelled input wait settles")
     assert store_a.state_of(rec.id) == m.RETRY_WAIT
     store_a.close()
 
@@ -737,6 +739,78 @@ async def test_settle_marks_settled_only_after_the_terminal_write_or_a_durable_r
 
 
 @pytest.mark.asyncio
+async def test_a_cancel_while_done_async_waits_for_the_writer_still_settles_the_row(
+    store: TaskStore, clock: Clock, monkeypatch
+) -> None:
+    """A run cancel can land on the normal path while ``done_async`` waits behind
+    other writer jobs. Cancelling that await cancels the queued write too, and
+    the slot release after it never runs, so the handle settles synchronously
+    before the cancel propagates: the row is ``done`` and the lane is whole."""
+    adm, _ = _admission(store, clock, cap=1)
+    rec = adm.accept(kind=m.KIND_TASKRUNNER_STEP, task_id="taskrunner:r:task1")
+    h = await adm.admit(rec.id)
+    assert await h.running_async()
+    busy, release = threading.Event(), threading.Event()
+
+    def _hold_the_writer() -> None:
+        busy.set()
+        release.wait(30)
+
+    holding = store.post(_hold_the_writer)
+    await async_wait_until(busy.is_set)
+    real_post, posted = store.post, asyncio.Event()
+
+    def _post(fn, /, *args, **kw):
+        future = real_post(fn, *args, **kw)
+        posted.set()
+        return future
+
+    monkeypatch.setattr(store, "post", _post)
+    settling = asyncio.create_task(h.done_async())
+    await await_until(posted)
+    settling.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await settling
+    release.set()
+    await holding
+    assert store.state_of(rec.id) == m.DONE
+    assert adm.lane.running == 0 and adm.lane.waiting == 0
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_while_done_async_commits_keeps_the_write_and_frees_the_slot(
+    store: TaskStore, clock: Clock, monkeypatch
+) -> None:
+    """The other side of that race: the write is already running when the cancel
+    lands, so it commits. The synchronous settle's repeat is refused because
+    the row is already terminal, and the slot still goes back."""
+    adm, _ = _admission(store, clock, cap=1)
+    rec = adm.accept(kind=m.KIND_TASKRUNNER_STEP, task_id="taskrunner:r:task1")
+    h = await adm.admit(rec.id)
+    assert await h.running_async()
+    committed, release = threading.Event(), threading.Event()
+    real_finish = store.finish
+
+    def _finish_then_hold(*a, **kw):
+        result = real_finish(*a, **kw)
+        if not committed.is_set():  # only the writer thread's first call holds
+            committed.set()
+            release.wait(30)
+        return result
+
+    monkeypatch.setattr(store, "finish", _finish_then_hold)
+    settling = asyncio.create_task(h.done_async())
+    await async_wait_until(committed.is_set)
+    settling.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await settling
+    release.set()
+    await settle_store_writes(store)
+    assert store.state_of(rec.id) == m.DONE
+    assert adm.lane.running == 0 and adm.lane.waiting == 0
+
+
+@pytest.mark.asyncio
 async def test_the_next_admit_replays_a_terminal_write_the_store_kept(
     store: TaskStore, clock: Clock, monkeypatch
 ) -> None:
@@ -860,8 +934,7 @@ async def test_answer_is_restored_from_the_wake_event_after_a_rebuild(
     # -- crash before the coroutine is re-admitted: RAM is gone.
     wait.cancel()
     with pytest.raises(asyncio.CancelledError):
-        # flake-ok: pre-existing await of the input-wait task cancelled just above, moved verbatim; tracked for a de-flake pass
-        await wait
+        await await_until(wait, timeout=30, what="cancelled input wait settles")
     assert store_a.state_of(rec.id) == m.RETRY_WAIT  # claimable, no lease
     store_a.close()
     store_b = TaskStore(path, window=8, clock=clock, network_fs=False).open()

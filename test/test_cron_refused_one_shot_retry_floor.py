@@ -195,6 +195,7 @@ async def _gateway_cron_callback(monkeypatch, cfg):
     gw.slack = gw.conv_log = gw.dashboard_state = gw.subagent_mgr = None
     gw._owner_id = "owner"
     gw._cron_injecting = {}
+    gw._cron_runs_holding = set()
     gw._no_crons = False
     gw._cfg = cfg
     gw.cron_svc = None
@@ -226,7 +227,7 @@ async def test_a_refusal_a_retry_cannot_clear_parks_a_plain_one_shot(monkeypatch
     cfg = KiroCrewConfig.load()
     gateway_on_job = await _gateway_cron_callback(monkeypatch, cfg)
     captured = ExecutionContext(
-        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", "app"
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", ""
     )
     with patch("kiro_crew.cron.admission_check", return_value=_ADMITTED):
         service = await _service(tmp_path, SimpleNamespace(on_job=gateway_on_job))
