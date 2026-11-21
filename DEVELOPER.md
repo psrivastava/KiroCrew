@@ -491,15 +491,16 @@ red.
 | Opus 5.5 Review, GPT 6.1 Review, UX Review, Design Review, First Principles Review | Need model credentials held as upstream secrets |
 | Security Scope Review | Needs the same credentials; also fails closed on diffs over 1 MB, which every sync exceeds |
 | Internal Content Scan, Internal Content Scan Gate | Need `KIRO_RELEASE_GATE_ROLE_ARN` / `KIRO_RELEASE_GATE_BUCKET` |
+| Fast Gate | Its Flake Pattern Ratchet compares against the change's base. After a merge commit, upstream code reads as new violations, so it fails on every sync. It also times out (>300 s) on hosted runners, where the user-namespace probe fails with EPERM |
+| CI | Its `Await Fast Gate` and `Coverage Gate` jobs fail closed when the test jobs are skipped, which they are with Fast Gate off |
+| Main Ratchet Audit | Same ratchet as Fast Gate, run on `main` (expected to fail the same way; its logs were not read) |
+| Deploy Site (GitHub Pages) | `pages.yml` builds `site/` and deploys `site/dist` with `actions/deploy-pages`. Pages is not enabled on the fork, so it 404s. The fork does not publish the site |
 
-**Left enabled:** the `Fork …` variants (Fork UX Review, Fork Security Scope Review, Fork Opus 5.5 Review, …), which are upstream's fork-aware counterparts, plus the checks below that run on GitHub-hosted runners: CI, Fast Gate, PR Policy,
+**Left enabled:** the `Fork …` variants (Fork UX Review, Fork Security Scope Review, Fork Opus 5.5 Review, …), which are upstream's fork-aware counterparts, plus the checks below that run on GitHub-hosted runners: PR Policy,
 PR Hygiene, Dependency License Gate, Crew Image Build, Denial Differential,
-Python Client Tests.
+Python Client Tests, Code Review, CodeQL, Platform Tests, Issue Gate.
 
 **Known red on a sync PR even with the above:**
-- *Fast Gate → Flake Pattern Ratchet* times out (>300 s) on the hosted runner,
-  where the user-namespace probe fails with EPERM. Environmental; re-run once,
-  then treat as accepted.
 - *PR Hygiene* needs a `## Backwards compatibility` section with
   `Reader: <path>:<symbol> -- <chat|cron|subagent|app|crew page|release> -- <why it still works | test name>`
   lines for every removed public def. "Removes nothing:" is not accepted
